@@ -107,8 +107,11 @@ func (ops *nodeOperations) Split(node *NodeFormat) (*NodeFormat, *NodeFormat, Pa
 
 func (ops *nodeOperations) splitLeaf(node *NodeFormat) (*NodeFormat, *NodeFormat, PageID) {
 	entries := ExtractLeafEntries(node)
-	median := int(node.Count) / 2
-	splitKey := entries[median].Key
+	// Split so that splitKey goes to LEFT as the last entry.
+	// Left has keys <= splitKey, right has keys > splitKey.
+	// Use ceil(n/2) for left to ensure splitKey is the last key of left.
+	median := (int(node.Count) + 1) / 2
+	splitKey := entries[median-1].Key // Last key of left
 
 	// Create right node - must NOT share RawData with left
 	right := &NodeFormat{

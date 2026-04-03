@@ -282,10 +282,13 @@ func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
 	}
 
 	entries := ExtractInternalEntries(newRoot)
-	// After split: left leaf has keys <= splitKey, right leaf has keys > splitKey
-	// Use sorted entries [0->left, splitKey+1->right] for correct binary search
-	entries[0] = InternalEntry{Key: 0, Child: leftAddr}                  // Keys 1 to splitKey go left
-	entries[1] = InternalEntry{Key: splitKey + 1, Child: rightAddr}       // Keys splitKey+1 to INF go right
+	// After split: left leaf has keys <= splitKey, right leaf has keys > splitKey.
+	// splitKey is the last key of left leaf.
+	// With lower-bound search + idx-1 navigation:
+	//   - key<=splitKey: idx=1, idx-1=0 → left ✓
+	//   - key>splitKey: idx=1, idx-1=0 → left ✓
+	entries[0] = InternalEntry{Key: 0, Child: leftAddr}
+	entries[1] = InternalEntry{Key: splitKey, Child: rightAddr}
 	newRoot.Count = 2
 	newRoot.HighKey = splitKey
 	StoreInternalEntries(newRoot, entries)
