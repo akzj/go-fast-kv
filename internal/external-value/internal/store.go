@@ -2,6 +2,9 @@ package internal
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,9 @@ type externalValueStore struct {
 
 	// Index for tracking value metadata (VAddr -> valueInfo)
 	index map[VAddr]*valueInfo
+	
+	// Manifest file for persistence
+	manifestFile string
 
 	// Metrics
 	storeCount   uint64
@@ -53,10 +59,19 @@ func NewExternalValueStore(segmentMgr storage.SegmentManager, config api.Config)
 		config.SegmentSize = 1 << 30 // 1 GB
 	}
 
+	manifestFile := ""
+	if sm, ok := segmentMgr.(interface{ Directory() string }); ok {
+		manifestFile = filepath.Join(sm.Directory(), "external_values.manifest")
+	}
 	store := &externalValueStore{
-		segmentMgr: segmentMgr,
-		config:     config,
-		index:      make(map[VAddr]*valueInfo),
+		segmentMgr:   segmentMgr,
+		config:       config,
+		index:        make(map[VAddr]*valueInfo),
+		manifestFile: manifestFile,
+	}
+	// Load persisted index if exists
+	if manifestFile != "" {
+		store.loadManifest()
 	}
 
 	return store, nil
@@ -133,6 +148,8 @@ func (s *externalValueStore) Store(value []byte) (VAddr, error) {
 		pageCount: pageCount,
 		deleted:   false,
 	}
+	// Persist index
+	s.saveManifest()
 
 	// Update metrics atomically
 	atomic.AddUint64(&s.storeCount, 1)
@@ -283,6 +300,32 @@ func (s *externalValueStore) GetValueSize(addr VAddr) (uint64, error) {
 }
 
 // Close releases resources held by the store.
+// loadManifest loads the index from a manifest file
+func (s *externalValueStore) loadManifest() {
+	if s.manifestFile == "" {
+		return
+	}
+	data, err := os.ReadFile(s.manifestFile)
+	if err != nil {
+		return // No manifest yet
+	}
+	if err := json.Unmarshal(data, &s.index); err != nil {
+		return // Corrupted manifest
+	}
+}
+
+// saveManifest saves the index to a manifest file
+func (s *externalValueStore) saveManifest() {
+	if s.manifestFile == "" {
+		return
+	}
+	data, err := json.Marshal(s.index)
+	if err != nil {
+		return
+	}
+	os.WriteFile(s.manifestFile, data, 0644)
+}
+
 func (s *externalValueStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
