@@ -84,10 +84,8 @@ func (mgr *nodeManager) Load(addr VAddr) (*NodeFormat, error) {
 		return nil, ErrNodeNotFound
 	}
 
-	// Read full node (header + max entries)
-	size := NodeHeaderSize + int(MaxNodeCapacity)*LeafEntrySize
-	data := make([]byte, size)
-	_, err := segment.ReadAt(offset, size)
+	// Read PageSize bytes (Serialize outputs PageSize, not variable size)
+	data, err := segment.ReadAt(offset, vaddr.PageSize)
 	if err != nil {
 		return nil, ErrNodeNotFound
 	}

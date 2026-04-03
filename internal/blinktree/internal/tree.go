@@ -94,6 +94,7 @@ func (t *tree) Get(key PageID) (InlineValue, error) {
 	rootAddr := t.rootAddr
 	t.mu.Unlock()
 
+
 	if !rootAddr.IsValid() {
 		return InlineValue{}, ErrKeyNotFound
 	}
@@ -110,11 +111,11 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 
 	if node.NodeType == NodeTypeLeaf {
 		idx := t.nodeOps.Search(node, key)
-		if idx < int(node.Count) {
-			entries := ExtractLeafEntries(node)
-			if entries[idx].Key == key {
-				return entries[idx].Value, nil
-			}
+		entries := ExtractLeafEntries(node)
+		// search returns first position where Key >= key
+		// If key exists, it's at idx (or earlier if duplicates, but we use first match)
+		if idx < len(entries) && entries[idx].Key == key {
+			return entries[idx].Value, nil
 		}
 		return InlineValue{}, ErrKeyNotFound
 	}
@@ -217,8 +218,16 @@ func (t *tree) put(key PageID, value InlineValue) error {
 		return t.propagateSplit(stack, leafAddr, rightAddr, splitKey)
 	}
 
-	_, err = t.nodeMgr.Persist(leaf)
-	return err
+	// Persist the modified leaf and update root address if needed
+	newAddr, err := t.nodeMgr.Persist(leaf)
+	if err != nil {
+		return err
+	}
+	// If leaf was the root, update root address to new persisted location
+	if leafAddr == t.rootAddr {
+		t.rootAddr = newAddr
+	}
+	return nil
 }
 
 // propagateSplit handles split propagation up the tree.
@@ -626,9 +635,13 @@ func (t *tree) deleteImpl(key PageID) error {
 	leaf.Count--
 	StoreLeafEntries(leaf, entries)
 
-	_, err = t.nodeMgr.Persist(leaf)
+	newAddr, err := t.nodeMgr.Persist(leaf)
 	if err != nil {
 		return err
+	}
+	// If leaf was the root, update root address to new persisted location
+	if leafAddr == t.rootAddr {
+		t.rootAddr = newAddr
 	}
 
 	// Check for underflow (merge/redistribute if needed)
@@ -644,6 +657,7 @@ func (t *tree) Scan(start, end PageID) (TreeIterator, error) {
 	t.mu.Lock()
 	rootAddr := t.rootAddr
 	t.mu.Unlock()
+
 
 	if !rootAddr.IsValid() {
 		return nil, ErrKeyNotFound

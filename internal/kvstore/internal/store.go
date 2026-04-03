@@ -261,7 +261,6 @@ func NewKVStore(config Config) (*kvStore, error) {
 		}
 	}
 	
-	fmt.Printf("DEBUG NewKVStore: segment count=%d, active=%v\n", segMgr.SegmentCount(), segMgr.ActiveSegment() != nil)
 
 	// Load tree root from metadata file if exists
 	metadataFile := filepath.Join(config.Directory, "metadata.json")

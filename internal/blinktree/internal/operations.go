@@ -67,8 +67,19 @@ func (ops *nodeOperations) Insert(node *NodeFormat, key PageID, value InlineValu
 	// If node has capacity, just insert
 	if int(node.Count) < int(node.Capacity) {
 		pos := ops.searchLeaf(node, key)
-		copy(entries[pos+1:], entries[pos:])
-		entries[pos] = LeafEntry{Key: key, Value: value}
+		// Handle empty node case (Count=0)
+		if node.Count == 0 {
+			entries = []LeafEntry{{Key: key, Value: value}}
+		} else {
+			// Create new slice with room for one more entry
+			newEntries := make([]LeafEntry, 0, node.Count+1)
+			newEntries = append(newEntries, entries[:pos]...)
+			newEntries = append(newEntries, LeafEntry{Key: key, Value: value})
+			if pos < len(entries) {
+				newEntries = append(newEntries, entries[pos:]...)
+			}
+			entries = newEntries
+		}
 		node.Count++
 		StoreLeafEntries(node, entries)
 		return nil, 0, nil
@@ -187,14 +198,10 @@ func (ops *nodeOperations) UpdateHighKey(node *NodeFormat) PageID {
 }
 
 // Serialize returns binary representation.
+// Always outputs PageSize bytes for consistent checksum and storage alignment.
 func (ops *nodeOperations) Serialize(node *NodeFormat) []byte {
-	entrySize := InternalEntrySize
-	if node.NodeType == NodeTypeLeaf {
-		entrySize = LeafEntrySize
-	}
-	totalSize := NodeHeaderSize + int(node.Count)*entrySize
-
-	buf := make([]byte, totalSize)
+	// Always output PageSize for storage alignment
+	buf := make([]byte, vaddr.PageSize)
 	offset := 0
 
 	// Write header fields
@@ -226,8 +233,7 @@ func (ops *nodeOperations) Serialize(node *NodeFormat) []byte {
 	binary.BigEndian.PutUint64(buf[offset:], uint64(node.HighKey))
 	offset += 8
 
-	// Checksum placeholder
-	binary.BigEndian.PutUint32(buf[offset:], node.Checksum)
+	// Skip checksum field (will compute below)
 	offset += 4
 	offset += 4 // Padding
 
@@ -253,9 +259,12 @@ func (ops *nodeOperations) Serialize(node *NodeFormat) []byte {
 		}
 	}
 
-	// Compute and set checksum
-	cs := crc32.ChecksumIEEE(buf[:totalSize])
-	binary.BigEndian.PutUint32(buf[60:64], cs)
+	// Compute checksum on full PageSize buffer
+	// Zero checksum field first, then compute
+	binary.BigEndian.PutUint32(buf[48:52], 0)
+	cs := crc32.ChecksumIEEE(buf)
+	binary.BigEndian.PutUint32(buf[48:52], cs)
+	node.Checksum = cs
 
 	return buf
 }
@@ -292,7 +301,13 @@ func (ops *nodeOperations) Deserialize(data []byte) (*NodeFormat, error) {
 	offset += 4 // Padding
 
 	// Verify checksum
-	cs := crc32.ChecksumIEEE(data[:len(data)])
+	// Zero checksum field at bytes 48-51 before computing checksum
+	// This must match how Serialize computes it (writes to buf[48:52])
+	data[48] = 0
+	data[49] = 0
+	data[50] = 0
+	data[51] = 0
+	cs := crc32.ChecksumIEEE(data)
 	if storedCS != cs {
 		return nil, ErrInvalidNode
 	}
@@ -300,7 +315,8 @@ func (ops *nodeOperations) Deserialize(data []byte) (*NodeFormat, error) {
 	node.Checksum = storedCS
 
 	// Store raw data for entry extraction
-	node.RawData = data[NodeHeaderSize:]
+	// Entries start at offset 56 in serialized format
+	node.RawData = data[56:]
 
 	return node, nil
 }
@@ -329,8 +345,8 @@ func ExtractLeafEntries(node *NodeFormat) []LeafEntry {
 	if node == nil {
 		return nil
 	}
-	// Always return capacity-sized slice to allow Insert to shift entries
-	entries := make([]LeafEntry, node.Capacity)
+	entries := make([]LeafEntry, node.Count)
+
 	// If RawData is empty or too short for the count, return zeroed entries
 	if len(node.RawData) == 0 || len(node.RawData) < int(node.Count)*LeafEntrySize {
 		return entries
@@ -342,7 +358,6 @@ func ExtractLeafEntries(node *NodeFormat) []LeafEntry {
 		offset += 8
 		copy(entries[i].Value.Length[:], node.RawData[offset:])
 		offset += 8
-		// Data field is exactly 56 bytes
 		copy(entries[i].Value.Data[:], node.RawData[offset:offset+56])
 		offset += 56
 	}
@@ -351,18 +366,14 @@ func ExtractLeafEntries(node *NodeFormat) []LeafEntry {
 
 // StoreLeafEntries serializes entries back into node.RawData.
 func StoreLeafEntries(node *NodeFormat, entries []LeafEntry) {
-	if node == nil {
-		return
-	}
-	size := int(node.Count) * LeafEntrySize
+	size := len(entries) * LeafEntrySize
 	node.RawData = make([]byte, size)
 	offset := 0
-	for i := 0; i < int(node.Count); i++ {
+	for i := 0; i < len(entries); i++ {
 		binary.BigEndian.PutUint64(node.RawData[offset:], uint64(entries[i].Key))
 		offset += 8
 		copy(node.RawData[offset:], entries[i].Value.Length[:])
 		offset += 8
-		// Data field is 56 bytes, but only copy up to 56 bytes of actual value
 		copy(node.RawData[offset:], entries[i].Value.Data[:])
 		offset += 56
 	}
@@ -373,8 +384,8 @@ func ExtractInternalEntries(node *NodeFormat) []InternalEntry {
 	if node == nil {
 		return nil
 	}
-	// Always return capacity-sized slice to allow Insert/Split to shift entries
-	entries := make([]InternalEntry, node.Capacity)
+	entries := make([]InternalEntry, node.Count)
+
 	if len(node.RawData) == 0 {
 		return entries
 	}
@@ -390,13 +401,10 @@ func ExtractInternalEntries(node *NodeFormat) []InternalEntry {
 
 // StoreInternalEntries serializes entries back into node.RawData.
 func StoreInternalEntries(node *NodeFormat, entries []InternalEntry) {
-	if node == nil {
-		return
-	}
-	size := int(node.Count) * InternalEntrySize
+	size := len(entries) * InternalEntrySize
 	node.RawData = make([]byte, size)
 	offset := 0
-	for i := 0; i < int(node.Count); i++ {
+	for i := 0; i < len(entries); i++ {
 		binary.BigEndian.PutUint64(node.RawData[offset:], uint64(entries[i].Key))
 		offset += 8
 		child := entries[i].Child.ToBytes()
@@ -405,30 +413,10 @@ func StoreInternalEntries(node *NodeFormat, entries []InternalEntry) {
 	}
 }
 
-// =============================================================================
-// InlineValue Helpers
-// =============================================================================
-
-// MakeInlineValue creates an inline value from data.
+// MakeInlineValue creates an InlineValue from a byte slice.
 func MakeInlineValue(data []byte) InlineValue {
-	var v InlineValue
-	n := len(data)
-	if n > 56 {
-		n = 56
-	}
-	// Encode length with top bit clear for inline
-	binary.BigEndian.PutUint64(v.Length[:], uint64(n))
-	copy(v.Data[:n], data)
-	return v
-}
-
-// MakeExternalValue creates an external value reference.
-func MakeExternalValue(addr vaddr.VAddr) InlineValue {
-	var v InlineValue
-	// Encode with top bit set for external
-	val := uint64(0x8000000000000000) // External flag
-	binary.BigEndian.PutUint64(v.Length[:], val)
-	addrBytes := addr.ToBytes()
-	copy(v.Data[:16], addrBytes[:])
-	return v
+	var iv InlineValue
+	binary.BigEndian.PutUint64(iv.Length[:], uint64(len(data)))
+	copy(iv.Data[:], data)
+	return iv
 }
