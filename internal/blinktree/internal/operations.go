@@ -211,6 +211,19 @@ func (ops *nodeOperations) Serialize(node *NodeFormat) []byte {
 	offset++
 	buf[offset] = node.Level
 	offset++
+
+	// Defensive: cap count to what fits in page
+	// PageSize - 56 (header) = 4040 bytes for entries
+	// Leaf: 4040/72 = 56, Internal: 4040/24 = 168
+	maxCount := uint8(255) // Default max
+	if node.NodeType == NodeTypeLeaf {
+		maxCount = uint8((vaddr.PageSize - 56) / LeafEntrySize)
+	} else {
+		maxCount = uint8((vaddr.PageSize - 56) / InternalEntrySize)
+	}
+	if node.Count > maxCount {
+		node.Count = maxCount
+	}
 	buf[offset] = node.Count
 	offset++
 
