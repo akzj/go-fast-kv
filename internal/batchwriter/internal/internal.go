@@ -108,6 +108,22 @@ func (bw *batchWriter) Close() error {
 	return nil
 }
 
+// Drain waits for all pending writes to complete but keeps the batchwriter alive.
+// This is useful when you need to ensure writes are on disk before reading,
+// without shutting down the batchwriter.
+func (bw *batchWriter) Drain() {
+	// Send a drain request through the channel
+	done := make(chan struct{})
+	bw.ch <- WriteRequest{
+		Data: nil,
+		WriteAt: func(d []byte, off int64) (int, error) {
+			close(done)
+			return 0, nil
+		},
+	}
+	<-done // Wait for drain request to be processed
+}
+
 // consumeLoop is the consumer goroutine that processes writes.
 // It uses the "read → loop read more → exit when empty → flush" pattern.
 // This is EVENT-DRIVEN: no timers, no periodic flushing.

@@ -244,12 +244,30 @@ func (s *segment) Sync() error {
 		return nil
 	}
 
-	// Write trailer first
-	if err := s.writeTrailer(); err != nil {
+	// Write trailer first (without syncing - we'll sync at the end)
+	if err := s.writeTrailerNoSync(); err != nil {
 		return err
 	}
 
 	return s.file.Sync()
+}
+
+// writeTrailerNoSync writes the trailer without syncing.
+// Caller must hold s.mu.
+func (s *segment) writeTrailerNoSync() error {
+	trailer := make([]byte, trailerSize)
+
+	// Calculate checksum of data
+	checksum := s.calculateDataChecksum()
+
+	binary.LittleEndian.PutUint64(trailer[trailerOffsetPageCount:], s.pageCount)
+	binary.LittleEndian.PutUint64(trailer[trailerOffsetDataSize:], uint64(s.dataSize))
+	binary.LittleEndian.PutUint32(trailer[trailerOffsetChecksum:], checksum)
+
+	// Write trailer after all data (header + dataSize)
+	offset := int64(headerSize) + s.dataSize
+	_, err := s.file.WriteAt(trailer, offset)
+	return err
 }
 
 // Close closes the segment file.
@@ -265,7 +283,7 @@ func (s *segment) Close() error {
 
 	// Write final trailer if active
 	if s.state == vaddr.SegmentStateActive {
-		if err := s.writeTrailer(); err != nil {
+		if err := s.writeTrailerNoSync(); err != nil {
 			return err
 		}
 	}

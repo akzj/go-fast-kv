@@ -7,6 +7,8 @@
 // This package re-exports all public interfaces from the api package.
 package batchwriter
 
+import "github.com/akzj/go-fast-kv/internal/batchwriter/internal"
+
 import batchwriterapi "github.com/akzj/go-fast-kv/internal/batchwriter/api"
 
 // Re-export all types.
@@ -21,7 +23,8 @@ var (
 	ErrNoWriteFunc = batchwriterapi.ErrNoWriteFunc
 )
 
-// Re-export functions.
-var (
-	New = batchwriterapi.New
-)
+// Re-export New function.
+var New = batchwriterapi.New
+
+// Drain waits for pending writes to complete without closing the batchwriter.
+var Drain = (*internal.BatchWriter).Drain
