@@ -21,7 +21,7 @@ package compaction
 import (
 	"errors"
 
-	"github.com/akzj/go-fast-kv/internal/vaddr/api"
+	"github.com/akzj/go-fast-kv/internal/vaddr"
 	"time"
 )
 

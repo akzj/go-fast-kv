@@ -1,21 +1,44 @@
+// Package vaddr provides foundation types for the append-only storage system.
+//
+// Usage:
+//
+//	import vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
+//
+// This package re-exports all public types from the api package.
 package vaddr
 
-// DefaultMaxValueSize is the maximum value size (64 MB).
-const DefaultMaxValueSize = 64 * 1024 * 1024
+import vaddrapi "github.com/akzj/go-fast-kv/internal/vaddr/api"
 
-// VAddr encodes a physical address in the append-only address space.
-type VAddr struct {
-	SegmentID uint64
-	Offset    uint64
-}
+// Re-export all types from api package.
+type (
+    VAddr       = vaddrapi.VAddr
+    SegmentID   = vaddrapi.SegmentID
+    PageID      = vaddrapi.PageID
+    SegmentState = vaddrapi.SegmentState
+    EpochID     = vaddrapi.EpochID
+)
 
-// IsValid returns true if this VAddr represents a valid address.
-func (v VAddr) IsValid() bool {
-	return v.SegmentID != 0
-}
+// Re-export constants.
+const (
+    PageSize            = vaddrapi.PageSize
+    ExternalThreshold   = vaddrapi.ExternalThreshold
+    MaxSegmentSize       = vaddrapi.MaxSegmentSize
+    SegmentHeaderSize    = vaddrapi.SegmentHeaderSize
+    SegmentTrailerSize   = vaddrapi.SegmentTrailerSize
+    EpochGracePeriod     = vaddrapi.EpochGracePeriod
 
-// VAddrInvalid is the null/invalid address (reserved).
-var VAddrInvalid = VAddr{SegmentID: 0, Offset: 0}
+    // SegmentState constants
+    SegmentStateActive   = vaddrapi.SegmentStateActive
+    SegmentStateSealed   = vaddrapi.SegmentStateSealed
+    SegmentStateArchived = vaddrapi.SegmentStateArchived
 
-// PageID is a logical identifier for a page.
-type PageID uint64
+    // Invalid IDs
+    SegmentIDInvalid = vaddrapi.SegmentIDInvalid
+    SegmentIDMin     = vaddrapi.SegmentIDMin
+    PageIDInvalid    = vaddrapi.PageIDInvalid
+)
+
+// Re-export functions.
+var (
+    VAddrFromBytes = vaddrapi.VAddrFromBytes
+)

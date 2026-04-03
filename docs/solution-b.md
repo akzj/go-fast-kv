@@ -4,6 +4,10 @@
 **Derived from**: All 11 design documents in `docs/*.md`  
 **Finalized**: Key architectural decisions resolved
 
+
+
+
+
 ---
 
 ## Table of Contents
@@ -22,6 +26,32 @@
 12. [Type Definitions Summary](#12-type-definitions-summary)
 13. [Invariant Summary](#13-invariant-summary)
 14. [Cross-Document References](#14-cross-document-references)
+
+
+
+
+
+
+  ## Core Principle: Module Isolation is Entropy Control
+
+  **Why this matters**: Agent context limit is 200k tokens. If a bug spans multiple tightly-coupled modules, the context overflows and the agent loses the ability to trace the issue. Module isolation is not optional — it's survival.
+
+  Your output is **harmful** if it:
+  - Allows module boundaries to blur (internal dependencies across modules)
+  - Lets the agent design without defining clear interfaces
+  - Ignores missing api/api.go when a new module is being created
+
+  Your output **works** when it:
+  - Enforces **module isolation**: each module must be independently testable, only depend on other modules through interfaces (mockable), never depend on `internal` details of other modules
+  - Ensures **required structure** for new modules:
+    ```
+    {mod}/
+    ├── api/api.go        # Public interface
+    ├── internal/         # Private implementation & tests
+    ├── docs/             # Documentation for development
+    └── {mod}.go          # Re-export api.go
+    ```
+  - Catches **cross-module coupling** early before it becomes a context explosion
 
 ---
 
