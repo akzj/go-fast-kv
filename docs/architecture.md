@@ -4,20 +4,50 @@
 
 go-fast-kv 是一个高性能的键值存储数据库,采用以下核心设计:
 
-- **B-link-tree**: 读优化的B+树变体
+- **B-link-tree**: 读优化的B+树变体,支持页面级锁和并发读取
 - **追加写入**: 所有数据追加到活动段,无随机写入
-- **全局WAL**: 所有模块共享预写日志
+- **异步WAL**: 3层通道架构,无锁写入
 - **分层GC**: 根据段类型采用不同垃圾回收策略
 
-## 2. 核心组件
+### 性能指标
 
-### 2.1 B+ Tree 层
+| Benchmark | 结果 |
+|-----------|------|
+| Sequential Put | ~2-3.5M ops/sec |
+| Sequential Get | ~6-8M ops/sec |
+| Concurrent Writes | >500K ops/sec |
+| Concurrent Reads | >3M ops/sec |
 
-B+树负责键值索引,具有以下特点:
+## 2. 模块隔离结构
 
+每个模块遵循严格隔离原则:
+
+```
+pkg/{mod}/
+├── api/api.go          # 公共接口定义
+├── internal/           # 私有实现
+│   ├── {mod}.go      # 核心实现
+│   ├── *_test.go     # 单元测试
+│   └── bench_test.go # 性能测试
+└── {mod}.go          # 从 api 包导出
+```
+
+**规则**:
+- `api/api.go` 仅包含接口和公共类型,无实现
+- `internal/` 可导入自己的 `api` 包,不可导入其他模块的 `internal`
+- 模块间通信仅通过 `api` 接口
+
+## 3. 核心组件
+
+### 3.1 B+ Tree 层 (pkg/btree/)
+
+B-link-tree 实现,具有以下特点:
+
+- **页面级锁**: 每页独立的读写锁,支持并发读取
+- **Lock Coupling**: 先锁子节点再解锁父节点
 - **虚拟PageID**: B+树只操作虚拟PageID,不知道物理位置
 - **内联存储**: 小值(<512B)直接存储在叶子节点
-- **引用存储**: 大值(>=512B)存储在ObjectStore,节点中只存blob_id
+- **引用存储**: 大值(>=512B)存储在ObjectStore
 
 **B+Tree值格式**:
 ```
@@ -25,7 +55,7 @@ B+树负责键值索引,具有以下特点:
 引用值:   [flag:1][blob_id:8]
 ```
 
-### 2.2 Object Store 层
+### 3.2 Object Store 层 (pkg/objectstore/)
 
 统一存储层,管理所有页面和Blob对象。
 
@@ -34,30 +64,34 @@ B+树负责键值索引,具有以下特点:
 - 维护Mapping Index(内存+WAL持久化)
 - ObjectID到物理位置的映射
 
-**写入流程**:
+### 3.3 Global WAL 层 (pkg/wal/)
+
+3层异步通道架构,实现无锁写入:
+
 ```
-B+Tree → ObjectStore → 追加到活动段 → 更新Mapping Index → 写WAL → Batch Fsync
-```
-
-### 2.3 Global WAL 层
-
-全局预写日志,所有模块共享。
-
-**设计原则**:
-- 条目类型区分不同模块(ObjectStore/B+Tree)
-- 批量fsync优化性能
-- Checkpoint持久化Mapping Index快照
-
-**WAL条目格式**:
-```
-[Type:1][Length:4][Payload:n]
+┌─────────────┐     chan     ┌───────────────┐     chan     ┌─────────────┐
+│   Put()     │ ──────────→ │  Batch Loop   │ ──────────→ │  File I/O   │
+│  (Producer) │  non-block  │  (Consumer)   │  non-block  │  (Writer)   │
+└─────────────┘             │  drain+batch  │             │  write+sync │
+      ↑                      └───────────────┘             └─────────────┘
+      │ callback                  ↑                             │
+      └──────────────────────────┘                             ↓
 ```
 
-### 2.4 GC Controller 层
+**Layer 1 - Entry Queue**: `entryChan` 接收生产者条目(非阻塞发送)
+**Layer 2 - Memory Buffer**: Consumer 累积条目到内存缓冲区
+**Layer 3 - File Writer**: 独立goroutine处理所有文件I/O
+
+**优势**:
+- 写入操作无锁,直接发送到channel
+- 批量写入减少I/O次数
+- Consumer不会因文件I/O阻塞
+
+### 3.4 GC Controller 层 (pkg/gc/)
 
 垃圾回收控制器,采用阈值+稳定性检查策略。
 
-## 3. 段类型
+## 4. 段类型
 
 | 段类型 | 大小 | GC策略 | 删除处理 |
 |--------|------|--------|----------|
@@ -67,29 +101,60 @@ B+Tree → ObjectStore → 追加到活动段 → 更新Mapping Index → 写WAL
 
 **Large Blob判定**: size >= 256MB
 
-## 4. 数据流
+## 5. 并发架构
 
-### 4.1 写入流程
+### 5.1 锁策略
+
+| 层级 | 锁策略 | 并发读 | 并发写 |
+|------|--------|--------|--------|
+| KVStore | 无锁 (atomic.Bool) | ✅ 完全并发 | ✅ 完全并发 |
+| BTree | Page-level latches + lock coupling | ✅ | ✅ |
+| ObjectStore | Per-segment mutexes | ✅ | ✅ |
+| WAL | 异步3层 (entryChan → buffer → writer) | N/A | ✅ 并发入队 |
+
+### 5.2 B-link-tree Lock Coupling
 
 ```
-1. B+Tree.Put(key, value)
+传统B+Tree (全局锁):
+  Lock → traverse → modify → unlock
+
+B-link-tree (页面级锁):
+  Lock parent → Lock child → Unlock parent → Lock grandchild → ...
+```
+
+**优势**:
+- 多个读操作可同时遍历
+- 写操作仅在特定页面相互阻塞
+- Lock coupling确保一致性
+
+## 6. 数据流
+
+### 6.1 写入流程
+
+```
+1. KVStore.Put(key, value)
    ├── value < 512B: 直接内联
    └── value >= 512B: 调用ObjectStore.WriteBlob()
 
 2. ObjectStore.WriteBlob()
    ├── 计算Segment类型
    ├── 追加到活动段
-   ├── 更新Mapping Index
-   └── 写入WAL
+   └── 更新Mapping Index
 
-3. WAL.Sync()
-   └── Batch fsync所有待写入条目
+3. WAL.Write() (异步)
+   ├── 发送到entryChan (非阻塞)
+   └── Consumer处理批量写入
+
+4. Consumer (Batch Loop)
+   ├── drain entryChan
+   ├── batch到writeBuffer
+   └── 发送到writerChan
 ```
 
-### 4.2 读取流程
+### 6.2 读取流程
 
 ```
-1. B+Tree.Get(key)
+1. BTree.Get(key)
    ├── 读取叶子节点
    ├── 检查flag
    ├── flag=内联: 直接返回data
@@ -101,18 +166,18 @@ B+Tree → ObjectStore → 追加到活动段 → 更新Mapping Index → 写WAL
    └── 验证Checksum
 ```
 
-### 4.3 删除流程
+### 6.3 删除流程
 
 ```
-B+Tree.Delete(key)
-├── 从B+Tree移除键
+BTree.Delete(key)
+├── 从BTree移除键
 ├── 如果value是blob,调用ObjectStore.Delete()
 └── ObjectStore标记对象为已删除(GC回收)
 ```
 
-## 5. GC策略
+## 7. GC策略
 
-### 5.1 Page Segment GC
+### 7.1 Page Segment GC
 
 **触发条件**: 垃圾比率 > 40%
 
@@ -122,24 +187,38 @@ B+Tree.Delete(key)
 3. 更新Mapping Index
 4. 删除旧段
 
-### 5.2 Blob Segment GC
+### 7.2 Blob Segment GC
 
 **触发条件**: 垃圾比率 > 50% **且** 修改率 < 阈值
 
 **为什么需要稳定性检查?**
 Blob Segment容量大(256MB),频繁压缩成本高。只有当修改率稳定时才触发GC。
 
-**修改率稳定性检查**:
-- 使用滑动窗口跟踪历史修改率
-- 方差小于阈值时判定为稳定
-
-### 5.3 Large Blob Segment GC
+### 7.3 Large Blob Segment GC
 
 **无需GC**,每个Large Blob独占一个Segment,删除即回收文件。
 
-## 6. WAL设计
+## 8. WAL设计
 
-### 6.1 条目类型
+### 8.1 3层异步架构
+
+```
+Layer 1: entryChan (无锁入队)
+  - Producer: select non-blocking send
+  - Fallback: sync write if channel full
+
+Layer 2: Memory Buffer (批量累积)
+  - Consumer drain with timeout
+  - batchEntry() marshals and buffers
+  - Send to writer when batch full
+
+Layer 3: writerRun() (文件I/O)
+  - Separate goroutine
+  - writeChan receives batches
+  - Signal callbacks when written
+```
+
+### 8.2 条目类型
 
 | Type | 模块 | 用途 |
 |------|------|------|
@@ -147,19 +226,16 @@ Blob Segment容量大(256MB),频繁压缩成本高。只有当修改率稳定时
 | 0x02 | B+Tree | 键值插入/删除 |
 | 0xFF | Checkpoint | 检查点标记 |
 
-### 6.2 Checkpoint机制
+### 8.3 WAL条目格式
 
-1. 写入Checkpoint标记到WAL
-2. 将Mapping Index快照序列化到WAL
-3. Fsync确保所有之前的写入已持久化
+```
+[Type:1][Length:4][Payload:n][Checksum:4]
+Total: 9 + len(Payload) bytes per entry
+```
 
-### 6.3 批量Sync
+## 9. 崩溃恢复
 
-多个写入累积后一次性fsync,显著提升吞吐量。
-
-## 7. 崩溃恢复
-
-### 7.1 恢复流程
+### 9.1 恢复流程
 
 ```
 1. 加载最后Checkpoint
@@ -172,11 +248,13 @@ Blob Segment容量大(256MB),频繁压缩成本高。只有当修改率稳定时
    └── 检测数据损坏
 ```
 
-### 7.2 Checkpoint频率
+### 9.2 Checkpoint机制
 
-建议每10000次操作或30秒执行一次Checkpoint。
+1. 写入Checkpoint标记到WAL
+2. 将Mapping Index快照序列化到WAL
+3. Fsync确保所有之前的写入已持久化
 
-## 8. 关键参数
+## 10. 关键参数
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
@@ -189,8 +267,9 @@ Blob Segment容量大(256MB),频繁压缩成本高。只有当修改率稳定时
 | BlobSegmentGCThreshold | 50% | Blob Segment GC阈值 |
 | ObjectHeaderSize | 32B | 对象头部固定大小 |
 | MappingIndexEntrySize | 16B | 映射条目大小 |
+| WALBatchSize | 4MB | WAL缓冲区大小 |
 
-## 9. Object ID格式
+## 11. Object ID格式
 
 ```
 63            56 55                                          0
@@ -205,7 +284,7 @@ Blob Segment容量大(256MB),频繁压缩成本高。只有当修改率稳定时
 - 0x01: Blob (普通Blob)
 - 0x02: Large (大型Blob)
 
-## 10. Object Header格式
+## 12. Object Header格式
 
 固定32字节:
 
@@ -219,52 +298,85 @@ Offset  Size  Field
 12      20    Reserved
 ```
 
-## 11. 目录结构
+## 13. 项目结构
 
 ```
 go-fast-kv/
 ├── docs/
 │   └── architecture.md        # 本文档
 ├── pkg/
-│   ├── objectstore/           # 对象存储层
-│   │   ├── types.go           # 类型定义
-│   │   └── objectstore.go     # 接口定义
-│   ├── wal/                   # 预写日志
-│   │   ├── types.go           # WAL类型和接口
-│   │   └── wal.go             # 辅助函数
-│   ├── btree/                 # B+树
-│   │   └── btree.go           # B+树接口和工具
-│   └── gc/                    # 垃圾回收
-│       └── gc.go              # GC控制器
-├── internal/                  # 内部实现包
-├── cmd/                       # 命令行工具
+│   ├── objectstore/           # 统一对象存储
+│   │   ├── api/api.go        # 接口定义
+│   │   ├── internal/          # 私有实现
+│   │   │   ├── store.go
+│   │   │   ├── segment_manager.go
+│   │   │   └── mapping_index.go
+│   │   └── objectstore.go     # 导出
+│   ├── wal/                   # 异步WAL
+│   │   ├── api/api.go
+│   │   ├── internal/wal.go   # 3层异步实现
+│   │   └── wal.go
+│   ├── btree/                # B-link-tree
+│   │   ├── api/api.go
+│   │   ├── internal/
+│   │   │   ├── btree_impl.go
+│   │   │   ├── page.go
+│   │   │   └── latch.go      # 页面级锁
+│   │   └── btree.go
+│   ├── gc/                   # GC控制器
+│   │   ├── api/api.go
+│   │   ├── internal/gc_impl.go
+│   │   └── gc.go
+│   └── kvstore/              # KV数据库
+│       ├── api/api.go
+│       ├── internal/kvstore.go
+│       └── kvstore.go
+├── cmd/                       # CLI工具
 ├── go.mod
 └── go.sum
 ```
 
-## 12. 设计权衡
+## 14. 设计权衡
 
-### 12.1 为什么追加写入?
+### 14.1 为什么追加写入?
 
 - **顺序写入友好**: 机械硬盘和SSD都有顺序写入优势
 - **简化GC**: 只需移动存活对象
 - **避免碎片化**: 新数据写入新位置
 
-### 12.2 为什么B+Tree不知道物理位置?
+### 14.2 为什么B+Tree不知道物理位置?
 
 - **隔离变化**: GC压缩后物理位置变化,B+Tree无需更新
 - **简化接口**: B+Tree只需ObjectID操作
 - **一致性**: 所有读写都通过ObjectStore,保证数据一致性
 
-### 12.3 为什么Large Blob不需要GC?
+### 14.3 为什么Large Blob不需要GC?
 
 - 1:1映射(每个Large Blob独占一个Segment)
 - 删除即回收文件
 - 压缩成本太高,不值得
 
-## 13. 未来扩展
+### 14.4 WAL为什么用3层架构?
 
-- 支持多盘并发写入
-- 支持压缩(热数据LZ4,冷数据ZSTD)
-- 支持加密(AES-256-GCM)
-- 支持分布式复制(Raft共识)
+- Layer 1 (channel): 实现无锁入队
+- Layer 2 (buffer): 批量累积减少I/O
+- Layer 3 (writer): 文件I/O不阻塞Consumer
+
+## 15. 测试覆盖
+
+| 模块 | 测试数 | 状态 |
+|------|--------|------|
+| objectstore | 15 | ✅ |
+| wal | 12 | ✅ |
+| btree | 10 | ✅ |
+| gc | 11 | ✅ |
+| kvstore | 9 | ✅ |
+| **总计** | **57** | ✅ |
+
+## 16. 未来扩展
+
+- [ ] 支持多盘并发写入
+- [ ] 支持压缩(热数据LZ4,冷数据ZSTD)
+- [ ] 支持加密(AES-256-GCM)
+- [ ] 支持分布式复制(Raft共识)
+- [ ] 支持事务(Batch operations)
