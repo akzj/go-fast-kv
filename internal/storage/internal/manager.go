@@ -117,6 +117,11 @@ func (sm *segmentManager) scanExistingSegments() error {
 }
 
 // ActiveSegment returns the current active segment for writing.
+// Directory returns the storage directory path.
+func (sm *segmentManager) Directory() string {
+	return sm.config.Directory
+}
+
 func (sm *segmentManager) ActiveSegment() api.Segment {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()

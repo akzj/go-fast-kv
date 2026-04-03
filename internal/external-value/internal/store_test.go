@@ -19,6 +19,7 @@ import (
 
 // mockSegmentManager implements storage.SegmentManager for testing.
 type mockSegmentManager struct {
+	dir string
 	mu        sync.RWMutex
 	segments  map[vaddr.SegmentID]*mockSegment
 	activeID  vaddr.SegmentID
@@ -39,6 +40,10 @@ func newMockSegmentManager() *mockSegmentManager {
 		segments: make(map[vaddr.SegmentID]*mockSegment),
 		nextID:   vaddr.SegmentIDMin,
 	}
+}
+
+func (m *mockSegmentManager) Directory() string {
+	return m.dir
 }
 
 func (m *mockSegmentManager) ActiveSegment() storage.Segment {

@@ -1126,7 +1126,10 @@ func TestWALRecoveryWithExternalValues(t *testing.T) {
 	}
 	store.Put([]byte("large"), largeVal)
 
-	// Recover
+	// Close first store to flush tree nodes and segments
+	store.Close()
+
+	// Recover - open fresh store
 	store2 := newStore(t, dir)
 	defer store2.Close()
 

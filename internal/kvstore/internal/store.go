@@ -146,7 +146,7 @@ func fnvHash64(data []byte) uint64 {
 	return hash
 }
 
-// parseWALPayload extracts key and value from WAL payload.
+// parseWALPayload extracts key and raw value from WAL payload.
 // Format: [len(key)][key bytes][len(value)][value bytes]
 func parseWALPayload(payload []byte) (key, value []byte, err error) {
 	if len(payload) < 2 {
@@ -163,6 +163,33 @@ func parseWALPayload(payload []byte) (key, value []byte, err error) {
 	}
 	value = payload[1+keyLen+1 : 1+keyLen+1+valueLen]
 	return key, value, nil
+}
+
+// parseWALPayloadForReplay extracts key and InlineValue from WAL payload.
+// Format: [len(key)][key bytes][len(inlineValue)=64][inlineValue bytes]
+func parseWALPayloadForReplay(payload []byte) (key []byte, iv blinktree.InlineValue, err error) {
+	if len(payload) < 2 {
+		return nil, iv, errors.New("invalid WAL payload")
+	}
+	keyLen := int(payload[0])
+	if len(payload) < 1+keyLen+1 {
+		return nil, iv, errors.New("invalid WAL payload: key truncated")
+	}
+	key = make([]byte, keyLen)
+	copy(key, payload[1:1+keyLen])
+	
+	inlineLen := int(payload[1+keyLen])
+	expectedLen := 1 + keyLen + 1 + 64
+	if inlineLen != 64 || len(payload) < expectedLen {
+		return nil, iv, errors.New("invalid WAL payload: invalid InlineValue length")
+	}
+	
+	// Extract InlineValue bytes
+	offset := 1 + keyLen + 1
+	copy(iv.Length[:], payload[offset:offset+8])
+	copy(iv.Data[:], payload[offset+8:offset+64])
+	
+	return key, iv, nil
 }
 
 func inlineValueFromBytes(store *kvStore, value []byte) (blinktree.InlineValue, error) {
@@ -300,28 +327,34 @@ func NewKVStore(config Config) (*kvStore, error) {
 		return nil, fmt.Errorf("open tree: %w", err)
 	}
 
-	// Replay WAL records to recover data
+	// If metadata file existed, tree was restored from segments.
+	// Skip WAL replay because tree nodes are already in segments.
+	// WAL replay would corrupt external values (extracts garbage from raw value bytes).
+	if _, err := os.Stat(metadataFile); err == nil {
+		// Tree restored from metadata - don't replay WAL
+		store := &kvStore{
+			tree:         tree,
+			segMgr:       segMgr,
+			extStore:     extStore,
+			wal:          walInstance,
+			config:       config,
+			metadataFile: metadataFile,
+			readOnly:     config.ReadOnly,
+		}
+		store.syncRoot()
+		return store, nil
+	}
+
+	// No metadata - replay WAL for crash recovery
 	iter, err := walInstance.ReadFrom(1)
 	if err == nil {
 		for iter.Next() {
 			rec := iter.Record()
 			if rec.RecordType == wal.WALNodeWrite {
-				key, value, parseErr := parseWALPayload(rec.Payload)
+				key, iv, parseErr := parseWALPayloadForReplay(rec.Payload)
 				if parseErr == nil {
 					pageID := bytesToPageID(key)
-					if len(value) > 0 {
-						// Build InlineValue directly - external values already stored
-						var iv blinktree.InlineValue
-						if len(value) > int(blinktree.ExternalThreshold) {
-							// External: extract vaddr from the stored format
-							binary.BigEndian.PutUint64(iv.Length[:], uint64(len(value)))
-							iv.Length[0] |= 0x80 // external flag
-							copy(iv.Data[0:16], value[0:16]) // segmentID + offset
-							binary.BigEndian.PutUint64(iv.Data[48:56], uint64(len(value)))
-						} else {
-							binary.BigEndian.PutUint64(iv.Length[:], uint64(len(value)))
-							copy(iv.Data[:], value)
-						}
+					if iv.IsValid() {
 						tree.Put(pageID, iv)
 					} else {
 						tree.Delete(pageID)
@@ -342,8 +375,8 @@ func NewKVStore(config Config) (*kvStore, error) {
 		readOnly:    config.ReadOnly,
 	}
 
-	// Initial sync of root to metadata
-	store.syncRoot()
+	// Don't sync root here - segments may not be synced yet.
+	// metadata.json will be written in Close() after segment sync.
 	return store, nil
 }
 
@@ -390,7 +423,7 @@ func (s *kvStore) Put(key, value []byte) error {
 	if err != nil {
 		return fmt.Errorf("convert value: %w", err)
 	}
-	if err := s.logWAL(wal.WALNodeWrite, key, value); err != nil {
+	if err := s.logWAL(wal.WALNodeWrite, key, iv); err != nil {
 		return fmt.Errorf("log WAL: %w", err)
 	}
 	if err := s.tree.Put(pageID, iv); err != nil {
@@ -432,7 +465,9 @@ func (s *kvStore) Delete(key []byte) error {
 			}
 		}
 	}
-	if err := s.logWAL(wal.WALNodeWrite, key, nil); err != nil {
+	// Pass zero-value InlineValue to indicate deletion in WAL
+	var emptyIV blinktree.InlineValue
+	if err := s.logWAL(wal.WALNodeWrite, key, emptyIV); err != nil {
 		return fmt.Errorf("log WAL: %w", err)
 	}
 	if err := s.tree.Delete(pageID); err != nil {
@@ -507,17 +542,26 @@ func (s *kvStore) syncRoot() {
 		return
 	}
 	data := s.tree.GetRootAddress()
-	if data != nil {
-		_ = os.WriteFile(s.metadataFile, data, 0644)
+	if data == nil || len(data) < 16 {
+		return
 	}
+	// Don't write metadata for empty trees (zero root address)
+	// This ensures WAL replay works for crash recovery
+	if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0 &&
+		data[4] == 0 && data[5] == 0 && data[6] == 0 && data[7] == 0 {
+		return
+	}
+	_ = os.WriteFile(s.metadataFile, data, 0644)
 }
 
-func (s *kvStore) logWAL(opType wal.WALRecordType, key, value []byte) error {
-	payload := make([]byte, 0, len(key)+len(value)+8)
+func (s *kvStore) logWAL(opType wal.WALRecordType, key []byte, iv blinktree.InlineValue) error {
+	payload := make([]byte, 0, len(key)+64+8)
 	payload = append(payload, byte(len(key)))
 	payload = append(payload, key...)
-	payload = append(payload, byte(len(value)))
-	payload = append(payload, value...)
+	// Write InlineValue bytes directly (64 bytes)
+	payload = append(payload, byte(64)) // InlineValue length
+	payload = append(payload, iv.Length[:]...)
+	payload = append(payload, iv.Data[:]...)
 	_, err := s.wal.Append(&wal.WALRecord{RecordType: opType, Payload: payload})
 	return err
 }

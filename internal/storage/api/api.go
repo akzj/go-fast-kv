@@ -147,6 +147,8 @@ type Segment interface {
 // Invariant: Exactly one segment is Active at any time.
 // Invariant: Segment IDs are monotonically increasing.
 type SegmentManager interface {
+    // Directory returns the storage directory path.
+    Directory() string
     // ActiveSegment returns the current active segment for writing.
     // Returns nil if no active segment (store closed or during recovery).
     // Invariant: Returned segment State() == SegmentStateActive.

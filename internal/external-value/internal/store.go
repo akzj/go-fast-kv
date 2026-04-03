@@ -3,9 +3,9 @@ package internal
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -31,16 +31,16 @@ type externalValueStore struct {
 
 	// Index for tracking value metadata (VAddr -> valueInfo)
 	index map[VAddr]*valueInfo
-	
+
 	// Manifest file for persistence
 	manifestFile string
 
 	// Metrics
-	storeCount   uint64
+	storeCount    uint64
 	retrieveCount uint64
-	totalBytes   uint64
-	deletedBytes uint64
-	activeCount  uint64
+	totalBytes    uint64
+	deletedBytes  uint64
+	activeCount   uint64
 }
 
 // valueInfo stores metadata about a stored value.
@@ -48,6 +48,19 @@ type valueInfo struct {
 	size      uint64 // Total size of the value
 	pageCount int    // Number of pages used
 	deleted   bool
+}
+
+// manifestEntry represents a serializable entry for external value index.
+type manifestEntry struct {
+	SegmentID uint64 `json:"segmentID"`
+	Offset    uint64 `json:"offset"`
+	Size      uint64 `json:"size"`
+	PageCount int    `json:"pageCount"`
+	Deleted   bool   `json:"deleted"`
+}
+
+type manifest struct {
+	Entries []manifestEntry `json:"entries"`
 }
 
 // NewExternalValueStore creates a new external value store.
@@ -299,7 +312,6 @@ func (s *externalValueStore) GetValueSize(addr VAddr) (uint64, error) {
 	return info.size, nil
 }
 
-// Close releases resources held by the store.
 // loadManifest loads the index from a manifest file
 func (s *externalValueStore) loadManifest() {
 	if s.manifestFile == "" {
@@ -309,8 +321,17 @@ func (s *externalValueStore) loadManifest() {
 	if err != nil {
 		return // No manifest yet
 	}
-	if err := json.Unmarshal(data, &s.index); err != nil {
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
 		return // Corrupted manifest
+	}
+	for _, e := range m.Entries {
+		addr := VAddr{SegmentID: e.SegmentID, Offset: e.Offset}
+		s.index[addr] = &valueInfo{
+			size:      e.Size,
+			pageCount: e.PageCount,
+			deleted:   e.Deleted,
+		}
 	}
 }
 
@@ -319,7 +340,17 @@ func (s *externalValueStore) saveManifest() {
 	if s.manifestFile == "" {
 		return
 	}
-	data, err := json.Marshal(s.index)
+	m := manifest{Entries: make([]manifestEntry, 0, len(s.index))}
+	for addr, info := range s.index {
+		m.Entries = append(m.Entries, manifestEntry{
+			SegmentID: addr.SegmentID,
+			Offset:    addr.Offset,
+			Size:      info.size,
+			PageCount: info.pageCount,
+			Deleted:   info.deleted,
+		})
+	}
+	data, err := json.Marshal(m)
 	if err != nil {
 		return
 	}
