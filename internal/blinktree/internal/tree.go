@@ -3,7 +3,6 @@ package internal
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"sync"
 )
 
@@ -33,13 +32,9 @@ func (t *tree) Open(_ string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	fmt.Printf("DEBUG tree.Open: rootAddr=%v, isValid=%v\n", t.rootAddr, t.rootAddr.IsValid())
 	if !t.rootAddr.IsValid() {
-		fmt.Println("DEBUG tree.Open: creating new leaf...")
 		rootNode, rootAddr := t.nodeMgr.CreateLeaf()
-		fmt.Printf("DEBUG tree.Open: CreateLeaf returned node=%v, addr=%v\n", rootNode, rootAddr)
 		if rootNode == nil {
-			fmt.Println("DEBUG tree.Open: rootNode is nil, returning ErrStoreClosed")
 			return ErrStoreClosed
 		}
 		t.rootAddr = rootAddr
@@ -126,15 +121,17 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 
 	entries := ExtractInternalEntries(node)
 	idx := t.nodeOps.Search(node, key)
-	// idx is the insertion point; we want the child that could contain key
-	// If idx == 0, use first child; otherwise use child at idx-1 (keys < entry[idx])
-	if idx >= int(node.Count) {
-		idx = int(node.Count) - 1
-	} else if idx > 0 {
-		idx = idx - 1
+	// idx is the first entry where Key >= key
+	// Key belongs to entries[idx-1]'s child (the range just before idx)
+	// If idx == 0, key is less than first entry's key, use entries[0].Child
+	// If idx >= Count, key is >= last entry's key, use entries[Count-1].Child
+	if idx == 0 {
+		return t.search(entries[0].Child, key)
 	}
-
-	return t.search(entries[idx].Child, key)
+	if idx >= int(node.Count) {
+		return t.search(entries[node.Count-1].Child, key)
+	}
+	return t.search(entries[idx-1].Child, key)
 }
 
 // Write performs a mutation on the tree.
@@ -182,6 +179,7 @@ func (t *tree) put(key PageID, value InlineValue) error {
 
 		entries := ExtractInternalEntries(node)
 		idx := t.nodeOps.Search(node, key)
+		// searchInternal with '<' returns first entry where Key >= key; use idx directly
 		if idx >= int(node.Count) {
 			idx = int(node.Count) - 1
 		}
@@ -209,6 +207,12 @@ func (t *tree) put(key PageID, value InlineValue) error {
 
 		newRight.HighSibling = leaf.HighSibling
 		leaf.HighSibling = rightAddr
+
+		// Persist the modified left leaf after split
+		_, err = t.nodeMgr.Persist(leaf)
+		if err != nil {
+			return err
+		}
 
 		return t.propagateSplit(stack, leafAddr, rightAddr, splitKey)
 	}
@@ -278,8 +282,10 @@ func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
 	}
 
 	entries := ExtractInternalEntries(newRoot)
-	entries[0] = InternalEntry{Key: splitKey, Child: leftAddr}
-	entries[1] = InternalEntry{Key: 0, Child: rightAddr}
+	// After split: left leaf has keys <= splitKey, right leaf has keys > splitKey
+	// Use sorted entries [0->left, splitKey+1->right] for correct binary search
+	entries[0] = InternalEntry{Key: 0, Child: leftAddr}                  // Keys 1 to splitKey go left
+	entries[1] = InternalEntry{Key: splitKey + 1, Child: rightAddr}       // Keys splitKey+1 to INF go right
 	newRoot.Count = 2
 	newRoot.HighKey = splitKey
 	StoreInternalEntries(newRoot, entries)
@@ -589,6 +595,7 @@ func (t *tree) deleteImpl(key PageID) error {
 
 		entries := ExtractInternalEntries(node)
 		idx := t.nodeOps.Search(node, key)
+		// searchInternal with '<' returns first entry where Key >= key; use idx directly
 		if idx >= int(node.Count) {
 			idx = int(node.Count) - 1
 		}
@@ -754,7 +761,9 @@ func (it *treeIterator) Next() bool {
 		return false
 	}
 
-	// Return current entry and advance idx
+	// Store current entry before advancing
+	it.currentKey = entries[it.idx].Key
+	it.currentVal = entries[it.idx].Value
 	it.idx++
 	return true
 }

@@ -33,8 +33,21 @@ func NewInMemoryNodeManager(nodeOps NodeOperations) NodeManager {
 	return &inMemoryNodeManager{
 		nodeOps:  nodeOps,
 		nodes:    make(map[vaddr.VAddr]*NodeFormat),
-		nextAddr: vaddr.VAddr{SegmentID: 1, Offset: 0},
+		nextAddr: vaddr.VAddr{SegmentID: 1, Offset: vaddr.PageSize}, // Start at PageSize to avoid addr 0
 	}
+}
+
+// addrForNode returns the address for a node if it already exists, or allocates a new one.
+func (mgr *inMemoryNodeManager) addrForNode(node *NodeFormat) VAddr {
+	for addr, n := range mgr.nodes {
+		if n == node {
+			return addr
+		}
+	}
+	// Node doesn't exist yet, allocate new address
+	addr := mgr.nextAddr
+	mgr.nextAddr.Offset += vaddr.PageSize
+	return addr
 }
 
 func (mgr *inMemoryNodeManager) CreateLeaf() (*NodeFormat, VAddr) {
@@ -74,8 +87,17 @@ func (mgr *inMemoryNodeManager) Persist(node *NodeFormat) (VAddr, error) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
-	addr := mgr.nextAddr
-	mgr.nextAddr.Offset += vaddr.PageSize
+	// Serialize entries to RawData so Load can read them
+	if node.NodeType == NodeTypeLeaf && len(node.RawData) == 0 {
+		// Extract and re-store to ensure RawData is populated
+		entries := ExtractLeafEntries(node)
+		StoreLeafEntries(node, entries)
+	} else if node.NodeType == NodeTypeInternal && len(node.RawData) == 0 {
+		entries := ExtractInternalEntries(node)
+		StoreInternalEntries(node, entries)
+	}
+
+	addr := mgr.addrForNode(node)
 	mgr.nodes[addr] = node
 	return addr, nil
 }
@@ -116,7 +138,7 @@ func (mgr *inMemoryNodeManager) UpdateParent(parentVAddr, oldChild, newChild VAd
 }
 
 // NewInMemoryTree creates a tree with an in-memory node manager for testing.
-func NewInMemoryTree() Tree {
+func NewInMemoryTree() TreeMutator {
 	nodeOps := NewNodeOperations()
 	nodeMgr := NewInMemoryNodeManager(nodeOps)
 	tree := newTreeImpl(nodeOps, nodeMgr, true)

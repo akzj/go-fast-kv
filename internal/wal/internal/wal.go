@@ -239,6 +239,7 @@ func (w *WALImpl) recover() error {
 			if err == nil {
 				defer f.Close()
 
+				// Scan backward byte-by-byte to find last valid record header
 				var lastLSN uint64
 				offset := info.Size() - RecordHeaderSize
 				header := make([]byte, RecordHeaderSize)
@@ -248,14 +249,17 @@ func (w *WALImpl) recover() error {
 						break
 					}
 					h := decodeHeader(header)
-					if h.LSN > 0 {
+
+					// Validate: LSN > 0, reasonable length, and record fits in file
+					if h.LSN > 0 && h.Length < 1024*1024 && offset+RecordHeaderSize+int64(h.Length) <= info.Size() {
 						lastLSN = h.LSN
 						break
 					}
+
 					if offset < RecordHeaderSize {
 						break
 					}
-					offset -= RecordHeaderSize + int64(h.Length)
+					offset--
 				}
 
 				w.nextLSN = lastLSN + 1
@@ -349,6 +353,10 @@ func (w *WALImpl) ReadAt(lsn uint64) (*WALRecord, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.closed {
+		return nil, ErrWALClosed
+	}
+
 	entries, err := os.ReadDir(w.directory)
 	if err != nil {
 		return nil, fmt.Errorf("read directory: %w", err)
@@ -384,13 +392,14 @@ func (w *WALImpl) ReadAt(lsn uint64) (*WALRecord, error) {
 
 			h := decodeHeader(header)
 			if h.LSN == lsn {
-				f.Close()
 				payload := make([]byte, h.Length)
 				if h.Length > 0 {
 					if _, err := f.ReadAt(payload, offset+RecordHeaderSize); err != nil {
+						f.Close()
 						return nil, fmt.Errorf("read payload: %w", err)
 					}
 				}
+				f.Close()
 				checksum := crc32.ChecksumIEEE(payload)
 				if checksum != h.CRC {
 					return nil, ErrWALCorrupted
@@ -880,9 +889,17 @@ func (cm *checkpointManager) Recover() error {
 	cm.inRecovery = true
 	defer func() { cm.inRecovery = false }()
 
-	latest, err := cm.LatestCheckpoint()
-	if err != nil {
-		return fmt.Errorf("find latest checkpoint: %w", err)
+	// Access checkpoints directly without locking (already holding cm.mu)
+	// This avoids deadlock since LatestCheckpoint() also tries to lock cm.mu
+	if len(cm.checkpoints) == 0 {
+		return nil
+	}
+
+	var latest *Checkpoint
+	for _, cp := range cm.checkpoints {
+		if latest == nil || cp.LSN > latest.LSN {
+			latest = cp
+		}
 	}
 
 	if latest == nil {

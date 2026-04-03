@@ -285,20 +285,14 @@ func (s *segment) writeTrailer() error {
 	binary.LittleEndian.PutUint64(trailer[trailerOffsetDataSize:], uint64(s.dataSize))
 	binary.LittleEndian.PutUint32(trailer[trailerOffsetChecksum:], checksum)
 
-	// Get current file size
-	fileSize, err := s.file.Size()
-	if err != nil {
-		return fmt.Errorf("get file size: %w", err)
-	}
-
 	// Sync data to disk first
 	if err := s.file.Sync(); err != nil {
 		return fmt.Errorf("sync file: %w", err)
 	}
 
-	// Write trailer at end of file (after data)
-	offset := fileSize - int64(trailerSize)
-	_, err = s.file.WriteAt(trailer, offset)
+	// Write trailer after all data (header + dataSize)
+	offset := int64(headerSize) + s.dataSize
+	_, err := s.file.WriteAt(trailer, offset)
 	return err
 }
 

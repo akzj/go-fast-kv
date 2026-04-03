@@ -253,19 +253,15 @@ func NewKVStore(config Config) (*kvStore, error) {
 	tree := blinktree.NewTreeMutator(nodeOps, nodeMgr)
 
 	// Ensure we have an active segment for writes BEFORE opening tree
-	segment := segMgr.ActiveSegment()
-	fmt.Printf("DEBUG: ActiveSegment=%v\n", segment)
-	if segment == nil {
-		fmt.Println("DEBUG: Creating new segment...")
-		newSeg, err := segMgr.CreateSegment()
-		fmt.Printf("DEBUG: CreateSegment returned: %v, err=%v\n", newSeg, err)
-		if err != nil {
+	if segMgr.ActiveSegment() == nil {
+		if _, err := segMgr.CreateSegment(); err != nil {
 			segMgr.Close()
 			walInstance.Close()
 			return nil, fmt.Errorf("create segment: %w", err)
 		}
-		fmt.Printf("DEBUG: New ActiveSegment=%v\n", segMgr.ActiveSegment())
 	}
+	
+	fmt.Printf("DEBUG NewKVStore: segment count=%d, active=%v\n", segMgr.SegmentCount(), segMgr.ActiveSegment() != nil)
 
 	// Load tree root from metadata file if exists
 	metadataFile := filepath.Join(config.Directory, "metadata.json")

@@ -47,7 +47,7 @@ func (ops *nodeOperations) searchInternal(node *NodeFormat, key PageID) int {
 	lo, hi := 0, int(node.Count)
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if entries[mid].Key <= key {
+		if entries[mid].Key < key {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -328,7 +328,8 @@ func ExtractLeafEntries(node *NodeFormat) []LeafEntry {
 	}
 	// Always return capacity-sized slice to allow Insert to shift entries
 	entries := make([]LeafEntry, node.Capacity)
-	if len(node.RawData) == 0 {
+	// If RawData is empty or too short for the count, return zeroed entries
+	if len(node.RawData) == 0 || len(node.RawData) < int(node.Count)*LeafEntrySize {
 		return entries
 	}
 
@@ -338,9 +339,8 @@ func ExtractLeafEntries(node *NodeFormat) []LeafEntry {
 		offset += 8
 		copy(entries[i].Value.Length[:], node.RawData[offset:])
 		offset += 8
-		// Data is 56 bytes, but we only copy the actual used portion
-		// based on the length field
-		copy(entries[i].Value.Data[:], node.RawData[offset:])
+		// Data field is exactly 56 bytes
+		copy(entries[i].Value.Data[:], node.RawData[offset:offset+56])
 		offset += 56
 	}
 	return entries

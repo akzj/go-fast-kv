@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
 	api "github.com/akzj/go-fast-kv/internal/external-value/api"
@@ -133,10 +134,10 @@ func (s *externalValueStore) Store(value []byte) (VAddr, error) {
 		deleted:   false,
 	}
 
-	// Update metrics
-	s.storeCount++
-	s.totalBytes += valueSize
-	s.activeCount++
+	// Update metrics atomically
+	atomic.AddUint64(&s.storeCount, 1)
+	atomic.AddUint64(&s.totalBytes, valueSize)
+	atomic.AddUint64(&s.activeCount, 1)
 
 	return newVAddr, nil
 }
@@ -200,9 +201,10 @@ func (s *externalValueStore) RetrieveAt(addr VAddr, offset, length uint64) ([]by
 	result := make([]byte, 0, length)
 	remaining := int(length)
 	skipBytes := int(offset % uint64(pageDataSize))
-	pageDataStart := headerSize // Skip header in first page
 
 	for page := 0; page < pageCount && remaining > 0; page++ {
+		// Calculate start of this page's data (after its header)
+		pageDataStart := page*bytesPerPage + headerSize
 		pageDataEnd := pageDataStart + pageDataSize
 		if pageDataEnd > len(data) {
 			pageDataEnd = len(data)
@@ -227,14 +229,13 @@ func (s *externalValueStore) RetrieveAt(addr VAddr, offset, length uint64) ([]by
 
 		result = append(result, pageData[:copyLen]...)
 		remaining -= copyLen
-		pageDataStart = headerSize // Reset for subsequent pages
 	}
 
 	if len(result) != int(length) {
 		return nil, api.ErrCorruptedValue
 	}
 
-	s.retrieveCount++
+	atomic.AddUint64(&s.retrieveCount, 1)
 	return result, nil
 }
 
@@ -258,8 +259,8 @@ func (s *externalValueStore) Delete(addr VAddr) error {
 	}
 
 	info.deleted = true
-	s.activeCount--
-	s.deletedBytes += info.size
+	atomic.AddUint64(&s.activeCount, ^uint64(0)) // decrement
+	atomic.AddUint64(&s.deletedBytes, info.size)
 
 	return nil
 }

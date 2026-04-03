@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/akzj/go-fast-kv/internal/storage"
@@ -25,8 +24,6 @@ func NewNodeManager(segmentMgr storage.SegmentManager, nodeOps NodeOperations) N
 
 // CreateLeaf initializes a new empty leaf node.
 func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
-	fmt.Printf("DEBUG CreateLeaf: segmentMgr=%v\n", mgr.segmentMgr)
-	fmt.Printf("DEBUG CreateLeaf: ActiveSegment=%v\n", mgr.segmentMgr.ActiveSegment())
 	node := &NodeFormat{
 		NodeType: NodeTypeLeaf,
 		Count:    0,
@@ -34,7 +31,6 @@ func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
 		RawData:  make([]byte, 0),
 	}
 	addr, err := mgr.Persist(node)
-	fmt.Printf("DEBUG CreateLeaf: Persist returned addr=%v, err=%v\n", addr, err)
 	if err != nil {
 		return nil, VAddr{}
 	}
@@ -63,6 +59,14 @@ func (mgr *nodeManager) Persist(node *NodeFormat) (VAddr, error) {
 	defer mgr.mu.Unlock()
 
 	data := mgr.nodeOps.Serialize(node)
+	
+	// Pad to page alignment (segment requires page-aligned writes)
+	pageSize := int(vaddr.PageSize)
+	if len(data)%pageSize != 0 {
+		padding := pageSize - (len(data) % pageSize)
+		data = append(data, make([]byte, padding)...)
+	}
+	
 	segment := mgr.segmentMgr.ActiveSegment()
 	if segment == nil {
 		return VAddr{}, storage.ErrSegmentNotActive
