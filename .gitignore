@@ -30,3 +30,14 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Database data
+*.db
+*.dat
+kvstore_data/
+
+# Backup files
+.backups/
+
+# Build binary
+gofastkv
