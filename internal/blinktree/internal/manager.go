@@ -24,10 +24,14 @@ func NewNodeManager(segmentMgr storage.SegmentManager, nodeOps NodeOperations) N
 
 // CreateLeaf initializes a new empty leaf node.
 func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
+	// Calculate actual capacity based on page size and entry size
+	// (PageSize - header) / LeafEntrySize = (4096 - 56) / 72 = 56
+	leafCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / LeafEntrySize)
+
 	node := &NodeFormat{
 		NodeType: NodeTypeLeaf,
 		Count:    0,
-		Capacity: MaxNodeCapacity,
+		Capacity: leafCapacity,
 		RawData:  make([]byte, 0),
 	}
 	addr, err := mgr.Persist(node)
@@ -39,17 +43,32 @@ func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
 
 // CreateInternal initializes a new internal node at given level.
 func (mgr *nodeManager) CreateInternal(level uint8) (*NodeFormat, VAddr) {
+	node, addr := mgr.createInternalNode(level)
+	if node == nil {
+		return nil, VAddr{}
+	}
+	_, err := mgr.Persist(node)
+	if err != nil {
+		return nil, VAddr{}
+	}
+	return node, addr
+}
+
+// createInternalNode creates a new internal node struct without persisting.
+func (mgr *nodeManager) createInternalNode(level uint8) (*NodeFormat, VAddr) {
+	// Calculate actual capacity based on page size and entry size
+	// (PageSize - header) / InternalEntrySize = (4096 - 56) / 24 = 168
+	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
+
 	node := &NodeFormat{
 		NodeType: NodeTypeInternal,
 		Level:    level,
 		Count:    0,
-		Capacity: MaxNodeCapacity,
+		Capacity: internalCapacity,
 		RawData:  make([]byte, 0),
 	}
-	addr, err := mgr.Persist(node)
-	if err != nil {
-		return nil, VAddr{}
-	}
+	// Allocate address for later persistence
+	addr := VAddr{} // Will be assigned on Persist
 	return node, addr
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+
+	vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
 )
 
 // tree implements the Tree interface using B-link tree algorithm.
@@ -114,6 +116,9 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 		entries := ExtractLeafEntries(node)
 		// search returns first position where Key >= key
 		// If key exists, it's at idx (or earlier if duplicates, but we use first match)
+		if node.Count == 0 {
+			return InlineValue{}, ErrKeyNotFound
+		}
 		if idx < len(entries) && entries[idx].Key == key {
 			return entries[idx].Value, nil
 		}
@@ -121,6 +126,9 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 	}
 
 	entries := ExtractInternalEntries(node)
+	if node.Count == 0 {
+		return InlineValue{}, ErrKeyNotFound
+	}
 	idx := t.nodeOps.Search(node, key)
 	// idx is the first entry where Key >= key
 	// Key belongs to entries[idx-1]'s child (the range just before idx)
@@ -182,6 +190,9 @@ func (t *tree) put(key PageID, value InlineValue) error {
 		idx := t.nodeOps.Search(node, key)
 		// searchInternal with '<' returns first entry where Key >= key; use idx directly
 		if idx >= int(node.Count) {
+			if node.Count == 0 {
+				return errors.New("blinktree: internal node has no entries")
+			}
 			idx = int(node.Count) - 1
 		}
 		childAddr := entries[idx].Child
@@ -274,10 +285,24 @@ func (t *tree) propagateSplit(stack []VAddr, leftAddr, rightAddr VAddr, splitKey
 		return t.propagateSplit(newStack, parentAddr, newParentAddr, newSplitKey)
 	}
 
-	copy(entries[idx+1:], entries[idx:])
-	entries[idx] = InternalEntry{Key: splitKey, Child: rightAddr}
+	// Guard against idx being at or beyond entry bounds
+	// This can happen if splitKey is greater than all existing keys
+	if idx >= len(entries) {
+		idx = len(entries) - 1
+	}
+	
+	// Create new slice with room for one more entry
+	newEntries := make([]InternalEntry, parent.Count+1)
+	// Copy entries before insertion point
+	copy(newEntries, entries[:idx])
+	// Copy entries from insertion point onward (shifted by 1)
+	if idx < len(entries) {
+		copy(newEntries[idx+1:], entries[idx:])
+	}
+	// Insert the new entry
+	newEntries[idx] = InternalEntry{Key: splitKey, Child: rightAddr}
 	parent.Count++
-	StoreInternalEntries(parent, entries)
+	StoreInternalEntries(parent, newEntries)
 
 	_, err = t.nodeMgr.Persist(parent)
 	return err
@@ -285,12 +310,19 @@ func (t *tree) propagateSplit(stack []VAddr, leftAddr, rightAddr VAddr, splitKey
 
 // splitRoot creates a new root after old root split.
 func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
-	newRoot, newRootAddr := t.nodeMgr.CreateInternal(1)
-	if newRoot == nil {
-		return ErrStoreClosed
+	// Create new root node directly - don't use CreateInternal which persists immediately
+	// We need to set fields first, then persist once
+	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
+	newRoot := &NodeFormat{
+		NodeType: NodeTypeInternal,
+		Level:    1,
+		Count:    0,
+		Capacity: internalCapacity,
+		RawData:  make([]byte, 0),
 	}
 
-	entries := ExtractInternalEntries(newRoot)
+	// Create entries slice directly (ExtractInternalEntries returns empty when Count=0)
+	entries := make([]InternalEntry, 2)
 	// After split: left leaf has keys <= splitKey, right leaf has keys > splitKey.
 	// splitKey is the last key of left leaf.
 	// With lower-bound search + idx-1 navigation:
@@ -298,11 +330,12 @@ func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
 	//   - key>splitKey: idx=1, idx-1=0 → left ✓
 	entries[0] = InternalEntry{Key: 0, Child: leftAddr}
 	entries[1] = InternalEntry{Key: splitKey, Child: rightAddr}
+	// IMPORTANT: Set Count BEFORE StoreInternalEntries so RawData is sized correctly
 	newRoot.Count = 2
 	newRoot.HighKey = splitKey
 	StoreInternalEntries(newRoot, entries)
 
-	_, err := t.nodeMgr.Persist(newRoot)
+	newRootAddr, err := t.nodeMgr.Persist(newRoot)
 	if err != nil {
 		return err
 	}
@@ -609,6 +642,9 @@ func (t *tree) deleteImpl(key PageID) error {
 		idx := t.nodeOps.Search(node, key)
 		// searchInternal with '<' returns first entry where Key >= key; use idx directly
 		if idx >= int(node.Count) {
+			if node.Count == 0 {
+				return errors.New("blinktree: internal node has no entries")
+			}
 			idx = int(node.Count) - 1
 		}
 		childAddr := entries[idx].Child
@@ -742,6 +778,10 @@ func (it *treeIterator) Next() bool {
 				break
 			}
 			entries := ExtractInternalEntries(node)
+			if node.Count == 0 || len(entries) == 0 {
+				it.err = errors.New("blinktree: internal node has no entries")
+				return false
+			}
 			addr = entries[0].Child
 		}
 	}

@@ -130,11 +130,19 @@ func bytesToPageID(key []byte) blinktree.PageID {
 	if len(key) == 0 {
 		return blinktree.PageID(0)
 	}
-	// Use big-endian encoding of first 8 bytes (or padded) to preserve lexical ordering for scan
-	// This enables range scans to work correctly by comparing encoded PageIDs
-	var buf [8]byte
-	copy(buf[:], key)
-	return blinktree.PageID(binary.BigEndian.Uint64(buf[:]))
+
+	// For keys <= 8 bytes: use direct encoding with zero padding
+	// This allows roundtrip via pageIDToBytes
+	if len(key) <= 8 {
+		var buf [8]byte
+		copy(buf[:], key)
+		return blinktree.PageID(binary.BigEndian.Uint64(buf[:]))
+	}
+
+	// For keys > 8 bytes: use FNV-1a hash and set high bit to indicate hash-based encoding
+	hash := fnvHash64(key)
+	hash |= 0x8000000000000000 // Set bit 63 to mark as hash
+	return blinktree.PageID(hash)
 }
 
 func fnvHash64(data []byte) uint64 {
@@ -701,13 +709,27 @@ func pageIDToBytes(pageID blinktree.PageID) []byte {
 	if pageID == 0 {
 		return nil
 	}
-	// Decode back to original key - trim trailing zeros
+	
+	// Check if this is a hash-based key (bit 63 set)
+	if pageID&0x8000000000000000 != 0 {
+		// Hash-based key - cannot recover original bytes
+		// Return the hash as bytes (lossy but deterministic)
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(pageID))
+		return buf[:]
+	}
+	
+	// Direct-encoded key - trim trailing zero bytes
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(pageID))
+	
 	// Find the last non-zero byte
 	end := 8
 	for end > 0 && buf[end-1] == 0 {
 		end--
+	}
+	if end == 0 {
+		return nil
 	}
 	result := make([]byte, end)
 	copy(result, buf[:end])

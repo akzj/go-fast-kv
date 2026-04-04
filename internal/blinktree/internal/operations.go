@@ -92,15 +92,23 @@ func (ops *nodeOperations) Insert(node *NodeFormat, key PageID, value InlineValu
 	if key >= splitKey {
 		rightEntries := ExtractLeafEntries(right)
 		pos := ops.searchLeaf(right, key)
-		copy(rightEntries[pos+1:], rightEntries[pos:])
-		rightEntries[pos] = LeafEntry{Key: key, Value: value}
+		// Handle insertion at end (pos == len)
+		if pos >= len(rightEntries) {
+			rightEntries = append(rightEntries, LeafEntry{Key: key, Value: value})
+		} else {
+			rightEntries = append(rightEntries[:pos], append([]LeafEntry{{Key: key, Value: value}}, rightEntries[pos:]...)...)
+		}
 		right.Count++
 		StoreLeafEntries(right, rightEntries)
 	} else {
 		entries := ExtractLeafEntries(left)
 		pos := ops.searchLeaf(left, key)
-		copy(entries[pos+1:], entries[pos:])
-		entries[pos] = LeafEntry{Key: key, Value: value}
+		// Handle insertion at end (pos == len)
+		if pos >= len(entries) {
+			entries = append(entries, LeafEntry{Key: key, Value: value})
+		} else {
+			entries = append(entries[:pos], append([]LeafEntry{{Key: key, Value: value}}, entries[pos:]...)...)
+		}
 		left.Count++
 		StoreLeafEntries(left, entries)
 	}
@@ -118,11 +126,11 @@ func (ops *nodeOperations) Split(node *NodeFormat) (*NodeFormat, *NodeFormat, Pa
 
 func (ops *nodeOperations) splitLeaf(node *NodeFormat) (*NodeFormat, *NodeFormat, PageID) {
 	entries := ExtractLeafEntries(node)
-	// Split so that splitKey goes to LEFT as the last entry.
-	// Left has keys <= splitKey, right has keys > splitKey.
-	// Use ceil(n/2) for left to ensure splitKey is the last key of left.
-	median := (int(node.Count) + 1) / 2
-	splitKey := entries[median-1].Key // Last key of left
+	// Split so that there's room for inserting the new key.
+	// Use floor(n/2) for left: with n entries, left=n/2, right=n/2
+	// This leaves room on both sides for the new key.
+	median := int(node.Count) / 2
+	splitKey := entries[median].Key // First key of right (separator)
 
 	// Create right node - must NOT share RawData with left
 	right := &NodeFormat{
@@ -136,12 +144,12 @@ func (ops *nodeOperations) splitLeaf(node *NodeFormat) (*NodeFormat, *NodeFormat
 		HighKey:      node.HighKey,
 	}
 
-	// Copy entries to right's own buffer
+	// Copy entries to right's own buffer (entries[median:] = keys >= splitKey)
 	rightEntries := make([]LeafEntry, right.Count)
 	copy(rightEntries, entries[median:])
 	StoreLeafEntries(right, rightEntries)
 
-	// Update left node - use entries from left's own buffer
+	// Update left node - use entries from left's own buffer (entries[:median] = keys < splitKey)
 	leftEntries := make([]LeafEntry, median)
 	copy(leftEntries, entries[:median])
 	node.Count = uint8(median)
@@ -153,27 +161,28 @@ func (ops *nodeOperations) splitLeaf(node *NodeFormat) (*NodeFormat, *NodeFormat
 
 func (ops *nodeOperations) splitInternal(node *NodeFormat) (*NodeFormat, *NodeFormat, PageID) {
 	entries := ExtractInternalEntries(node)
+	// Split at floor(n/2): left has entries[0..median-1], right has entries[median..n-1]
 	median := int(node.Count) / 2
 	splitKey := entries[median].Key
 
-	// Create right node - must NOT share RawData with left
+	// Create right node with Count = remaining entries (median to end)
 	right := &NodeFormat{
 		NodeType:     NodeTypeInternal,
 		IsDeleted:    node.IsDeleted,
 		Level:        node.Level,
-		Count:        node.Count - uint8(median) - 1, // Exclude median separator
+		Count:        node.Count - uint8(median), // All entries from median onwards
 		Capacity:     node.Capacity,
 		HighSibling:  node.HighSibling,
 		LowSibling:   vaddr.VAddr{},
 		HighKey:      node.HighKey,
 	}
 
-	// Copy entries to right's own buffer (skip the median entry)
+	// Copy entries to right node (entries[median:] includes the median)
 	rightEntries := make([]InternalEntry, right.Count)
-	copy(rightEntries, entries[median+1:])
+	copy(rightEntries, entries[median:])
 	StoreInternalEntries(right, rightEntries)
 
-	// Update left node - use entries from left's own buffer (exclude median)
+	// Update left node with entries [0..median-1]
 	leftEntries := make([]InternalEntry, median)
 	copy(leftEntries, entries[:median])
 	node.Count = uint8(median)
@@ -329,7 +338,16 @@ func (ops *nodeOperations) Deserialize(data []byte) (*NodeFormat, error) {
 
 	// Store raw data for entry extraction
 	// Entries start at offset 56 in serialized format
-	node.RawData = data[56:]
+	// Only copy the actual entry data based on Count, not the entire buffer
+	var entrySize int
+	if node.NodeType == NodeTypeLeaf {
+		entrySize = LeafEntrySize
+	} else {
+		entrySize = InternalEntrySize
+	}
+	entryDataLen := int(node.Count) * entrySize
+	node.RawData = make([]byte, entryDataLen)
+	copy(node.RawData, data[56:56+entryDataLen])
 
 	return node, nil
 }

@@ -54,10 +54,14 @@ func (mgr *inMemoryNodeManager) CreateLeaf() (*NodeFormat, VAddr) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
+	// Calculate actual capacity based on page size and entry size
+	// (PageSize - header) / LeafEntrySize = (4096 - 56) / 72 = 56
+	leafCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / LeafEntrySize)
+
 	node := &NodeFormat{
 		NodeType: NodeTypeLeaf,
 		Count:    0,
-		Capacity: MaxNodeCapacity,
+		Capacity: leafCapacity,
 		RawData:  make([]byte, 0),
 	}
 	addr := mgr.nextAddr
@@ -70,16 +74,39 @@ func (mgr *inMemoryNodeManager) CreateInternal(level uint8) (*NodeFormat, VAddr)
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
+	// Calculate actual capacity based on page size and entry size
+	// (PageSize - header) / InternalEntrySize = (4096 - 56) / 24 = 168
+	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
+
 	node := &NodeFormat{
 		NodeType: NodeTypeInternal,
 		Level:    level,
 		Count:    0,
-		Capacity: MaxNodeCapacity,
+		Capacity: internalCapacity,
 		RawData:  make([]byte, 0),
 	}
 	addr := mgr.nextAddr
 	mgr.nextAddr.Offset += vaddr.PageSize
 	mgr.nodes[addr] = node
+	return node, addr
+}
+
+// createInternalNode creates an internal node without persisting (for splitRoot)
+func (mgr *inMemoryNodeManager) createInternalNode(level uint8) (*NodeFormat, VAddr) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
+
+	node := &NodeFormat{
+		NodeType: NodeTypeInternal,
+		Level:    level,
+		Count:    0,
+		Capacity: internalCapacity,
+		RawData:  make([]byte, 0),
+	}
+	// Allocate address but don't store yet
+	addr := mgr.nextAddr
 	return node, addr
 }
 
@@ -125,12 +152,18 @@ func (mgr *inMemoryNodeManager) UpdateParent(parentVAddr, oldChild, newChild VAd
 	entries := ExtractInternalEntries(parent)
 	for i := 0; i < int(parent.Count); i++ {
 		if entries[i].Child == oldChild {
-			if i+1 < int(parent.Capacity) {
-				copy(entries[i+2:], entries[i+1:])
+			// Create new slice with room for one more entry
+			newEntries := make([]InternalEntry, parent.Count+1)
+			// Copy entries before the insertion point
+			copy(newEntries, entries[:i+1])
+			// Copy entries after the insertion point (shifted by 1)
+			if i+1 < int(parent.Count) {
+				copy(newEntries[i+2:], entries[i+1:])
 			}
-			entries[i+1] = InternalEntry{Key: splitKey, Child: newChild}
+			// Insert the new entry
+			newEntries[i+1] = InternalEntry{Key: splitKey, Child: newChild}
 			parent.Count++
-			StoreInternalEntries(parent, entries)
+			StoreInternalEntries(parent, newEntries)
 			break
 		}
 	}
