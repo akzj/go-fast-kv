@@ -249,6 +249,10 @@ func (sm *mockSegmentManager) Close() error {
 	return nil
 }
 
+func (m *mockSegmentManager) Directory() string {
+	return ""
+}
+
 // =============================================================================
 // DenseArray Tests
 // =============================================================================

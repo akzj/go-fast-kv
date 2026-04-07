@@ -70,18 +70,25 @@ func (ops *nodeOperations) Insert(node *NodeFormat, key PageID, value InlineValu
 		// Handle empty node case (Count=0)
 		if node.Count == 0 {
 			entries = []LeafEntry{{Key: key, Value: value}}
+			node.Count++
+			StoreLeafEntries(node, entries)
 		} else {
-			// Create new slice with room for one more entry
-			newEntries := make([]LeafEntry, 0, node.Count+1)
-			newEntries = append(newEntries, entries[:pos]...)
-			newEntries = append(newEntries, LeafEntry{Key: key, Value: value})
-			if pos < len(entries) {
-				newEntries = append(newEntries, entries[pos:]...)
+			// Check if key already exists at this position (update) or is new (insert)
+			if pos < len(entries) && entries[pos].Key == key {
+				// Replace existing entry
+				entries[pos].Value = value
+				StoreLeafEntries(node, entries)
+			} else {
+				// Insert new entry
+				newEntries := make([]LeafEntry, len(entries)+1)
+				copy(newEntries, entries[:pos])
+				newEntries[pos] = LeafEntry{Key: key, Value: value}
+				copy(newEntries[pos+1:], entries[pos:])
+				entries = newEntries
+				node.Count++
+				StoreLeafEntries(node, entries)
 			}
-			entries = newEntries
 		}
-		node.Count++
-		StoreLeafEntries(node, entries)
 		return nil, 0, nil
 	}
 
@@ -89,28 +96,36 @@ func (ops *nodeOperations) Insert(node *NodeFormat, key PageID, value InlineValu
 	left, right, splitKey := ops.Split(node)
 
 	// Determine which node gets the new key
-	if key >= splitKey {
+	if key > splitKey {
 		rightEntries := ExtractLeafEntries(right)
 		pos := ops.searchLeaf(right, key)
-		// Handle insertion at end (pos == len)
-		if pos >= len(rightEntries) {
-			rightEntries = append(rightEntries, LeafEntry{Key: key, Value: value})
+		// Check if key already exists (update) or is new (insert)
+		if pos < len(rightEntries) && rightEntries[pos].Key == key {
+			rightEntries[pos].Value = value
+			StoreLeafEntries(right, rightEntries)
 		} else {
-			rightEntries = append(rightEntries[:pos], append([]LeafEntry{{Key: key, Value: value}}, rightEntries[pos:]...)...)
+			newEntries := make([]LeafEntry, len(rightEntries)+1)
+			copy(newEntries, rightEntries[:pos])
+			newEntries[pos] = LeafEntry{Key: key, Value: value}
+			copy(newEntries[pos+1:], rightEntries[pos:])
+			right.Count++
+			StoreLeafEntries(right, newEntries)
 		}
-		right.Count++
-		StoreLeafEntries(right, rightEntries)
 	} else {
 		entries := ExtractLeafEntries(left)
 		pos := ops.searchLeaf(left, key)
-		// Handle insertion at end (pos == len)
-		if pos >= len(entries) {
-			entries = append(entries, LeafEntry{Key: key, Value: value})
+		// Check if key already exists (update) or is new (insert)
+		if pos < len(entries) && entries[pos].Key == key {
+			entries[pos].Value = value
+			StoreLeafEntries(left, entries)
 		} else {
-			entries = append(entries[:pos], append([]LeafEntry{{Key: key, Value: value}}, entries[pos:]...)...)
+			newEntries := make([]LeafEntry, len(entries)+1)
+			copy(newEntries, entries[:pos])
+			newEntries[pos] = LeafEntry{Key: key, Value: value}
+			copy(newEntries[pos+1:], entries[pos:])
+			left.Count++
+			StoreLeafEntries(left, newEntries)
 		}
-		left.Count++
-		StoreLeafEntries(left, entries)
 	}
 
 	return right, splitKey, nil

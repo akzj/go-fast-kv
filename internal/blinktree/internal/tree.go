@@ -131,16 +131,24 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 	}
 	idx := t.nodeOps.Search(node, key)
 	// idx is the first entry where Key >= key
-	// Key belongs to entries[idx-1]'s child (the range just before idx)
-	// If idx == 0, key is less than first entry's key, use entries[0].Child
-	// If idx >= Count, key is >= last entry's key, use entries[Count-1].Child
+	// If key < entries[idx].Key, key belongs to entries[idx-1].Child
+	// If key >= entries[idx].Key, key belongs to entries[idx].Child
+	// Clamp idx to valid range
+	if idx >= int(node.Count) {
+		if node.Count == 0 {
+			return InlineValue{}, ErrKeyNotFound
+		}
+		idx = int(node.Count) - 1
+	}
+	// Handle idx==0 case: key is less than first entry's Key, use first entry's child
 	if idx == 0 {
 		return t.search(entries[0].Child, key)
 	}
-	if idx >= int(node.Count) {
-		return t.search(entries[node.Count-1].Child, key)
+	// For idx > 0: check if key < current entry's Key
+	if key < entries[idx].Key {
+		return t.search(entries[idx-1].Child, key)
 	}
-	return t.search(entries[idx-1].Child, key)
+	return t.search(entries[idx].Child, key)
 }
 
 // Write performs a mutation on the tree.
@@ -188,12 +196,26 @@ func (t *tree) put(key PageID, value InlineValue) error {
 
 		entries := ExtractInternalEntries(node)
 		idx := t.nodeOps.Search(node, key)
-		// searchInternal with '<' returns first entry where Key >= key; use idx directly
+		// Clamp idx to valid range [0, Count-1]
 		if idx >= int(node.Count) {
 			if node.Count == 0 {
-				return errors.New("blinktree: internal node has no entries")
+				return errors.New("blinktree: tree not initialized")
 			}
 			idx = int(node.Count) - 1
+		}
+		// Handle idx==0 case: key < first entry's Key, use first entry's child
+		if idx == 0 {
+			childAddr := entries[0].Child
+			stack = append(stack, childAddr)
+			currentAddr = childAddr
+			continue
+		}
+		// For idx > 0: check if key < current entry's Key
+		if key < entries[idx].Key {
+			childAddr := entries[idx-1].Child
+			stack = append(stack, childAddr)
+			currentAddr = childAddr
+			continue
 		}
 		childAddr := entries[idx].Child
 		stack = append(stack, childAddr)
@@ -212,12 +234,16 @@ func (t *tree) put(key PageID, value InlineValue) error {
 	}
 
 	if newRight != nil {
+		// Set sibling link BEFORE persisting
+		newRight.HighSibling = leaf.HighSibling
+
+		// Persist right node FIRST (so it has correct HighSibling when loaded)
 		rightAddr, err := t.nodeMgr.Persist(newRight)
 		if err != nil {
 			return err
 		}
 
-		newRight.HighSibling = leaf.HighSibling
+		// Now update left leaf's sibling to point to right
 		leaf.HighSibling = rightAddr
 
 		// Persist the modified left leaf after split

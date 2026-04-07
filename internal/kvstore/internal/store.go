@@ -131,15 +131,20 @@ func bytesToPageID(key []byte) blinktree.PageID {
 		return blinktree.PageID(0)
 	}
 
-	// For keys <= 8 bytes: use direct encoding with zero padding
-	// This allows roundtrip via pageIDToBytes
-	if len(key) <= 8 {
-		var buf [8]byte
-		copy(buf[:], key)
-		return blinktree.PageID(binary.BigEndian.Uint64(buf[:]))
+	// For keys ≤ 7 bytes: encode length in upper 4 bits, data in lower 56 bits
+	// This enables correct roundtrip: bytesToPageID -> pageIDToBytes = original key
+	if len(key) <= 7 {
+		var data uint64
+		for i := 0; i < len(key); i++ {
+			data = (data << 8) | uint64(key[i])
+		}
+		// Shift data to upper bits, encode length in bits 60-63
+		data = data << 32
+		data |= uint64(len(key))
+		return blinktree.PageID(data)
 	}
 
-	// For keys > 8 bytes: use FNV-1a hash and set high bit to indicate hash-based encoding
+	// For keys > 7 bytes: use FNV-1a hash with bit 63 set (lossy)
 	hash := fnvHash64(key)
 	hash |= 0x8000000000000000 // Set bit 63 to mark as hash
 	return blinktree.PageID(hash)
@@ -709,30 +714,30 @@ func pageIDToBytes(pageID blinktree.PageID) []byte {
 	if pageID == 0 {
 		return nil
 	}
-	
+
 	// Check if this is a hash-based key (bit 63 set)
 	if pageID&0x8000000000000000 != 0 {
 		// Hash-based key - cannot recover original bytes
-		// Return the hash as bytes (lossy but deterministic)
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], uint64(pageID))
 		return buf[:]
 	}
-	
-	// Direct-encoded key - trim trailing zero bytes
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(pageID))
-	
-	// Find the last non-zero byte
-	end := 8
-	for end > 0 && buf[end-1] == 0 {
-		end--
-	}
-	if end == 0 {
+
+	// Extract length from bits 60-63 (lower 4 bits of upper byte)
+	length := int(uint64(pageID) & 0x000000000000000F)
+	if length == 0 || length > 7 {
 		return nil
 	}
-	result := make([]byte, end)
-	copy(result, buf[:end])
+
+	// Extract data from upper bits
+	data := uint64(pageID) >> 32
+
+	// Build result byte by byte
+	result := make([]byte, length)
+	for i := length - 1; i >= 0; i-- {
+		result[i] = byte(data & 0xFF)
+		data >>= 8
+	}
 	return result
 }
 
