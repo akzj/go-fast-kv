@@ -113,11 +113,14 @@ type MappingEntry struct {
 	Size   uint32
 }
 
-// BlobStoreRecovery provides methods for crash recovery.
+// BlobStoreRecovery provides methods for crash recovery and checkpoint.
 // Implemented by the same struct that implements BlobStore.
 type BlobStoreRecovery interface {
 	// LoadMapping bulk-loads the mapping table from checkpoint data.
 	LoadMapping(entries []MappingEntry)
+
+	// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
+	ExportMapping() []MappingEntry
 
 	// ApplyBlobMap applies a WAL RecordBlobMap record during replay.
 	ApplyBlobMap(blobID BlobID, vaddr uint64, size uint32)

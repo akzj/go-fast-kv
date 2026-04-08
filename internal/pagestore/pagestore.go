@@ -180,6 +180,23 @@ func (ps *pageStore) LoadMapping(entries []pagestoreapi.MappingEntry) {
 	}
 }
 
+// ExportMapping returns all non-zero page mappings for checkpoint serialization.
+func (ps *pageStore) ExportMapping() []pagestoreapi.MappingEntry {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var entries []pagestoreapi.MappingEntry
+	for i, v := range ps.mapping {
+		if v != 0 {
+			entries = append(entries, pagestoreapi.MappingEntry{
+				PageID: uint64(i),
+				VAddr:  v,
+			})
+		}
+	}
+	return entries
+}
+
 // ApplyPageMap applies a WAL RecordPageMap record during replay.
 func (ps *pageStore) ApplyPageMap(pageID pagestoreapi.PageID, vaddr uint64) {
 	ps.mu.Lock()

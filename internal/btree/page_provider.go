@@ -74,3 +74,13 @@ func (p *RealPageProvider) WALEntries() []pagestoreapi.WALEntry {
 	copy(out, p.walEntries)
 	return out
 }
+
+// DrainWALEntries returns all collected WALEntries and clears the buffer.
+// Used by KVStore to collect WAL entries for a single operation's batch.
+func (p *RealPageProvider) DrainWALEntries() []pagestoreapi.WALEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := p.walEntries
+	p.walEntries = nil
+	return out
+}

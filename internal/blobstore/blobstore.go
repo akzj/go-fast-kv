@@ -176,6 +176,24 @@ func (bs *blobStore) LoadMapping(entries []blobstoreapi.MappingEntry) {
 	}
 }
 
+// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
+func (bs *blobStore) ExportMapping() []blobstoreapi.MappingEntry {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+
+	var entries []blobstoreapi.MappingEntry
+	for i, m := range bs.mapping {
+		if !m.IsZero() {
+			entries = append(entries, blobstoreapi.MappingEntry{
+				BlobID: uint64(i),
+				VAddr:  m.VAddr,
+				Size:   m.Size,
+			})
+		}
+	}
+	return entries
+}
+
 // ApplyBlobMap applies a WAL RecordBlobMap record during replay.
 func (bs *blobStore) ApplyBlobMap(blobID blobstoreapi.BlobID, vaddr uint64, size uint32) {
 	bs.mu.Lock()

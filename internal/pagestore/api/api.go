@@ -135,12 +135,15 @@ type MappingEntry struct {
 // These are used by the top-level recovery orchestrator (KVStore),
 // not by PageStore itself. PageStore provides methods to apply them:
 
-// PageStoreRecovery provides methods for crash recovery.
+// PageStoreRecovery provides methods for crash recovery and checkpoint.
 // Implemented by the same struct that implements PageStore.
 type PageStoreRecovery interface {
 	// LoadMapping bulk-loads the mapping table from checkpoint data.
 	// Called once during recovery before WAL replay.
 	LoadMapping(entries []MappingEntry)
+
+	// ExportMapping returns all non-zero page mappings for checkpoint serialization.
+	ExportMapping() []MappingEntry
 
 	// ApplyPageMap applies a WAL RecordPageMap record during replay.
 	ApplyPageMap(pageID PageID, vaddr uint64)
