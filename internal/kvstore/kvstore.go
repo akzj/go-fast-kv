@@ -37,7 +37,7 @@ const (
 
 // store implements kvstoreapi.Store.
 type store struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	dir string
 	cfg kvstoreapi.Config
@@ -195,14 +195,17 @@ func (s *store) Put(key, value []byte) error {
 // ─── Get ────────────────────────────────────────────────────────────
 
 func (s *store) Get(key []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if s.closed {
 		return nil, kvstoreapi.ErrClosed
 	}
 
-	// Auto-commit read: use readTxnID to see all committed versions
+	// Auto-commit read: use readTxnID to see all committed versions.
+	// B-tree is concurrent-safe (per-page RwLocks).
+	// RLock held for entire read to prevent Close() from shutting down
+	// segment files while a read is in flight.
 	val, err := s.tree.Get(key, readTxnID)
 	if err != nil {
 		if err == btreeapi.ErrKeyNotFound {
@@ -258,14 +261,19 @@ func (s *store) Delete(key []byte) error {
 // ─── Scan ───────────────────────────────────────────────────────────
 
 func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 
 	if s.closed {
+		s.mu.RUnlock()
 		return &errIterator{err: kvstoreapi.ErrClosed}
 	}
 
+	// B-tree Scan is concurrent-safe (per-page RwLocks).
+	// RLock held during iterator creation to prevent Close() race.
+	// The B-tree iterator clones leaf data under its own per-page locks,
+	// so we can release RLock after creating the iterator.
 	btreeIter := s.tree.Scan(start, end, readTxnID)
+	s.mu.RUnlock()
 	return &iteratorAdapter{inner: btreeIter}
 }
 
