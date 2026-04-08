@@ -123,41 +123,8 @@ type BatchCreator interface {
 }
 
 // =============================================================================
-// Key Conversion
+// WAL Payload Helpers
 // =============================================================================
-
-func bytesToPageID(key []byte) blinktree.PageID {
-	if len(key) == 0 {
-		return blinktree.PageID(0)
-	}
-
-	// For keys ≤ 7 bytes: encode length in upper 4 bits, data in lower 56 bits
-	// This enables correct roundtrip: bytesToPageID -> pageIDToBytes = original key
-	if len(key) <= 7 {
-		var data uint64
-		for i := 0; i < len(key); i++ {
-			data = (data << 8) | uint64(key[i])
-		}
-		// Shift data to upper bits, encode length in bits 60-63
-		data = data << 32
-		data |= uint64(len(key))
-		return blinktree.PageID(data)
-	}
-
-	// For keys > 7 bytes: use FNV-1a hash with bit 63 set (lossy)
-	hash := fnvHash64(key)
-	hash |= 0x8000000000000000 // Set bit 63 to mark as hash
-	return blinktree.PageID(hash)
-}
-
-func fnvHash64(data []byte) uint64 {
-	hash := uint64(14695981039346656037)
-	for _, b := range data {
-		hash ^= uint64(b)
-		hash *= 1099511628211
-	}
-	return hash
-}
 
 // parseWALPayload extracts key and raw value from WAL payload.
 // Format: [len(key)][key bytes][len(value)][value bytes]
@@ -362,6 +329,7 @@ func NewKVStore(config Config) (*kvStore, error) {
 	}
 
 	// No metadata - replay WAL for crash recovery
+	// Keys are now stored directly as []byte in the B-tree (no hash conversion)
 	iter, err := walInstance.ReadFrom(1)
 	if err == nil {
 		for iter.Next() {
@@ -369,11 +337,10 @@ func NewKVStore(config Config) (*kvStore, error) {
 			if rec.RecordType == wal.WALNodeWrite {
 				key, iv, parseErr := parseWALPayloadForReplay(rec.Payload)
 				if parseErr == nil {
-					pageID := bytesToPageID(key)
 					if iv.IsValid() {
-						tree.Put(pageID, iv)
+						tree.Put(key, iv)
 					} else {
-						tree.Delete(pageID)
+						tree.Delete(key)
 					}
 				}
 			}
@@ -408,8 +375,8 @@ func (s *kvStore) Get(key []byte) ([]byte, error) {
 	if len(key) > int(s.config.MaxKeySize) {
 		return nil, ErrKeyTooLarge
 	}
-	pageID := bytesToPageID(key)
-	iv, err := s.tree.Get(pageID)
+	// Pass key directly to B-tree — no hash conversion needed
+	iv, err := s.tree.Get(key)
 	if err != nil {
 		if errors.Is(err, blinktree.ErrKeyNotFound) {
 			return nil, ErrKeyNotFound
@@ -434,7 +401,6 @@ func (s *kvStore) Put(key, value []byte) error {
 	if uint64(len(value)) > s.config.MaxValueSize {
 		return ErrValueTooLarge
 	}
-	pageID := bytesToPageID(key)
 	iv, err := inlineValueFromBytes(s, value)
 	if err != nil {
 		return fmt.Errorf("convert value: %w", err)
@@ -442,7 +408,8 @@ func (s *kvStore) Put(key, value []byte) error {
 	if err := s.logWAL(wal.WALNodeWrite, key, iv); err != nil {
 		return fmt.Errorf("log WAL: %w", err)
 	}
-	if err := s.tree.Put(pageID, iv); err != nil {
+	// Pass key directly to B-tree — no hash conversion needed
+	if err := s.tree.Put(key, iv); err != nil {
 		return fmt.Errorf("tree put: %w", err)
 	}
 	if s.config.SyncWrites {
@@ -462,8 +429,7 @@ func (s *kvStore) Delete(key []byte) error {
 	if s.readOnly {
 		return ErrReadOnly
 	}
-	pageID := bytesToPageID(key)
-	iv, err := s.tree.Get(pageID)
+	iv, err := s.tree.Get(key)
 	if err != nil {
 		if errors.Is(err, blinktree.ErrKeyNotFound) {
 			return ErrKeyNotFound
@@ -486,7 +452,7 @@ func (s *kvStore) Delete(key []byte) error {
 	if err := s.logWAL(wal.WALNodeWrite, key, emptyIV); err != nil {
 		return fmt.Errorf("log WAL: %w", err)
 	}
-	if err := s.tree.Delete(pageID); err != nil {
+	if err := s.tree.Delete(key); err != nil {
 		return fmt.Errorf("tree delete: %w", err)
 	}
 	if s.config.SyncWrites {
@@ -503,16 +469,9 @@ func (s *kvStore) Scan(start, end []byte) (Iterator, error) {
 	if s.closed {
 		return nil, ErrStoreClosed
 	}
-	startPageID := blinktree.PageID(0)
-	// Use 0 for end to mean "no upper bound" - treeIterator treats end=0 as unlimited
-	endPageID := blinktree.PageID(0)
-	if len(start) > 0 {
-		startPageID = bytesToPageID(start)
-	}
-	if len(end) > 0 {
-		endPageID = bytesToPageID(end)
-	}
-	treeIter, err := s.tree.Scan(startPageID, endPageID)
+	// Pass start/end directly to B-tree — no hash conversion needed
+	// nil/empty start means scan from beginning; nil/empty end means scan to end
+	treeIter, err := s.tree.Scan(start, end)
 	if err != nil {
 		return nil, fmt.Errorf("tree scan: %w", err)
 	}
@@ -629,7 +588,8 @@ func (it *kvIterator) Next() bool {
 		it.err = it.treeIter.Error()
 		return false
 	}
-	it.current = pageIDToBytes(it.treeIter.Key())
+	// TreeIterator.Key() now returns []byte directly — no conversion needed
+	it.current = it.treeIter.Key()
 	val, err := inlineValueToBytes(it.store, it.treeIter.Value())
 	if err != nil {
 		it.err = err
@@ -707,37 +667,6 @@ func (it *txScanIterator) Close() {
 		it.closed = true
 		it.storeIter.Close()
 	}
-}
-
-func pageIDToBytes(pageID blinktree.PageID) []byte {
-	if pageID == 0 {
-		return nil
-	}
-
-	// Check if this is a hash-based key (bit 63 set)
-	if pageID&0x8000000000000000 != 0 {
-		// Hash-based key - cannot recover original bytes
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(pageID))
-		return buf[:]
-	}
-
-	// Extract length from bits 60-63 (lower 4 bits of upper byte)
-	length := int(uint64(pageID) & 0x000000000000000F)
-	if length == 0 || length > 7 {
-		return nil
-	}
-
-	// Extract data from upper bits
-	data := uint64(pageID) >> 32
-
-	// Build result byte by byte
-	result := make([]byte, length)
-	for i := length - 1; i >= 0; i-- {
-		result[i] = byte(data & 0xFF)
-		data >>= 8
-	}
-	return result
 }
 
 // =============================================================================

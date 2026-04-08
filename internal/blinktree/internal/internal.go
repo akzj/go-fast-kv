@@ -25,6 +25,8 @@ const (
 	NodeTypeLeaf      = blinktree.NodeTypeLeaf
 	NodeTypeInternal  = blinktree.NodeTypeInternal
 	MaxNodeCapacity   = blinktree.MaxNodeCapacity
+	MaxKeySize        = blinktree.MaxKeySize
+	KeySlotSize       = blinktree.KeySlotSize
 	LeafEntrySize     = blinktree.LeafEntrySize
 	InternalEntrySize = blinktree.InternalEntrySize
 	NodeHeaderSize    = blinktree.NodeHeaderSize

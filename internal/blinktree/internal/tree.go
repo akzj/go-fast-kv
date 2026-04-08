@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 )
@@ -9,15 +10,16 @@ import (
 // Key design: B-tree uses stable PageIDs for all child/sibling pointers.
 // The underlying storage layer (PageStorage) maps PageID → VAddr internally.
 // No CoW re-persist needed — PageID never changes.
+// Keys are raw []byte, compared lexicographically with bytes.Compare.
 type tree struct {
-	nodeOps   NodeOperations
-	nodeMgr   NodeManager
-	latchMgr  LatchManager
-	mu        sync.Mutex
+	nodeOps    NodeOperations
+	nodeMgr    NodeManager
+	latchMgr   LatchManager
+	mu         sync.Mutex
 	rootPageID PageID
-	rootNode  *NodeFormat
-	isClosed  bool
-	isMutator bool
+	rootNode   *NodeFormat
+	isClosed   bool
+	isMutator  bool
 }
 
 func newTreeImpl(nodeOps NodeOperations, nodeMgr NodeManager, isMutator bool) *tree {
@@ -76,7 +78,7 @@ func (t *tree) IsClosed() bool {
 }
 
 // Get retrieves the value for key.
-func (t *tree) Get(key PageID) (InlineValue, error) {
+func (t *tree) Get(key []byte) (InlineValue, error) {
 	if t.isClosed {
 		return InlineValue{}, ErrStoreClosed
 	}
@@ -93,7 +95,7 @@ func (t *tree) Get(key PageID) (InlineValue, error) {
 }
 
 // search traverses the tree to find key.
-func (t *tree) search(pageID PageID, key PageID) (InlineValue, error) {
+func (t *tree) search(pageID PageID, key []byte) (InlineValue, error) {
 	node, err := t.nodeMgr.Load(pageID)
 	if err != nil {
 		return InlineValue{}, ErrNodeNotFound
@@ -105,7 +107,7 @@ func (t *tree) search(pageID PageID, key PageID) (InlineValue, error) {
 		if node.Count == 0 {
 			return InlineValue{}, ErrKeyNotFound
 		}
-		if idx < len(entries) && entries[idx].Key == key {
+		if idx < len(entries) && bytes.Equal(entries[idx].Key, key) {
 			return entries[idx].Value, nil
 		}
 		return InlineValue{}, ErrKeyNotFound
@@ -122,7 +124,7 @@ func (t *tree) search(pageID PageID, key PageID) (InlineValue, error) {
 	if idx == 0 {
 		return t.search(entries[0].Child, key)
 	}
-	if key < entries[idx].Key {
+	if bytes.Compare(key, entries[idx].Key) < 0 {
 		return t.search(entries[idx-1].Child, key)
 	}
 	return t.search(entries[idx].Child, key)
@@ -151,7 +153,7 @@ func (t *tree) Write(op TreeOperation) error {
 }
 
 // put inserts or updates a key-value pair.
-func (t *tree) put(key PageID, value InlineValue) error {
+func (t *tree) put(key []byte, value InlineValue) error {
 	rootPageID := t.rootPageID
 	if !rootPageID.IsValid() {
 		return errors.New("blinktree: tree not initialized")
@@ -186,7 +188,7 @@ func (t *tree) put(key PageID, value InlineValue) error {
 			currentPageID = childPageID
 			continue
 		}
-		if key < entries[idx].Key {
+		if bytes.Compare(key, entries[idx].Key) < 0 {
 			childPageID := entries[idx-1].Child
 			stack = append(stack, childPageID)
 			currentPageID = childPageID
@@ -244,7 +246,7 @@ func (t *tree) put(key PageID, value InlineValue) error {
 // propagateSplit handles split propagation up the tree.
 // leftPageID is the original leaf's PageID.
 // rightPageID is the new right node's PageID.
-func (t *tree) propagateSplit(stack []PageID, leftPageID, rightPageID PageID, splitKey PageID) error {
+func (t *tree) propagateSplit(stack []PageID, leftPageID, rightPageID PageID, splitKey []byte) error {
 	if len(stack) == 1 {
 		// Leaf was root — create new root
 		return t.splitRoot(leftPageID, rightPageID, splitKey)
@@ -269,7 +271,7 @@ func (t *tree) propagateSplit(stack []PageID, leftPageID, rightPageID PageID, sp
 			idx = int(parent.Count)
 		}
 		copy(newEntries, entries[:idx])
-		newEntries[idx] = InternalEntry{Key: splitKey, Child: rightPageID}
+		newEntries[idx] = InternalEntry{Key: copyKey(splitKey), Child: rightPageID}
 		copy(newEntries[idx+1:], entries[idx:])
 		parent.Count++
 		StoreInternalEntries(parent, newEntries)
@@ -313,7 +315,7 @@ func (t *tree) propagateSplit(stack []PageID, leftPageID, rightPageID PageID, sp
 	}
 	// Standard sorted insert: copy before idx, insert at idx, copy after idx
 	copy(newEntries, entries[:idx])
-	newEntries[idx] = InternalEntry{Key: splitKey, Child: rightPageID}
+	newEntries[idx] = InternalEntry{Key: copyKey(splitKey), Child: rightPageID}
 	copy(newEntries[idx+1:], entries[idx:])
 	parent.Count++
 	StoreInternalEntries(parent, newEntries)
@@ -325,17 +327,20 @@ func (t *tree) propagateSplit(stack []PageID, leftPageID, rightPageID PageID, sp
 }
 
 // splitRoot creates a new root after old root split.
-func (t *tree) splitRoot(leftPageID, rightPageID PageID, splitKey PageID) error {
+func (t *tree) splitRoot(leftPageID, rightPageID PageID, splitKey []byte) error {
 	newRootNode, newRootPageID := t.nodeMgr.CreateInternal(1)
 	if newRootNode == nil {
 		return ErrStoreClosed
 	}
 
 	entries := make([]InternalEntry, 2)
-	entries[0] = InternalEntry{Key: 0, Child: leftPageID}
-	entries[1] = InternalEntry{Key: splitKey, Child: rightPageID}
+	// First child gets empty key (sentinel for leftmost child)
+	// Must be []byte{} not nil — nil key writes keyLen=0, readKeySlot returns nil,
+	// which breaks search comparisons (nil != any key)
+	entries[0] = InternalEntry{Key: []byte{}, Child: leftPageID}
+	entries[1] = InternalEntry{Key: copyKey(splitKey), Child: rightPageID}
 	newRootNode.Count = 2
-	newRootNode.HighKey = splitKey
+	newRootNode.HighKey = copyKey(splitKey)
 	StoreInternalEntries(newRootNode, entries)
 
 	if err := t.nodeMgr.Persist(newRootNode, newRootPageID); err != nil {
@@ -397,11 +402,11 @@ func (t *tree) handleUnderflow(stack []PageID) error {
 				if node.NodeType == NodeTypeLeaf {
 					t.redistributeLeaf(left, node)
 					leafEntries := ExtractLeafEntries(node)
-					entries[myIdx].Key = leafEntries[0].Key
+					entries[myIdx].Key = copyKey(leafEntries[0].Key)
 				} else {
 					t.redistributeInternal(left, node)
 					intEntries := ExtractInternalEntries(node)
-					entries[myIdx].Key = intEntries[0].Key
+					entries[myIdx].Key = copyKey(intEntries[0].Key)
 				}
 				StoreInternalEntries(parent, entries)
 				if err := t.nodeMgr.Persist(left, leftPageID); err != nil {
@@ -425,11 +430,11 @@ func (t *tree) handleUnderflow(stack []PageID) error {
 				if node.NodeType == NodeTypeLeaf {
 					t.redistributeLeafRight(node, right)
 					leafEntries := ExtractLeafEntries(right)
-					entries[myIdx+1].Key = leafEntries[0].Key
+					entries[myIdx+1].Key = copyKey(leafEntries[0].Key)
 				} else {
 					t.redistributeInternalRight(node, right)
 					intEntries := ExtractInternalEntries(right)
-					entries[myIdx+1].Key = intEntries[0].Key
+					entries[myIdx+1].Key = copyKey(intEntries[0].Key)
 				}
 				StoreInternalEntries(parent, entries)
 				if err := t.nodeMgr.Persist(right, rightPageID); err != nil {
@@ -596,17 +601,17 @@ func (t *tree) mergeInternalNodes(left, right *NodeFormat) {
 }
 
 // Put implements TreeMutator.
-func (t *tree) Put(key PageID, value InlineValue) error {
+func (t *tree) Put(key []byte, value InlineValue) error {
 	return t.Write(TreeOperation{Type: OpPut, Key: key, Value: value})
 }
 
 // Delete implements TreeMutator.
-func (t *tree) Delete(key PageID) error {
+func (t *tree) Delete(key []byte) error {
 	return t.Write(TreeOperation{Type: OpDelete, Key: key})
 }
 
 // deleteImpl performs the actual delete under lock.
-func (t *tree) deleteImpl(key PageID) error {
+func (t *tree) deleteImpl(key []byte) error {
 	rootPageID := t.rootPageID
 	if !rootPageID.IsValid() {
 		return ErrKeyNotFound
@@ -650,7 +655,7 @@ func (t *tree) deleteImpl(key PageID) error {
 	entries := ExtractLeafEntries(leaf)
 	idx := t.nodeOps.Search(leaf, key)
 
-	if idx >= int(leaf.Count) || entries[idx].Key != key {
+	if idx >= int(leaf.Count) || !bytes.Equal(entries[idx].Key, key) {
 		return ErrKeyNotFound
 	}
 
@@ -666,7 +671,7 @@ func (t *tree) deleteImpl(key PageID) error {
 }
 
 // Scan returns an iterator over key range.
-func (t *tree) Scan(start, end PageID) (TreeIterator, error) {
+func (t *tree) Scan(start, end []byte) (TreeIterator, error) {
 	if t.isClosed {
 		return nil, ErrStoreClosed
 	}
@@ -724,11 +729,11 @@ type treeMutator = tree
 type treeIterator struct {
 	tree       *tree
 	rootPageID PageID
-	start      PageID
-	end        PageID
+	start      []byte
+	end        []byte
 	finished   bool
-	err       error
-	currentKey PageID
+	err        error
+	currentKey []byte
 	currentVal InlineValue
 
 	// DFS-collected leaves
@@ -792,7 +797,7 @@ func (it *treeIterator) Next() bool {
 
 		entries := ExtractLeafEntries(it.node)
 
-		for it.entryIdx < int(it.node.Count) && entries[it.entryIdx].Key < it.start {
+		for it.entryIdx < int(it.node.Count) && len(it.start) > 0 && bytes.Compare(entries[it.entryIdx].Key, it.start) < 0 {
 			it.entryIdx++
 		}
 
@@ -812,7 +817,7 @@ func (it *treeIterator) Next() bool {
 			continue
 		}
 
-		if it.end > 0 && entries[it.entryIdx].Key >= it.end {
+		if len(it.end) > 0 && bytes.Compare(entries[it.entryIdx].Key, it.end) >= 0 {
 			it.finished = true
 			return false
 		}
@@ -824,7 +829,7 @@ func (it *treeIterator) Next() bool {
 	}
 }
 
-func (it *treeIterator) Key() PageID {
+func (it *treeIterator) Key() []byte {
 	return it.currentKey
 }
 

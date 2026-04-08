@@ -8,6 +8,8 @@
 //   - Node immutability: once written, a node is never modified in place
 //   - B-tree uses PageID (logical, stable) for child/sibling pointers
 //   - VAddr (physical, append-only) is only used inside storage layer
+//   - Keys are raw []byte, compared with bytes.Compare (lexicographic order)
+//   - MaxKeySize = 64 bytes; keys are stored in fixed 66-byte slots (64 data + 2 length)
 package blinktree
 
 import (
@@ -29,10 +31,12 @@ type PageID = vaddr.PageID
 
 const (
 	ExternalThreshold = 48
-	NodeHeaderSize    = 40 // 1+1+1+1+2+2+8+8+8+4+4 = 40
+	MaxKeySize        = 64                   // Maximum key size in bytes
+	KeySlotSize       = MaxKeySize + 2       // 64 bytes data + 2 bytes length = 66
+	NodeHeaderSize    = 98                   // 1+1+1+1+2+2+8+8+66+4+4 = 98
 	MaxNodeCapacity   = 255
-	LeafEntrySize     = 72 // 8 (Key) + 8 (Length) + 56 (Data)
-	InternalEntrySize = 16 // 8 (Key) + 8 (Child PageID)
+	LeafEntrySize     = KeySlotSize + 64     // 66 (key slot) + 64 (InlineValue) = 130
+	InternalEntrySize = KeySlotSize + 8      // 66 (key slot) + 8 (Child PageID) = 74
 	NodeTypeLeaf      = uint8(0)
 	NodeTypeInternal  = uint8(1)
 	OpPut             = OperationType(0)
@@ -67,19 +71,19 @@ type NodeFormat struct {
 	_           uint16
 	HighSibling PageID // Sibling pointer: stable PageID, not VAddr
 	LowSibling  PageID // Sibling pointer: stable PageID, not VAddr
-	HighKey     PageID
+	HighKey     []byte // Highest key in this node (variable length, max 64 bytes)
 	Checksum    uint32
 	_           [4]byte
 	RawData     []byte
 }
 
 type LeafEntry struct {
-	Key   PageID
+	Key   []byte
 	Value InlineValue
 }
 
 type InternalEntry struct {
-	Key   PageID
+	Key   []byte
 	Child PageID // Stable logical PageID, not physical VAddr
 }
 
@@ -103,10 +107,10 @@ func (v InlineValue) IsValid() bool {
 // =============================================================================
 
 type NodeOperations interface {
-	Search(node *NodeFormat, key PageID) int
-	Insert(node *NodeFormat, key PageID, value InlineValue) (newNode *NodeFormat, splitKey PageID, err error)
-	Split(node *NodeFormat) (left, right *NodeFormat, splitKey PageID)
-	UpdateHighKey(node *NodeFormat) PageID
+	Search(node *NodeFormat, key []byte) int
+	Insert(node *NodeFormat, key []byte, value InlineValue) (newNode *NodeFormat, splitKey []byte, err error)
+	Split(node *NodeFormat) (left, right *NodeFormat, splitKey []byte)
+	UpdateHighKey(node *NodeFormat) []byte
 	Serialize(node *NodeFormat) []byte
 	Deserialize(data []byte) (*NodeFormat, error)
 }
@@ -131,7 +135,7 @@ type NodeManager interface {
 
 type TreeOperation struct {
 	Type  OperationType
-	Key   PageID
+	Key   []byte
 	Value InlineValue
 }
 
@@ -139,7 +143,7 @@ type OperationType uint8
 
 type TreeIterator interface {
 	Next() bool
-	Key() PageID
+	Key() []byte
 	Value() InlineValue
 	Error() error
 	Close()
@@ -149,16 +153,16 @@ type Tree interface {
 	Open(path string) error
 	Close() error
 	IsClosed() bool
-	Get(key PageID) (InlineValue, error)
+	Get(key []byte) (InlineValue, error)
 	Write(op TreeOperation) error
-	Scan(start, end PageID) (TreeIterator, error)
+	Scan(start, end []byte) (TreeIterator, error)
 	Batch(ops []TreeOperation) error
 }
 
 type TreeMutator interface {
 	Tree
-	Put(key PageID, value InlineValue) error
-	Delete(key PageID) error
+	Put(key []byte, value InlineValue) error
+	Delete(key []byte) error
 	GetRootPageID() PageID
 	RestoreRootPageID(pageID PageID)
 }

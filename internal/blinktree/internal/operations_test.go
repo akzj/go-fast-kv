@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"testing"
 
 	blinktree "github.com/akzj/go-fast-kv/internal/blinktree/api"
@@ -19,7 +20,7 @@ func TestNodeOperations_Search(t *testing.T) {
 			Count:    0,
 			Capacity: MaxNodeCapacity,
 		}
-		idx := nodeOps.Search(node, 100)
+		idx := nodeOps.Search(node, intKey(100))
 		if idx != 0 {
 			t.Errorf("expected 0, got %d", idx)
 		}
@@ -32,29 +33,30 @@ func TestNodeOperations_Search(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []LeafEntry{
-			{Key: 10, Value: MakeInlineValue([]byte("val10"))},
-			{Key: 20, Value: MakeInlineValue([]byte("val20"))},
-			{Key: 30, Value: MakeInlineValue([]byte("val30"))},
+			{Key: intKey(10), Value: MakeInlineValue([]byte("val10"))},
+			{Key: intKey(20), Value: MakeInlineValue([]byte("val20"))},
+			{Key: intKey(30), Value: MakeInlineValue([]byte("val30"))},
 		}
 		StoreLeafEntries(node, entries)
 
+		// Lower-bound search: returns first index where entry.Key >= key
 		tests := []struct {
-			key      PageID
+			key      []byte
 			expected int
 		}{
-			{5, 0},   // Before first
-			{10, 1},  // At first
-			{15, 1},  // Between first and second
-			{20, 2},  // At second
-			{25, 2},  // Between second and third
-			{30, 3},  // At third
-			{35, 3},  // After last
+			{intKey(5), 0},  // Before first → 0
+			{intKey(10), 0}, // At first → 0 (lower bound)
+			{intKey(15), 1}, // Between first and second → 1
+			{intKey(20), 1}, // At second → 1
+			{intKey(25), 2}, // Between second and third → 2
+			{intKey(30), 2}, // At third → 2
+			{intKey(35), 3}, // After last → 3
 		}
 
 		for _, tc := range tests {
 			idx := nodeOps.Search(node, tc.key)
 			if idx != tc.expected {
-				t.Errorf("Search(%d): expected %d, got %d", tc.key, tc.expected, idx)
+				t.Errorf("Search(%x): expected %d, got %d", tc.key, tc.expected, idx)
 			}
 		}
 	})
@@ -67,29 +69,29 @@ func TestNodeOperations_Search(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []InternalEntry{
-			{Key: 10, Child: PageID(100)},
-			{Key: 20, Child: PageID(200)},
-			{Key: 30, Child: PageID(300)},
+			{Key: intKey(10), Child: PageID(100)},
+			{Key: intKey(20), Child: PageID(200)},
+			{Key: intKey(30), Child: PageID(300)},
 		}
 		StoreInternalEntries(node, entries)
 
 		tests := []struct {
-			key      PageID
+			key      []byte
 			expected int
 		}{
-			{5, 0},   // Before first
-			{10, 1},  // At first key
-			{15, 1},  // Between first and second
-			{20, 2},  // At second key
-			{25, 2},  // Between second and third
-			{30, 3},  // At third key
-			{35, 3},  // After last
+			{intKey(5), 0},  // Before first → 0
+			{intKey(10), 0}, // At first → 0
+			{intKey(15), 1}, // Between first and second → 1
+			{intKey(20), 1}, // At second → 1
+			{intKey(25), 2}, // Between second and third → 2
+			{intKey(30), 2}, // At third → 2
+			{intKey(35), 3}, // After last → 3
 		}
 
 		for _, tc := range tests {
 			idx := nodeOps.Search(node, tc.key)
 			if idx != tc.expected {
-				t.Errorf("Search(%d): expected %d, got %d", tc.key, tc.expected, idx)
+				t.Errorf("Search(%x): expected %d, got %d", tc.key, tc.expected, idx)
 			}
 		}
 	})
@@ -105,22 +107,22 @@ func TestNodeOperations_Insert(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		value := MakeInlineValue([]byte("test"))
-		newNode, splitKey, err := nodeOps.Insert(node, 100, value)
+		newNode, splitKey, err := nodeOps.Insert(node, intKey(100), value)
 		if err != nil {
 			t.Fatalf("Insert failed: %v", err)
 		}
 		if newNode != nil {
 			t.Error("expected no split for first insert")
 		}
-		if splitKey != 0 {
-			t.Errorf("expected splitKey 0, got %d", splitKey)
+		if splitKey != nil {
+			t.Errorf("expected nil splitKey, got %x", splitKey)
 		}
 		entries := ExtractLeafEntries(node)
 		if node.Count != 1 {
 			t.Errorf("expected count 1, got %d", node.Count)
 		}
-		if entries[0].Key != 100 {
-			t.Errorf("expected key 100, got %d", entries[0].Key)
+		if !bytes.Equal(entries[0].Key, intKey(100)) {
+			t.Errorf("expected key intKey(100), got %x", entries[0].Key)
 		}
 	})
 
@@ -130,9 +132,9 @@ func TestNodeOperations_Insert(t *testing.T) {
 			Count:    0,
 			Capacity: MaxNodeCapacity,
 		}
-		for i := PageID(1); i <= 10; i++ {
+		for i := uint64(1); i <= 10; i++ {
 			value := MakeInlineValue([]byte("val"))
-			_, _, err := nodeOps.Insert(node, i*10, value)
+			_, _, err := nodeOps.Insert(node, intKey(i*10), value)
 			if err != nil {
 				t.Fatalf("Insert %d failed: %v", i, err)
 			}
@@ -142,9 +144,9 @@ func TestNodeOperations_Insert(t *testing.T) {
 		}
 		entries := ExtractLeafEntries(node)
 		for i := 0; i < 10; i++ {
-			expected := PageID((i + 1) * 10)
-			if entries[i].Key != expected {
-				t.Errorf("entry %d: expected key %d, got %d", i, expected, entries[i].Key)
+			expected := intKey(uint64((i + 1) * 10))
+			if !bytes.Equal(entries[i].Key, expected) {
+				t.Errorf("entry %d: expected key %x, got %x", i, expected, entries[i].Key)
 			}
 		}
 	})
@@ -155,42 +157,44 @@ func TestNodeOperations_Insert(t *testing.T) {
 			Count:    0,
 			Capacity: MaxNodeCapacity,
 		}
-		keys := []PageID{50, 10, 30, 20, 40}
+		keys := []uint64{50, 10, 30, 20, 40}
 		for _, k := range keys {
 			value := MakeInlineValue([]byte("val"))
-			_, _, err := nodeOps.Insert(node, k, value)
+			_, _, err := nodeOps.Insert(node, intKey(k), value)
 			if err != nil {
 				t.Fatalf("Insert %d failed: %v", k, err)
 			}
 		}
 		entries := ExtractLeafEntries(node)
-		expectedKeys := []PageID{10, 20, 30, 40, 50}
+		expectedKeys := []uint64{10, 20, 30, 40, 50}
 		for i, expected := range expectedKeys {
-			if entries[i].Key != expected {
-				t.Errorf("entry %d: expected key %d, got %d", i, expected, entries[i].Key)
+			if !bytes.Equal(entries[i].Key, intKey(expected)) {
+				t.Errorf("entry %d: expected key %x, got %x", i, intKey(expected), entries[i].Key)
 			}
 		}
 	})
 
 	t.Run("InsertTriggersSplit", func(t *testing.T) {
+		// Realistic leaf capacity: (4096 - 98) / 130 = 30
+		leafCapacity := uint16((4096 - NodeHeaderSize) / LeafEntrySize)
 		node := &NodeFormat{
 			NodeType: NodeTypeLeaf,
 			Count:    0,
-			Capacity: MaxNodeCapacity,
+			Capacity: leafCapacity,
 		}
-		// Fill node to capacity
-		for i := PageID(1); i <= PageID(MaxNodeCapacity); i++ {
+		// Fill node to capacity, then one more triggers split
+		for i := uint64(1); i <= uint64(leafCapacity)+1; i++ {
 			value := MakeInlineValue([]byte("val"))
-			newNode, splitKey, err := nodeOps.Insert(node, i, value)
+			newNode, splitKey, err := nodeOps.Insert(node, intKey(i), value)
 			if err != nil {
 				t.Fatalf("Insert %d failed: %v", i, err)
 			}
-			if i == PageID(MaxNodeCapacity) {
+			if i == uint64(leafCapacity)+1 {
 				if newNode == nil {
-					t.Error("expected split at capacity")
+					t.Error("expected split at capacity+1")
 				}
-				if splitKey == 0 {
-					t.Error("expected non-zero split key")
+				if splitKey == nil {
+					t.Error("expected non-nil split key")
 				}
 			}
 		}
@@ -203,12 +207,12 @@ func TestNodeOperations_Insert(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		value1 := MakeInlineValue([]byte("val1"))
-		_, _, err := nodeOps.Insert(node, 100, value1)
+		_, _, err := nodeOps.Insert(node, intKey(100), value1)
 		if err != nil {
 			t.Fatalf("Insert 1 failed: %v", err)
 		}
 		value2 := MakeInlineValue([]byte("val2"))
-		_, _, err = nodeOps.Insert(node, 100, value2)
+		_, _, err = nodeOps.Insert(node, intKey(100), value2)
 		if err != nil {
 			t.Fatalf("Insert 2 failed: %v", err)
 		}
@@ -226,7 +230,7 @@ func TestNodeOperations_Insert(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		value := MakeInlineValue([]byte("test"))
-		_, _, err := nodeOps.Insert(node, 100, value)
+		_, _, err := nodeOps.Insert(node, intKey(100), value)
 		if err != ErrInvalidNode {
 			t.Errorf("expected ErrInvalidNode, got %v", err)
 		}
@@ -244,15 +248,15 @@ func TestNodeOperations_Split(t *testing.T) {
 		}
 		entries := make([]LeafEntry, 10)
 		for i := 0; i < 10; i++ {
-			entries[i] = LeafEntry{Key: PageID(i + 1), Value: MakeInlineValue([]byte("val"))}
+			entries[i] = LeafEntry{Key: intKey(uint64(i + 1)), Value: MakeInlineValue([]byte("val"))}
 		}
 		StoreLeafEntries(node, entries)
 
 		left, right, splitKey := nodeOps.Split(node)
 
-		// Check split key is median
-		if splitKey != 5 {
-			t.Errorf("expected splitKey 5, got %d", splitKey)
+		// Check split key is median (key 6, since median index = 5)
+		if !bytes.Equal(splitKey, intKey(6)) {
+			t.Errorf("expected splitKey intKey(6), got %x", splitKey)
 		}
 
 		// Check left node has first half
@@ -261,8 +265,8 @@ func TestNodeOperations_Split(t *testing.T) {
 		}
 		leftEntries := ExtractLeafEntries(left)
 		for i := 0; i < int(left.Count); i++ {
-			if leftEntries[i].Key != PageID(i+1) {
-				t.Errorf("left entry %d: expected %d, got %d", i, i+1, leftEntries[i].Key)
+			if !bytes.Equal(leftEntries[i].Key, intKey(uint64(i+1))) {
+				t.Errorf("left entry %d: expected %x, got %x", i, intKey(uint64(i+1)), leftEntries[i].Key)
 			}
 		}
 
@@ -272,9 +276,9 @@ func TestNodeOperations_Split(t *testing.T) {
 		}
 		rightEntries := ExtractLeafEntries(right)
 		for i := 0; i < int(right.Count); i++ {
-			expected := PageID(i + 6)
-			if rightEntries[i].Key != expected {
-				t.Errorf("right entry %d: expected %d, got %d", i, expected, rightEntries[i].Key)
+			expected := intKey(uint64(i + 6))
+			if !bytes.Equal(rightEntries[i].Key, expected) {
+				t.Errorf("right entry %d: expected %x, got %x", i, expected, rightEntries[i].Key)
 			}
 		}
 
@@ -294,7 +298,7 @@ func TestNodeOperations_Split(t *testing.T) {
 		entries := make([]InternalEntry, 6)
 		for i := 0; i < 6; i++ {
 			entries[i] = InternalEntry{
-				Key:   PageID((i+1)*10),
+				Key:   intKey(uint64((i + 1) * 10)),
 				Child: PageID(uint64(i) * 100),
 			}
 		}
@@ -302,26 +306,30 @@ func TestNodeOperations_Split(t *testing.T) {
 
 		left, right, splitKey := nodeOps.Split(node)
 
-		// Median is at index 3 (0-indexed), which is key 30
-		if splitKey != 30 {
-			t.Errorf("expected splitKey 30, got %d", splitKey)
+		// Median is at index 3 (0-indexed), which is key 40
+		if !bytes.Equal(splitKey, intKey(40)) {
+			t.Errorf("expected splitKey intKey(40), got %x", splitKey)
 		}
 
-		// Left has 3 entries (indices 0,1,2) - keys 10,20
+		// Left has 3 entries (indices 0,1,2) - keys 10,20,30
 		if left.Count != 3 {
 			t.Errorf("left count: expected 3, got %d", left.Count)
 		}
 		leftEntries := ExtractInternalEntries(left)
-		if leftEntries[0].Key != 10 || leftEntries[1].Key != 20 || leftEntries[2].Key != 30 {
+		if !bytes.Equal(leftEntries[0].Key, intKey(10)) ||
+			!bytes.Equal(leftEntries[1].Key, intKey(20)) ||
+			!bytes.Equal(leftEntries[2].Key, intKey(30)) {
 			t.Error("left entries incorrect")
 		}
 
-		// Right has 3 entries (indices 4,5) - keys 40,50,60
+		// Right has 3 entries (indices 3,4,5) - keys 40,50,60
 		if right.Count != 3 {
 			t.Errorf("right count: expected 3, got %d", right.Count)
 		}
 		rightEntries := ExtractInternalEntries(right)
-		if rightEntries[0].Key != 40 || rightEntries[1].Key != 50 || rightEntries[2].Key != 60 {
+		if !bytes.Equal(rightEntries[0].Key, intKey(40)) ||
+			!bytes.Equal(rightEntries[1].Key, intKey(50)) ||
+			!bytes.Equal(rightEntries[2].Key, intKey(60)) {
 			t.Error("right entries incorrect")
 		}
 	})
@@ -334,14 +342,14 @@ func TestNodeOperations_Split(t *testing.T) {
 		}
 		entries := make([]LeafEntry, 5)
 		for i := 0; i < 5; i++ {
-			entries[i] = LeafEntry{Key: PageID(i + 1), Value: MakeInlineValue([]byte("val"))}
+			entries[i] = LeafEntry{Key: intKey(uint64(i + 1)), Value: MakeInlineValue([]byte("val"))}
 		}
 		StoreLeafEntries(node, entries)
 
 		_, _, splitKey := nodeOps.Split(node)
 		// Median is index 2 (key 3)
-		if splitKey != 3 {
-			t.Errorf("expected splitKey 3, got %d", splitKey)
+		if !bytes.Equal(splitKey, intKey(3)) {
+			t.Errorf("expected splitKey intKey(3), got %x", splitKey)
 		}
 	})
 }
@@ -356,8 +364,8 @@ func TestNodeOperations_UpdateHighKey(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		highKey := nodeOps.UpdateHighKey(node)
-		if highKey != 0 {
-			t.Errorf("expected 0 for empty node, got %d", highKey)
+		if highKey != nil {
+			t.Errorf("expected nil for empty node, got %x", highKey)
 		}
 	})
 
@@ -368,17 +376,17 @@ func TestNodeOperations_UpdateHighKey(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []LeafEntry{
-			{Key: 10, Value: MakeInlineValue([]byte("a"))},
-			{Key: 20, Value: MakeInlineValue([]byte("b"))},
-			{Key: 30, Value: MakeInlineValue([]byte("c"))},
-			{Key: 40, Value: MakeInlineValue([]byte("d"))},
-			{Key: 50, Value: MakeInlineValue([]byte("e"))},
+			{Key: intKey(10), Value: MakeInlineValue([]byte("a"))},
+			{Key: intKey(20), Value: MakeInlineValue([]byte("b"))},
+			{Key: intKey(30), Value: MakeInlineValue([]byte("c"))},
+			{Key: intKey(40), Value: MakeInlineValue([]byte("d"))},
+			{Key: intKey(50), Value: MakeInlineValue([]byte("e"))},
 		}
 		StoreLeafEntries(node, entries)
 
 		highKey := nodeOps.UpdateHighKey(node)
-		if highKey != 50 {
-			t.Errorf("expected 50, got %d", highKey)
+		if !bytes.Equal(highKey, intKey(50)) {
+			t.Errorf("expected intKey(50), got %x", highKey)
 		}
 	})
 
@@ -390,15 +398,15 @@ func TestNodeOperations_UpdateHighKey(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []InternalEntry{
-			{Key: 10, Child: PageID(100)},
-			{Key: 20, Child: PageID(200)},
-			{Key: 30, Child: PageID(300)},
+			{Key: intKey(10), Child: PageID(100)},
+			{Key: intKey(20), Child: PageID(200)},
+			{Key: intKey(30), Child: PageID(300)},
 		}
 		StoreInternalEntries(node, entries)
 
 		highKey := nodeOps.UpdateHighKey(node)
-		if highKey != 30 {
-			t.Errorf("expected 30, got %d", highKey)
+		if !bytes.Equal(highKey, intKey(30)) {
+			t.Errorf("expected intKey(30), got %x", highKey)
 		}
 	})
 }
@@ -408,17 +416,17 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 
 	t.Run("SerializeDeserializeLeaf", func(t *testing.T) {
 		original := &NodeFormat{
-			NodeType:     NodeTypeLeaf,
-			Count:        3,
-			Capacity:     MaxNodeCapacity,
-			HighSibling:  PageID(1000),
-			LowSibling:   PageID(0),
-			HighKey:      300,
+			NodeType:    NodeTypeLeaf,
+			Count:       3,
+			Capacity:    MaxNodeCapacity,
+			HighSibling: PageID(1000),
+			LowSibling:  PageID(0),
+			HighKey:     intKey(300),
 		}
 		entries := []LeafEntry{
-			{Key: 100, Value: MakeInlineValue([]byte("val100"))},
-			{Key: 200, Value: MakeInlineValue([]byte("val200"))},
-			{Key: 300, Value: MakeInlineValue([]byte("val300"))},
+			{Key: intKey(100), Value: MakeInlineValue([]byte("val100"))},
+			{Key: intKey(200), Value: MakeInlineValue([]byte("val200"))},
+			{Key: intKey(300), Value: MakeInlineValue([]byte("val300"))},
 		}
 		StoreLeafEntries(original, entries)
 
@@ -434,14 +442,14 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 		if restored.Count != original.Count {
 			t.Errorf("Count: expected %d, got %d", original.Count, restored.Count)
 		}
-		if restored.HighKey != original.HighKey {
-			t.Errorf("HighKey: expected %d, got %d", original.HighKey, restored.HighKey)
+		if !bytes.Equal(restored.HighKey, original.HighKey) {
+			t.Errorf("HighKey: expected %x, got %x", original.HighKey, restored.HighKey)
 		}
 
 		restoredEntries := ExtractLeafEntries(restored)
 		for i := 0; i < int(original.Count); i++ {
-			if restoredEntries[i].Key != entries[i].Key {
-				t.Errorf("entry %d key: expected %d, got %d", i, entries[i].Key, restoredEntries[i].Key)
+			if !bytes.Equal(restoredEntries[i].Key, entries[i].Key) {
+				t.Errorf("entry %d key: expected %x, got %x", i, entries[i].Key, restoredEntries[i].Key)
 			}
 		}
 	})
@@ -455,9 +463,9 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 			HighSibling: PageID(500),
 		}
 		entries := []InternalEntry{
-			{Key: 100, Child: PageID(100)},
-			{Key: 200, Child: PageID(200)},
-			{Key: 300, Child: PageID(300)},
+			{Key: intKey(100), Child: PageID(100)},
+			{Key: intKey(200), Child: PageID(200)},
+			{Key: intKey(300), Child: PageID(300)},
 		}
 		StoreInternalEntries(original, entries)
 
@@ -479,8 +487,8 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 
 		restoredEntries := ExtractInternalEntries(restored)
 		for i := 0; i < 3; i++ {
-			if restoredEntries[i].Key != entries[i].Key {
-				t.Errorf("entry %d key: expected %d, got %d", i, entries[i].Key, restoredEntries[i].Key)
+			if !bytes.Equal(restoredEntries[i].Key, entries[i].Key) {
+				t.Errorf("entry %d key: expected %x, got %x", i, entries[i].Key, restoredEntries[i].Key)
 			}
 			if restoredEntries[i].Child != entries[i].Child {
 				t.Errorf("entry %d child mismatch", i)
@@ -543,8 +551,8 @@ func TestInMemoryNodeManager(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []LeafEntry{
-			{Key: 100, Value: MakeInlineValue([]byte("a"))},
-			{Key: 200, Value: MakeInlineValue([]byte("b"))},
+			{Key: intKey(100), Value: MakeInlineValue([]byte("a"))},
+			{Key: intKey(200), Value: MakeInlineValue([]byte("b"))},
 		}
 		StoreLeafEntries(node, entries)
 
@@ -566,7 +574,7 @@ func TestInMemoryNodeManager(t *testing.T) {
 		}
 
 		loadedEntries := ExtractLeafEntries(loaded)
-		if loadedEntries[0].Key != 100 || loadedEntries[1].Key != 200 {
+		if !bytes.Equal(loadedEntries[0].Key, intKey(100)) || !bytes.Equal(loadedEntries[1].Key, intKey(200)) {
 			t.Error("loaded entries don't match")
 		}
 	})
@@ -613,7 +621,7 @@ func TestTree_Put(t *testing.T) {
 
 	t.Run("PutSingleKey", func(t *testing.T) {
 		value := MakeInlineValue([]byte("test value"))
-		err := tree.Put(100, value)
+		err := tree.Put(intKey(100), value)
 		if err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
@@ -622,7 +630,7 @@ func TestTree_Put(t *testing.T) {
 	t.Run("PutMultipleKeys", func(t *testing.T) {
 		for i := 1; i <= 100; i++ {
 			value := MakeInlineValue([]byte("value"))
-			err := tree.Put(PageID(i*10), value)
+			err := tree.Put(intKey(uint64(i*10)), value)
 			if err != nil {
 				t.Fatalf("Put %d failed: %v", i*10, err)
 			}
@@ -631,13 +639,13 @@ func TestTree_Put(t *testing.T) {
 
 	t.Run("PutDuplicateKey", func(t *testing.T) {
 		value1 := MakeInlineValue([]byte("first"))
-		err := tree.Put(500, value1)
+		err := tree.Put(intKey(500), value1)
 		if err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
 
 		value2 := MakeInlineValue([]byte("second"))
-		err = tree.Put(500, value2)
+		err = tree.Put(intKey(500), value2)
 		if err != nil {
 			t.Fatalf("Put duplicate failed: %v", err)
 		}
@@ -646,7 +654,7 @@ func TestTree_Put(t *testing.T) {
 	t.Run("PutAfterClose", func(t *testing.T) {
 		tree.Close()
 		value := MakeInlineValue([]byte("test"))
-		err := tree.Put(100, value)
+		err := tree.Put(intKey(100), value)
 		if err != ErrStoreClosed {
 			t.Errorf("expected ErrStoreClosed, got %v", err)
 		}
@@ -658,31 +666,35 @@ func TestTree_Get(t *testing.T) {
 	defer tree.Close()
 
 	// Insert test data
-	inserted := make(map[PageID][]byte)
+	type keyData struct {
+		key  []byte
+		data []byte
+	}
+	inserted := make([]keyData, 0, 50)
 	for i := 1; i <= 50; i++ {
-		key := PageID(i * 10)
+		key := intKey(uint64(i * 10))
 		data := []byte("value for key ")
 		data = append(data, byte(i))
 		value := MakeInlineValue(data)
 		_ = tree.Put(key, value)
-		inserted[key] = data
+		inserted = append(inserted, keyData{key: key, data: data})
 	}
 
 	t.Run("GetExistingKeys", func(t *testing.T) {
-		for key, expectedData := range inserted {
-			val, err := tree.Get(key)
+		for _, kd := range inserted {
+			val, err := tree.Get(kd.key)
 			if err != nil {
-				t.Fatalf("Get %d failed: %v", key, err)
+				t.Fatalf("Get %x failed: %v", kd.key, err)
 			}
-			// Verify value matches (at least first few bytes)
-			if val.Length[7] != byte(len(expectedData)) {
-				t.Errorf("Get %d: wrong length", key)
+			// Verify value matches (at least length byte)
+			if val.Length[7] != byte(len(kd.data)) {
+				t.Errorf("Get %x: wrong length", kd.key)
 			}
 		}
 	})
 
 	t.Run("GetNonExistingKey", func(t *testing.T) {
-		_, err := tree.Get(9999)
+		_, err := tree.Get(intKey(9999))
 		if err != ErrKeyNotFound {
 			t.Errorf("expected ErrKeyNotFound, got %v", err)
 		}
@@ -690,7 +702,7 @@ func TestTree_Get(t *testing.T) {
 
 	t.Run("GetFromEmptyTree", func(t *testing.T) {
 		emptyTree := NewInMemoryTree()
-		_, err := emptyTree.Get(100)
+		_, err := emptyTree.Get(intKey(100))
 		if err != ErrKeyNotFound {
 			t.Errorf("expected ErrKeyNotFound, got %v", err)
 		}
@@ -703,27 +715,27 @@ func TestTree_Delete(t *testing.T) {
 	defer tree.Close()
 
 	// Setup: insert keys
-	keys := []PageID{10, 20, 30, 40, 50}
+	keys := []uint64{10, 20, 30, 40, 50}
 	for _, k := range keys {
 		value := MakeInlineValue([]byte("val"))
-		_ = tree.Put(k, value)
+		_ = tree.Put(intKey(k), value)
 	}
 
 	t.Run("DeleteMiddleKey", func(t *testing.T) {
-		err := tree.Delete(30)
+		err := tree.Delete(intKey(30))
 		if err != nil {
 			t.Fatalf("Delete failed: %v", err)
 		}
 
 		// Verify key is gone
-		_, err = tree.Get(30)
+		_, err = tree.Get(intKey(30))
 		if err != ErrKeyNotFound {
 			t.Errorf("expected ErrKeyNotFound after delete, got %v", err)
 		}
 
 		// Other keys still exist
-		for _, k := range []PageID{10, 20, 40, 50} {
-			_, err := tree.Get(k)
+		for _, k := range []uint64{10, 20, 40, 50} {
+			_, err := tree.Get(intKey(k))
 			if err != nil {
 				t.Errorf("key %d should exist after deleting 30", k)
 			}
@@ -731,22 +743,22 @@ func TestTree_Delete(t *testing.T) {
 	})
 
 	t.Run("DeleteNonExistent", func(t *testing.T) {
-		err := tree.Delete(9999)
+		err := tree.Delete(intKey(9999))
 		if err != ErrKeyNotFound {
 			t.Errorf("expected ErrKeyNotFound, got %v", err)
 		}
 	})
 
 	t.Run("DeleteAllKeys", func(t *testing.T) {
-		for _, k := range []PageID{10, 20, 40, 50} {
-			err := tree.Delete(k)
+		for _, k := range []uint64{10, 20, 40, 50} {
+			err := tree.Delete(intKey(k))
 			if err != nil {
 				t.Fatalf("Delete %d failed: %v", k, err)
 			}
 		}
 
 		for _, k := range keys {
-			_, err := tree.Get(k)
+			_, err := tree.Get(intKey(k))
 			if err != ErrKeyNotFound {
 				t.Errorf("key %d should be deleted", k)
 			}
@@ -755,7 +767,7 @@ func TestTree_Delete(t *testing.T) {
 
 	t.Run("DeleteAfterClose", func(t *testing.T) {
 		tree.Close()
-		err := tree.Delete(10)
+		err := tree.Delete(intKey(10))
 		if err != ErrStoreClosed {
 			t.Errorf("expected ErrStoreClosed, got %v", err)
 		}
@@ -769,11 +781,11 @@ func TestTree_Scan(t *testing.T) {
 	// Insert test data
 	for i := 1; i <= 100; i++ {
 		value := MakeInlineValue([]byte("val"))
-		_ = tree.Put(PageID(i*10), value)
+		_ = tree.Put(intKey(uint64(i*10)), value)
 	}
 
 	t.Run("ScanAll", func(t *testing.T) {
-		iter, err := tree.Scan(0, 0)
+		iter, err := tree.Scan(nil, nil)
 		if err != nil {
 			t.Fatalf("Scan failed: %v", err)
 		}
@@ -782,8 +794,8 @@ func TestTree_Scan(t *testing.T) {
 		count := 0
 		for iter.Next() {
 			key := iter.Key()
-			if key == 0 {
-				t.Error("iterator returned zero key")
+			if len(key) == 0 {
+				t.Error("iterator returned empty key")
 			}
 			count++
 		}
@@ -793,7 +805,7 @@ func TestTree_Scan(t *testing.T) {
 	})
 
 	t.Run("ScanRange", func(t *testing.T) {
-		iter, err := tree.Scan(200, 500)
+		iter, err := tree.Scan(intKey(200), intKey(500))
 		if err != nil {
 			t.Fatalf("Scan failed: %v", err)
 		}
@@ -802,18 +814,18 @@ func TestTree_Scan(t *testing.T) {
 		count := 0
 		for iter.Next() {
 			key := iter.Key()
-			if key < 200 || key >= 500 {
-				t.Errorf("key %d out of range [200, 500)", key)
+			if bytes.Compare(key, intKey(200)) < 0 || bytes.Compare(key, intKey(500)) >= 0 {
+				t.Errorf("key %x out of range [200, 500)", key)
 			}
 			count++
 		}
-		if count != 30 { // 210,220,...,490 = 30 keys
+		if count != 30 { // 200,210,...,490 = 30 keys
 			t.Errorf("expected 30 entries in range, got %d", count)
 		}
 	})
 
 	t.Run("ScanEmptyRange", func(t *testing.T) {
-		iter, err := tree.Scan(5000, 6000)
+		iter, err := tree.Scan(intKey(5000), intKey(6000))
 		if err != nil {
 			t.Fatalf("Scan failed: %v", err)
 		}
@@ -830,7 +842,7 @@ func TestTree_Scan(t *testing.T) {
 
 	t.Run("ScanAfterClose", func(t *testing.T) {
 		tree.Close()
-		_, err := tree.Scan(0, 0)
+		_, err := tree.Scan(nil, nil)
 		if err != ErrStoreClosed {
 			t.Errorf("expected ErrStoreClosed, got %v", err)
 		}
@@ -845,7 +857,7 @@ func TestTree_Batch(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		ops[i] = blinktree.TreeOperation{
 			Type:  blinktree.OpPut,
-			Key:   PageID((i+1)*10),
+			Key:   intKey(uint64((i + 1) * 10)),
 			Value: MakeInlineValue([]byte("batch")),
 		}
 	}
@@ -857,7 +869,7 @@ func TestTree_Batch(t *testing.T) {
 
 	// Verify all inserted
 	for i := 1; i <= 100; i++ {
-		_, err := tree.Get(PageID(i * 10))
+		_, err := tree.Get(intKey(uint64(i * 10)))
 		if err != nil {
 			t.Errorf("key %d not found after batch", i*10)
 		}
@@ -871,7 +883,7 @@ func TestTree_RootPersistence(t *testing.T) {
 	// Insert some data
 	for i := 1; i <= 20; i++ {
 		value := MakeInlineValue([]byte("val"))
-		_ = tree.Put(PageID(i*10), value)
+		_ = tree.Put(intKey(uint64(i*10)), value)
 	}
 
 	// Get root PageID
@@ -888,7 +900,7 @@ func TestTree_RootPersistence(t *testing.T) {
 	// Verify data is accessible (note: this test uses separate PageStorage instances,
 	// so data won't actually be accessible — this tests the root persistence mechanism only)
 	for i := 1; i <= 20; i++ {
-		_, err := tree2.Get(PageID(i * 10))
+		_, err := tree2.Get(intKey(uint64(i * 10)))
 		if err != nil {
 			t.Errorf("key %d not found after restore", i*10)
 		}
@@ -906,11 +918,11 @@ func TestTreeIterator(t *testing.T) {
 	// Insert test data
 	for i := 1; i <= 50; i++ {
 		value := MakeInlineValue([]byte("val"))
-		_ = tree.Put(PageID(i*10), value)
+		_ = tree.Put(intKey(uint64(i*10)), value)
 	}
 
 	t.Run("IteratorKeyValue", func(t *testing.T) {
-		iter, _ := tree.Scan(0, 0)
+		iter, _ := tree.Scan(nil, nil)
 		defer iter.Close()
 
 		// Should find first entry
@@ -919,8 +931,8 @@ func TestTreeIterator(t *testing.T) {
 		}
 
 		key := iter.Key()
-		if key == 0 {
-			t.Error("Key() returned 0")
+		if len(key) == 0 {
+			t.Error("Key() returned empty")
 		}
 
 		val := iter.Value()
@@ -930,16 +942,17 @@ func TestTreeIterator(t *testing.T) {
 	})
 
 	t.Run("IteratorOrder", func(t *testing.T) {
-		iter, _ := tree.Scan(0, 0)
+		iter, _ := tree.Scan(nil, nil)
 		defer iter.Close()
 
-		var prevKey PageID = 0
+		var prevKey []byte
 		for iter.Next() {
 			key := iter.Key()
-			if key <= prevKey {
-				t.Errorf("keys not in order: %d <= %d", key, prevKey)
+			if prevKey != nil && bytes.Compare(key, prevKey) <= 0 {
+				t.Errorf("keys not in order: %x <= %x", key, prevKey)
 			}
-			prevKey = key
+			prevKey = make([]byte, len(key))
+			copy(prevKey, key)
 		}
 	})
 }
@@ -980,7 +993,7 @@ func TestConcurrent_NodeManager(t *testing.T) {
 		entries := []LeafEntry{}
 		for i := 1; i <= 5; i++ {
 			entries = append(entries, LeafEntry{
-				Key:   PageID(i * 10),
+				Key:   intKey(uint64(i * 10)),
 				Value: MakeInlineValue([]byte{byte(i)}),
 			})
 		}
@@ -1016,7 +1029,7 @@ func TestConcurrent_Tree(t *testing.T) {
 		for g := 0; g < 5; g++ {
 			go func(goroutineID int) {
 				for i := 0; i < 50; i++ {
-					key := PageID(goroutineID*1000 + i)
+					key := intKey(uint64(goroutineID*1000 + i))
 					value := MakeInlineValue([]byte("val"))
 					_ = tree.Put(key, value)
 				}
@@ -1030,10 +1043,10 @@ func TestConcurrent_Tree(t *testing.T) {
 		// Verify all keys were inserted
 		for g := 0; g < 5; g++ {
 			for i := 0; i < 50; i++ {
-				key := PageID(g*1000 + i)
+				key := intKey(uint64(g*1000 + i))
 				_, err := tree.Get(key)
 				if err != nil {
-					t.Errorf("key %d not found", key)
+					t.Errorf("key %x not found", key)
 				}
 			}
 		}
@@ -1046,14 +1059,14 @@ func TestConcurrent_Tree(t *testing.T) {
 		// Pre-insert some keys
 		for i := 0; i < 100; i++ {
 			value := MakeInlineValue([]byte("initial"))
-			_ = tree.Put(PageID(i), value)
+			_ = tree.Put(intKey(uint64(i)), value)
 		}
 
 		done := make(chan bool, 5)
 		for g := 0; g < 5; g++ {
 			go func(goroutineID int) {
 				for i := 0; i < 20; i++ {
-					key := PageID((goroutineID*20 + i) % 100)
+					key := intKey(uint64((goroutineID*20 + i) % 100))
 					if goroutineID%2 == 0 {
 						// Readers
 						_, _ = tree.Get(key)
@@ -1084,7 +1097,7 @@ func TestEdgeCases(t *testing.T) {
 		// Insert enough to trigger multiple levels
 		for i := 1; i <= 1000; i++ {
 			value := MakeInlineValue([]byte("val"))
-			err := tree.Put(PageID(i), value)
+			err := tree.Put(intKey(uint64(i)), value)
 			if err != nil {
 				t.Fatalf("Put %d failed: %v", i, err)
 			}
@@ -1092,7 +1105,7 @@ func TestEdgeCases(t *testing.T) {
 
 		// Verify all present
 		for i := 1; i <= 1000; i++ {
-			_, err := tree.Get(PageID(i))
+			_, err := tree.Get(intKey(uint64(i)))
 			if err != nil {
 				t.Errorf("key %d missing", i)
 			}
@@ -1106,18 +1119,18 @@ func TestEdgeCases(t *testing.T) {
 		// Insert
 		for i := 1; i <= 100; i++ {
 			value := MakeInlineValue([]byte("val"))
-			_ = tree.Put(PageID(i), value)
+			_ = tree.Put(intKey(uint64(i)), value)
 		}
 
 		// Delete all
 		for i := 1; i <= 100; i++ {
-			_ = tree.Delete(PageID(i))
+			_ = tree.Delete(intKey(uint64(i)))
 		}
 
 		// Reinsert
 		for i := 1; i <= 100; i++ {
 			value := MakeInlineValue([]byte("val2"))
-			err := tree.Put(PageID(i), value)
+			err := tree.Put(intKey(uint64(i)), value)
 			if err != nil {
 				t.Fatalf("Reinsert %d failed: %v", i, err)
 			}
@@ -1125,7 +1138,7 @@ func TestEdgeCases(t *testing.T) {
 
 		// Verify
 		for i := 1; i <= 100; i++ {
-			_, err := tree.Get(PageID(i))
+			_, err := tree.Get(intKey(uint64(i)))
 			if err != nil {
 				t.Errorf("key %d missing after reinsert", i)
 			}
@@ -1138,12 +1151,12 @@ func TestEdgeCases(t *testing.T) {
 
 		for round := 0; round < 10; round++ {
 			for i := 1; i <= 50; i++ {
-				key := PageID(round*100 + i)
+				key := intKey(uint64(round*100 + i))
 				value := MakeInlineValue([]byte("val"))
 				_ = tree.Put(key, value)
 			}
 			for i := 1; i <= 50; i++ {
-				key := PageID(round*100 + i)
+				key := intKey(uint64(round*100 + i))
 				_ = tree.Delete(key)
 			}
 		}

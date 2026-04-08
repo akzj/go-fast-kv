@@ -17,14 +17,14 @@ func TestVerifyTreeSplit(t *testing.T) {
 
 	// Insert 60 keys (triggers at least one split)
 	for i := 1; i <= 60; i++ {
-		err := tree.Put(PageID(i), InlineValue{})
+		err := tree.Put(intKey(uint64(i)), InlineValue{})
 		if err != nil {
 			t.Fatalf("Put %d failed: %v", i, err)
 		}
 	}
 
 	// Scan
-	iter, _ := tree.Scan(0, 0)
+	iter, _ := tree.Scan(nil, nil)
 	count := 0
 	for iter.Next() {
 		count++
