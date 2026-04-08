@@ -8,7 +8,6 @@ import (
 )
 
 // StorageAccessor provides compaction with access to storage internals.
-// Defined here to avoid circular dependencies with internal packages.
 type StorageAccessor interface {
 	// ListSegments returns all segments.
 	ListSegments() []SegmentInfo
@@ -43,16 +42,16 @@ type compactor struct {
 	mu       sync.Mutex
 	accessor StorageAccessor
 	writer   api.CompactionWriter
-	reclaimer api.Reclaimer
 	selector api.SegmentSelector
 	running  bool
 }
 
 // NewCompactor creates a new Compactor.
-func NewCompactor(writer api.CompactionWriter, reclaimer api.Reclaimer) api.Compactor {
+// writer must be created via NewCompactionWriter(accessor) to ensure
+// the same segment is used for both output tracking and data writing.
+func NewCompactor(writer api.CompactionWriter) api.Compactor {
 	return &compactor{
 		writer:   writer,
-		reclaimer: reclaimer,
 		selector: NewSegmentSelector("age"),
 	}
 }
@@ -118,27 +117,19 @@ func (c *compactor) Compact() (*api.CompactionResult, error) {
 	// Compact one segment at a time for safety
 	segID := toCompact[0]
 
-	// Open output for compacted data
-	outSegID, err := c.accessor.OpenOutput()
+	// Open writer — this opens the output segment via accessor (only ONE segment created)
+	outSegID, err := c.writer.Open()
 	if err != nil {
-		return nil, err
-	}
-
-	// Initialize writer
-	if _, err := c.writer.Open(); err != nil {
-		c.accessor.AbortOutput()
 		return nil, err
 	}
 
 	// Get root page ID (must not be compacted)
 	rootPageID := c.accessor.GetRootPageID()
-	_ = rootPageID // Used to filter
+	_ = rootPageID
 
 	var bytesReclaimed uint64
-	var pagesCompacted int
 
 	// Scan all pages and copy live ones to output
-	// For each segment that matches our target
 	for _, seg := range segments {
 		if seg.ID != segID {
 			continue
@@ -151,18 +142,14 @@ func (c *compactor) Compact() (*api.CompactionResult, error) {
 		// 3. If yes, copy to output
 		// For now, estimate bytes reclaimed
 		bytesReclaimed = uint64(seg.Size)
-		_ = pagesCompacted
 		break
 	}
 
 	// Commit output
 	if err := c.writer.Commit(); err != nil {
-		c.accessor.AbortOutput()
+		c.writer.Abort()
 		return nil, err
 	}
-
-	// Finalize output
-	c.accessor.CloseOutput()
 
 	result := &api.CompactionResult{
 		OldSegments:   []api.SegmentID{segID},

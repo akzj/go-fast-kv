@@ -85,3 +85,10 @@ func (mgr *pageNodeManager) Load(pageID PageID) (*NodeFormat, error) {
 	}
 	return mgr.nodeOps.Deserialize(data)
 }
+
+// StorageAccessor returns nil for pageNodeManager.
+// The full StorageAccessor is implemented at the kvstore level,
+// which has access to the underlying SegmentManager.
+func (mgr *pageNodeManager) StorageAccessor() any {
+	return nil
+}

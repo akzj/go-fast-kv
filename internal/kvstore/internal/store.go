@@ -12,6 +12,7 @@ import (
 
 	vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
 	"github.com/akzj/go-fast-kv/internal/blinktree"
+	compactionapi "github.com/akzj/go-fast-kv/internal/compaction/api"
 	"github.com/akzj/go-fast-kv/internal/external-value"
 	"github.com/akzj/go-fast-kv/internal/wal"
 	"github.com/akzj/go-fast-kv/internal/storage"
@@ -229,6 +230,10 @@ type kvStore struct {
 	txCounter    uint64
 	readOnly     bool
 	metadataFile string
+	// GC compaction
+	compactor     compactionapi.Compactor
+	compactorMu   sync.Mutex
+	compactorDone chan struct{}
 }
 
 func NewKVStore(config Config) (*kvStore, error) {

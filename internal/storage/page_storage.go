@@ -73,6 +73,11 @@ type PageStorage interface {
 	// Returns false if VAddr has no known PageID mapping.
 	GetPageID(vaddr vaddr.VAddr) (PageID, bool)
 
+	// UpdateMappingCAS atomically updates a page's VAddr mapping.
+	// Used by GC to remap pages after compaction.
+	// Returns true if update succeeded, false if concurrent update occurred.
+	UpdateMappingCAS(pageID PageID, expected, newVAddr vaddr.VAddr) bool
+
 	// Close releases all resources.
 	Close() error
 }
@@ -179,6 +184,19 @@ func (m *MemoryPageStorage) GetVAddr(pageID PageID) (vaddr.VAddr, bool) {
 	defer m.mu.Unlock()
 	physAddr, exists := m.pageToVAddr[pageID]
 	return physAddr, exists
+}
+
+// UpdateMappingCAS atomically updates a page's VAddr mapping.
+// MemoryPageStorage is always consistent so this always succeeds.
+func (m *MemoryPageStorage) UpdateMappingCAS(pageID PageID, expected, newVAddr vaddr.VAddr) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, exists := m.pageToVAddr[pageID]
+	if !exists || current != expected {
+		return false
+	}
+	m.pageToVAddr[pageID] = newVAddr
+	return true
 }
 
 func (m *MemoryPageStorage) Close() error {
@@ -471,6 +489,22 @@ func (s *SegmentManagerPageStorage) GetVAddr(pageID PageID) (vaddr.VAddr, bool) 
 
 	physAddr, exists := s.pageToVAddr[pageID]
 	return physAddr, exists
+}
+
+// UpdateMappingCAS atomically updates a page's VAddr mapping.
+func (s *SegmentManagerPageStorage) UpdateMappingCAS(pageID PageID, expected, newVAddr vaddr.VAddr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, exists := s.pageToVAddr[pageID]
+	if !exists || current != expected {
+		return false
+	}
+
+	s.pageToVAddr[pageID] = newVAddr
+	delete(s.vaddrToPage, expected)
+	s.vaddrToPage[newVAddr] = pageID
+	return true
 }
 
 func (s *SegmentManagerPageStorage) Close() error {

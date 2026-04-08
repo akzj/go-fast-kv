@@ -131,6 +131,10 @@ type NodeManager interface {
 
 	// Load reads the node for the given PageID.
 	Load(pageID PageID) (*NodeFormat, error)
+
+	// StorageAccessorFactory allows kvstore to get a StorageAccessor for GC.
+	// Returns nil if the underlying storage doesn't support it.
+	StorageAccessor() any
 }
 
 type TreeOperation struct {

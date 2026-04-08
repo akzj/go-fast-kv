@@ -27,7 +27,8 @@ func NewCompactionStrategy(config *api.CompactionConfig) api.CompactionStrategy 
 	reclaimer := NewReclaimer(epochMgr)
 	selector := NewSegmentSelector("age")
 	trigger := NewCompactionTrigger(config)
-	comp := NewCompactor(nil, reclaimer)
+	writer := NewCompactionWriter(nil)
+	comp := NewCompactor(writer)
 	comp.SetSelector(selector)
 	return &compactionStrategy{
 		trigger:   trigger,
