@@ -1,4 +1,4 @@
-package kvstore
+package internal
 
 import (
 	"encoding/binary"

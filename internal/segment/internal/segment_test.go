@@ -1,4 +1,4 @@
-package segment
+package internal
 
 import (
 	"bytes"

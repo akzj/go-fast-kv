@@ -1,4 +1,4 @@
-package pagestore
+package internal
 
 import (
 	"bytes"

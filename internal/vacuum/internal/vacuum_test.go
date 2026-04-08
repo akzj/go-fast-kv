@@ -1,4 +1,4 @@
-package vacuum
+package internal
 
 import (
 	"bytes"

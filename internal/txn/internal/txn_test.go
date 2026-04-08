@@ -1,4 +1,4 @@
-package txn
+package internal
 
 import (
 	"sync"

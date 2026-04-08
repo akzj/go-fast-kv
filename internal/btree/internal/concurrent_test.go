@@ -1,4 +1,4 @@
-package btree
+package internal
 
 import (
 	"bytes"

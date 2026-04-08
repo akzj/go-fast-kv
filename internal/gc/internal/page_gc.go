@@ -5,7 +5,7 @@
 // physical storage layer — it does NOT touch B-tree entries.
 //
 // Design reference: docs/DESIGN.md §3.7
-package gc
+package internal
 
 import (
 	"encoding/binary"

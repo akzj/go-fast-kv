@@ -1,5 +1,5 @@
 // Package btree implements the B-link tree index layer.
-package btree
+package internal
 
 import (
 	"encoding/binary"
