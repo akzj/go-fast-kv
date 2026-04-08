@@ -2,17 +2,22 @@ package btree
 
 import (
 	"bytes"
+	"sync"
+	"sync/atomic"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
+	"github.com/akzj/go-fast-kv/internal/lock"
 )
 
 type bTree struct {
 	pages       btreeapi.PageProvider
 	blobs       btreeapi.BlobWriter
 	serializer  btreeapi.NodeSerializer
-	rootPageID  uint64
+	rootPageID  atomic.Uint64        // atomic for concurrent reads (§3.8.8)
 	inlineThres int
 	closed      bool
+	pageLocks   *lock.PageRWLocks    // per-page RwLock manager (§3.8.1)
+	bootstrapMu sync.Mutex           // protects root creation when rootPageID == 0
 }
 
 // New creates a new BTree instance.
@@ -26,14 +31,15 @@ func New(cfg btreeapi.Config, pages btreeapi.PageProvider, blobs btreeapi.BlobWr
 		blobs:       blobs,
 		serializer:  NewNodeSerializer(),
 		inlineThres: thresh,
+		pageLocks:   lock.New(),
 	}
 }
 
 // RootPageID returns the current root node's PageID.
-func (t *bTree) RootPageID() uint64 { return t.rootPageID }
+func (t *bTree) RootPageID() uint64 { return t.rootPageID.Load() }
 
 // SetRootPageID sets the root node's PageID.
-func (t *bTree) SetRootPageID(pid uint64) { t.rootPageID = pid }
+func (t *bTree) SetRootPageID(pid uint64) { t.rootPageID.Store(pid) }
 
 // Close releases resources.
 func (t *bTree) Close() error {
@@ -41,7 +47,7 @@ func (t *bTree) Close() error {
 	return nil
 }
 
-// ─── Put ────────────────────────────────────────────────────────────
+// ─── Put (§3.8.3) ──────────────────────────────────────────────────
 
 func (t *bTree) Put(key, value []byte, txnID uint64) error {
 	if t.closed {
@@ -51,33 +57,85 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		return btreeapi.ErrKeyTooLarge
 	}
 
-	// Bootstrap: create root leaf if empty
-	if t.rootPageID == 0 {
-		pid := t.pages.AllocPage()
-		root := &btreeapi.Node{IsLeaf: true}
-		if err := t.pages.WritePage(pid, root); err != nil {
-			return err
+	// Bootstrap: create root leaf if empty (synchronized)
+	if t.rootPageID.Load() == 0 {
+		t.bootstrapMu.Lock()
+		if t.rootPageID.Load() == 0 { // double-check under lock
+			pid := t.pages.AllocPage()
+			root := &btreeapi.Node{IsLeaf: true}
+			if err := t.pages.WritePage(pid, root); err != nil {
+				t.bootstrapMu.Unlock()
+				return err
+			}
+			t.rootPageID.Store(pid)
 		}
-		t.rootPageID = pid
+		t.bootstrapMu.Unlock()
 	}
 
-	// Search down to leaf, recording path
-	path, leaf, leafPID, err := t.searchLeaf(key)
+	// Phase 1: Search down to leaf (read locks only), record path
+	path, err := t.searchPath(key)
 	if err != nil {
 		return err
 	}
 
-	// MVCC insert: mark old visible version, insert new entry
+	// Phase 2: Write-lock the leaf
+	leafPID := path[len(path)-1]
+	t.pageLocks.WLock(leafPID)
+	leaf, err := t.pages.ReadPage(leafPID)
+	if err != nil {
+		t.pageLocks.WUnlock(leafPID)
+		return err
+	}
+
+	// B-link correction under write lock: the leaf may have split since we searched
+	for leaf.HighKey != nil && bytes.Compare(key, leaf.HighKey) >= 0 && leaf.Next != 0 {
+		nextPID := leaf.Next
+		t.pageLocks.WUnlock(leafPID)
+		leafPID = nextPID
+		t.pageLocks.WLock(leafPID)
+		leaf, err = t.pages.ReadPage(leafPID)
+		if err != nil {
+			t.pageLocks.WUnlock(leafPID)
+			return err
+		}
+	}
+
+	// Phase 3: MVCC insert
 	t.mvccInsert(leaf, key, value, txnID)
 	leaf.Count = uint16(len(leaf.Entries))
 
 	// Check if split needed
 	if t.serializer.SerializedSize(leaf) <= btreeapi.PageSize {
-		return t.pages.WritePage(leafPID, leaf)
+		if err := t.pages.WritePage(leafPID, leaf); err != nil {
+			t.pageLocks.WUnlock(leafPID)
+			return err
+		}
+		t.pageLocks.WUnlock(leafPID)
+		return nil
 	}
 
-	// Split and propagate
-	return t.splitAndPropagate(leaf, leafPID, path)
+	// Phase 4: Split the leaf (still under write lock)
+	splitKey, right := t.splitNode(leaf)
+	rightPID := t.pages.AllocPage()
+
+	// Set up B-link pointers
+	right.Next = leaf.Next
+	leaf.Next = rightPID
+	right.HighKey = cloneBytes(leaf.HighKey) // right inherits original HighKey
+	leaf.HighKey = cloneBytes(splitKey)       // left gets splitKey as HighKey
+
+	if err := t.pages.WritePage(rightPID, right); err != nil {
+		t.pageLocks.WUnlock(leafPID)
+		return err
+	}
+	if err := t.pages.WritePage(leafPID, leaf); err != nil {
+		t.pageLocks.WUnlock(leafPID)
+		return err
+	}
+	t.pageLocks.WUnlock(leafPID)
+
+	// Phase 5: Propagate split upward (each level locks independently)
+	return t.propagateSplit(path[:len(path)-1], splitKey, rightPID)
 }
 
 func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64) {
@@ -127,27 +185,39 @@ func (t *bTree) findInsertPos(leaf *btreeapi.Node, key []byte, txnMin uint64) in
 	return len(leaf.Entries)
 }
 
-// ─── Search ─────────────────────────────────────────────────────────
+// ─── Search (§3.8.2 search phase) ──────────────────────────────────
 
-// searchLeaf traverses from root to the target leaf, returning the path
-// of internal node PageIDs, the leaf node, and the leaf's PageID.
-func (t *bTree) searchLeaf(key []byte) (path []uint64, leaf *btreeapi.Node, leafPID uint64, err error) {
-	pid := t.rootPageID
+// searchPath traverses from root to the target leaf using read locks,
+// returning the path of all node PageIDs visited (internal + leaf).
+// Each node is read-locked, then unlocked before moving to the next.
+func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
+	currentPID := t.rootPageID.Load()
 	for {
-		node, err := t.pages.ReadPage(pid)
+		t.pageLocks.RLock(currentPID)
+		node, err := t.pages.ReadPage(currentPID)
 		if err != nil {
-			return nil, nil, 0, err
+			t.pageLocks.RUnlock(currentPID)
+			return nil, err
 		}
+
 		// B-link right-link correction
 		if node.HighKey != nil && bytes.Compare(key, node.HighKey) >= 0 && node.Next != 0 {
-			pid = node.Next
+			nextPID := node.Next
+			t.pageLocks.RUnlock(currentPID)
+			currentPID = nextPID
 			continue
 		}
+
+		path = append(path, currentPID)
+
 		if node.IsLeaf {
-			return path, node, pid, nil
+			t.pageLocks.RUnlock(currentPID)
+			return path, nil
 		}
-		path = append(path, pid)
-		pid = findChild(node, key)
+
+		childPID := findChild(node, key)
+		t.pageLocks.RUnlock(currentPID)
+		currentPID = childPID
 	}
 }
 
@@ -160,76 +230,77 @@ func findChild(node *btreeapi.Node, key []byte) uint64 {
 	return node.Children[len(node.Children)-1]
 }
 
-// ─── Split ──────────────────────────────────────────────────────────
+// ─── Split propagation (§3.8.4) ────────────────────────────────────
 
-func (t *bTree) splitAndPropagate(node *btreeapi.Node, nodePID uint64, path []uint64) error {
-	splitKey, right := t.splitNode(node)
-	rightPID := t.pages.AllocPage()
-
-	// Set up B-link pointers
-	right.Next = node.Next
-	right.HighKey = cloneBytes(node.HighKey) // right inherits original HighKey
-	node.Next = rightPID
-	node.HighKey = cloneBytes(splitKey) // left gets splitKey as HighKey
-
-	if err := t.pages.WritePage(nodePID, node); err != nil {
-		return err
-	}
-	if err := t.pages.WritePage(rightPID, right); err != nil {
-		return err
-	}
-
-	// Propagate split upward
+func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint64) error {
 	for i := len(path) - 1; i >= 0; i-- {
 		parentPID := path[i]
+		t.pageLocks.WLock(parentPID)
 		parent, err := t.pages.ReadPage(parentPID)
 		if err != nil {
+			t.pageLocks.WUnlock(parentPID)
 			return err
 		}
-		// B-link correction on parent
+
+		// B-link correction: parent may have been split concurrently
 		for parent.HighKey != nil && bytes.Compare(splitKey, parent.HighKey) >= 0 && parent.Next != 0 {
-			parentPID = parent.Next
+			nextPID := parent.Next
+			t.pageLocks.WUnlock(parentPID)
+			parentPID = nextPID
+			t.pageLocks.WLock(parentPID)
 			parent, err = t.pages.ReadPage(parentPID)
 			if err != nil {
+				t.pageLocks.WUnlock(parentPID)
 				return err
 			}
 		}
 
-		insertInternalEntry(parent, splitKey, rightPID)
+		insertInternalEntry(parent, splitKey, newChildPID)
 		parent.Count = uint16(len(parent.Keys))
 
 		if t.serializer.SerializedSize(parent) <= btreeapi.PageSize {
-			return t.pages.WritePage(parentPID, parent)
+			if err := t.pages.WritePage(parentPID, parent); err != nil {
+				t.pageLocks.WUnlock(parentPID)
+				return err
+			}
+			t.pageLocks.WUnlock(parentPID)
+			return nil // Done — no further propagation needed
 		}
 
-		// Parent also needs split
-		splitKey, right = t.splitInternalNode(parent)
-		rightPID = t.pages.AllocPage()
+		// Parent also needs to split
+		newSplitKey, right := t.splitInternalNode(parent)
+		newParentPID := t.pages.AllocPage()
 		right.Next = parent.Next
+		parent.Next = newParentPID
 		right.HighKey = cloneBytes(parent.HighKey)
-		parent.Next = rightPID
-		parent.HighKey = cloneBytes(splitKey)
+		parent.HighKey = cloneBytes(newSplitKey)
 
+		if err := t.pages.WritePage(newParentPID, right); err != nil {
+			t.pageLocks.WUnlock(parentPID)
+			return err
+		}
 		if err := t.pages.WritePage(parentPID, parent); err != nil {
+			t.pageLocks.WUnlock(parentPID)
 			return err
 		}
-		if err := t.pages.WritePage(rightPID, right); err != nil {
-			return err
-		}
+		t.pageLocks.WUnlock(parentPID)
+
+		splitKey = newSplitKey
+		newChildPID = newParentPID
 	}
 
-	// Need new root
+	// Reached root and still need to split → create new root
 	newRoot := &btreeapi.Node{
 		IsLeaf:   false,
 		Count:    1,
 		Keys:     [][]byte{cloneBytes(splitKey)},
-		Children: []uint64{t.rootPageID, rightPID},
+		Children: []uint64{t.rootPageID.Load(), newChildPID},
 	}
 	newRootPID := t.pages.AllocPage()
 	if err := t.pages.WritePage(newRootPID, newRoot); err != nil {
 		return err
 	}
-	t.rootPageID = newRootPID
+	t.rootPageID.Store(newRootPID)
 	return nil
 }
 
@@ -297,32 +368,56 @@ func insertInternalEntry(node *btreeapi.Node, key []byte, childPID uint64) {
 	node.Children[pos+1] = childPID
 }
 
-// ─── Get ────────────────────────────────────────────────────────────
+// ─── Get (§3.8.2) ──────────────────────────────────────────────────
 
 func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
 	if t.closed {
 		return nil, btreeapi.ErrClosed
 	}
-	if t.rootPageID == 0 {
+
+	currentPID := t.rootPageID.Load()
+	if currentPID == 0 {
 		return nil, btreeapi.ErrKeyNotFound
 	}
 
-	_, leaf, _, err := t.searchLeaf(key)
-	if err != nil {
-		return nil, err
-	}
+	for {
+		t.pageLocks.RLock(currentPID)
+		node, err := t.pages.ReadPage(currentPID)
+		if err != nil {
+			t.pageLocks.RUnlock(currentPID)
+			return nil, err
+		}
 
-	for i := range leaf.Entries {
-		e := &leaf.Entries[i]
-		cmp := bytes.Compare(e.Key, key)
-		if cmp > 0 {
-			break
+		// B-link correction: if key >= HighKey, follow right-link
+		if node.HighKey != nil && bytes.Compare(key, node.HighKey) >= 0 && node.Next != 0 {
+			nextPID := node.Next
+			t.pageLocks.RUnlock(currentPID)
+			currentPID = nextPID
+			continue
 		}
-		if cmp == 0 && e.TxnMin <= txnID && e.TxnMax > txnID {
-			return t.resolveValue(&e.Value)
+
+		if node.IsLeaf {
+			// Find visible entry
+			for i := range node.Entries {
+				e := &node.Entries[i]
+				cmp := bytes.Compare(e.Key, key)
+				if cmp > 0 {
+					break
+				}
+				if cmp == 0 && e.TxnMin <= txnID && e.TxnMax > txnID {
+					t.pageLocks.RUnlock(currentPID)
+					return t.resolveValue(&e.Value)
+				}
+			}
+			t.pageLocks.RUnlock(currentPID)
+			return nil, btreeapi.ErrKeyNotFound
 		}
+
+		// Internal node: descend to child
+		childPID := findChild(node, key)
+		t.pageLocks.RUnlock(currentPID)
+		currentPID = childPID
 	}
-	return nil, btreeapi.ErrKeyNotFound
 }
 
 func (t *bTree) resolveValue(v *btreeapi.Value) ([]byte, error) {
@@ -332,32 +427,62 @@ func (t *bTree) resolveValue(v *btreeapi.Value) ([]byte, error) {
 	return cloneBytes(v.Inline), nil
 }
 
-// ─── Delete ─────────────────────────────────────────────────────────
+// ─── Delete (§3.8.5) ───────────────────────────────────────────────
 
 func (t *bTree) Delete(key []byte, txnID uint64) error {
 	if t.closed {
 		return btreeapi.ErrClosed
 	}
-	if t.rootPageID == 0 {
+	if t.rootPageID.Load() == 0 {
 		return btreeapi.ErrKeyNotFound
 	}
 
-	_, leaf, leafPID, err := t.searchLeaf(key)
+	// Phase 1: Search down to leaf (read locks only)
+	path, err := t.searchPath(key)
 	if err != nil {
 		return err
 	}
 
+	// Phase 2: Write-lock the leaf
+	leafPID := path[len(path)-1]
+	t.pageLocks.WLock(leafPID)
+	leaf, err := t.pages.ReadPage(leafPID)
+	if err != nil {
+		t.pageLocks.WUnlock(leafPID)
+		return err
+	}
+
+	// B-link correction under write lock
+	for leaf.HighKey != nil && bytes.Compare(key, leaf.HighKey) >= 0 && leaf.Next != 0 {
+		nextPID := leaf.Next
+		t.pageLocks.WUnlock(leafPID)
+		leafPID = nextPID
+		t.pageLocks.WLock(leafPID)
+		leaf, err = t.pages.ReadPage(leafPID)
+		if err != nil {
+			t.pageLocks.WUnlock(leafPID)
+			return err
+		}
+	}
+
+	// Phase 3: MVCC delete (mark TxnMax)
 	for i := range leaf.Entries {
 		e := &leaf.Entries[i]
 		if bytes.Equal(e.Key, key) && e.TxnMin <= txnID && e.TxnMax > txnID {
 			e.TxnMax = txnID
-			return t.pages.WritePage(leafPID, leaf)
+			if err := t.pages.WritePage(leafPID, leaf); err != nil {
+				t.pageLocks.WUnlock(leafPID)
+				return err
+			}
+			t.pageLocks.WUnlock(leafPID)
+			return nil
 		}
 	}
+	t.pageLocks.WUnlock(leafPID)
 	return btreeapi.ErrKeyNotFound
 }
 
-// ─── Scan ───────────────────────────────────────────────────────────
+// ─── Scan (§3.8.6) ─────────────────────────────────────────────────
 
 func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 	it := &iterator{
@@ -365,30 +490,66 @@ func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 		endKey: end,
 		txnID:  txnID,
 	}
-	if t.closed || t.rootPageID == 0 {
+	if t.closed || t.rootPageID.Load() == 0 {
 		it.done = true
 		return it
 	}
 
-	// Find the starting leaf
-	_, leaf, _, err := t.searchLeaf(start)
-	if err != nil {
-		it.err = err
-		it.done = true
-		return it
-	}
-	it.curNode = leaf
-	it.curIdx = 0
-
-	// Advance curIdx to the first entry >= start
-	for it.curIdx < len(leaf.Entries) {
-		if bytes.Compare(leaf.Entries[it.curIdx].Key, start) >= 0 {
-			break
+	// Find the starting leaf using read locks
+	currentPID := t.rootPageID.Load()
+	for {
+		t.pageLocks.RLock(currentPID)
+		node, err := t.pages.ReadPage(currentPID)
+		if err != nil {
+			t.pageLocks.RUnlock(currentPID)
+			it.err = err
+			it.done = true
+			return it
 		}
-		it.curIdx++
-	}
 
-	return it
+		// B-link correction
+		if node.HighKey != nil && bytes.Compare(start, node.HighKey) >= 0 && node.Next != 0 {
+			nextPID := node.Next
+			t.pageLocks.RUnlock(currentPID)
+			currentPID = nextPID
+			continue
+		}
+
+		if node.IsLeaf {
+			// Copy entries while holding the read lock, then release
+			it.curNode = cloneNode(node)
+			t.pageLocks.RUnlock(currentPID)
+			it.curIdx = 0
+
+			// Advance curIdx to the first entry >= start
+			for it.curIdx < len(it.curNode.Entries) {
+				if bytes.Compare(it.curNode.Entries[it.curIdx].Key, start) >= 0 {
+					break
+				}
+				it.curIdx++
+			}
+			return it
+		}
+
+		childPID := findChild(node, start)
+		t.pageLocks.RUnlock(currentPID)
+		currentPID = childPID
+	}
+}
+
+// cloneNode creates a deep copy of a node's entries so the iterator
+// doesn't hold a reference to page data that might change.
+func cloneNode(node *btreeapi.Node) *btreeapi.Node {
+	clone := &btreeapi.Node{
+		IsLeaf:  node.IsLeaf,
+		Count:   node.Count,
+		HighKey: cloneBytes(node.HighKey),
+		Next:    node.Next,
+	}
+	if node.IsLeaf {
+		clone.Entries = cloneLeafEntries(node.Entries)
+	}
+	return clone
 }
 
 type iterator struct {
@@ -416,12 +577,17 @@ func (it *iterator) Next() bool {
 				it.done = true
 				return false
 			}
-			node, err := it.tree.pages.ReadPage(it.curNode.Next)
+			// Read next leaf with read lock, clone, release
+			nextPID := it.curNode.Next
+			it.tree.pageLocks.RLock(nextPID)
+			node, err := it.tree.pages.ReadPage(nextPID)
 			if err != nil {
+				it.tree.pageLocks.RUnlock(nextPID)
 				it.err = err
 				return false
 			}
-			it.curNode = node
+			it.curNode = cloneNode(node)
+			it.tree.pageLocks.RUnlock(nextPID)
 			it.curIdx = 0
 		}
 

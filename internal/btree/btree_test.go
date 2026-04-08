@@ -352,7 +352,7 @@ func TestHighKeyAfterSplit(t *testing.T) {
 	}
 
 	// Read root — should be internal node after splits
-	root, err := pages.ReadPage(tree.rootPageID)
+	root, err := pages.ReadPage(tree.rootPageID.Load())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestHighKeyAfterSplit(t *testing.T) {
 
 	// Walk all leaves via right-links, verify HighKey chain
 	// Find leftmost leaf
-	pid := tree.rootPageID
+	pid := tree.rootPageID.Load()
 	for {
 		node, err := pages.ReadPage(pid)
 		if err != nil {
