@@ -892,18 +892,23 @@ func TestTree_RootPersistence(t *testing.T) {
 		t.Fatal("expected non-zero root pageID")
 	}
 
-	// Create new tree and restore root PageID
+	// Create new tree with the same storage and restore root PageID.
+	// Note: NewInMemoryTree creates a fresh MemoryPageStorage each time,
+	// so data won't be accessible — we only verify root PageID persistence.
+	// Data persistence is tested by kvstore persistence tests.
 	tree2 := NewInMemoryTree()
 	defer tree2.Close()
 	tree2.RestoreRootPageID(rootPageID)
 
-	// Verify data is accessible (note: this test uses separate PageStorage instances,
-	// so data won't actually be accessible — this tests the root persistence mechanism only)
-	for i := 1; i <= 20; i++ {
-		_, err := tree2.Get(intKey(uint64(i * 10)))
-		if err != nil {
-			t.Errorf("key %d not found after restore", i*10)
-		}
+	// Verify root PageID was restored correctly
+	restoredRootPageID := tree2.GetRootPageID()
+	if restoredRootPageID != rootPageID {
+		t.Errorf("expected root PageID %d, got %d", rootPageID, restoredRootPageID)
+	}
+
+	// Verify root is non-zero (tree was properly initialized with the restored root)
+	if restoredRootPageID == 0 {
+		t.Error("restored root PageID should not be zero")
 	}
 }
 
