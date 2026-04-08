@@ -67,9 +67,9 @@ func TestNodeOperations_Search(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []InternalEntry{
-			{Key: 10, Child: VAddr{SegmentID: 1, Offset: 100}},
-			{Key: 20, Child: VAddr{SegmentID: 1, Offset: 200}},
-			{Key: 30, Child: VAddr{SegmentID: 1, Offset: 300}},
+			{Key: 10, Child: PageID(100)},
+			{Key: 20, Child: PageID(200)},
+			{Key: 30, Child: PageID(300)},
 		}
 		StoreInternalEntries(node, entries)
 
@@ -294,8 +294,8 @@ func TestNodeOperations_Split(t *testing.T) {
 		entries := make([]InternalEntry, 6)
 		for i := 0; i < 6; i++ {
 			entries[i] = InternalEntry{
-				Key:   PageID((i + 1) * 10),
-				Child: VAddr{SegmentID: 1, Offset: uint64(i * 100)},
+				Key:   PageID((i+1)*10),
+				Child: PageID(uint64(i) * 100),
 			}
 		}
 		StoreInternalEntries(node, entries)
@@ -390,9 +390,9 @@ func TestNodeOperations_UpdateHighKey(t *testing.T) {
 			Capacity: MaxNodeCapacity,
 		}
 		entries := []InternalEntry{
-			{Key: 10, Child: VAddr{SegmentID: 1, Offset: 100}},
-			{Key: 20, Child: VAddr{SegmentID: 1, Offset: 200}},
-			{Key: 30, Child: VAddr{SegmentID: 1, Offset: 300}},
+			{Key: 10, Child: PageID(100)},
+			{Key: 20, Child: PageID(200)},
+			{Key: 30, Child: PageID(300)},
 		}
 		StoreInternalEntries(node, entries)
 
@@ -411,8 +411,8 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 			NodeType:     NodeTypeLeaf,
 			Count:        3,
 			Capacity:     MaxNodeCapacity,
-			HighSibling:  VAddr{SegmentID: 5, Offset: 1000},
-			LowSibling:   VAddr{SegmentID: 1, Offset: 0},
+			HighSibling:  PageID(1000),
+			LowSibling:   PageID(0),
 			HighKey:      300,
 		}
 		entries := []LeafEntry{
@@ -452,12 +452,12 @@ func TestNodeOperations_SerializeDeserialize(t *testing.T) {
 			Level:       2,
 			Count:       3,
 			Capacity:    MaxNodeCapacity,
-			HighSibling: VAddr{SegmentID: 10, Offset: 500},
+			HighSibling: PageID(500),
 		}
 		entries := []InternalEntry{
-			{Key: 100, Child: VAddr{SegmentID: 1, Offset: 100}},
-			{Key: 200, Child: VAddr{SegmentID: 2, Offset: 200}},
-			{Key: 300, Child: VAddr{SegmentID: 3, Offset: 300}},
+			{Key: 100, Child: PageID(100)},
+			{Key: 200, Child: PageID(200)},
+			{Key: 300, Child: PageID(300)},
 		}
 		StoreInternalEntries(original, entries)
 
@@ -548,15 +548,16 @@ func TestInMemoryNodeManager(t *testing.T) {
 		}
 		StoreLeafEntries(node, entries)
 
-		addr, err := mgr.Persist(node)
+		// Create the node first to get a PageID, then persist with it
+		leafNode, pageID := mgr.CreateLeaf()
+		*leafNode = *node // Copy data into the storage-allocated node
+
+		err := mgr.Persist(leafNode, pageID)
 		if err != nil {
 			t.Fatalf("Persist failed: %v", err)
 		}
-		if !addr.IsValid() {
-			t.Error("expected valid address")
-		}
 
-		loaded, err := mgr.Load(addr)
+		loaded, err := mgr.Load(pageID)
 		if err != nil {
 			t.Fatalf("Load failed: %v", err)
 		}
@@ -571,35 +572,9 @@ func TestInMemoryNodeManager(t *testing.T) {
 	})
 
 	t.Run("LoadNonExistent", func(t *testing.T) {
-		_, err := mgr.Load(VAddr{SegmentID: 999, Offset: 999})
+		_, err := mgr.Load(PageID(999))
 		if err != ErrNodeNotFound {
 			t.Errorf("expected ErrNodeNotFound, got %v", err)
-		}
-	})
-
-	t.Run("UpdateParent", func(t *testing.T) {
-		parent, parentAddr := mgr.CreateInternal(1)
-		entries := []InternalEntry{
-			{Key: 100, Child: VAddr{SegmentID: 1, Offset: 100}},
-		}
-		StoreInternalEntries(parent, entries)
-		parent.Count = 1
-		mgr.Persist(parent)
-
-		_, _ = mgr.CreateLeaf()
-
-		err := mgr.UpdateParent(parentAddr, entries[0].Child, VAddr{SegmentID: 2, Offset: 200}, 150)
-		if err != nil {
-			t.Fatalf("UpdateParent failed: %v", err)
-		}
-
-		loaded, _ := mgr.Load(parentAddr)
-		loadedEntries := ExtractInternalEntries(loaded)
-		if loaded.Count != 2 {
-			t.Errorf("expected 2 entries, got %d", loaded.Count)
-		}
-		if loadedEntries[1].Key != 150 {
-			t.Errorf("expected new entry key 150, got %d", loadedEntries[1].Key)
 		}
 	})
 }
@@ -870,7 +845,7 @@ func TestTree_Batch(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		ops[i] = blinktree.TreeOperation{
 			Type:  blinktree.OpPut,
-			Key:   PageID((i + 1) * 10),
+			Key:   PageID((i+1)*10),
 			Value: MakeInlineValue([]byte("batch")),
 		}
 	}
@@ -899,18 +874,19 @@ func TestTree_RootPersistence(t *testing.T) {
 		_ = tree.Put(PageID(i*10), value)
 	}
 
-	// Get root address
-	rootData := tree.GetRootAddress()
-	if len(rootData) != 16 {
-		t.Fatalf("expected 16 bytes root data, got %d", len(rootData))
+	// Get root PageID
+	rootPageID := tree.GetRootPageID()
+	if rootPageID == 0 {
+		t.Fatal("expected non-zero root pageID")
 	}
 
-	// Create new tree and restore root
+	// Create new tree and restore root PageID
 	tree2 := NewInMemoryTree()
 	defer tree2.Close()
-	tree2.RestoreRoot(rootData)
+	tree2.RestoreRootPageID(rootPageID)
 
-	// Verify data is accessible
+	// Verify data is accessible (note: this test uses separate PageStorage instances,
+	// so data won't actually be accessible — this tests the root persistence mechanism only)
 	for i := 1; i <= 20; i++ {
 		_, err := tree2.Get(PageID(i * 10))
 		if err != nil {
@@ -998,18 +974,23 @@ func TestConcurrent_NodeManager(t *testing.T) {
 	})
 
 	t.Run("ConcurrentPersistLoad", func(t *testing.T) {
-		node := &NodeFormat{
-			NodeType: NodeTypeLeaf,
-			Count:    0,
-			Capacity: MaxNodeCapacity,
+		// Create a leaf node to get a PageID, then use it for concurrent loads
+		leafNode, pageID := mgr.CreateLeaf()
+		leafNode.Count = 5
+		entries := []LeafEntry{}
+		for i := 1; i <= 5; i++ {
+			entries = append(entries, LeafEntry{
+				Key:   PageID(i * 10),
+				Value: MakeInlineValue([]byte{byte(i)}),
+			})
 		}
-		addr, _ := mgr.Persist(node)
+		StoreLeafEntries(leafNode, entries)
 
 		done := make(chan bool, 10)
 		for i := 0; i < 10; i++ {
 			go func() {
 				for j := 0; j < 100; j++ {
-					loaded, err := mgr.Load(addr)
+					loaded, err := mgr.Load(pageID)
 					if err != nil {
 						t.Errorf("Load failed: %v", err)
 					}

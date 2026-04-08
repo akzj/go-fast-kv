@@ -7,25 +7,16 @@ import (
 	vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
 )
 
-// nodeManager implements NodeManager interface using storage.SegmentManager.
-type nodeManager struct {
-	segmentMgr storage.SegmentManager
+// pageNodeManager implements NodeManager interface using storage.PageStorage.
+// B-tree code works with stable PageIDs; PageStorage maps PageID → VAddr internally.
+type pageNodeManager struct {
+	pageStorage storage.PageStorage
 	nodeOps    NodeOperations
 	mu         sync.Mutex
 }
 
-// NewNodeManager creates a new NodeManager.
-func NewNodeManager(segmentMgr storage.SegmentManager, nodeOps NodeOperations) NodeManager {
-	return &nodeManager{
-		segmentMgr: segmentMgr,
-		nodeOps:    nodeOps,
-	}
-}
-
-// CreateLeaf initializes a new empty leaf node.
-func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
-	// Calculate actual capacity based on page size and entry size
-	// (PageSize - header) / LeafEntrySize = (4096 - 56) / 72 = 56
+// CreateLeaf creates a new empty leaf node.
+func (mgr *pageNodeManager) CreateLeaf() (*NodeFormat, PageID) {
 	leafCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / LeafEntrySize)
 
 	node := &NodeFormat{
@@ -34,30 +25,18 @@ func (mgr *nodeManager) CreateLeaf() (*NodeFormat, VAddr) {
 		Capacity: leafCapacity,
 		RawData:  make([]byte, 0),
 	}
-	addr, err := mgr.Persist(node)
+
+	// Create page in storage, get back (node, pageID)
+	mgr.persistNode(node)
+	pageID, _, err := mgr.pageStorage.CreatePage(mgr.nodeOps.Serialize(node))
 	if err != nil {
-		return nil, VAddr{}
+		return nil, 0
 	}
-	return node, addr
+	return node, pageID
 }
 
-// CreateInternal initializes a new internal node at given level.
-func (mgr *nodeManager) CreateInternal(level uint8) (*NodeFormat, VAddr) {
-	node, addr := mgr.createInternalNode(level)
-	if node == nil {
-		return nil, VAddr{}
-	}
-	_, err := mgr.Persist(node)
-	if err != nil {
-		return nil, VAddr{}
-	}
-	return node, addr
-}
-
-// createInternalNode creates a new internal node struct without persisting.
-func (mgr *nodeManager) createInternalNode(level uint8) (*NodeFormat, VAddr) {
-	// Calculate actual capacity based on page size and entry size
-	// (PageSize - header) / InternalEntrySize = (4096 - 56) / 24 = 168
+// CreateInternal creates a new internal node at given level.
+func (mgr *pageNodeManager) CreateInternal(level uint8) (*NodeFormat, PageID) {
 	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
 
 	node := &NodeFormat{
@@ -67,71 +46,42 @@ func (mgr *nodeManager) createInternalNode(level uint8) (*NodeFormat, VAddr) {
 		Capacity: internalCapacity,
 		RawData:  make([]byte, 0),
 	}
-	// Allocate address for later persistence
-	addr := VAddr{} // Will be assigned on Persist
-	return node, addr
+
+	mgr.persistNode(node)
+	pageID, _, err := mgr.pageStorage.CreatePage(mgr.nodeOps.Serialize(node))
+	if err != nil {
+		return nil, 0
+	}
+	return node, pageID
 }
 
-// Persist appends node to append-only storage.
-func (mgr *nodeManager) Persist(node *NodeFormat) (VAddr, error) {
+// persistNode ensures node.RawData is populated before serialization.
+func (mgr *pageNodeManager) persistNode(node *NodeFormat) {
+	if node.NodeType == NodeTypeLeaf && len(node.RawData) == 0 {
+		entries := ExtractLeafEntries(node)
+		StoreLeafEntries(node, entries)
+	} else if node.NodeType == NodeTypeInternal && len(node.RawData) == 0 {
+		entries := ExtractInternalEntries(node)
+		StoreInternalEntries(node, entries)
+	}
+}
+
+// Persist writes the node to storage for the given PageID.
+// PageID is stable — this updates the content at the same logical address.
+func (mgr *pageNodeManager) Persist(node *NodeFormat, pageID PageID) error {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
-	data := mgr.nodeOps.Serialize(node)
-	
-	// Pad to page alignment (segment requires page-aligned writes)
-	pageSize := int(vaddr.PageSize)
-	if len(data)%pageSize != 0 {
-		padding := pageSize - (len(data) % pageSize)
-		data = append(data, make([]byte, padding)...)
-	}
-	
-	segment := mgr.segmentMgr.ActiveSegment()
-	if segment == nil {
-		return VAddr{}, storage.ErrSegmentNotActive
-	}
-	return segment.Append(data)
-}
-
-// Load reads node from storage by VAddr.
-func (mgr *nodeManager) Load(addr VAddr) (*NodeFormat, error) {
-	segmentID := vaddr.SegmentID(addr.SegmentID)
-	offset := int64(addr.Offset)
-
-	segment := mgr.segmentMgr.GetSegment(segmentID)
-	if segment == nil {
-		return nil, ErrNodeNotFound
-	}
-
-	// Read PageSize bytes (Serialize outputs PageSize, not variable size)
-	data, err := segment.ReadAt(offset, vaddr.PageSize)
-	if err != nil {
-		return nil, ErrNodeNotFound
-	}
-
-	return mgr.nodeOps.Deserialize(data)
-}
-
-// UpdateParent updates parent node's child pointer after a split.
-func (mgr *nodeManager) UpdateParent(parentVAddr, oldChild, newChild VAddr, splitKey PageID) error {
-	parent, err := mgr.Load(parentVAddr)
-	if err != nil {
-		return err
-	}
-
-	entries := ExtractInternalEntries(parent)
-	for i := 0; i < int(parent.Count); i++ {
-		if entries[i].Child == oldChild {
-			if i+1 < int(parent.Capacity) {
-				copy(entries[i+2:], entries[i+1:])
-			}
-			entries[i+1] = InternalEntry{Key: splitKey, Child: newChild}
-			parent.Count++
-			StoreInternalEntries(parent, entries)
-			break
-		}
-	}
-
-	_, err = mgr.Persist(parent)
+	mgr.persistNode(node)
+	_, err := mgr.pageStorage.WritePage(pageID, mgr.nodeOps.Serialize(node))
 	return err
+}
+
+// Load reads the node for the given PageID.
+func (mgr *pageNodeManager) Load(pageID PageID) (*NodeFormat, error) {
+	data, err := mgr.pageStorage.ReadPage(pageID)
+	if err != nil {
+		return nil, ErrNodeNotFound
+	}
+	return mgr.nodeOps.Deserialize(data)
 }

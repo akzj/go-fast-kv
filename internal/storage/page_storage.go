@@ -83,9 +83,11 @@ type PageStorage interface {
 
 // MemoryPageStorage implements PageStorage with in-memory storage.
 // Used for unit testing and when persistence is not required.
+// Thread-safe: all operations are protected by a mutex.
 //
 // Invariant: All data is lost on Close().
 type MemoryPageStorage struct {
+	mu          sync.Mutex
 	pageToVAddr map[PageID]vaddr.VAddr
 	vaddrToData map[vaddr.VAddr][]byte
 	nextPageID  PageID
@@ -102,19 +104,29 @@ func NewMemoryPageStorage() *MemoryPageStorage {
 }
 
 func (m *MemoryPageStorage) CreatePage(data []byte) (PageID, vaddr.VAddr, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	pageID := m.nextPageID
 	m.nextPageID++
 
 	addr := vaddr.VAddr{SegmentID: 1, Offset: m.nextVAddr}
 	m.nextVAddr += uint64(len(data))
 
+	// Store a copy to prevent mutation
+	stored := make([]byte, len(data))
+	copy(stored, data)
+
 	m.pageToVAddr[pageID] = addr
-	m.vaddrToData[addr] = data
+	m.vaddrToData[addr] = stored
 
 	return pageID, addr, nil
 }
 
 func (m *MemoryPageStorage) WritePage(pageID PageID, data []byte) (vaddr.VAddr, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if _, exists := m.pageToVAddr[pageID]; !exists {
 		return vaddr.VAddr{}, ErrPageNotFound
 	}
@@ -123,13 +135,20 @@ func (m *MemoryPageStorage) WritePage(pageID PageID, data []byte) (vaddr.VAddr, 
 	addr := vaddr.VAddr{SegmentID: 1, Offset: m.nextVAddr}
 	m.nextVAddr += uint64(len(data))
 
+	// Store a copy
+	stored := make([]byte, len(data))
+	copy(stored, data)
+
 	m.pageToVAddr[pageID] = addr
-	m.vaddrToData[addr] = data
+	m.vaddrToData[addr] = stored
 
 	return addr, nil
 }
 
 func (m *MemoryPageStorage) ReadPage(pageID PageID) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	addr, exists := m.pageToVAddr[pageID]
 	if !exists {
 		return nil, ErrPageNotFound
@@ -138,29 +157,33 @@ func (m *MemoryPageStorage) ReadPage(pageID PageID) ([]byte, error) {
 	if !exists {
 		return nil, ErrPageNotFound
 	}
-	// Return a copy to prevent callers (e.g., Deserialize) from corrupting stored data
+	// Return a copy to prevent callers from corrupting stored data
 	result := make([]byte, len(data))
 	copy(result, data)
 	return result, nil
 }
 
 func (m *MemoryPageStorage) DeletePage(pageID PageID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.pageToVAddr, pageID)
 	return nil
 }
 
-func (m *MemoryPageStorage) GetPageID(vaddr vaddr.VAddr) (PageID, bool) {
-	// MemoryPageStorage doesn't maintain reverse mapping
-	// This would require adding vaddrToPage to MemoryPageStorage
+func (m *MemoryPageStorage) GetPageID(v vaddr.VAddr) (PageID, bool) {
 	return PageID(0), false
 }
 
 func (m *MemoryPageStorage) GetVAddr(pageID PageID) (vaddr.VAddr, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	physAddr, exists := m.pageToVAddr[pageID]
 	return physAddr, exists
 }
 
 func (m *MemoryPageStorage) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pageToVAddr = nil
 	m.vaddrToData = nil
 	return nil

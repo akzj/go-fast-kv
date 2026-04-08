@@ -328,9 +328,12 @@ func NewKVStore(config Config) (*kvStore, error) {
 
 	// Load tree root from metadata file if exists
 	metadataFile := filepath.Join(config.Directory, "metadata.json")
-	if data, err := os.ReadFile(metadataFile); err == nil {
-		// Metadata exists, try to restore root
-		tree.RestoreRoot(data)
+	if data, err := os.ReadFile(metadataFile); err == nil && len(data) >= 8 {
+		// Metadata exists, try to restore root PageID
+		rootPageID := blinktree.PageID(binary.LittleEndian.Uint64(data[0:8]))
+		if rootPageID != 0 {
+			tree.RestoreRootPageID(rootPageID)
+		}
 	}
 
 	if err := tree.Open(""); err != nil {
@@ -549,21 +552,17 @@ func (s *kvStore) Close() error {
 	return err
 }
 
-// syncRoot persists tree root address to metadata file
+// syncRoot persists tree root PageID to metadata file
 func (s *kvStore) syncRoot() {
 	if s.metadataFile == "" {
 		return
 	}
-	data := s.tree.GetRootAddress()
-	if data == nil || len(data) < 16 {
+	rootPageID := s.tree.GetRootPageID()
+	if rootPageID == 0 {
 		return
 	}
-	// Don't write metadata for empty trees (zero root address)
-	// This ensures WAL replay works for crash recovery
-	if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0 &&
-		data[4] == 0 && data[5] == 0 && data[6] == 0 && data[7] == 0 {
-		return
-	}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data[0:8], uint64(rootPageID))
 	_ = os.WriteFile(s.metadataFile, data, 0644)
 }
 

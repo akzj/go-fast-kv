@@ -6,6 +6,8 @@
 //   - Latch crabbing: acquire parent before child, release in reverse order
 //   - Single-writer/multi-reader: exclusive write access required for mutations
 //   - Node immutability: once written, a node is never modified in place
+//   - B-tree uses PageID (logical, stable) for child/sibling pointers
+//   - VAddr (physical, append-only) is only used inside storage layer
 package blinktree
 
 import (
@@ -26,15 +28,15 @@ type PageID = vaddr.PageID
 // =============================================================================
 
 const (
-	ExternalThreshold  = 48
-	NodeHeaderSize     = 64
-	MaxNodeCapacity    = 255
-	LeafEntrySize      = 72  // 8 (Key) + 8 (Length) + 56 (Data)
-	InternalEntrySize  = 24  // 8 (Key) + 16 (Child VAddr)
-	NodeTypeLeaf       = uint8(0)
-	NodeTypeInternal   = uint8(1)
-	OpPut              = OperationType(0)
-	OpDelete           = OperationType(1)
+	ExternalThreshold = 48
+	NodeHeaderSize    = 40 // 1+1+1+1+2+2+8+8+8+4+4 = 40
+	MaxNodeCapacity   = 255
+	LeafEntrySize     = 72 // 8 (Key) + 8 (Length) + 56 (Data)
+	InternalEntrySize = 16 // 8 (Key) + 8 (Child PageID)
+	NodeTypeLeaf      = uint8(0)
+	NodeTypeInternal  = uint8(1)
+	OpPut             = OperationType(0)
+	OpDelete          = OperationType(1)
 )
 
 // =============================================================================
@@ -42,13 +44,13 @@ const (
 // =============================================================================
 
 var (
-	ErrKeyNotFound = errors.New("blinktree: key not found")
-	ErrStoreClosed = errors.New("blinktree: store is closed")
-	ErrWriteLocked = errors.New("blinktree: write operation in progress")
-	ErrNodeNotFound = errors.New("blinktree: node not found at address")
-	ErrInvalidNode = errors.New("blinktree: invalid node format")
-	ErrNodeFull     = errors.New("blinktree: node is full")
-	ErrKeyTooLarge  = errors.New("blinktree: key too large")
+	ErrKeyNotFound   = errors.New("blinktree: key not found")
+	ErrStoreClosed   = errors.New("blinktree: store is closed")
+	ErrWriteLocked   = errors.New("blinktree: write operation in progress")
+	ErrNodeNotFound  = errors.New("blinktree: node not found at address")
+	ErrInvalidNode   = errors.New("blinktree: invalid node format")
+	ErrNodeFull      = errors.New("blinktree: node is full")
+	ErrKeyTooLarge   = errors.New("blinktree: key too large")
 	ErrValueTooLarge = errors.New("blinktree: value too large for inline storage")
 )
 
@@ -63,8 +65,8 @@ type NodeFormat struct {
 	Count       uint8
 	Capacity    uint16
 	_           uint16
-	HighSibling VAddr
-	LowSibling  VAddr
+	HighSibling PageID // Sibling pointer: stable PageID, not VAddr
+	LowSibling  PageID // Sibling pointer: stable PageID, not VAddr
 	HighKey     PageID
 	Checksum    uint32
 	_           [4]byte
@@ -78,7 +80,7 @@ type LeafEntry struct {
 
 type InternalEntry struct {
 	Key   PageID
-	Child VAddr
+	Child PageID // Stable logical PageID, not physical VAddr
 }
 
 type InlineValue struct {
@@ -91,9 +93,6 @@ func (v InlineValue) IsExternal() bool {
 }
 
 func (v InlineValue) IsValid() bool {
-	// For external values: top bit of Length[0] is set
-	// For inline values: length > 0 means valid
-	// Check if any length byte is non-zero
 	return v.Length[0] != 0 || v.Length[1] != 0 || v.Length[2] != 0 ||
 		v.Length[3] != 0 || v.Length[4] != 0 || v.Length[5] != 0 ||
 		v.Length[6] != 0 || v.Length[7] != 0
@@ -112,12 +111,22 @@ type NodeOperations interface {
 	Deserialize(data []byte) (*NodeFormat, error)
 }
 
+// NodeManager manages node persistence using stable PageIDs.
+// The underlying storage maps PageID → VAddr internally.
+// B-tree code never sees VAddr.
 type NodeManager interface {
-	CreateLeaf() (*NodeFormat, VAddr)
-	CreateInternal(level uint8) (*NodeFormat, VAddr)
-	Persist(node *NodeFormat) (VAddr, error)
-	Load(addr VAddr) (*NodeFormat, error)
-	UpdateParent(parentVAddr VAddr, oldChild, newChild VAddr, splitKey PageID) error
+	// CreateLeaf creates a new empty leaf node and returns it with its PageID.
+	CreateLeaf() (*NodeFormat, PageID)
+
+	// CreateInternal creates a new internal node at given level.
+	CreateInternal(level uint8) (*NodeFormat, PageID)
+
+	// Persist writes the node data for the given PageID.
+	// PageID is stable — the same PageID is used for the lifetime of the node.
+	Persist(node *NodeFormat, pageID PageID) error
+
+	// Load reads the node for the given PageID.
+	Load(pageID PageID) (*NodeFormat, error)
 }
 
 type TreeOperation struct {
@@ -150,6 +159,6 @@ type TreeMutator interface {
 	Tree
 	Put(key PageID, value InlineValue) error
 	Delete(key PageID) error
-	GetRootAddress() []byte
-	RestoreRoot(data []byte)
+	GetRootPageID() PageID
+	RestoreRootPageID(pageID PageID)
 }

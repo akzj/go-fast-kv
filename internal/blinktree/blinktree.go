@@ -9,32 +9,31 @@ import (
 
 // Re-export all interfaces from api package.
 type (
-	NodeFormat      = blinktreeapi.NodeFormat
-	LeafEntry       = blinktreeapi.LeafEntry
-	InternalEntry   = blinktreeapi.InternalEntry
-	InlineValue     = blinktreeapi.InlineValue
-	TreeOperation   = blinktreeapi.TreeOperation
-	TreeIterator    = blinktreeapi.TreeIterator
-	NodeOperations  = blinktreeapi.NodeOperations
-	NodeManager     = blinktreeapi.NodeManager
-	Tree            = blinktreeapi.Tree
-	TreeMutator     = blinktreeapi.TreeMutator
-	VAddr           = blinktreeapi.VAddr
-	PageID          = blinktreeapi.PageID
-	OperationType   = blinktreeapi.OperationType
+	NodeFormat     = blinktreeapi.NodeFormat
+	LeafEntry      = blinktreeapi.LeafEntry
+	InternalEntry  = blinktreeapi.InternalEntry
+	InlineValue    = blinktreeapi.InlineValue
+	TreeOperation  = blinktreeapi.TreeOperation
+	TreeIterator   = blinktreeapi.TreeIterator
+	NodeOperations = blinktreeapi.NodeOperations
+	NodeManager    = blinktreeapi.NodeManager
+	Tree           = blinktreeapi.Tree
+	TreeMutator    = blinktreeapi.TreeMutator
+	PageID         = blinktreeapi.PageID
+	OperationType  = blinktreeapi.OperationType
 )
 
 // Re-export constants.
 const (
-	ExternalThreshold  = blinktreeapi.ExternalThreshold
-	NodeHeaderSize     = blinktreeapi.NodeHeaderSize
-	MaxNodeCapacity    = blinktreeapi.MaxNodeCapacity
-	LeafEntrySize      = blinktreeapi.LeafEntrySize
-	InternalEntrySize  = blinktreeapi.InternalEntrySize
-	NodeTypeLeaf       = blinktreeapi.NodeTypeLeaf
-	NodeTypeInternal   = blinktreeapi.NodeTypeInternal
-	OpPut              = blinktreeapi.OpPut
-	OpDelete           = blinktreeapi.OpDelete
+	ExternalThreshold = blinktreeapi.ExternalThreshold
+	NodeHeaderSize    = blinktreeapi.NodeHeaderSize
+	MaxNodeCapacity   = blinktreeapi.MaxNodeCapacity
+	LeafEntrySize     = blinktreeapi.LeafEntrySize
+	InternalEntrySize = blinktreeapi.InternalEntrySize
+	NodeTypeLeaf      = blinktreeapi.NodeTypeLeaf
+	NodeTypeInternal  = blinktreeapi.NodeTypeInternal
+	OpPut             = blinktreeapi.OpPut
+	OpDelete          = blinktreeapi.OpDelete
 )
 
 // Re-export errors.
@@ -66,10 +65,6 @@ func NewTreeMutator(nodeOps NodeOperations, nodeMgr NodeManager) TreeMutator {
 	return internal.NewTreeMutator(nodeOps, nodeMgr)
 }
 
-func NewInMemoryTree() Tree {
+func NewInMemoryTree() TreeMutator {
 	return internal.NewInMemoryTree()
-}
-
-func NewInMemoryNodeManager(nodeOps NodeOperations) NodeManager {
-	return internal.NewInMemoryNodeManager(nodeOps)
 }

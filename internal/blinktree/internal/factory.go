@@ -1,180 +1,52 @@
 package internal
 
 import (
-	"sync"
-
-	"github.com/akzj/go-fast-kv/internal/vaddr"
+	"github.com/akzj/go-fast-kv/internal/storage"
 )
 
 // =============================================================================
-// In-Memory NodeManager for Testing
+// NodeManager Factory
 // =============================================================================
 
-// inMemoryNodeManager stores nodes in a map (for testing).
-type inMemoryNodeManager struct {
-	nodeOps  NodeOperations
-	nodes    map[vaddr.VAddr]*NodeFormat
-	nextAddr vaddr.VAddr
-	mu       sync.Mutex
+// NewNodeManager creates a NodeManager using the given storage.SegmentManager.
+// Internally wraps it in a SegmentManagerPageStorage.
+func NewNodeManager(segmentMgr storage.SegmentManager, nodeOps NodeOperations) NodeManager {
+	pageStorage := storage.NewSegmentManagerPageStorage(segmentMgr)
+	return newPageNodeManager(pageStorage, nodeOps)
 }
 
-// NewTree creates a new B-link-tree.
-func NewTree(nodeOps NodeOperations, nodeMgr NodeManager, isMutator bool) Tree {
-	return newTreeImpl(nodeOps, nodeMgr, isMutator)
+func newPageNodeManager(pageStorage storage.PageStorage, nodeOps NodeOperations) NodeManager {
+	return &pageNodeManager{
+		pageStorage: pageStorage,
+		nodeOps:     nodeOps,
+	}
 }
 
-// NewTreeMutator creates a mutable B-link-tree.
-func NewTreeMutator(nodeOps NodeOperations, nodeMgr NodeManager) TreeMutator {
-	return newTreeImpl(nodeOps, nodeMgr, true)
-}
-
-// NewInMemoryNodeManager creates a node manager that stores nodes in memory.
+// NewInMemoryNodeManager creates a NodeManager using MemoryPageStorage.
+// For testing only.
 func NewInMemoryNodeManager(nodeOps NodeOperations) NodeManager {
-	return &inMemoryNodeManager{
-		nodeOps:  nodeOps,
-		nodes:    make(map[vaddr.VAddr]*NodeFormat),
-		nextAddr: vaddr.VAddr{SegmentID: 1, Offset: vaddr.PageSize}, // Start at PageSize to avoid addr 0
-	}
+	return newPageNodeManager(storage.NewMemoryPageStorage(), nodeOps)
 }
 
-// addrForNode returns the address for a node if it already exists, or allocates a new one.
-func (mgr *inMemoryNodeManager) addrForNode(node *NodeFormat) VAddr {
-	for addr, n := range mgr.nodes {
-		if n == node {
-			return addr
-		}
-	}
-	// Node doesn't exist yet, allocate new address
-	addr := mgr.nextAddr
-	mgr.nextAddr.Offset += vaddr.PageSize
-	return addr
-}
-
-func (mgr *inMemoryNodeManager) CreateLeaf() (*NodeFormat, VAddr) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	// Calculate actual capacity based on page size and entry size
-	// (PageSize - header) / LeafEntrySize = (4096 - 56) / 72 = 56
-	leafCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / LeafEntrySize)
-
-	node := &NodeFormat{
-		NodeType: NodeTypeLeaf,
-		Count:    0,
-		Capacity: leafCapacity,
-		RawData:  make([]byte, 0),
-	}
-	addr := mgr.nextAddr
-	mgr.nextAddr.Offset += vaddr.PageSize
-	mgr.nodes[addr] = node
-	return node, addr
-}
-
-func (mgr *inMemoryNodeManager) CreateInternal(level uint8) (*NodeFormat, VAddr) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	// Calculate actual capacity based on page size and entry size
-	// (PageSize - header) / InternalEntrySize = (4096 - 56) / 24 = 168
-	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
-
-	node := &NodeFormat{
-		NodeType: NodeTypeInternal,
-		Level:    level,
-		Count:    0,
-		Capacity: internalCapacity,
-		RawData:  make([]byte, 0),
-	}
-	addr := mgr.nextAddr
-	mgr.nextAddr.Offset += vaddr.PageSize
-	mgr.nodes[addr] = node
-	return node, addr
-}
-
-// createInternalNode creates an internal node without persisting (for splitRoot)
-func (mgr *inMemoryNodeManager) createInternalNode(level uint8) (*NodeFormat, VAddr) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
-
-	node := &NodeFormat{
-		NodeType: NodeTypeInternal,
-		Level:    level,
-		Count:    0,
-		Capacity: internalCapacity,
-		RawData:  make([]byte, 0),
-	}
-	// Allocate address but don't store yet
-	addr := mgr.nextAddr
-	return node, addr
-}
-
-func (mgr *inMemoryNodeManager) Persist(node *NodeFormat) (VAddr, error) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	// Serialize entries to RawData so Load can read them
-	if node.NodeType == NodeTypeLeaf && len(node.RawData) == 0 {
-		// Extract and re-store to ensure RawData is populated
-		entries := ExtractLeafEntries(node)
-		StoreLeafEntries(node, entries)
-	} else if node.NodeType == NodeTypeInternal && len(node.RawData) == 0 {
-		entries := ExtractInternalEntries(node)
-		StoreInternalEntries(node, entries)
-	}
-
-	addr := mgr.addrForNode(node)
-	mgr.nodes[addr] = node
-	return addr, nil
-}
-
-func (mgr *inMemoryNodeManager) Load(addr VAddr) (*NodeFormat, error) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	node, ok := mgr.nodes[addr]
-	if !ok {
-		return nil, ErrNodeNotFound
-	}
-	return node, nil
-}
-
-func (mgr *inMemoryNodeManager) UpdateParent(parentVAddr, oldChild, newChild VAddr, splitKey PageID) error {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	parent, ok := mgr.nodes[parentVAddr]
-	if !ok {
-		return ErrNodeNotFound
-	}
-
-	entries := ExtractInternalEntries(parent)
-	for i := 0; i < int(parent.Count); i++ {
-		if entries[i].Child == oldChild {
-			// Create new slice with room for one more entry
-			newEntries := make([]InternalEntry, parent.Count+1)
-			// Copy entries before the insertion point
-			copy(newEntries, entries[:i+1])
-			// Copy entries after the insertion point (shifted by 1)
-			if i+1 < int(parent.Count) {
-				copy(newEntries[i+2:], entries[i+1:])
-			}
-			// Insert the new entry
-			newEntries[i+1] = InternalEntry{Key: splitKey, Child: newChild}
-			parent.Count++
-			StoreInternalEntries(parent, newEntries)
-			break
-		}
-	}
-	return nil
-}
+// =============================================================================
+// In-Memory Tree for Testing
+// =============================================================================
 
 // NewInMemoryTree creates a tree with an in-memory node manager for testing.
 func NewInMemoryTree() TreeMutator {
 	nodeOps := NewNodeOperations()
-	nodeMgr := NewInMemoryNodeManager(nodeOps)
+	pageStorage := storage.NewMemoryPageStorage()
+	nodeMgr := newPageNodeManager(pageStorage, nodeOps)
 	tree := newTreeImpl(nodeOps, nodeMgr, true)
 	_ = tree.Open("")
 	return tree
+}
+
+// Tree factory functions
+func NewTree(nodeOps NodeOperations, nodeMgr NodeManager, isMutator bool) Tree {
+	return newTreeImpl(nodeOps, nodeMgr, isMutator)
+}
+
+func NewTreeMutator(nodeOps NodeOperations, nodeMgr NodeManager) TreeMutator {
+	return newTreeImpl(nodeOps, nodeMgr, true)
 }

@@ -7,19 +7,18 @@ import (
 
 // Re-export types from api package
 type (
-	NodeFormat      = blinktree.NodeFormat
-	LeafEntry       = blinktree.LeafEntry
-	InternalEntry   = blinktree.InternalEntry
-	InlineValue     = blinktree.InlineValue
-	TreeOperation   = blinktree.TreeOperation
-	OperationType   = blinktree.OperationType
-	VAddr           = blinktree.VAddr
-	PageID          = blinktree.PageID
-	Tree            = blinktree.Tree
-	TreeMutator     = blinktree.TreeMutator
-	TreeIterator    = blinktree.TreeIterator
-	NodeOperations  = blinktree.NodeOperations
-	NodeManager     = blinktree.NodeManager
+	NodeFormat     = blinktree.NodeFormat
+	LeafEntry      = blinktree.LeafEntry
+	InternalEntry  = blinktree.InternalEntry
+	InlineValue    = blinktree.InlineValue
+	TreeOperation  = blinktree.TreeOperation
+	OperationType  = blinktree.OperationType
+	PageID         = blinktree.PageID
+	Tree           = blinktree.Tree
+	TreeMutator    = blinktree.TreeMutator
+	TreeIterator   = blinktree.TreeIterator
+	NodeOperations = blinktree.NodeOperations
+	NodeManager    = blinktree.NodeManager
 )
 
 const (
@@ -35,12 +34,12 @@ const (
 
 // Re-export errors
 var (
-	ErrKeyNotFound  = blinktree.ErrKeyNotFound
-	ErrStoreClosed  = blinktree.ErrStoreClosed
-	ErrWriteLocked  = blinktree.ErrWriteLocked
-	ErrNodeNotFound = blinktree.ErrNodeNotFound
-	ErrInvalidNode  = blinktree.ErrInvalidNode
-	ErrNodeFull     = blinktree.ErrNodeFull
-	ErrKeyTooLarge  = blinktree.ErrKeyTooLarge
+	ErrKeyNotFound   = blinktree.ErrKeyNotFound
+	ErrStoreClosed   = blinktree.ErrStoreClosed
+	ErrWriteLocked   = blinktree.ErrWriteLocked
+	ErrNodeNotFound  = blinktree.ErrNodeNotFound
+	ErrInvalidNode   = blinktree.ErrInvalidNode
+	ErrNodeFull      = blinktree.ErrNodeFull
+	ErrKeyTooLarge   = blinktree.ErrKeyTooLarge
 	ErrValueTooLarge = blinktree.ErrValueTooLarge
 )
