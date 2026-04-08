@@ -377,5 +377,51 @@ func TestVAddrPackUnpack(t *testing.T) {
 	}
 }
 
+// ─── Test 15: SegmentSize ────────────────────────────────────────────
+
+func TestSegmentSize(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	// Active segment starts empty.
+	size, err := sm.SegmentSize(sm.ActiveSegmentID())
+	if err != nil {
+		t.Fatalf("SegmentSize active: %v", err)
+	}
+	if size != 0 {
+		t.Fatalf("expected 0, got %d", size)
+	}
+
+	// Write some data.
+	data := []byte("hello world") // 11 bytes
+	sm.Append(data)
+
+	size, err = sm.SegmentSize(sm.ActiveSegmentID())
+	if err != nil {
+		t.Fatalf("SegmentSize active after write: %v", err)
+	}
+	if size != int64(len(data)) {
+		t.Fatalf("expected %d, got %d", len(data), size)
+	}
+
+	// Rotate → sealed segment should keep its size.
+	sealedID := sm.ActiveSegmentID()
+	sm.Rotate()
+
+	size, err = sm.SegmentSize(sealedID)
+	if err != nil {
+		t.Fatalf("SegmentSize sealed: %v", err)
+	}
+	if size != int64(len(data)) {
+		t.Fatalf("expected %d, got %d", len(data), size)
+	}
+
+	// Non-existent segment → error.
+	_, err = sm.SegmentSize(999)
+	if !errors.Is(err, segmentapi.ErrInvalidVAddr) {
+		t.Fatalf("expected ErrInvalidVAddr, got %v", err)
+	}
+}
+
 // suppress unused import warning
 var _ = os.Remove

@@ -144,6 +144,13 @@ type SegmentManager interface {
 	// ActiveSegmentID returns the ID of the current active (writable) segment.
 	ActiveSegmentID() uint32
 
+	// SegmentSize returns the total size in bytes of the segment with the
+	// given ID. Works for both sealed and active segments.
+	// Returns ErrInvalidVAddr if the segment does not exist.
+	//
+	// Used by GC to iterate through all records in a sealed segment.
+	SegmentSize(segID uint32) (int64, error)
+
 	// SealedSegments returns the IDs of all sealed (read-only) segments,
 	// sorted in ascending order. Used by GC to select candidates.
 	SealedSegments() []uint32

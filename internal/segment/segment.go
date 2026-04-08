@@ -307,6 +307,22 @@ func (sm *segmentManager) ActiveSegmentID() uint32 {
 	return sm.active.id
 }
 
+func (sm *segmentManager) SegmentSize(segID uint32) (int64, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	if sm.closed {
+		return 0, segmentapi.ErrClosed
+	}
+
+	sf := sm.findSegment(segID)
+	if sf == nil {
+		return 0, fmt.Errorf("segment %d not found: %w", segID, segmentapi.ErrInvalidVAddr)
+	}
+
+	return sf.size, nil
+}
+
 func (sm *segmentManager) SealedSegments() []uint32 {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
