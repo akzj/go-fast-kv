@@ -21,7 +21,7 @@ package compaction
 import (
 	"errors"
 
-	"github.com/akzj/go-fast-kv/internal/vaddr"
+	vaddr "github.com/akzj/go-fast-kv/internal/vaddr"
 	"time"
 )
 
@@ -355,38 +355,6 @@ type CompactionStrategy interface {
 	Reclaimer() Reclaimer
 }
 
-// =============================================================================
-// Factory Functions
-// =============================================================================
-
-// NewCompactionStrategy creates a default generational compaction strategy.
-// Uses size-based triggering, age-based selection, and epoch-based reclamation.
-func NewCompactionStrategy(config *CompactionConfig) CompactionStrategy {
-	panic("TODO: implementation provided by branch")
-}
-
-// NewCompactor creates a new Compactor instance.
-// The compactor uses the provided writer to output compacted data.
-func NewCompactor(writer CompactionWriter, reclaimer Reclaimer) Compactor {
-	panic("TODO: implementation provided by branch")
-}
-
-// NewCompactionTrigger creates a trigger based on configuration.
-func NewCompactionTrigger(config *CompactionConfig) CompactionTrigger {
-	panic("TODO: implementation provided by branch")
-}
-
-// NewReclaimer creates a new Reclaimer instance.
-func NewReclaimer(epochManager EpochManager) Reclaimer {
-	panic("TODO: implementation provided by branch")
-}
-
-// NewSegmentSelector creates a segment selector with the given policy.
-func NewSegmentSelector(policy string) SegmentSelector {
-	panic("TODO: implementation provided by branch")
-}
-
-// =============================================================================
 // EpochManager Interface
 // =============================================================================
 
