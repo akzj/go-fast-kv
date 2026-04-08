@@ -96,7 +96,6 @@ func (t *tree) Get(key PageID) (InlineValue, error) {
 	rootAddr := t.rootAddr
 	t.mu.Unlock()
 
-
 	if !rootAddr.IsValid() {
 		return InlineValue{}, ErrKeyNotFound
 	}
@@ -114,8 +113,6 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 	if node.NodeType == NodeTypeLeaf {
 		idx := t.nodeOps.Search(node, key)
 		entries := ExtractLeafEntries(node)
-		// search returns first position where Key >= key
-		// If key exists, it's at idx (or earlier if duplicates, but we use first match)
 		if node.Count == 0 {
 			return InlineValue{}, ErrKeyNotFound
 		}
@@ -130,25 +127,114 @@ func (t *tree) search(addr VAddr, key PageID) (InlineValue, error) {
 		return InlineValue{}, ErrKeyNotFound
 	}
 	idx := t.nodeOps.Search(node, key)
-	// idx is the first entry where Key >= key
-	// If key < entries[idx].Key, key belongs to entries[idx-1].Child
-	// If key >= entries[idx].Key, key belongs to entries[idx].Child
-	// Clamp idx to valid range
 	if idx >= int(node.Count) {
-		if node.Count == 0 {
-			return InlineValue{}, ErrKeyNotFound
-		}
 		idx = int(node.Count) - 1
 	}
-	// Handle idx==0 case: key is less than first entry's Key, use first entry's child
 	if idx == 0 {
 		return t.search(entries[0].Child, key)
 	}
-	// For idx > 0: check if key < current entry's Key
 	if key < entries[idx].Key {
 		return t.search(entries[idx-1].Child, key)
 	}
 	return t.search(entries[idx].Child, key)
+}
+
+// addrRemap is a mapping from old VAddr to new VAddr, used during CoW re-persist.
+type addrRemap struct {
+	oldAddr VAddr
+	newAddr VAddr
+}
+
+// repersistPath walks the stack from mutatedIdx upward to root,
+// applying address remappings to each parent's child pointers, then
+// re-persisting the parent. Finally updates t.rootAddr.
+//
+// remaps contains all (oldAddr → newAddr) pairs that need to be applied
+// to child pointers at the level just above mutatedIdx.
+// As we move up, only the parent's own remap propagates further.
+func (t *tree) repersistPath(stack []VAddr, mutatedIdx int, remaps []addrRemap) error {
+	currentRemaps := remaps
+
+	for i := mutatedIdx - 1; i >= 0; i-- {
+		parent, err := t.nodeMgr.Load(stack[i])
+		if err != nil {
+			return err
+		}
+		entries := ExtractInternalEntries(parent)
+
+		// Apply all remaps to child pointers
+		for _, r := range currentRemaps {
+			for j := 0; j < int(parent.Count); j++ {
+				if entries[j].Child == r.oldAddr {
+					entries[j].Child = r.newAddr
+					break
+				}
+			}
+		}
+		StoreInternalEntries(parent, entries)
+
+		newParentAddr, err := t.nodeMgr.Persist(parent)
+		if err != nil {
+			return err
+		}
+
+		// For the next level up, only the parent's own address changed
+		currentRemaps = []addrRemap{{oldAddr: stack[i], newAddr: newParentAddr}}
+	}
+
+	// The topmost remap gives us the new root address
+	if len(currentRemaps) > 0 {
+		t.rootAddr = currentRemaps[0].newAddr
+	}
+	return nil
+}
+
+// updateLeftSibling finds the left sibling of the node at stack[nodeIdx],
+// updates its HighSibling to newNodeAddr, persists it, and returns the remap.
+// Returns zero-value remap if there is no left sibling.
+func (t *tree) updateLeftSibling(stack []VAddr, nodeIdx int, newNodeAddr VAddr) (addrRemap, error) {
+	if nodeIdx == 0 || len(stack) < 2 {
+		// Node is root, no parent to find siblings in
+		return addrRemap{}, nil
+	}
+
+	parentAddr := stack[nodeIdx-1]
+	parent, err := t.nodeMgr.Load(parentAddr)
+	if err != nil {
+		return addrRemap{}, err
+	}
+
+	entries := ExtractInternalEntries(parent)
+	oldNodeAddr := stack[nodeIdx]
+
+	// Find our node in parent's children
+	myIdx := -1
+	for j := 0; j < int(parent.Count); j++ {
+		if entries[j].Child == oldNodeAddr {
+			myIdx = j
+			break
+		}
+	}
+
+	if myIdx <= 0 {
+		// No left sibling in this parent
+		return addrRemap{}, nil
+	}
+
+	// Load left sibling and update its HighSibling
+	leftSibAddr := entries[myIdx-1].Child
+	leftSib, err := t.nodeMgr.Load(leftSibAddr)
+	if err != nil {
+		return addrRemap{}, err
+	}
+
+	leftSib.HighSibling = newNodeAddr
+	newLeftSibAddr, err := t.nodeMgr.Persist(leftSib)
+	if err != nil {
+		return addrRemap{}, err
+	}
+
+	return addrRemap{oldAddr: leftSibAddr, newAddr: newLeftSibAddr}, nil
 }
 
 // Write performs a mutation on the tree.
@@ -196,21 +282,18 @@ func (t *tree) put(key PageID, value InlineValue) error {
 
 		entries := ExtractInternalEntries(node)
 		idx := t.nodeOps.Search(node, key)
-		// Clamp idx to valid range [0, Count-1]
 		if idx >= int(node.Count) {
 			if node.Count == 0 {
 				return errors.New("blinktree: tree not initialized")
 			}
 			idx = int(node.Count) - 1
 		}
-		// Handle idx==0 case: key < first entry's Key, use first entry's child
 		if idx == 0 {
 			childAddr := entries[0].Child
 			stack = append(stack, childAddr)
 			currentAddr = childAddr
 			continue
 		}
-		// For idx > 0: check if key < current entry's Key
 		if key < entries[idx].Key {
 			childAddr := entries[idx-1].Child
 			stack = append(stack, childAddr)
@@ -222,7 +305,8 @@ func (t *tree) put(key PageID, value InlineValue) error {
 		currentAddr = childAddr
 	}
 
-	leafAddr := stack[len(stack)-1]
+	leafIdx := len(stack) - 1
+	leafAddr := stack[leafIdx]
 	leaf, err := t.nodeMgr.Load(leafAddr)
 	if err != nil {
 		return err
@@ -237,107 +321,180 @@ func (t *tree) put(key PageID, value InlineValue) error {
 		// Set sibling link BEFORE persisting
 		newRight.HighSibling = leaf.HighSibling
 
-		// Persist right node FIRST (so it has correct HighSibling when loaded)
+		// Persist right node FIRST
 		rightAddr, err := t.nodeMgr.Persist(newRight)
 		if err != nil {
 			return err
 		}
 
-		// Now update left leaf's sibling to point to right
+		// Update left leaf's sibling to point to right
 		leaf.HighSibling = rightAddr
 
-		// Persist the modified left leaf after split
-		_, err = t.nodeMgr.Persist(leaf)
+		// Persist the modified left leaf
+		newLeftAddr, err := t.nodeMgr.Persist(leaf)
 		if err != nil {
 			return err
 		}
 
-		return t.propagateSplit(stack, leafAddr, rightAddr, splitKey)
+		// Update left sibling's HighSibling to point to new left addr
+		leftSibRemap, err := t.updateLeftSibling(stack, leafIdx, newLeftAddr)
+		if err != nil {
+			return err
+		}
+
+		// Propagate split upward, including sibling remap
+		return t.propagateSplit(stack, newLeftAddr, rightAddr, splitKey, leftSibRemap)
 	}
 
-	// Persist the modified leaf and update root address if needed
-	newAddr, err := t.nodeMgr.Persist(leaf)
+	// No split: persist the modified leaf
+	newLeafAddr, err := t.nodeMgr.Persist(leaf)
 	if err != nil {
 		return err
 	}
-	// If leaf was the root, update root address to new persisted location
-	if leafAddr == t.rootAddr {
-		t.rootAddr = newAddr
+
+	// If leaf is the root (stack has only 1 entry), just update rootAddr
+	if len(stack) == 1 {
+		t.rootAddr = newLeafAddr
+		return nil
 	}
-	return nil
+
+	// Update left sibling's HighSibling to point to new leaf addr
+	leftSibRemap, err := t.updateLeftSibling(stack, leafIdx, newLeafAddr)
+	if err != nil {
+		return err
+	}
+
+	// Build remaps: the leaf itself + optionally the left sibling
+	remaps := []addrRemap{{oldAddr: leafAddr, newAddr: newLeafAddr}}
+	if leftSibRemap.oldAddr.IsValid() {
+		remaps = append(remaps, leftSibRemap)
+	}
+
+	return t.repersistPath(stack, leafIdx, remaps)
 }
 
 // propagateSplit handles split propagation up the tree.
-func (t *tree) propagateSplit(stack []VAddr, leftAddr, rightAddr VAddr, splitKey PageID) error {
+// leftAddr is the NEW address of the left (original) node after persist.
+// rightAddr is the NEW address of the right (split) node after persist.
+// extraRemap is an additional address remap (e.g., left sibling update) to apply at this level.
+func (t *tree) propagateSplit(stack []VAddr, leftAddr, rightAddr VAddr, splitKey PageID, extraRemap addrRemap) error {
 	if len(stack) == 1 {
+		// Leaf was root — create new root
 		return t.splitRoot(leftAddr, rightAddr, splitKey)
 	}
 
-	parentAddr := stack[len(stack)-2]
+	parentIdx := len(stack) - 2
+	parentAddr := stack[parentIdx]
 	parent, err := t.nodeMgr.Load(parentAddr)
 	if err != nil {
 		return err
 	}
 
 	entries := ExtractInternalEntries(parent)
+
+	// The old child addr is stack[len(stack)-1] (the address we traversed through)
+	oldChildAddr := stack[len(stack)-1]
+
+	// Update the existing entry to point to the new left addr
+	for j := 0; j < int(parent.Count); j++ {
+		if entries[j].Child == oldChildAddr {
+			entries[j].Child = leftAddr
+			break
+		}
+	}
+
+	// Apply extra remap (e.g., left sibling update)
+	if extraRemap.oldAddr.IsValid() {
+		for j := 0; j < int(parent.Count); j++ {
+			if entries[j].Child == extraRemap.oldAddr {
+				entries[j].Child = extraRemap.newAddr
+				break
+			}
+		}
+	}
+
+	StoreInternalEntries(parent, entries)
+
+	// Now insert the new entry for the right child
 	idx := t.nodeOps.Search(parent, splitKey)
 
 	if int(parent.Count)+1 > int(parent.Capacity) {
-		_, newParent, newSplitKey := t.nodeOps.Split(parent)
-		newParentAddr, err := t.nodeMgr.Persist(newParent)
+		// Parent is full — need to split parent too
+
+		// Insert the new entry into parent before splitting
+		newEntries := make([]InternalEntry, parent.Count+1)
+		if idx > int(parent.Count) {
+			idx = int(parent.Count)
+		}
+		copy(newEntries, entries[:idx])
+		newEntries[idx] = InternalEntry{Key: splitKey, Child: rightAddr}
+		copy(newEntries[idx+1:], entries[idx:])
+		parent.Count++
+		StoreInternalEntries(parent, newEntries)
+
+		// Split the overfull parent
+		_, newParentRight, newSplitKey := t.nodeOps.Split(parent)
+
+		// Set sibling links
+		newParentRight.HighSibling = parent.HighSibling
+
+		// Persist right parent first
+		newParentRightAddr, err := t.nodeMgr.Persist(newParentRight)
 		if err != nil {
 			return err
 		}
 
-		if splitKey >= newSplitKey {
-			newParentEntries := ExtractInternalEntries(newParent)
-			insertIdx := t.nodeOps.Search(newParent, splitKey)
-			copy(newParentEntries[insertIdx+1:], newParentEntries[insertIdx:])
-			newParentEntries[insertIdx] = InternalEntry{Key: splitKey, Child: rightAddr}
-			newParent.Count++
-			StoreInternalEntries(newParent, newParentEntries)
-		} else {
-			copy(entries[idx+1:], entries[idx:])
-			entries[idx] = InternalEntry{Key: splitKey, Child: rightAddr}
-			parent.Count++
-			StoreInternalEntries(parent, entries)
+		// Update left parent's sibling
+		parent.HighSibling = newParentRightAddr
+
+		// Persist left parent
+		newParentLeftAddr, err := t.nodeMgr.Persist(parent)
+		if err != nil {
+			return err
 		}
 
-		t.nodeMgr.Persist(parent)
-		t.nodeMgr.Persist(newParent)
+		// Update left sibling of parent (if any) for sibling chain
+		parentSibRemap, err := t.updateLeftSibling(stack[:parentIdx+1], parentIdx, newParentLeftAddr)
+		if err != nil {
+			return err
+		}
 
-		newStack := stack[:len(stack)-1]
-		newStack[len(newStack)-1] = newParentAddr
-		return t.propagateSplit(newStack, parentAddr, newParentAddr, newSplitKey)
+		// Recurse: propagate the parent split upward
+		newStack := make([]VAddr, parentIdx+1)
+		copy(newStack, stack[:parentIdx+1])
+		return t.propagateSplit(newStack, newParentLeftAddr, newParentRightAddr, newSplitKey, parentSibRemap)
 	}
 
-	// Guard against idx being at or beyond entry bounds
-	// This can happen if splitKey is greater than all existing keys
-	if idx >= len(entries) {
-		idx = len(entries) - 1
-	}
-	
-	// Create new slice with room for one more entry
+	// Parent has room — insert the new entry
 	newEntries := make([]InternalEntry, parent.Count+1)
-	// Copy entries before insertion point
-	copy(newEntries, entries[:idx])
-	// Copy entries from insertion point onward (shifted by 1)
-	if idx < len(entries) {
-		copy(newEntries[idx+1:], entries[idx:])
+	if idx > int(parent.Count) {
+		idx = int(parent.Count)
 	}
-	// Insert the new entry
+	copy(newEntries, entries[:idx])
 	newEntries[idx] = InternalEntry{Key: splitKey, Child: rightAddr}
+	copy(newEntries[idx+1:], entries[idx:])
 	parent.Count++
 	StoreInternalEntries(parent, newEntries)
 
-	_, err = t.nodeMgr.Persist(parent)
-	return err
+	// Persist parent
+	newParentAddr, err := t.nodeMgr.Persist(parent)
+	if err != nil {
+		return err
+	}
+
+	// If parent is root, just update rootAddr
+	if parentIdx == 0 {
+		t.rootAddr = newParentAddr
+		return nil
+	}
+
+	// Otherwise, re-persist path from parent to root
+	remaps := []addrRemap{{oldAddr: parentAddr, newAddr: newParentAddr}}
+	return t.repersistPath(stack[:parentIdx+1], parentIdx, remaps)
 }
 
 // splitRoot creates a new root after old root split.
 func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
-	// Create new root node directly - don't use CreateInternal which persists immediately
-	// We need to set fields first, then persist once
 	internalCapacity := uint16((vaddr.PageSize - NodeHeaderSize) / InternalEntrySize)
 	newRoot := &NodeFormat{
 		NodeType: NodeTypeInternal,
@@ -347,16 +504,9 @@ func (t *tree) splitRoot(leftAddr, rightAddr VAddr, splitKey PageID) error {
 		RawData:  make([]byte, 0),
 	}
 
-	// Create entries slice directly (ExtractInternalEntries returns empty when Count=0)
 	entries := make([]InternalEntry, 2)
-	// After split: left leaf has keys <= splitKey, right leaf has keys > splitKey.
-	// splitKey is the last key of left leaf.
-	// With lower-bound search + idx-1 navigation:
-	//   - key<=splitKey: idx=1, idx-1=0 → left ✓
-	//   - key>splitKey: idx=1, idx-1=0 → left ✓
 	entries[0] = InternalEntry{Key: 0, Child: leftAddr}
 	entries[1] = InternalEntry{Key: splitKey, Child: rightAddr}
-	// IMPORTANT: Set Count BEFORE StoreInternalEntries so RawData is sized correctly
 	newRoot.Count = 2
 	newRoot.HighKey = splitKey
 	StoreInternalEntries(newRoot, entries)
@@ -377,7 +527,6 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 		return nil
 	}
 
-	// Start from leaf and propagate up
 	for i := len(stack) - 1; i >= 1; i-- {
 		nodeAddr := stack[i]
 		node, err := t.nodeMgr.Load(nodeAddr)
@@ -385,13 +534,11 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 			return err
 		}
 
-		// Underflow threshold: less than half capacity (minimum for B-link tree)
 		threshold := int(node.Capacity) / 2
 		if int(node.Count) >= threshold {
 			continue
 		}
 
-		// Root node can have just 1 entry
 		if i == 1 && node.Count >= 1 {
 			continue
 		}
@@ -403,12 +550,7 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 		}
 
 		entries := ExtractInternalEntries(parent)
-		idx := t.nodeOps.Search(parent, 0)
-		if idx >= int(parent.Count) {
-			idx = int(parent.Count) - 1
-		}
 
-		// Find our node in parent's children to get siblings
 		var myIdx int
 		for myIdx = 0; myIdx < int(parent.Count); myIdx++ {
 			if entries[myIdx].Child == nodeAddr {
@@ -416,59 +558,159 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 			}
 		}
 
-		// Try left sibling
+		// Try left sibling redistribution
 		if myIdx > 0 {
 			leftAddr := entries[myIdx-1].Child
 			if leftAddr.IsValid() {
 				left, err := t.nodeMgr.Load(leftAddr)
-				if err == nil {
-					if int(left.Count) > threshold {
-						// Redistribute: move last entry from left to node
-						if node.NodeType == NodeTypeLeaf {
-							t.redistributeLeaf(left, node)
-							// Update separator key in parent
-							leafEntries := ExtractLeafEntries(node)
-							entries[myIdx].Key = leafEntries[0].Key
-							StoreInternalEntries(parent, entries)
-						} else {
-							t.redistributeInternal(left, node)
-							intEntries := ExtractInternalEntries(node)
-							entries[myIdx].Key = intEntries[0].Key
-							StoreInternalEntries(parent, entries)
-						}
-						t.nodeMgr.Persist(left)
-						t.nodeMgr.Persist(node)
-						t.nodeMgr.Persist(parent)
-						continue
+				if err == nil && int(left.Count) > threshold {
+					if node.NodeType == NodeTypeLeaf {
+						t.redistributeLeaf(left, node)
+						leafEntries := ExtractLeafEntries(node)
+						entries[myIdx].Key = leafEntries[0].Key
+					} else {
+						t.redistributeInternal(left, node)
+						intEntries := ExtractInternalEntries(node)
+						entries[myIdx].Key = intEntries[0].Key
 					}
+					StoreInternalEntries(parent, entries)
+
+					// Re-persist modified nodes
+					newLeftAddr, err := t.nodeMgr.Persist(left)
+					if err != nil {
+						return err
+					}
+					newNodeAddr, err := t.nodeMgr.Persist(node)
+					if err != nil {
+						return err
+					}
+
+					// Update sibling chain if leaf
+					var sibRemaps []addrRemap
+					if node.NodeType == NodeTypeLeaf {
+						// Left sibling of 'left' needs HighSibling update
+						if myIdx-1 > 0 {
+							prevAddr := entries[myIdx-2].Child
+							prev, perr := t.nodeMgr.Load(prevAddr)
+							if perr == nil {
+								prev.HighSibling = newLeftAddr
+								newPrevAddr, perr := t.nodeMgr.Persist(prev)
+								if perr == nil {
+									sibRemaps = append(sibRemaps, addrRemap{oldAddr: prevAddr, newAddr: newPrevAddr})
+								}
+							}
+						}
+					}
+
+					remaps := []addrRemap{
+						{oldAddr: leftAddr, newAddr: newLeftAddr},
+						{oldAddr: nodeAddr, newAddr: newNodeAddr},
+					}
+					remaps = append(remaps, sibRemaps...)
+
+					// Re-persist parent with updated child pointers
+					entries = ExtractInternalEntries(parent)
+					for _, r := range remaps {
+						for j := 0; j < int(parent.Count); j++ {
+							if entries[j].Child == r.oldAddr {
+								entries[j].Child = r.newAddr
+								break
+							}
+						}
+					}
+					StoreInternalEntries(parent, entries)
+					newParentAddr, err := t.nodeMgr.Persist(parent)
+					if err != nil {
+						return err
+					}
+
+					stack[i] = newNodeAddr
+					stack[i-1] = newParentAddr
+					if i-1 == 0 {
+						t.rootAddr = newParentAddr
+					} else {
+						err = t.repersistPath(stack, i-1, []addrRemap{{oldAddr: parentAddr, newAddr: newParentAddr}})
+						if err != nil {
+							return err
+						}
+					}
+					continue
 				}
 			}
 		}
 
-		// Try right sibling
+		// Try right sibling redistribution
 		if myIdx < int(parent.Count)-1 {
 			rightAddr := entries[myIdx+1].Child
 			if rightAddr.IsValid() {
 				right, err := t.nodeMgr.Load(rightAddr)
-				if err == nil {
-					if int(right.Count) > threshold {
-						// Redistribute: move first entry from right to node
-						if node.NodeType == NodeTypeLeaf {
-							t.redistributeLeafRight(node, right)
-							leafEntries := ExtractLeafEntries(right)
-							entries[myIdx+1].Key = leafEntries[0].Key
-							StoreInternalEntries(parent, entries)
-						} else {
-							t.redistributeInternalRight(node, right)
-							intEntries := ExtractInternalEntries(right)
-							entries[myIdx+1].Key = intEntries[0].Key
-							StoreInternalEntries(parent, entries)
-						}
-						t.nodeMgr.Persist(right)
-						t.nodeMgr.Persist(node)
-						t.nodeMgr.Persist(parent)
-						continue
+				if err == nil && int(right.Count) > threshold {
+					if node.NodeType == NodeTypeLeaf {
+						t.redistributeLeafRight(node, right)
+						leafEntries := ExtractLeafEntries(right)
+						entries[myIdx+1].Key = leafEntries[0].Key
+					} else {
+						t.redistributeInternalRight(node, right)
+						intEntries := ExtractInternalEntries(right)
+						entries[myIdx+1].Key = intEntries[0].Key
 					}
+					StoreInternalEntries(parent, entries)
+
+					newRightAddr, err := t.nodeMgr.Persist(right)
+					if err != nil {
+						return err
+					}
+					newNodeAddr, err := t.nodeMgr.Persist(node)
+					if err != nil {
+						return err
+					}
+
+					// Update sibling chain
+					var sibRemaps []addrRemap
+					if node.NodeType == NodeTypeLeaf && myIdx > 0 {
+						prevAddr := entries[myIdx-1].Child
+						prev, perr := t.nodeMgr.Load(prevAddr)
+						if perr == nil {
+							prev.HighSibling = newNodeAddr
+							newPrevAddr, perr := t.nodeMgr.Persist(prev)
+							if perr == nil {
+								sibRemaps = append(sibRemaps, addrRemap{oldAddr: prevAddr, newAddr: newPrevAddr})
+							}
+						}
+					}
+
+					remaps := []addrRemap{
+						{oldAddr: rightAddr, newAddr: newRightAddr},
+						{oldAddr: nodeAddr, newAddr: newNodeAddr},
+					}
+					remaps = append(remaps, sibRemaps...)
+
+					entries = ExtractInternalEntries(parent)
+					for _, r := range remaps {
+						for j := 0; j < int(parent.Count); j++ {
+							if entries[j].Child == r.oldAddr {
+								entries[j].Child = r.newAddr
+								break
+							}
+						}
+					}
+					StoreInternalEntries(parent, entries)
+					newParentAddr, err := t.nodeMgr.Persist(parent)
+					if err != nil {
+						return err
+					}
+
+					stack[i] = newNodeAddr
+					stack[i-1] = newParentAddr
+					if i-1 == 0 {
+						t.rootAddr = newParentAddr
+					} else {
+						err = t.repersistPath(stack, i-1, []addrRemap{{oldAddr: parentAddr, newAddr: newParentAddr}})
+						if err != nil {
+							return err
+						}
+					}
+					continue
 				}
 			}
 		}
@@ -483,7 +725,6 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 			siblingAddr = entries[myIdx+1].Child
 			mergeLeft = false
 		} else {
-			// No siblings, can't merge
 			continue
 		}
 
@@ -492,35 +733,86 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 			continue
 		}
 
-		// Merge node into sibling
 		if node.NodeType == NodeTypeLeaf {
 			t.mergeLeafNodes(sibling, node)
 		} else {
 			t.mergeInternalNodes(sibling, node)
 		}
 
-		t.nodeMgr.Persist(sibling)
+		newSiblingAddr, err := t.nodeMgr.Persist(sibling)
+		if err != nil {
+			return err
+		}
 
-		// Remove entry from parent
+		// Update sibling chain for merge
+		var sibRemaps []addrRemap
+		if node.NodeType == NodeTypeLeaf {
+			if mergeLeft && myIdx-1 > 0 {
+				// Update left-left sibling's HighSibling
+				prevAddr := entries[myIdx-2].Child
+				prev, perr := t.nodeMgr.Load(prevAddr)
+				if perr == nil {
+					prev.HighSibling = newSiblingAddr
+					newPrevAddr, perr := t.nodeMgr.Persist(prev)
+					if perr == nil {
+						sibRemaps = append(sibRemaps, addrRemap{oldAddr: prevAddr, newAddr: newPrevAddr})
+					}
+				}
+			} else if !mergeLeft && myIdx > 0 {
+				// Update left sibling's HighSibling to point to merged sibling
+				prevAddr := entries[myIdx-1].Child
+				prev, perr := t.nodeMgr.Load(prevAddr)
+				if perr == nil {
+					prev.HighSibling = newSiblingAddr
+					newPrevAddr, perr := t.nodeMgr.Persist(prev)
+					if perr == nil {
+						sibRemaps = append(sibRemaps, addrRemap{oldAddr: prevAddr, newAddr: newPrevAddr})
+					}
+				}
+			}
+		}
+
+		// Remove entry from parent and update sibling addr
+		remaps := []addrRemap{{oldAddr: siblingAddr, newAddr: newSiblingAddr}}
+		remaps = append(remaps, sibRemaps...)
+
+		for _, r := range remaps {
+			for j := 0; j < int(parent.Count); j++ {
+				if entries[j].Child == r.oldAddr {
+					entries[j].Child = r.newAddr
+					break
+				}
+			}
+		}
+
 		if mergeLeft {
-			// Remove entry at myIdx (which points to the deleted node after sibling)
 			copy(entries[myIdx:], entries[myIdx+1:])
 		} else {
-			// Remove entry at myIdx+1 (right sibling)
 			copy(entries[myIdx+1:], entries[myIdx+2:])
 		}
 		parent.Count--
-		StoreInternalEntries(parent, entries)
-		t.nodeMgr.Persist(parent)
+		StoreInternalEntries(parent, entries[:parent.Count])
 
-		// Check if root needs to shrink
-		if len(stack) == 2 && parent.Count == 1 && parentAddr == t.rootAddr {
-			// Shrink root
-			childAddr := entries[0].Child
+		newParentAddr, err := t.nodeMgr.Persist(parent)
+		if err != nil {
+			return err
+		}
+		stack[i-1] = newParentAddr
+
+		if i-1 == 0 && parent.Count == 1 {
+			remainingEntries := ExtractInternalEntries(parent)
+			childAddr := remainingEntries[0].Child
 			child, err := t.nodeMgr.Load(childAddr)
 			if err == nil {
 				t.rootAddr = childAddr
 				t.rootNode = child
+			}
+		} else if i-1 == 0 {
+			t.rootAddr = newParentAddr
+		} else {
+			err = t.repersistPath(stack, i-1, []addrRemap{{oldAddr: parentAddr, newAddr: newParentAddr}})
+			if err != nil {
+				return err
 			}
 		}
 	}
@@ -528,78 +820,68 @@ func (t *tree) handleUnderflow(stack []VAddr) error {
 	return nil
 }
 
-// redistributeLeaf moves entries from left to right (left loses one).
+// redistributeLeaf moves last entry from left to beginning of right.
 func (t *tree) redistributeLeaf(left, right *NodeFormat) {
 	leftEntries := ExtractLeafEntries(left)
 	rightEntries := ExtractLeafEntries(right)
 
-	// Move first entry of right to end of left
-	lastIdx := int(left.Count) - 1
-	leftEntries[lastIdx+1] = rightEntries[0]
+	newRightEntries := make([]LeafEntry, right.Count+1)
+	newRightEntries[0] = leftEntries[left.Count-1]
+	copy(newRightEntries[1:], rightEntries[:right.Count])
 
-	// Shift right entries left
-	copy(rightEntries, rightEntries[1:])
+	left.Count--
+	right.Count++
 
-	left.Count++
-	right.Count--
-
-	StoreLeafEntries(left, leftEntries)
-	StoreLeafEntries(right, rightEntries)
+	StoreLeafEntries(left, leftEntries[:left.Count])
+	StoreLeafEntries(right, newRightEntries)
 }
 
-// redistributeLeafRight moves entry from right to node (right loses one).
+// redistributeLeafRight moves first entry from right to end of node.
 func (t *tree) redistributeLeafRight(node, right *NodeFormat) {
 	nodeEntries := ExtractLeafEntries(node)
 	rightEntries := ExtractLeafEntries(right)
 
-	// Move first entry of right to end of node
-	nodeEntries[int(node.Count)] = rightEntries[0]
-
-	// Shift right entries left
-	copy(rightEntries, rightEntries[1:])
+	newNodeEntries := make([]LeafEntry, node.Count+1)
+	copy(newNodeEntries, nodeEntries[:node.Count])
+	newNodeEntries[node.Count] = rightEntries[0]
 
 	node.Count++
 	right.Count--
 
-	StoreLeafEntries(node, nodeEntries)
-	StoreLeafEntries(right, rightEntries)
+	StoreLeafEntries(node, newNodeEntries)
+	StoreLeafEntries(right, rightEntries[1:int(right.Count)+1])
 }
 
-// redistributeInternal moves entries from left to right.
+// redistributeInternal moves last entry from left to beginning of right.
 func (t *tree) redistributeInternal(left, right *NodeFormat) {
 	leftEntries := ExtractInternalEntries(left)
 	rightEntries := ExtractInternalEntries(right)
 
-	// Move first entry of right to end of left
-	lastIdx := int(left.Count) - 1
-	leftEntries[lastIdx+1] = rightEntries[0]
+	newRightEntries := make([]InternalEntry, right.Count+1)
+	newRightEntries[0] = leftEntries[left.Count-1]
+	copy(newRightEntries[1:], rightEntries[:right.Count])
 
-	// Shift right entries left
-	copy(rightEntries, rightEntries[1:])
+	left.Count--
+	right.Count++
 
-	left.Count++
-	right.Count--
-
-	StoreInternalEntries(left, leftEntries)
-	StoreInternalEntries(right, rightEntries)
+	StoreInternalEntries(left, leftEntries[:left.Count])
+	StoreInternalEntries(right, newRightEntries)
 }
 
-// redistributeInternalRight moves entry from right to node.
+// redistributeInternalRight moves first entry from right to end of node.
 func (t *tree) redistributeInternalRight(node, right *NodeFormat) {
 	nodeEntries := ExtractInternalEntries(node)
 	rightEntries := ExtractInternalEntries(right)
 
-	// Move first entry of right to end of node
-	nodeEntries[int(node.Count)] = rightEntries[0]
-
-	// Shift right entries left
-	copy(rightEntries, rightEntries[1:])
+	newNodeEntries := make([]InternalEntry, node.Count+1)
+	copy(newNodeEntries, nodeEntries[:node.Count])
+	newNodeEntries[node.Count] = rightEntries[0]
 
 	node.Count++
 	right.Count--
 
-	StoreInternalEntries(node, nodeEntries)
-	StoreInternalEntries(right, rightEntries)
+	StoreInternalEntries(node, newNodeEntries)
+	StoreInternalEntries(right, rightEntries[1:int(right.Count)+1])
 }
 
 // mergeLeafNodes merges right into left.
@@ -607,13 +889,14 @@ func (t *tree) mergeLeafNodes(left, right *NodeFormat) {
 	leftEntries := ExtractLeafEntries(left)
 	rightEntries := ExtractLeafEntries(right)
 
-	copy(leftEntries[int(left.Count):], rightEntries[:int(right.Count)])
+	newEntries := make([]LeafEntry, left.Count+right.Count)
+	copy(newEntries, leftEntries[:left.Count])
+	copy(newEntries[left.Count:], rightEntries[:right.Count])
 	left.Count += right.Count
 
-	// Update sibling link
 	left.HighSibling = right.HighSibling
 
-	StoreLeafEntries(left, leftEntries)
+	StoreLeafEntries(left, newEntries)
 }
 
 // mergeInternalNodes merges right into left.
@@ -621,15 +904,14 @@ func (t *tree) mergeInternalNodes(left, right *NodeFormat) {
 	leftEntries := ExtractInternalEntries(left)
 	rightEntries := ExtractInternalEntries(right)
 
-	// The separator key between the two nodes should be the first key of right
-	// But we need it in the parent, so we just copy the entries
-	copy(leftEntries[int(left.Count):], rightEntries[:int(right.Count)])
+	newEntries := make([]InternalEntry, left.Count+right.Count)
+	copy(newEntries, leftEntries[:left.Count])
+	copy(newEntries[left.Count:], rightEntries[:right.Count])
 	left.Count += right.Count
 
-	// Update sibling link
 	left.HighSibling = right.HighSibling
 
-	StoreInternalEntries(left, leftEntries)
+	StoreInternalEntries(left, newEntries)
 }
 
 // Put implements TreeMutator.
@@ -649,7 +931,6 @@ func (t *tree) deleteImpl(key PageID) error {
 		return ErrKeyNotFound
 	}
 
-	// Build stack to leaf
 	stack := make([]VAddr, 0, 16)
 	stack = append(stack, rootAddr)
 
@@ -666,7 +947,6 @@ func (t *tree) deleteImpl(key PageID) error {
 
 		entries := ExtractInternalEntries(node)
 		idx := t.nodeOps.Search(node, key)
-		// searchInternal with '<' returns first entry where Key >= key; use idx directly
 		if idx >= int(node.Count) {
 			if node.Count == 0 {
 				return errors.New("blinktree: internal node has no entries")
@@ -678,8 +958,8 @@ func (t *tree) deleteImpl(key PageID) error {
 		currentAddr = childAddr
 	}
 
-	// Find and delete key in leaf
-	leafAddr := stack[len(stack)-1]
+	leafIdx := len(stack) - 1
+	leafAddr := stack[leafIdx]
 	leaf, err := t.nodeMgr.Load(leafAddr)
 	if err != nil {
 		return err
@@ -692,22 +972,81 @@ func (t *tree) deleteImpl(key PageID) error {
 		return ErrKeyNotFound
 	}
 
-	// Remove entry by shifting
 	copy(entries[idx:], entries[idx+1:])
 	leaf.Count--
-	StoreLeafEntries(leaf, entries)
+	StoreLeafEntries(leaf, entries[:leaf.Count])
 
-	newAddr, err := t.nodeMgr.Persist(leaf)
+	newLeafAddr, err := t.nodeMgr.Persist(leaf)
 	if err != nil {
 		return err
 	}
-	// If leaf was the root, update root address to new persisted location
-	if leafAddr == t.rootAddr {
-		t.rootAddr = newAddr
+
+	if len(stack) == 1 {
+		t.rootAddr = newLeafAddr
+		return nil
 	}
 
-	// Check for underflow (merge/redistribute if needed)
-	return t.handleUnderflow(stack)
+	// Update left sibling
+	leftSibRemap, err := t.updateLeftSibling(stack, leafIdx, newLeafAddr)
+	if err != nil {
+		return err
+	}
+
+	remaps := []addrRemap{{oldAddr: leafAddr, newAddr: newLeafAddr}}
+	if leftSibRemap.oldAddr.IsValid() {
+		remaps = append(remaps, leftSibRemap)
+	}
+
+	err = t.repersistPath(stack, leafIdx, remaps)
+	if err != nil {
+		return err
+	}
+
+	// Rebuild stack with fresh addresses for underflow handling
+	newStack, err := t.buildStack(key)
+	if err != nil {
+		// Key was deleted, leaf might be empty — that's OK
+		return nil
+	}
+
+	return t.handleUnderflow(newStack)
+}
+
+// buildStack rebuilds the traversal stack from root to the leaf that would contain key.
+func (t *tree) buildStack(key PageID) ([]VAddr, error) {
+	rootAddr := t.rootAddr
+	if !rootAddr.IsValid() {
+		return nil, errors.New("blinktree: tree not initialized")
+	}
+
+	stack := make([]VAddr, 0, 16)
+	stack = append(stack, rootAddr)
+
+	currentAddr := rootAddr
+	for {
+		node, err := t.nodeMgr.Load(currentAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		if node.NodeType == NodeTypeLeaf {
+			break
+		}
+
+		entries := ExtractInternalEntries(node)
+		idx := t.nodeOps.Search(node, key)
+		if idx >= int(node.Count) {
+			if node.Count == 0 {
+				return nil, errors.New("blinktree: internal node has no entries")
+			}
+			idx = int(node.Count) - 1
+		}
+		childAddr := entries[idx].Child
+		stack = append(stack, childAddr)
+		currentAddr = childAddr
+	}
+
+	return stack, nil
 }
 
 // Scan returns an iterator over key range.
@@ -720,14 +1059,12 @@ func (t *tree) Scan(start, end PageID) (TreeIterator, error) {
 	rootAddr := t.rootAddr
 	t.mu.Unlock()
 
-
 	if !rootAddr.IsValid() {
 		return nil, ErrKeyNotFound
 	}
 
 	return &treeIterator{
 		tree:     t,
-		current:  VAddr{},
 		rootAddr: rootAddr,
 		start:    start,
 		end:      end,
@@ -762,25 +1099,47 @@ func (t *tree) Batch(ops []TreeOperation) error {
 // TreeMutator Implementation
 // =============================================================================
 
-// treeMutator is an alias for tree (implements both Tree and TreeMutator).
 type treeMutator = tree
 
 // =============================================================================
-// TreeIterator Implementation
+// TreeIterator Implementation (DFS-based, no sibling chain dependency)
 // =============================================================================
 
 type treeIterator struct {
-	tree        *tree
-	current     VAddr
-	rootAddr    VAddr
-	node        *NodeFormat
-	idx         int
-	start       PageID
-	end         PageID
-	finished    bool
-	err         error
-	currentKey  PageID
-	currentVal  InlineValue
+	tree       *tree
+	rootAddr   VAddr
+	start      PageID
+	end        PageID
+	finished   bool
+	err        error
+	currentKey PageID
+	currentVal InlineValue
+
+	// DFS-collected leaves
+	leaves    []VAddr // all leaf addrs in order
+	leafIdx   int     // current leaf index
+	node      *NodeFormat
+	entryIdx  int // current entry index within leaf
+	inited    bool
+}
+
+// collectLeaves performs a DFS from addr, appending all leaf VAddrs in left-to-right order.
+func collectLeaves(nodeMgr NodeManager, addr VAddr, out *[]VAddr) error {
+	node, err := nodeMgr.Load(addr)
+	if err != nil {
+		return err
+	}
+	if node.NodeType == NodeTypeLeaf {
+		*out = append(*out, addr)
+		return nil
+	}
+	entries := ExtractInternalEntries(node)
+	for i := 0; i < int(node.Count); i++ {
+		if err := collectLeaves(nodeMgr, entries[i].Child, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (it *treeIterator) Next() bool {
@@ -788,67 +1147,70 @@ func (it *treeIterator) Next() bool {
 		return false
 	}
 
-	// Initialize: find leftmost leaf
-	if !it.current.IsValid() {
-		addr := it.rootAddr
-		for {
-			node, err := it.tree.nodeMgr.Load(addr)
-			if err != nil {
-				it.err = err
-				return false
-			}
-			if node.NodeType == NodeTypeLeaf {
-				it.current = addr
-				it.node = node
-				it.idx = 0
-				break
-			}
-			entries := ExtractInternalEntries(node)
-			if node.Count == 0 || len(entries) == 0 {
-				it.err = errors.New("blinktree: internal node has no entries")
-				return false
-			}
-			addr = entries[0].Child
+	// First call: collect all leaves via DFS
+	if !it.inited {
+		it.inited = true
+		it.leaves = make([]VAddr, 0, 64)
+		if err := collectLeaves(it.tree.nodeMgr, it.rootAddr, &it.leaves); err != nil {
+			it.err = err
+			return false
 		}
-	}
-
-	entries := ExtractLeafEntries(it.node)
-	
-	// Skip entries before start
-	for it.idx < int(it.node.Count) && entries[it.idx].Key < it.start {
-		it.idx++
-	}
-
-	// Check if we're done with current node
-	if it.idx >= int(it.node.Count) {
-		// Try to advance to next node via sibling
-		nextAddr := it.node.HighSibling
-		if !nextAddr.IsValid() {
+		if len(it.leaves) == 0 {
 			it.finished = true
 			return false
 		}
-		node, err := it.tree.nodeMgr.Load(nextAddr)
+		// Load first leaf
+		node, err := it.tree.nodeMgr.Load(it.leaves[0])
 		if err != nil {
 			it.err = err
 			return false
 		}
-		it.current = nextAddr
 		it.node = node
-		it.idx = 0
-		entries = ExtractLeafEntries(it.node)
+		it.leafIdx = 0
+		it.entryIdx = 0
 	}
 
-	// Check end boundary
-	if it.end > 0 && entries[it.idx].Key >= it.end {
-		it.finished = true
-		return false
-	}
+	for {
+		if it.node == nil {
+			it.finished = true
+			return false
+		}
 
-	// Store current entry before advancing
-	it.currentKey = entries[it.idx].Key
-	it.currentVal = entries[it.idx].Value
-	it.idx++
-	return true
+		entries := ExtractLeafEntries(it.node)
+
+		// Skip entries before start
+		for it.entryIdx < int(it.node.Count) && entries[it.entryIdx].Key < it.start {
+			it.entryIdx++
+		}
+
+		// If done with current leaf, advance to next
+		if it.entryIdx >= int(it.node.Count) {
+			it.leafIdx++
+			if it.leafIdx >= len(it.leaves) {
+				it.finished = true
+				return false
+			}
+			node, err := it.tree.nodeMgr.Load(it.leaves[it.leafIdx])
+			if err != nil {
+				it.err = err
+				return false
+			}
+			it.node = node
+			it.entryIdx = 0
+			continue
+		}
+
+		// Check end boundary
+		if it.end > 0 && entries[it.entryIdx].Key >= it.end {
+			it.finished = true
+			return false
+		}
+
+		it.currentKey = entries[it.entryIdx].Key
+		it.currentVal = entries[it.entryIdx].Value
+		it.entryIdx++
+		return true
+	}
 }
 
 func (it *treeIterator) Key() PageID {
@@ -865,4 +1227,5 @@ func (it *treeIterator) Error() error {
 
 func (it *treeIterator) Close() {
 	it.node = nil
+	it.leaves = nil
 }
