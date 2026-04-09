@@ -3,12 +3,25 @@
 // It wires together: SegmentManager×2, WAL, PageStore, BlobStore, BTree, TxnManager.
 // Every Put/Get/Delete/Scan operates in auto-commit mode.
 //
+// Concurrency model:
+//   - Put/Delete use s.mu.RLock (shared) — multiple writers run concurrently.
+//   - Get/Scan use s.mu.RLock (shared) — readers run concurrently with writers.
+//   - Checkpoint/Close use s.mu.Lock (exclusive) — block all other operations.
+//   - Per-operation WAL entry isolation via goroutine-keyed collectors:
+//     each Put/Delete registers a collector before tree.Put/Delete, and
+//     WritePage/WriteBlob route entries to the caller's collector via goroutine ID.
+//   - B-tree is concurrent-safe (per-page RwLocks).
+//   - PageStore, BlobStore, SegmentManager, TxnManager are all internally locked.
+//
 // Design reference: docs/DESIGN.md §1, §3.6, §3.9.10
 package internal
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 
 	"github.com/akzj/go-fast-kv/internal/blobstore"
@@ -34,6 +47,22 @@ const (
 	defaultMaxSegmentSize  = 64 * 1024 * 1024 // 64 MB
 	defaultInlineThreshold = 256
 )
+
+// ─── goroutineID ────────────────────────────────────────────────────
+
+// goroutineID returns the current goroutine's numeric ID.
+// Used to route WAL entries to per-operation collectors in blobWriterAdapter.
+// Cost: ~200ns — acceptable for functions that do disk I/O.
+func goroutineID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// buf looks like "goroutine 123 [running]:\n..."
+	s := buf[:n]
+	s = s[len("goroutine "):]
+	s = s[:bytes.IndexByte(s, ' ')]
+	id, _ := strconv.ParseInt(string(s), 10, 64)
+	return id
+}
 
 // store implements kvstoreapi.Store.
 type store struct {
@@ -143,8 +172,8 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 // ─── Put ────────────────────────────────────────────────────────────
 
 func (s *store) Put(key, value []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if s.closed {
 		return kvstoreapi.ErrClosed
@@ -156,12 +185,15 @@ func (s *store) Put(key, value []byte) error {
 	// Begin transaction
 	xid, _ := s.txnMgr.BeginTxn()
 
-	// Clear WAL entry collectors
-	s.provider.DrainWALEntries()
-	s.blobAdapter.drain()
+	// Register per-operation WAL collectors (goroutine-keyed).
+	// WritePage/WriteBlob route entries here via goroutine ID.
+	pageCollector, unregPage := s.provider.RegisterCollector()
+	defer unregPage()
+	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	defer unregBlob()
 
-	// B-tree Put (internally calls WritePage → collects page WAL entries;
-	// large values call WriteBlob → collects blob WAL entries)
+	// B-tree Put (concurrent-safe via per-page locks).
+	// WritePage → pageCollector, WriteBlob → blobCollector.
 	if err := s.tree.Put(key, value, xid); err != nil {
 		s.txnMgr.Abort(xid)
 		return err
@@ -173,14 +205,14 @@ func (s *store) Put(key, value []byte) error {
 	// Collect root change
 	rootPageID := s.tree.RootPageID()
 
-	// Assemble WAL batch
-	batch := s.assembleBatch(rootPageID, commitEntry)
+	// Assemble WAL batch from per-operation collectors
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
 
 	// Fsync ordering: segments → WAL
 	if err := s.pageSegMgr.Sync(); err != nil {
 		return err
 	}
-	if len(s.blobAdapter.entries) > 0 {
+	if len(blobCollector.Entries) > 0 {
 		if err := s.blobSegMgr.Sync(); err != nil {
 			return err
 		}
@@ -219,8 +251,8 @@ func (s *store) Get(key []byte) ([]byte, error) {
 // ─── Delete ─────────────────────────────────────────────────────────
 
 func (s *store) Delete(key []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if s.closed {
 		return kvstoreapi.ErrClosed
@@ -229,11 +261,13 @@ func (s *store) Delete(key []byte) error {
 	// Begin transaction
 	xid, _ := s.txnMgr.BeginTxn()
 
-	// Clear WAL entry collectors
-	s.provider.DrainWALEntries()
-	s.blobAdapter.drain()
+	// Register per-operation WAL collectors (goroutine-keyed).
+	pageCollector, unregPage := s.provider.RegisterCollector()
+	defer unregPage()
+	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	defer unregBlob()
 
-	// B-tree Delete
+	// B-tree Delete (concurrent-safe via per-page locks).
 	if err := s.tree.Delete(key, xid); err != nil {
 		s.txnMgr.Abort(xid)
 		if err == btreeapi.ErrKeyNotFound {
@@ -246,10 +280,15 @@ func (s *store) Delete(key []byte) error {
 	commitEntry := s.txnMgr.Commit(xid)
 	rootPageID := s.tree.RootPageID()
 
-	batch := s.assembleBatch(rootPageID, commitEntry)
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
 
 	if err := s.pageSegMgr.Sync(); err != nil {
 		return err
+	}
+	if len(blobCollector.Entries) > 0 {
+		if err := s.blobSegMgr.Sync(); err != nil {
+			return err
+		}
 	}
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		return err
@@ -306,20 +345,25 @@ func (s *store) closeAll() error {
 	return firstErr
 }
 
-// ─── assembleBatch ──────────────────────────────────────────────────
+// ─── assembleBatchFromCollectors ────────────────────────────────────
 
-// assembleBatch collects all WAL entries from the current operation
-// into a single atomic WAL batch.
-func (s *store) assembleBatch(rootPageID uint64, commitEntry txnapi.WALEntry) *walapi.Batch {
+// assembleBatchFromCollectors builds a WAL batch from per-operation collectors.
+// This replaces the old assembleBatch that drained shared buffers.
+func assembleBatchFromCollectors(
+	pageCollector *btree.WALCollector,
+	blobCollector *blobCollector,
+	rootPageID uint64,
+	commitEntry txnapi.WALEntry,
+) *walapi.Batch {
 	batch := walapi.NewBatch()
 
 	// Page WAL entries
-	for _, e := range s.provider.DrainWALEntries() {
+	for _, e := range pageCollector.PageEntries {
 		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
 	// Blob WAL entries
-	for _, e := range s.blobAdapter.drain() {
+	for _, e := range blobCollector.Entries {
 		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
@@ -334,11 +378,25 @@ func (s *store) assembleBatch(rootPageID uint64, commitEntry txnapi.WALEntry) *w
 
 // ─── blobWriterAdapter ──────────────────────────────────────────────
 
+// blobCollector collects blob WAL entries for a single KVStore operation.
+type blobCollector struct {
+	Entries []blobstoreapi.WALEntry
+}
+
 // blobWriterAdapter adapts BlobStore to btreeapi.BlobWriter,
-// collecting WAL entries for each write operation.
+// collecting WAL entries per-operation via goroutine-keyed collectors.
 type blobWriterAdapter struct {
-	store   blobstoreapi.BlobStore
-	entries []blobstoreapi.WALEntry
+	store      blobstoreapi.BlobStore
+	collectors sync.Map // map[int64]*blobCollector — keyed by goroutine ID
+}
+
+// registerCollector creates a per-operation blob WAL entry collector
+// for the current goroutine. Returns the collector and an unregister function.
+func (a *blobWriterAdapter) registerCollector() (*blobCollector, func()) {
+	gid := goroutineID()
+	c := &blobCollector{}
+	a.collectors.Store(gid, c)
+	return c, func() { a.collectors.Delete(gid) }
 }
 
 func (a *blobWriterAdapter) WriteBlob(data []byte) (uint64, error) {
@@ -346,18 +404,21 @@ func (a *blobWriterAdapter) WriteBlob(data []byte) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	a.entries = append(a.entries, entry)
+
+	// Route WAL entry to per-operation collector or drop (should not happen
+	// in normal operation — registerCollector is always called before WriteBlob).
+	gid := goroutineID()
+	if c, ok := a.collectors.Load(gid); ok {
+		collector := c.(*blobCollector)
+		collector.Entries = append(collector.Entries, entry)
+	}
+	// No fallback buffer — if no collector is registered, the entry is lost.
+	// This is intentional: all KVStore operations register collectors.
 	return blobID, nil
 }
 
 func (a *blobWriterAdapter) ReadBlob(blobID uint64) ([]byte, error) {
 	return a.store.Read(blobID)
-}
-
-func (a *blobWriterAdapter) drain() []blobstoreapi.WALEntry {
-	out := a.entries
-	a.entries = nil
-	return out
 }
 
 // ─── iteratorAdapter ────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import (
 type (
 	RealPageProvider = internal.RealPageProvider
 	MemPageProvider  = internal.MemPageProvider
+	WALCollector     = internal.WALCollector
 )
 
 // New creates a new BTree.
