@@ -578,25 +578,31 @@ func BenchmarkBadger_Scan100(b *testing.B)    { benchScan(b, openBadger) }
 // Tests batch-mode writes where available.
 // BoltDB: multiple puts in a single Update tx (1 fsync per 100 puts)
 // Badger: WriteBatch API
-// go-fast-kv: sequential puts (no batch API yet — 100 fsyncs)
+// go-fast-kv: WriteBatch API (1 transaction + 1 WAL fsync per 100 puts)
 
 func BenchmarkGoFastKV_BatchPut100(b *testing.B) {
 	vals := pregenValues(256)
 	dir := b.TempDir()
-	store, err := openGoFastKV(dir)
+	adapter, err := openGoFastKV(dir)
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer adapter.Close()
+
+	gfkv := adapter.(*goFastKVAdapter).store
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		base := i * 100
+		batch := gfkv.NewWriteBatch()
 		for j := 0; j < 100; j++ {
 			idx := base + j
-			if err := store.Put(makeKey(idx), vals[idx%len(vals)]); err != nil {
+			if err := batch.Put(makeKey(idx), vals[idx%len(vals)]); err != nil {
 				b.Fatal(err)
 			}
+		}
+		if err := batch.Commit(); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

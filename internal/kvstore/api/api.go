@@ -21,6 +21,9 @@ var (
 
 	// ErrClosed is returned when operating on a closed store.
 	ErrClosed = errors.New("kvstore: closed")
+
+	// ErrBatchCommitted is returned when operating on a committed or discarded batch.
+	ErrBatchCommitted = errors.New("kvstore: batch already committed or discarded")
 )
 
 // ─── Iterator ───────────────────────────────────────────────────────
@@ -44,6 +47,41 @@ type Iterator interface {
 	Close()
 }
 
+// ─── WriteBatch ─────────────────────────────────────────────────────
+
+// WriteBatch groups multiple Put/Delete operations into a single atomic batch.
+// All operations share one transaction and one WAL fsync, dramatically
+// reducing per-operation overhead for bulk writes.
+//
+// Usage:
+//
+//	batch := store.NewWriteBatch()
+//	batch.Put(key1, value1)
+//	batch.Put(key2, value2)
+//	batch.Delete(key3)
+//	err := batch.Commit()
+//
+// Thread safety: WriteBatch is NOT safe for concurrent use.
+// Create one WriteBatch per goroutine.
+type WriteBatch interface {
+	// Put stages a key-value pair for writing.
+	// The write is not visible until Commit is called.
+	Put(key, value []byte) error
+
+	// Delete stages a key for deletion.
+	// The delete is not visible until Commit is called.
+	Delete(key []byte) error
+
+	// Commit atomically applies all staged operations.
+	// All operations share a single transaction and a single WAL fsync.
+	// After Commit, the batch cannot be reused.
+	Commit() error
+
+	// Discard releases resources without committing.
+	// Safe to call multiple times. After Discard, the batch cannot be reused.
+	Discard()
+}
+
 // ─── Store ──────────────────────────────────────────────────────────
 
 // Store is the main key-value store interface.
@@ -51,6 +89,9 @@ type Iterator interface {
 // Every Put/Get/Delete/Scan operates in auto-commit mode:
 // each operation is wrapped in its own transaction (BeginTxn + Commit).
 // This means every read sees the latest committed state.
+//
+// For bulk writes, use NewWriteBatch to group multiple operations
+// into a single atomic batch with one WAL fsync.
 //
 // Large values (> 256 bytes) are transparently stored in BlobStore.
 //
@@ -81,6 +122,11 @@ type Store interface {
 	// The iterator sees a consistent snapshot (auto-commit read txn).
 	// Each key appears at most once (latest committed version).
 	Scan(start, end []byte) Iterator
+
+	// NewWriteBatch creates a new write batch for grouping operations.
+	// Multiple Put/Delete calls are staged and applied atomically on Commit.
+	// This amortizes WAL fsync cost across all operations in the batch.
+	NewWriteBatch() WriteBatch
 
 	// Checkpoint writes a full snapshot of the current state to disk.
 	//

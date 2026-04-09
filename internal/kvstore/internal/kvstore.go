@@ -428,3 +428,118 @@ func (it *errIterator) Key() []byte   { return nil }
 func (it *errIterator) Value() []byte { return nil }
 func (it *errIterator) Err() error    { return it.err }
 func (it *errIterator) Close()        {}
+
+// ─── WriteBatch ─────────────────────────────────────────────────────
+
+// batchOp represents a single staged operation in a WriteBatch.
+type batchOp struct {
+	opType byte // 0 = put, 1 = delete
+	key    []byte
+	value  []byte
+}
+
+// writeBatch implements kvstoreapi.WriteBatch.
+// It stages Put/Delete operations and applies them atomically on Commit,
+// sharing a single transaction and a single WAL fsync.
+//
+// NOT thread-safe — create one per goroutine.
+type writeBatch struct {
+	store    *store
+	ops      []batchOp
+	finished bool // true after Commit or Discard
+}
+
+// NewWriteBatch creates a new write batch for grouping operations.
+func (s *store) NewWriteBatch() kvstoreapi.WriteBatch {
+	return &writeBatch{store: s}
+}
+
+// Put stages a key-value pair for writing.
+func (wb *writeBatch) Put(key, value []byte) error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+	if len(key) > btreeapi.MaxKeySize {
+		return kvstoreapi.ErrKeyTooLarge
+	}
+	wb.ops = append(wb.ops, batchOp{opType: 0, key: key, value: value})
+	return nil
+}
+
+// Delete stages a key for deletion.
+func (wb *writeBatch) Delete(key []byte) error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+	wb.ops = append(wb.ops, batchOp{opType: 1, key: key})
+	return nil
+}
+
+// Commit atomically applies all staged operations.
+// All operations share one transaction and one WAL fsync.
+// On error, the transaction is aborted — no partial writes are visible.
+func (wb *writeBatch) Commit() error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+	wb.finished = true
+
+	s := wb.store
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	// Empty batch — nothing to do
+	if len(wb.ops) == 0 {
+		return nil
+	}
+
+	// One transaction for the entire batch
+	xid, _ := s.txnMgr.BeginTxn()
+
+	// Register per-operation WAL collectors (goroutine-keyed).
+	pageCollector, unregPage := s.provider.RegisterCollector()
+	defer unregPage()
+	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	defer unregBlob()
+
+	// Execute all operations in the same transaction
+	for _, op := range wb.ops {
+		var err error
+		switch op.opType {
+		case 0: // Put
+			err = s.tree.Put(op.key, op.value, xid)
+		case 1: // Delete
+			err = s.tree.Delete(op.key, xid)
+			if err == btreeapi.ErrKeyNotFound {
+				err = kvstoreapi.ErrKeyNotFound
+			}
+		}
+		if err != nil {
+			s.txnMgr.Abort(xid)
+			return err
+		}
+	}
+
+	// Commit transaction
+	commitEntry := s.txnMgr.Commit(xid)
+	rootPageID := s.tree.RootPageID()
+
+	// ONE WAL batch for ALL operations → ONE fsync
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Discard releases resources without committing.
+// Safe to call multiple times.
+func (wb *writeBatch) Discard() {
+	wb.ops = nil
+	wb.finished = true
+}
