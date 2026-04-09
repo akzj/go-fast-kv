@@ -11,44 +11,54 @@ import (
 )
 
 // recover loads checkpoint + replays WAL to restore store state.
-// Called during Open. If no checkpoint exists, this is a fresh start (no-op).
+// Called during Open.
 //
 // Recovery flow (DESIGN.md §3.6):
-//  1. Load checkpoint → restore mappings, CLOG, nextXID, rootPageID
-//  2. Replay WAL after checkpoint LSN → apply incremental changes
+//  1. Load checkpoint (if exists) → restore mappings, CLOG, nextXID, rootPageID
+//  2. Replay WAL after checkpoint LSN (or from 0 if no checkpoint)
 //  3. MarkInProgressAsAborted → any in-flight txn at crash is aborted
 //  4. Set btree root
 func (s *store) recover() error {
 	cpPath := filepath.Join(s.dir, "checkpoint")
 
+	// Recovery interfaces for PageStore and BlobStore
+	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)
+
+	var afterLSN uint64
+	var rootPageID uint64
+	var maxTxnXID uint64
+
 	cpData, err := loadCheckpoint(cpPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // fresh start — nothing to recover
+		if !os.IsNotExist(err) {
+			return err
 		}
-		return err
+		// No checkpoint — replay WAL from the very beginning (LSN 0).
+		// afterLSN=0 means Replay will process all records with LSN > 0,
+		// which is every record in the WAL.
+		afterLSN = 0
+		rootPageID = 0
+		maxTxnXID = 0
+	} else {
+		// Checkpoint exists — restore state from it, then replay WAL
+		// for records after the checkpoint LSN.
+		psRecovery.LoadMapping(cpData.toPageMappings())
+		psRecovery.SetNextPageID(cpData.NextPageID)
+
+		bsRecovery.LoadMapping(cpData.toBlobMappings())
+		bsRecovery.SetNextBlobID(cpData.NextBlobID)
+
+		s.txnMgr.LoadCLOG(cpData.toCLOGEntries())
+		s.txnMgr.SetNextXID(cpData.NextXID)
+
+		afterLSN = cpData.LSN
+		rootPageID = cpData.RootPageID
+		maxTxnXID = cpData.NextXID
 	}
 
-	// 1. Restore PageStore mapping
-	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
-	psRecovery.LoadMapping(cpData.toPageMappings())
-	psRecovery.SetNextPageID(cpData.NextPageID)
-
-	// 2. Restore BlobStore mapping
-	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)
-	bsRecovery.LoadMapping(cpData.toBlobMappings())
-	bsRecovery.SetNextBlobID(cpData.NextBlobID)
-
-	// 3. Restore CLOG + nextXID
-	s.txnMgr.LoadCLOG(cpData.toCLOGEntries())
-	s.txnMgr.SetNextXID(cpData.NextXID)
-
-	// 4. Restore root PageID
-	rootPageID := cpData.RootPageID
-
-	// 5. Replay WAL after checkpoint LSN
-	maxTxnXID := cpData.NextXID
-	err = s.wal.Replay(cpData.LSN, func(r walapi.Record) error {
+	// Replay WAL after the checkpoint LSN (or from 0 if no checkpoint).
+	err = s.wal.Replay(afterLSN, func(r walapi.Record) error {
 		switch r.Type {
 		case walapi.RecordPageMap:
 			psRecovery.ApplyPageMap(r.ID, r.VAddr)
@@ -80,15 +90,21 @@ func (s *store) recover() error {
 	}
 
 	// Update nextXID if WAL replay found higher XIDs
-	if maxTxnXID > cpData.NextXID {
+	initialNextXID := uint64(0)
+	if cpData != nil {
+		initialNextXID = cpData.NextXID
+	}
+	if maxTxnXID > initialNextXID {
 		s.txnMgr.SetNextXID(maxTxnXID)
 	}
 
-	// 6. Mark in-progress transactions as aborted
+	// Mark in-progress transactions as aborted
 	s.txnMgr.MarkInProgressAsAborted()
 
-	// 7. Set btree root
-	s.tree.SetRootPageID(rootPageID)
+	// Set btree root (may be 0 if truly fresh start with empty WAL)
+	if rootPageID != 0 {
+		s.tree.SetRootPageID(rootPageID)
+	}
 
 	return nil
 }

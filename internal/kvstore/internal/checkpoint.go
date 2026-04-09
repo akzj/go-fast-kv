@@ -70,6 +70,11 @@ func (s *store) Checkpoint() error {
 		return kvstoreapi.ErrClosed
 	}
 
+	return s.checkpointLocked()
+}
+
+// checkpointLocked performs the checkpoint while the caller already holds s.mu.
+func (s *store) checkpointLocked() error {
 	// Sync segments to ensure all page/blob data is durable before checkpoint.
 	// Per-Put/Delete no longer fsyncs segments (WAL provides durability);
 	// this is the point where segment data becomes durable on disk.

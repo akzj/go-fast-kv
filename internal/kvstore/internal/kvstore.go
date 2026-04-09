@@ -311,6 +311,13 @@ func (s *store) Close() error {
 	if s.closed {
 		return kvstoreapi.ErrClosed
 	}
+
+	// Checkpoint before closing to persist all in-memory state.
+	// This ensures the next Open can recover quickly from the checkpoint
+	// rather than replaying the entire WAL. Even if Checkpoint fails,
+	// we still close — WAL replay will recover on next Open.
+	_ = s.checkpointLocked()
+
 	s.closed = true
 	return s.closeAll()
 }
