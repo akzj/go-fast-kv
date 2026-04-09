@@ -276,6 +276,13 @@ type Config struct {
 	// Values larger than this are stored via BlobWriter.
 	// Defaults to InlineThreshold (256) if zero.
 	InlineThreshold int
+
+	// VisibilityChecker determines if a version (txnMin, txnMax) is visible
+	// to a reader with the given readTxnID. If nil, the default range check
+	// is used: txnMin <= readTxnID && txnMax > readTxnID.
+	// KVStore sets this to check CLOG + snapshot boundary (readTxnID),
+	// ensuring uncommitted, aborted, and future entries are never visible.
+	VisibilityChecker func(txnMin, txnMax, readTxnID uint64) bool
 }
 
 // ─── BlobWriter ─────────────────────────────────────────────────────

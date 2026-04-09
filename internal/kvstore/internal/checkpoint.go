@@ -128,10 +128,27 @@ func (s *store) checkpointLocked() error {
 func writeCheckpoint(path string, data *checkpointData) error {
 	buf := serializeCheckpoint(data)
 
-	// Write to temp file, then atomic rename
+	// Write to temp file, fsync, then atomic rename.
+	// The fsync ensures data is durable before rename; without it,
+	// a crash after rename could leave a zero-filled or partial checkpoint.
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, buf, 0644); err != nil {
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("checkpoint: create temp: %w", err)
+	}
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("checkpoint: write temp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("checkpoint: sync temp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("checkpoint: close temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)

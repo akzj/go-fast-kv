@@ -39,9 +39,9 @@ import (
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
-// readTxnID is used for auto-commit reads (Get/Scan).
-// MaxXID = MaxUint64-1, so TxnMaxInfinity (MaxUint64) > readTxnID → visible.
-const readTxnID = txnapi.MaxXID
+// snapshotTxnID returns the current NextXID from the TxnManager,
+// used as a snapshot boundary for reads. Entries from transactions
+// that started at or after this point are invisible to the reader.
 
 const (
 	defaultMaxSegmentSize  = 64 * 1024 * 1024 // 64 MB
@@ -87,6 +87,10 @@ type store struct {
 
 	// Transaction
 	txnMgr txnapi.TxnManager
+
+	// Read snapshots: maps readTxnID → Snapshot for MVCC visibility.
+	// Get/Scan register a snapshot before reading, unregister after.
+	readSnaps sync.Map // map[uint64]*txnapi.Snapshot
 
 	closed bool
 }
@@ -143,8 +147,48 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	provider := btree.NewRealPageProvider(ps)
 	ba := &blobWriterAdapter{store: bs}
 
-	// Create BTree
-	tree := btree.New(btreeapi.Config{InlineThreshold: cfg.InlineThreshold}, provider, ba)
+	// We need a pointer to the store for the VisibilityChecker closure,
+	// but the store doesn't exist yet. Use a pointer variable.
+	var storeRef *store
+
+	// Create BTree with snapshot-based MVCC visibility checker.
+	// Readers register a Snapshot in readSnaps before calling Get/Scan.
+	// The checker looks up the snapshot and uses Snapshot.IsVisible()
+	// for true point-in-time consistency (immune to CLOG mutations mid-scan).
+	// Writers (Delete's internal visibility) have no snapshot registered;
+	// they fall back to a CLOG-only check.
+	tree := btree.New(btreeapi.Config{
+		InlineThreshold: cfg.InlineThreshold,
+		VisibilityChecker: func(txnMin, txnMax, readTxnID uint64) bool {
+			clog := tm.CLOG()
+
+			// Try to find a registered read snapshot for this readTxnID.
+			if storeRef != nil {
+				if snapVal, ok := storeRef.readSnaps.Load(readTxnID); ok {
+					snap := snapVal.(*txnapi.Snapshot)
+					return snap.IsVisible(txnMin, txnMax, clog)
+				}
+			}
+
+			// Fallback: writer path (Delete's internal visibility check).
+			// The writer uses its own xid as readTxnID. No snapshot registered.
+			// Own writes: visible if not yet deleted
+			if txnMin == readTxnID {
+				return txnMax == txnapi.TxnMaxInfinity
+			}
+			// Creator must be committed
+			if clog.Get(txnMin) != txnapi.TxnCommitted {
+				return false
+			}
+			// If deleted/superseded by a committed transaction, not visible
+			if txnMax != txnapi.TxnMaxInfinity {
+				if clog.Get(txnMax) == txnapi.TxnCommitted {
+					return false
+				}
+			}
+			return true
+		},
+	}, provider, ba)
 
 	s := &store{
 		dir:         cfg.Dir,
@@ -159,6 +203,8 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		blobAdapter: ba,
 		txnMgr:      tm,
 	}
+	// Wire up the storeRef so the VisibilityChecker closure can access readSnaps.
+	storeRef = s
 
 	// Attempt crash recovery
 	if err := s.recover(); err != nil {
@@ -193,27 +239,31 @@ func (s *store) Put(key, value []byte) error {
 	defer unregBlob()
 
 	// B-tree Put (concurrent-safe via per-page locks).
-	// WritePage → pageCollector, WriteBlob → blobCollector.
+	// Entry is in the tree but NOT yet visible — VisibilityChecker
+	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Put(key, value, xid); err != nil {
 		s.txnMgr.Abort(xid)
 		return err
 	}
 
-	// Commit transaction (returns WAL entry)
-	commitEntry := s.txnMgr.Commit(xid)
-
 	// Collect root change
 	rootPageID := s.tree.RootPageID()
 
-	// Assemble WAL batch from per-operation collectors
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
+	// Build WAL commit entry manually (Type 7 = RecordTxnCommit).
+	// We write the commit record to WAL BEFORE updating CLOG in memory,
+	// so the entry remains invisible until WAL succeeds.
+	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
 
-	// WAL fsync provides durability. Segment data is fsynced at checkpoint time.
-	// On crash recovery, WAL replay reconstructs any un-fsynced segment pages.
+	// WAL fsync provides durability. If this fails, abort the transaction
+	// so the entry never becomes visible.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
+		s.txnMgr.Abort(xid)
 		return err
 	}
 
+	// WAL succeeded — now make the entry visible by committing in CLOG.
+	s.txnMgr.Commit(xid)
 	return nil
 }
 
@@ -227,11 +277,17 @@ func (s *store) Get(key []byte) ([]byte, error) {
 		return nil, kvstoreapi.ErrClosed
 	}
 
-	// Auto-commit read: use readTxnID to see all committed versions.
-	// B-tree is concurrent-safe (per-page RwLocks).
-	// RLock held for entire read to prevent Close() from shutting down
-	// segment files while a read is in flight.
-	val, err := s.tree.Get(key, readTxnID)
+	// Snapshot read: begin a real transaction to get a consistent snapshot.
+	// The snapshot captures ActiveXIDs at this moment, making visibility
+	// immune to concurrent commits (true point-in-time isolation).
+	readXID, snap := s.txnMgr.BeginTxn()
+	s.readSnaps.Store(readXID, snap)
+	defer func() {
+		s.readSnaps.Delete(readXID)
+		s.txnMgr.Abort(readXID) // read-only txn — always abort (no WAL entry needed)
+	}()
+
+	val, err := s.tree.Get(key, readXID)
 	if err != nil {
 		if err == btreeapi.ErrKeyNotFound {
 			return nil, kvstoreapi.ErrKeyNotFound
@@ -261,6 +317,8 @@ func (s *store) Delete(key []byte) error {
 	defer unregBlob()
 
 	// B-tree Delete (concurrent-safe via per-page locks).
+	// Deletion mark is in the tree but NOT yet visible — VisibilityChecker
+	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Delete(key, xid); err != nil {
 		s.txnMgr.Abort(xid)
 		if err == btreeapi.ErrKeyNotFound {
@@ -269,17 +327,20 @@ func (s *store) Delete(key []byte) error {
 		return err
 	}
 
-	// Commit
-	commitEntry := s.txnMgr.Commit(xid)
+	// Collect root change
 	rootPageID := s.tree.RootPageID()
 
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
+	// Build WAL commit entry manually. Write WAL BEFORE committing in CLOG.
+	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
 
-	// WAL fsync provides durability. Segment data is fsynced at checkpoint time.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
+		s.txnMgr.Abort(xid)
 		return err
 	}
 
+	// WAL succeeded — now make the deletion visible by committing in CLOG.
+	s.txnMgr.Commit(xid)
 	return nil
 }
 
@@ -293,13 +354,23 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 		return &errIterator{err: kvstoreapi.ErrClosed}
 	}
 
+	// Snapshot read: begin a real transaction to get a consistent snapshot.
+	// The snapshot captures ActiveXIDs at this moment, providing true
+	// point-in-time isolation for the entire scan (immune to concurrent commits).
+	readXID, snap := s.txnMgr.BeginTxn()
+	s.readSnaps.Store(readXID, snap)
+
 	// B-tree Scan is concurrent-safe (per-page RwLocks).
 	// RLock held during iterator creation to prevent Close() race.
-	// The B-tree iterator clones leaf data under its own per-page locks,
-	// so we can release RLock after creating the iterator.
-	btreeIter := s.tree.Scan(start, end, readTxnID)
+	btreeIter := s.tree.Scan(start, end, readXID)
 	s.mu.RUnlock()
-	return &iteratorAdapter{inner: btreeIter}
+
+	// Snapshot cleanup happens in snapshotIterator.Close()
+	return &snapshotIterator{
+		inner:   btreeIter,
+		store:   s,
+		readXID: readXID,
+	}
 }
 
 // ─── Close ──────────────────────────────────────────────────────────
@@ -427,6 +498,30 @@ func (it *iteratorAdapter) Value() []byte { return it.inner.Value() }
 func (it *iteratorAdapter) Err() error    { return it.inner.Err() }
 func (it *iteratorAdapter) Close()        { it.inner.Close() }
 
+// ─── snapshotIterator ───────────────────────────────────────────────
+
+// snapshotIterator wraps btreeapi.Iterator and manages the read snapshot lifetime.
+// The snapshot is registered in store.readSnaps at Scan() time and cleaned up
+// when Close() is called. This ensures the VisibilityChecker uses a consistent
+// point-in-time snapshot for the entire scan duration.
+type snapshotIterator struct {
+	inner   btreeapi.Iterator
+	store   *store
+	readXID uint64
+}
+
+func (it *snapshotIterator) Next() bool    { return it.inner.Next() }
+func (it *snapshotIterator) Key() []byte   { return it.inner.Key() }
+func (it *snapshotIterator) Value() []byte { return it.inner.Value() }
+func (it *snapshotIterator) Err() error    { return it.inner.Err() }
+func (it *snapshotIterator) Close() {
+	it.inner.Close()
+	// Clean up the read snapshot so the VisibilityChecker no longer references it,
+	// and abort the read-only transaction to remove it from the active set.
+	it.store.readSnaps.Delete(it.readXID)
+	it.store.txnMgr.Abort(it.readXID)
+}
+
 // errIterator is returned when the store is closed.
 type errIterator struct{ err error }
 
@@ -531,16 +626,22 @@ func (wb *writeBatch) Commit() error {
 		}
 	}
 
-	// Commit transaction
-	commitEntry := s.txnMgr.Commit(xid)
+	// Collect root change
 	rootPageID := s.tree.RootPageID()
 
-	// ONE WAL batch for ALL operations → ONE fsync
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
+	// Build WAL commit entry manually. Write WAL BEFORE committing in CLOG.
+	// All batch entries are in the tree but NOT visible — VisibilityChecker
+	// checks CLOG, and xid is still InProgress. This guarantees atomicity:
+	// readers see either all entries (after Commit) or none (before Commit).
+	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
+	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
 	if _, err := s.wal.WriteBatch(batch); err != nil {
+		s.txnMgr.Abort(xid)
 		return err
 	}
 
+	// WAL succeeded — now make all batch entries visible atomically.
+	s.txnMgr.Commit(xid)
 	return nil
 }
 

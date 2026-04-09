@@ -15,9 +15,10 @@ type bTree struct {
 	serializer  btreeapi.NodeSerializer
 	rootPageID  atomic.Uint64        // atomic for concurrent reads (§3.8.8)
 	inlineThres int
-	closed      bool
+	closed      atomic.Bool          // atomic for concurrent close check
 	pageLocks   *lock.PageRWLocks    // per-page RwLock manager (§3.8.1)
 	bootstrapMu sync.Mutex           // protects root creation when rootPageID == 0
+	visCheck    func(txnMin, txnMax, readTxnID uint64) bool // MVCC visibility via CLOG (nil = default range check)
 }
 
 // New creates a new BTree instance.
@@ -27,11 +28,12 @@ func New(cfg btreeapi.Config, pages btreeapi.PageProvider, blobs btreeapi.BlobWr
 		thresh = btreeapi.InlineThreshold
 	}
 	return &bTree{
-		pages:       pages,
-		blobs:       blobs,
-		serializer:  NewNodeSerializer(),
-		inlineThres: thresh,
-		pageLocks:   lock.New(),
+		pages:          pages,
+		blobs:          blobs,
+		serializer:     NewNodeSerializer(),
+		inlineThres:    thresh,
+		pageLocks:      lock.New(),
+		visCheck:       cfg.VisibilityChecker,
 	}
 }
 
@@ -43,14 +45,24 @@ func (t *bTree) SetRootPageID(pid uint64) { t.rootPageID.Store(pid) }
 
 // Close releases resources.
 func (t *bTree) Close() error {
-	t.closed = true
+	t.closed.Store(true)
 	return nil
+}
+
+// isVisible checks if a version (txnMin, txnMax) is visible.
+// If a VisibilityChecker is configured (CLOG-based), it delegates to that.
+// Otherwise, falls back to the default range check for backward compatibility.
+func (t *bTree) isVisible(txnMin, txnMax, txnID uint64) bool {
+	if t.visCheck != nil {
+		return t.visCheck(txnMin, txnMax, txnID)
+	}
+	return txnMin <= txnID && txnMax > txnID
 }
 
 // ─── Put (§3.8.3) ──────────────────────────────────────────────────
 
 func (t *bTree) Put(key, value []byte, txnID uint64) error {
-	if t.closed {
+	if t.closed.Load() {
 		return btreeapi.ErrClosed
 	}
 	if len(key) > btreeapi.MaxKeySize {
@@ -290,6 +302,9 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	}
 
 	// Reached root and still need to split → create new root
+	// Serialize root creation to prevent two concurrent propagateSplits
+	// from both creating a new root (one would be lost).
+	t.bootstrapMu.Lock()
 	newRoot := &btreeapi.Node{
 		IsLeaf:   false,
 		Count:    1,
@@ -298,9 +313,11 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	}
 	newRootPID := t.pages.AllocPage()
 	if err := t.pages.WritePage(newRootPID, newRoot); err != nil {
+		t.bootstrapMu.Unlock()
 		return err
 	}
 	t.rootPageID.Store(newRootPID)
+	t.bootstrapMu.Unlock()
 	return nil
 }
 
@@ -386,7 +403,7 @@ func insertInternalEntry(node *btreeapi.Node, key []byte, childPID uint64) {
 // ─── Get (§3.8.2) ──────────────────────────────────────────────────
 
 func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
-	if t.closed {
+	if t.closed.Load() {
 		return nil, btreeapi.ErrClosed
 	}
 
@@ -419,7 +436,7 @@ func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
 				if cmp > 0 {
 					break
 				}
-				if cmp == 0 && e.TxnMin <= txnID && e.TxnMax > txnID {
+				if cmp == 0 && t.isVisible(e.TxnMin, e.TxnMax, txnID) {
 					t.pageLocks.RUnlock(currentPID)
 					return t.resolveValue(&e.Value)
 				}
@@ -445,7 +462,7 @@ func (t *bTree) resolveValue(v *btreeapi.Value) ([]byte, error) {
 // ─── Delete (§3.8.5) ───────────────────────────────────────────────
 
 func (t *bTree) Delete(key []byte, txnID uint64) error {
-	if t.closed {
+	if t.closed.Load() {
 		return btreeapi.ErrClosed
 	}
 	if t.rootPageID.Load() == 0 {
@@ -483,7 +500,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	// Phase 3: MVCC delete (mark TxnMax)
 	for i := range leaf.Entries {
 		e := &leaf.Entries[i]
-		if bytes.Equal(e.Key, key) && e.TxnMin <= txnID && e.TxnMax > txnID {
+		if bytes.Equal(e.Key, key) && t.isVisible(e.TxnMin, e.TxnMax, txnID) {
 			e.TxnMax = txnID
 			if err := t.pages.WritePage(leafPID, leaf); err != nil {
 				t.pageLocks.WUnlock(leafPID)
@@ -501,11 +518,12 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 
 func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 	it := &iterator{
-		tree:   t,
-		endKey: end,
-		txnID:  txnID,
+		tree:     t,
+		endKey:   end,
+		txnID:    txnID,
+		visCheck: t.visCheck,
 	}
-	if t.closed || t.rootPageID.Load() == 0 {
+	if t.closed.Load() || t.rootPageID.Load() == 0 {
 		it.done = true
 		return it
 	}
@@ -579,6 +597,7 @@ type iterator struct {
 	tree     *bTree
 	endKey   []byte
 	txnID    uint64
+	visCheck func(txnMin, txnMax, readTxnID uint64) bool // snapshot-based visibility (nil = use tree default)
 	curNode  *btreeapi.Node
 	curIdx   int
 	curKey   []byte
@@ -628,8 +647,14 @@ func (it *iterator) Next() bool {
 			continue
 		}
 
-		// Visibility check
-		if e.TxnMin <= it.txnID && e.TxnMax > it.txnID {
+		// Visibility check (uses per-scan snapshot if available)
+		visible := false
+		if it.visCheck != nil {
+			visible = it.visCheck(e.TxnMin, e.TxnMax, it.txnID)
+		} else {
+			visible = it.tree.isVisible(e.TxnMin, e.TxnMax, it.txnID)
+		}
+		if visible {
 			val, err := it.tree.resolveValue(&e.Value)
 			if err != nil {
 				it.err = err
