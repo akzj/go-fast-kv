@@ -315,19 +315,34 @@ func (t *bTree) splitLeafNode(node *btreeapi.Node) (splitKey []byte, right *btre
 	entries := node.Entries
 	mid := len(entries) / 2
 
-	// Don't split in the middle of a version chain
+	// Don't split in the middle of a version chain — find a key boundary
+	origMid := mid
 	for mid < len(entries)-1 && bytes.Equal(entries[mid].Key, entries[mid-1].Key) {
 		mid++
 	}
 	// If we went all the way to the end, try going left
 	if mid >= len(entries)-1 {
-		mid = len(entries) / 2
+		mid = origMid
 		for mid > 1 && bytes.Equal(entries[mid].Key, entries[mid-1].Key) {
 			mid--
 		}
 	}
 
-	splitKey = cloneBytes(entries[mid].Key)
+	// All entries share the same key (e.g., many MVCC versions of one key).
+	// Using the actual key as splitKey would violate the exclusive HighKey
+	// invariant: LEFT would contain key "K" but have HighKey = "K", making
+	// the latest version unreachable. Use a synthetic splitKey = key + 0x00
+	// so that HighKey > actual key, preserving correct routing.
+	allSameKey := mid <= 1 && len(entries) > 1 &&
+		bytes.Equal(entries[0].Key, entries[len(entries)-1].Key)
+
+	if allSameKey {
+		mid = len(entries) / 2
+		splitKey = append(cloneBytes(entries[0].Key), 0x00)
+	} else {
+		splitKey = cloneBytes(entries[mid].Key)
+	}
+
 	right = &btreeapi.Node{
 		IsLeaf:  true,
 		Entries: cloneLeafEntries(entries[mid:]),
