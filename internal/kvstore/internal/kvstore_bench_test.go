@@ -17,7 +17,10 @@ func benchValue(i int) []byte { return []byte(fmt.Sprintf("bench-value-%08d-padd
 func openBenchStore(b *testing.B) kvstoreapi.Store {
 	b.Helper()
 	dir := b.TempDir()
-	s, err := Open(kvstoreapi.Config{Dir: dir})
+	s, err := Open(kvstoreapi.Config{
+		Dir:            dir,
+		MaxSegmentSize: 256 * 1024 * 1024, // 256 MB — larger to avoid segment-full during benchmarks
+	})
 	if err != nil {
 		b.Fatalf("Open: %v", err)
 	}

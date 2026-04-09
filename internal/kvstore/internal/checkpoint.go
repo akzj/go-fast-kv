@@ -70,6 +70,16 @@ func (s *store) Checkpoint() error {
 		return kvstoreapi.ErrClosed
 	}
 
+	// Sync segments to ensure all page/blob data is durable before checkpoint.
+	// Per-Put/Delete no longer fsyncs segments (WAL provides durability);
+	// this is the point where segment data becomes durable on disk.
+	if err := s.pageSegMgr.Sync(); err != nil {
+		return err
+	}
+	if err := s.blobSegMgr.Sync(); err != nil {
+		return err
+	}
+
 	// Collect state
 	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
 	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)

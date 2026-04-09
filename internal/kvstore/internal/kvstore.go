@@ -208,15 +208,8 @@ func (s *store) Put(key, value []byte) error {
 	// Assemble WAL batch from per-operation collectors
 	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
 
-	// Fsync ordering: segments → WAL
-	if err := s.pageSegMgr.Sync(); err != nil {
-		return err
-	}
-	if len(blobCollector.Entries) > 0 {
-		if err := s.blobSegMgr.Sync(); err != nil {
-			return err
-		}
-	}
+	// WAL fsync provides durability. Segment data is fsynced at checkpoint time.
+	// On crash recovery, WAL replay reconstructs any un-fsynced segment pages.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		return err
 	}
@@ -282,14 +275,7 @@ func (s *store) Delete(key []byte) error {
 
 	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitEntry)
 
-	if err := s.pageSegMgr.Sync(); err != nil {
-		return err
-	}
-	if len(blobCollector.Entries) > 0 {
-		if err := s.blobSegMgr.Sync(); err != nil {
-			return err
-		}
-	}
+	// WAL fsync provides durability. Segment data is fsynced at checkpoint time.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		return err
 	}
