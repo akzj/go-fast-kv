@@ -1,4 +1,10 @@
-// Package wal implements the shared Write-Ahead Log.
+// Package wal implements the shared Write-Ahead Log with group commit.
+//
+// WriteBatch uses a channel-based producer-consumer pattern:
+// multiple goroutines submit batches to a channel, a single consumer
+// goroutine drains pending requests, writes them all, and performs
+// a single fsync. The fsync latency is the natural batching window —
+// no artificial sleep is needed.
 //
 // Design reference: docs/DESIGN.md §3.6
 package internal
@@ -11,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
@@ -23,18 +30,41 @@ func crc32c(data []byte) uint32 {
 	return crc32.Checksum(data, crc32cTable)
 }
 
-// wal implements walapi.WAL.
+// ─── Group Commit Types ─────────────────────────────────────────────
+
+// walRequest is submitted by WriteBatch producers to the consumer goroutine.
+type walRequest struct {
+	batch  *walapi.Batch
+	result chan walResult
+}
+
+// walResult is the response from the consumer goroutine back to a producer.
+type walResult struct {
+	lsn uint64
+	err error
+}
+
+// ─── WAL ────────────────────────────────────────────────────────────
+
+// wal implements walapi.WAL with channel-based group commit.
 type wal struct {
-	mu         sync.Mutex
+	mu         sync.Mutex // protects file, currentLSN for Replay/Truncate
 	dir        string
 	file       *os.File
 	currentLSN uint64
-	closed     bool
+	closed     atomic.Bool
+
+	// Group commit channel and consumer lifecycle.
+	reqCh  chan walRequest
+	doneCh chan struct{} // closed when consumer goroutine exits
 }
+
+const reqChBufferSize = 1024
 
 // New creates or opens a WAL in the given directory.
 // If the WAL file already exists, it replays to recover currentLSN
 // and truncates any trailing corrupt batches.
+// Starts the background consumer goroutine for group commit.
 func New(cfg walapi.Config) (walapi.WAL, error) {
 	if err := os.MkdirAll(cfg.Dir, 0755); err != nil {
 		return nil, fmt.Errorf("wal: mkdir %s: %w", cfg.Dir, err)
@@ -46,13 +76,21 @@ func New(cfg walapi.Config) (walapi.WAL, error) {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}
 
-	w := &wal{dir: cfg.Dir, file: f}
+	w := &wal{
+		dir:    cfg.Dir,
+		file:   f,
+		reqCh:  make(chan walRequest, reqChBufferSize),
+		doneCh: make(chan struct{}),
+	}
 
 	// Recover: replay to find currentLSN and truncate corrupt tail.
 	if err := w.recover(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("wal: recover: %w", err)
 	}
+
+	// Start the consumer goroutine.
+	go w.consumeLoop()
 
 	return w, nil
 }
@@ -83,29 +121,138 @@ func (w *wal) recover() error {
 	return nil
 }
 
-// WriteBatch atomically writes a batch of records to the WAL.
-func (w *wal) WriteBatch(batch *walapi.Batch) (uint64, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// ─── WriteBatch (Producer) ──────────────────────────────────────────
 
-	if w.closed {
+// WriteBatch atomically writes a batch of records to the WAL.
+// It submits the batch to the consumer goroutine via channel and
+// waits for the result. Multiple concurrent WriteBatch calls share
+// a single fsync (group commit).
+func (w *wal) WriteBatch(batch *walapi.Batch) (uint64, error) {
+	if w.closed.Load() {
 		return 0, walapi.ErrClosed
 	}
 	if batch.Len() == 0 {
-		return w.currentLSN, nil
+		return atomic.LoadUint64(&w.currentLSN), nil
 	}
 
-	buf := w.serializeBatch(batch)
-
-	if _, err := w.file.Write(buf); err != nil {
-		return 0, fmt.Errorf("wal: write: %w", err)
-	}
-	if err := w.file.Sync(); err != nil {
-		return 0, fmt.Errorf("wal: sync: %w", err)
+	req := walRequest{
+		batch:  batch,
+		result: make(chan walResult, 1),
 	}
 
-	return w.currentLSN, nil
+	// Submit to consumer. If channel is closed (shutdown), recover from panic.
+	select {
+	case w.reqCh <- req:
+	default:
+		// Channel full or closed — check closed flag.
+		if w.closed.Load() {
+			return 0, walapi.ErrClosed
+		}
+		// Channel full — block.
+		w.reqCh <- req
+	}
+
+	res := <-req.result
+	return res.lsn, res.err
 }
+
+// ─── Consumer Loop (Group Commit) ───────────────────────────────────
+
+// consumeLoop is the single consumer goroutine. It:
+// 1. Blocks waiting for the first request
+// 2. Drains all pending requests from the channel (non-blocking)
+// 3. Serializes all batches + writes to file + single fsync
+// 4. Notifies all producers
+// 5. Repeats
+//
+// The fsync latency (~50μs SSD, ~5ms HDD) is the natural batching window.
+// During fsync, new producers fill the channel buffer. When fsync returns,
+// the consumer immediately drains them all — zero artificial delay.
+func (w *wal) consumeLoop() {
+	defer close(w.doneCh)
+
+	for {
+		// 1. Block wait for the first request.
+		req, ok := <-w.reqCh
+		if !ok {
+			return // channel closed → shutdown
+		}
+
+		// 2. Drain: non-blocking read all pending requests.
+		pending := []walRequest{req}
+	drain:
+		for {
+			select {
+			case r, ok := <-w.reqCh:
+				if !ok {
+					// Channel closed during drain. Process what we have, then exit.
+					w.processBatch(pending)
+					return
+				}
+				pending = append(pending, r)
+			default:
+				break drain // channel empty → stop collecting
+			}
+		}
+
+		// 3. Process the batch: serialize + write + fsync + notify.
+		w.processBatch(pending)
+	}
+}
+
+// processBatch serializes all pending batches, writes them to the file,
+// performs a single fsync, and notifies all waiting producers.
+func (w *wal) processBatch(pending []walRequest) {
+	w.mu.Lock()
+
+	// Serialize all batches and collect results.
+	type batchResult struct {
+		lsn uint64
+		err error
+	}
+	results := make([]batchResult, len(pending))
+
+	// Accumulate all serialized data into a single buffer for one write call.
+	var combinedBuf []byte
+
+	for i, p := range pending {
+		if w.closed.Load() {
+			results[i] = batchResult{err: walapi.ErrClosed}
+			continue
+		}
+		buf := w.serializeBatch(p.batch)
+		combinedBuf = append(combinedBuf, buf...)
+		results[i] = batchResult{lsn: w.currentLSN}
+	}
+
+	// Single write + single fsync for the entire group.
+	var writeErr, syncErr error
+	if len(combinedBuf) > 0 {
+		if _, writeErr = w.file.Write(combinedBuf); writeErr != nil {
+			writeErr = fmt.Errorf("wal: write: %w", writeErr)
+		} else {
+			if syncErr = w.file.Sync(); syncErr != nil {
+				syncErr = fmt.Errorf("wal: sync: %w", syncErr)
+			}
+		}
+	}
+
+	w.mu.Unlock()
+
+	// Notify all producers.
+	for i, p := range pending {
+		res := results[i]
+		if res.err == nil && writeErr != nil {
+			res.err = writeErr
+		}
+		if res.err == nil && syncErr != nil {
+			res.err = syncErr
+		}
+		p.result <- walResult{lsn: res.lsn, err: res.err}
+	}
+}
+
+// ─── Serialization ──────────────────────────────────────────────────
 
 // serializeBatch assigns LSNs, computes CRCs, and returns the serialized bytes.
 // Must be called with w.mu held.
@@ -159,12 +306,14 @@ func deserializeRecord(buf []byte) walapi.Record {
 	}
 }
 
+// ─── Replay ─────────────────────────────────────────────────────────
+
 // Replay reads all valid batches after afterLSN, calling fn for each record.
 func (w *wal) Replay(afterLSN uint64, fn func(walapi.Record) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.closed {
+	if w.closed.Load() {
 		return walapi.ErrClosed
 	}
 
@@ -272,6 +421,8 @@ func (w *wal) replayInternal(afterLSN uint64, fn func(walapi.Record) error) (int
 	return validEnd, nil
 }
 
+// ─── CurrentLSN ─────────────────────────────────────────────────────
+
 // CurrentLSN returns the LSN of the last successfully written record.
 func (w *wal) CurrentLSN() uint64 {
 	w.mu.Lock()
@@ -279,12 +430,14 @@ func (w *wal) CurrentLSN() uint64 {
 	return w.currentLSN
 }
 
+// ─── Truncate ───────────────────────────────────────────────────────
+
 // Truncate removes all WAL data at or before upToLSN.
 func (w *wal) Truncate(upToLSN uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.closed {
+	if w.closed.Load() {
 		return walapi.ErrClosed
 	}
 
@@ -375,16 +528,28 @@ func (w *wal) Truncate(upToLSN uint64) error {
 	return nil
 }
 
-// Close flushes and closes the WAL file.
+// ─── Close ──────────────────────────────────────────────────────────
+
+// Close shuts down the WAL:
+// 1. Sets closed flag (rejects new WriteBatch calls)
+// 2. Closes the request channel (consumer drains remaining, then exits)
+// 3. Waits for consumer goroutine to finish
+// 4. Final fsync + close file
 func (w *wal) Close() error {
+	if w.closed.Swap(true) {
+		return walapi.ErrClosed // already closed
+	}
+
+	// Close the channel to signal consumer to stop.
+	close(w.reqCh)
+
+	// Wait for consumer goroutine to finish processing remaining requests.
+	<-w.doneCh
+
+	// Final fsync + close.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.closed {
-		return walapi.ErrClosed
-	}
-
-	w.closed = true
 	if err := w.file.Sync(); err != nil {
 		w.file.Close()
 		return err
