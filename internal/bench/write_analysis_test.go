@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	badger "github.com/dgraph-io/badger/v4"
+
+	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	kvstore "github.com/akzj/go-fast-kv/internal/kvstore"
 )
 
 // ─── Badger SyncWrites comparison ───────────────────────────────────
@@ -120,4 +123,29 @@ func benchBatchN(b *testing.B, batchSize int) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// ─── go-fast-kv SyncNone benchmarks ────────────────────────────────
+
+func openGoFastKV_SyncNone(dir string) (kvAdapter, error) {
+	cfg := kvstoreapi.Config{
+		Dir:            dir,
+		MaxSegmentSize: 256 * 1024 * 1024,
+		SyncMode:       kvstoreapi.SyncNone,
+	}
+	s, err := kvstore.Open(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &goFastKVAdapter{store: s}, nil
+}
+
+// go-fast-kv with SyncNone — no per-write WAL fsync (like Badger default)
+func BenchmarkGoFastKV_PutSequential_SyncNone(b *testing.B) {
+	benchPutSequential(b, openGoFastKV_SyncNone)
+}
+
+// go-fast-kv SyncNone with random keys
+func BenchmarkGoFastKV_PutRandom_SyncNone(b *testing.B) {
+	benchPutRandom(b, openGoFastKV_SyncNone)
 }

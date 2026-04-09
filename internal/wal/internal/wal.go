@@ -53,6 +53,7 @@ type wal struct {
 	file       *os.File
 	currentLSN uint64
 	closed     atomic.Bool
+	syncMode   int // 0=SyncAlways, 1=SyncNone
 
 	// Group commit channel and consumer lifecycle.
 	reqCh  chan walRequest
@@ -77,10 +78,11 @@ func New(cfg walapi.Config) (walapi.WAL, error) {
 	}
 
 	w := &wal{
-		dir:    cfg.Dir,
-		file:   f,
-		reqCh:  make(chan walRequest, reqChBufferSize),
-		doneCh: make(chan struct{}),
+		dir:      cfg.Dir,
+		file:     f,
+		syncMode: cfg.SyncMode,
+		reqCh:    make(chan walRequest, reqChBufferSize),
+		doneCh:   make(chan struct{}),
 	}
 
 	// Recover: replay to find currentLSN and truncate corrupt tail.
@@ -225,12 +227,12 @@ func (w *wal) processBatch(pending []walRequest) {
 		results[i] = batchResult{lsn: w.currentLSN}
 	}
 
-	// Single write + single fsync for the entire group.
+	// Single write + conditional fsync for the entire group.
 	var writeErr, syncErr error
 	if len(combinedBuf) > 0 {
 		if _, writeErr = w.file.Write(combinedBuf); writeErr != nil {
 			writeErr = fmt.Errorf("wal: write: %w", writeErr)
-		} else {
+		} else if w.syncMode == 0 { // SyncAlways
 			if syncErr = w.file.Sync(); syncErr != nil {
 				syncErr = fmt.Errorf("wal: sync: %w", syncErr)
 			}

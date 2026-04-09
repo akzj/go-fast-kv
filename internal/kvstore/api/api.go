@@ -140,6 +140,26 @@ type Store interface {
 	Close() error
 }
 
+// ─── SyncMode ───────────────────────────────────────────────────────
+
+// SyncMode controls WAL fsync behavior, trading durability for performance.
+type SyncMode int
+
+const (
+	// SyncAlways fsyncs the WAL after every write batch.
+	// Maximum durability — no data loss on crash.
+	// This is the default (zero value).
+	SyncAlways SyncMode = iota
+
+	// SyncNone does not fsync the WAL per write.
+	// WAL data is written to OS page cache but not fsynced.
+	// On crash, recent writes since the last Checkpoint may be lost.
+	// Segment data is still fsynced at Checkpoint time.
+	// Close() always fsyncs regardless of this setting.
+	// Equivalent to Badger's SyncWrites=false.
+	SyncNone
+)
+
 // ─── Config ─────────────────────────────────────────────────────────
 
 // Config holds configuration for opening a KVStore.
@@ -160,4 +180,10 @@ type Config struct {
 	// Values larger than this are stored in BlobStore.
 	// Defaults to 256 if zero.
 	InlineThreshold int
+
+	// SyncMode controls WAL fsync behavior.
+	// SyncAlways (default): fsync after every write — maximum durability.
+	// SyncNone: no per-write fsync — faster writes, risk of data loss on crash.
+	// Close() and Checkpoint() always fsync regardless of this setting.
+	SyncMode SyncMode
 }

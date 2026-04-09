@@ -125,7 +125,7 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	}
 
 	// Create WAL
-	w, err := wal.New(walapi.Config{Dir: walDir})
+	w, err := wal.New(walapi.Config{Dir: walDir, SyncMode: int(cfg.SyncMode)})
 	if err != nil {
 		pageSegMgr.Close()
 		blobSegMgr.Close()

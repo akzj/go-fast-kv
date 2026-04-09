@@ -205,4 +205,10 @@ type Config struct {
 	// The WAL file is named "wal.log" within this directory.
 	// The directory is created if it does not exist.
 	Dir string
+
+	// SyncMode controls fsync behavior for WAL writes.
+	// 0 (default) = SyncAlways: fsync after every write batch.
+	// 1 = SyncNone: no per-write fsync (data in OS page cache only).
+	// Close() always fsyncs regardless of this setting.
+	SyncMode int
 }
