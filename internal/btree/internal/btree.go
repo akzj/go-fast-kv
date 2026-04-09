@@ -537,8 +537,9 @@ func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 	}
 }
 
-// cloneNode creates a deep copy of a node's entries so the iterator
-// doesn't hold a reference to page data that might change.
+// cloneNode creates a deep copy of a node so the caller doesn't hold
+// a reference to page data that might change. Handles both leaf and
+// internal nodes.
 func cloneNode(node *btreeapi.Node) *btreeapi.Node {
 	clone := &btreeapi.Node{
 		IsLeaf:  node.IsLeaf,
@@ -548,6 +549,13 @@ func cloneNode(node *btreeapi.Node) *btreeapi.Node {
 	}
 	if node.IsLeaf {
 		clone.Entries = cloneLeafEntries(node.Entries)
+	} else {
+		if len(node.Keys) > 0 {
+			clone.Keys = cloneBytesSlice(node.Keys)
+		}
+		if len(node.Children) > 0 {
+			clone.Children = cloneUint64Slice(node.Children)
+		}
 	}
 	return clone
 }
