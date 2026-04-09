@@ -9,6 +9,8 @@ package internal
 
 import (
 	"encoding/binary"
+	"fmt"
+	"hash/crc32"
 	"sync"
 
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
@@ -65,9 +67,9 @@ func (ps *pageStore) Alloc() pagestoreapi.PageID {
 
 // Write writes page data for the given PageID.
 //
-// It prepends a big-endian pageID header (8 bytes) to the data,
-// appends the 4104-byte record to the segment, updates the in-memory
-// mapping, and returns a WALEntry for the caller to batch.
+// It builds a [pageID:8][data:4096][crc32:4] record (4108 bytes),
+// appends it to the segment, updates the in-memory mapping,
+// and returns a WALEntry for the caller to batch.
 func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreapi.WALEntry, error) {
 	if len(data) != pagestoreapi.PageSize {
 		return pagestoreapi.WALEntry{}, pagestoreapi.ErrInvalidPageSize
@@ -80,10 +82,14 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 		return pagestoreapi.WALEntry{}, pagestoreapi.ErrClosed
 	}
 
-	// Build the 4104-byte record: [pageID:8][data:4096]
+	// Build the 4108-byte record: [pageID:8][data:4096][crc32:4]
 	record := make([]byte, pagestoreapi.PageRecordSize)
 	binary.BigEndian.PutUint64(record[:8], pageID)
-	copy(record[8:], data)
+	copy(record[8:8+pagestoreapi.PageSize], data)
+
+	// Compute CRC32 over [pageID:8][data:4096] = first 4104 bytes
+	checksum := crc32.ChecksumIEEE(record[:8+pagestoreapi.PageSize])
+	binary.BigEndian.PutUint32(record[8+pagestoreapi.PageSize:], checksum)
 
 	// Append to segment
 	vaddr, err := ps.segMgr.Append(record)
@@ -107,7 +113,8 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 
 // Read reads the page data for the given PageID.
 //
-// Returns exactly PageSize (4096) bytes — the pageID header is stripped.
+// Returns exactly PageSize (4096) bytes — the pageID header and CRC are stripped.
+// Verifies the CRC32 checksum; returns ErrChecksumMismatch if data is corrupt.
 // Returns ErrPageNotFound if the page has not been allocated or was freed.
 func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 	ps.mu.Lock()
@@ -128,9 +135,17 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 		return nil, err
 	}
 
-	// Strip the 8-byte pageID header, return only the page data
+	// Verify CRC32 checksum
+	expected := binary.BigEndian.Uint32(raw[8+pagestoreapi.PageSize:])
+	actual := crc32.ChecksumIEEE(raw[:8+pagestoreapi.PageSize])
+	if expected != actual {
+		return nil, fmt.Errorf("%w: pageID=%d expected=0x%08x actual=0x%08x",
+			pagestoreapi.ErrChecksumMismatch, pageID, expected, actual)
+	}
+
+	// Strip the 8-byte pageID header and 4-byte CRC, return only the page data
 	result := make([]byte, pagestoreapi.PageSize)
-	copy(result, raw[8:])
+	copy(result, raw[8:8+pagestoreapi.PageSize])
 	return result, nil
 }
 

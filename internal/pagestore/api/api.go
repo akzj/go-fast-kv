@@ -25,6 +25,11 @@ var (
 
 	// ErrClosed is returned when operating on a closed PageStore.
 	ErrClosed = errors.New("pagestore: closed")
+
+	// ErrChecksumMismatch is returned when a page record's CRC32 checksum
+	// does not match the stored value. This indicates data corruption,
+	// typically from a torn write (partial page flush to disk).
+	ErrChecksumMismatch = errors.New("pagestore: checksum mismatch — data corruption detected")
 )
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -34,10 +39,13 @@ const (
 	PageSize = 4096
 
 	// PageRecordSize is the size of a page record in a segment file:
-	// 8 bytes pageID header + 4096 bytes page data = 4104 bytes.
+	// 8 bytes pageID header + 4096 bytes page data + 4 bytes CRC32 = 4108 bytes.
+	//
+	// The CRC32 (IEEE polynomial) covers [pageID:8][data:4096] and is stored
+	// as the last 4 bytes of the record in big-endian order.
 	//
 	// Design reference: docs/DESIGN.md §3.2, §3.7, §7.7
-	PageRecordSize = 8 + PageSize // 4104
+	PageRecordSize = 8 + PageSize + 4 // 4108
 )
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -67,7 +75,7 @@ type PageStore interface {
 	// Write writes page data for the given PageID.
 	//
 	// Internally:
-	//   1. Prepends pageID (8 bytes big-endian) to data → 4104-byte record
+	//   1. Prepends pageID (8 bytes big-endian) to data, appends CRC32 → 4108-byte record
 	//   2. Appends record to page segment via SegmentManager
 	//   3. Returns a WAL record (RecordPageMap) that the caller must
 	//      include in their WAL batch for crash recovery

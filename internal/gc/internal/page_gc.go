@@ -52,7 +52,7 @@ func NewPageGC(
 //
 // Algorithm (per DESIGN.md §3.7):
 //  1. Get sealed segments; pick the first one (simplest heuristic).
-//  2. Get segment size; iterate through all 4104-byte page records.
+//  2. Get segment size; iterate through all 4108-byte page records.
 //  3. For each record, extract pageID and check liveness against the
 //     current mapping table.
 //  4. Live pages are re-appended to the active segment; dead pages skipped.
@@ -94,10 +94,10 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 	batch := walapi.NewBatch()
 
 	var offset uint32
-	recordSize := uint32(pagestoreapi.PageRecordSize) // 4104
+	recordSize := uint32(pagestoreapi.PageRecordSize) // 4108
 
 	for int64(offset)+int64(recordSize) <= segSize {
-		// Read the full 4104-byte record.
+		// Read the full 4108-byte record.
 		addr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
 		record, err := gc.segMgr.ReadAt(addr, recordSize)
 		if err != nil {
