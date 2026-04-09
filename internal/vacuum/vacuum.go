@@ -22,6 +22,7 @@ func New(
 	wal walapi.WAL,
 	segSync func() error,
 	drainPageWAL func() []pagestoreapi.WALEntry,
+	pageLocks vacuumapi.PageLocker,
 ) vacuumapi.Vacuum {
-	return internal.New(rootPageIDFn, pages, txnMgr, blobStore, wal, segSync, drainPageWAL)
+	return internal.New(rootPageIDFn, pages, txnMgr, blobStore, wal, segSync, drainPageWAL, pageLocks)
 }

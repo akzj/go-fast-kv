@@ -8,6 +8,8 @@ package kvstoreapi
 
 import (
 	"errors"
+
+	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -25,6 +27,10 @@ var (
 	// ErrBatchCommitted is returned when operating on a committed or discarded batch.
 	ErrBatchCommitted = errors.New("kvstore: batch already committed or discarded")
 )
+
+// VacuumStats reports the results of a vacuum run.
+// Re-exported from the vacuum module for user convenience.
+type VacuumStats = vacuumapi.VacuumStats
 
 // ─── Iterator ───────────────────────────────────────────────────────
 
@@ -134,6 +140,22 @@ type Store interface {
 	// next XIDs, and root PageID. After checkpoint, old WAL entries
 	// can be truncated.
 	Checkpoint() error
+
+	// RunVacuum performs a single vacuum pass, cleaning up old MVCC
+	// versions from B-tree leaf nodes that are no longer visible to
+	// any active transaction.
+	//
+	// Two cleanup cases:
+	//   1. Committed delete/overwrite: entry.TxnMax < safeXID and committed
+	//   2. Aborted creator: entry.TxnMin was aborted
+	//
+	// This is an on-demand operation — call it periodically or after
+	// a batch of deletes/updates to reclaim space.
+	//
+	// Thread safety: RunVacuum acquires per-page write locks individually,
+	// so it can run concurrently with Put/Get/Delete/Scan. It does NOT
+	// block the entire store.
+	RunVacuum() (*VacuumStats, error)
 
 	// Close flushes all data and closes the store.
 	// After Close, all operations return ErrClosed.

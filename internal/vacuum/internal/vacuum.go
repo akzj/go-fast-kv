@@ -34,6 +34,7 @@ type vacuumer struct {
 	wal          walapi.WAL
 	segSync      func() error
 	drainPageWAL func() []pagestoreapi.WALEntry
+	pageLocks    vacuumapi.PageLocker // page-level locks for concurrent safety
 }
 
 // New creates a new Vacuum instance.
@@ -46,6 +47,9 @@ type vacuumer struct {
 //   - wal: WAL for atomic batch writes
 //   - segSync: function to fsync the page segment (e.g. pageSegMgr.Sync)
 //   - drainPageWAL: function to drain page WAL entries (e.g. provider.DrainWALEntries)
+//   - pageLocks: PageLocker for acquiring page locks during vacuum.
+//     This prevents concurrent Put/Delete from corrupting data while
+//     vacuum rewrites leaf pages.
 func New(
 	rootPageIDFn func() uint64,
 	pages btreeapi.PageProvider,
@@ -54,6 +58,7 @@ func New(
 	wal walapi.WAL,
 	segSync func() error,
 	drainPageWAL func() []pagestoreapi.WALEntry,
+	pageLocks vacuumapi.PageLocker,
 ) vacuumapi.Vacuum {
 	return &vacuumer{
 		rootPageIDFn: rootPageIDFn,
@@ -63,6 +68,7 @@ func New(
 		wal:          wal,
 		segSync:      segSync,
 		drainPageWAL: drainPageWAL,
+		pageLocks:    pageLocks,
 	}
 }
 
@@ -95,34 +101,51 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 	// Collect blob WAL entries across all leaves
 	var blobWALEntries []blobstoreapi.WALEntry
 
-	// 4. Iterate all leaves via Next links
+	// 4. Iterate all leaves via Next links, with page locks for safety
 	for leafPID != 0 {
+		// Acquire write lock before reading — prevents concurrent Put/Delete
+		// from modifying the page while we analyze and potentially rewrite it.
+		v.pageLocks.WLock(leafPID)
+
 		node, err := v.pages.ReadPage(leafPID)
 		if err != nil {
+			v.pageLocks.WUnlock(leafPID)
 			return nil, err
 		}
 		if !node.IsLeaf {
 			// Safety: should not happen if tree is well-formed
+			v.pageLocks.WUnlock(leafPID)
 			break
 		}
 
 		stats.LeavesScanned++
 
-		// Process this leaf
+		// Process this leaf under the write lock
 		removed, blobEntries, err := v.processLeaf(node, leafPID, safeXID)
 		if err != nil {
+			v.pageLocks.WUnlock(leafPID)
 			return nil, err
 		}
 
 		if removed > 0 {
+			// Rewrite the leaf page under the write lock
+			if err := v.pages.WritePage(leafPID, node); err != nil {
+				v.pageLocks.WUnlock(leafPID)
+				return nil, err
+			}
 			stats.LeavesModified++
 			stats.EntriesRemoved += removed
 			stats.BlobsFreed += len(blobEntries)
 			blobWALEntries = append(blobWALEntries, blobEntries...)
 		}
 
-		// Move to next leaf
-		leafPID = node.Next
+		// Release lock and move to next leaf.
+		// The next PID was captured under lock, so it's consistent.
+		// If the leaf was split concurrently, nextPID points to the new
+		// right sibling — we will visit it in the next iteration.
+		nextPID := node.Next
+		v.pageLocks.WUnlock(leafPID)
+		leafPID = nextPID
 	}
 
 	// 5. If any leaves were modified, flush WAL batch
@@ -158,17 +181,23 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 // always following Children[0].
 func (v *vacuumer) findLeftmostLeaf(pid uint64) (uint64, error) {
 	for {
+		v.pageLocks.RLock(pid)
 		node, err := v.pages.ReadPage(pid)
 		if err != nil {
+			v.pageLocks.RUnlock(pid)
 			return 0, err
 		}
 		if node.IsLeaf {
+			v.pageLocks.RUnlock(pid)
 			return pid, nil
 		}
 		if len(node.Children) == 0 {
+			v.pageLocks.RUnlock(pid)
 			return 0, vacuumapi.ErrNoLeaves
 		}
-		pid = node.Children[0]
+		nextPID := node.Children[0]
+		v.pageLocks.RUnlock(pid)
+		pid = nextPID
 	}
 }
 
@@ -246,10 +275,6 @@ func (v *vacuumer) processLeaf(
 	node.Entries = newEntries
 	node.Count = uint16(len(newEntries))
 
-	// Rewrite the leaf page
-	if err := v.pages.WritePage(leafPID, node); err != nil {
-		return 0, nil, err
-	}
-
+	// Note: caller (Run) handles WritePage under the page lock.
 	return removed, blobEntries, nil
 }

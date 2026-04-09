@@ -18,6 +18,7 @@ package internal
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,12 +30,15 @@ import (
 	"github.com/akzj/go-fast-kv/internal/btree"
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	"github.com/akzj/go-fast-kv/internal/lock"
 	"github.com/akzj/go-fast-kv/internal/pagestore"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	txnmod "github.com/akzj/go-fast-kv/internal/txn"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
+	"github.com/akzj/go-fast-kv/internal/vacuum"
+	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 	"github.com/akzj/go-fast-kv/internal/wal"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
@@ -87,6 +91,9 @@ type store struct {
 
 	// Transaction
 	txnMgr txnapi.TxnManager
+
+	// Vacuum — MVCC old version cleanup
+	vacuum vacuumapi.Vacuum
 
 	// Read snapshots: maps readTxnID → Snapshot for MVCC visibility.
 	// Get/Scan register a snapshot before reading, unregister after.
@@ -205,6 +212,24 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	}
 	// Wire up the storeRef so the VisibilityChecker closure can access readSnaps.
 	storeRef = s
+
+	// Wire vacuum — extract the B-tree's page locks via type assertion
+	// so vacuum acquires the same per-page locks as Put/Delete/Get/Scan.
+	type pageLockerProvider interface {
+		PageLocks() *lock.PageRWLocks
+	}
+	if plp, ok := tree.(pageLockerProvider); ok {
+		s.vacuum = vacuum.New(
+			tree.RootPageID,
+			provider,
+			tm,
+			bs,
+			w,
+			pageSegMgr.Sync,
+			provider.DrainWALEntries,
+			plp.PageLocks(),
+		)
+	}
 
 	// Attempt crash recovery
 	if err := s.recover(); err != nil {
@@ -407,6 +432,29 @@ func (s *store) closeAll() error {
 	save(s.pageSegMgr.Close())
 	save(s.blobSegMgr.Close())
 	return firstErr
+}
+
+// ─── RunVacuum ──────────────────────────────────────────────────────
+
+// RunVacuum performs a single vacuum pass, cleaning up old MVCC versions
+// from B-tree leaf nodes that are no longer visible to any active transaction.
+//
+// Thread safety: Vacuum acquires per-page write locks individually (the same
+// locks used by Put/Delete/Get/Scan), so it can run concurrently with normal
+// operations without blocking the entire store.
+func (s *store) RunVacuum() (*kvstoreapi.VacuumStats, error) {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, kvstoreapi.ErrClosed
+	}
+	s.mu.RUnlock()
+
+	if s.vacuum == nil {
+		return nil, errors.New("kvstore: vacuum not initialized")
+	}
+
+	return s.vacuum.Run()
 }
 
 // ─── assembleBatchFromCollectors ────────────────────────────────────

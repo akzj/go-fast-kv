@@ -43,6 +43,22 @@ type VacuumStats struct {
 	BlobsFreed     int // blobs freed via BlobStore.Delete
 }
 
+// ─── PageLocker ─────────────────────────────────────────────────────
+
+// PageLocker abstracts page-level locking for vacuum.
+// Vacuum acquires write locks on each leaf page during processing,
+// and read locks when navigating the internal node hierarchy,
+// preventing concurrent Put/Delete operations from corrupting data.
+//
+// The B-link tree guarantees that at most one lock is held at a time
+// per goroutine, making deadlocks impossible.
+type PageLocker interface {
+	RLock(pageID uint64)
+	RUnlock(pageID uint64)
+	WLock(pageID uint64)
+	WUnlock(pageID uint64)
+}
+
 // ─── Interface ──────────────────────────────────────────────────────
 
 // Vacuum cleans up old MVCC versions from B-tree leaves.

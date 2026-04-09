@@ -49,6 +49,14 @@ func (t *bTree) Close() error {
 	return nil
 }
 
+// PageLocks returns the per-page RwLock manager used by this B-tree.
+// This is needed by the Vacuum process to acquire the same page locks
+// as Put/Delete/Get/Scan, preventing concurrent corruption during
+// leaf page rewrites.
+func (t *bTree) PageLocks() *lock.PageRWLocks {
+	return t.pageLocks
+}
+
 // isVisible checks if a version (txnMin, txnMax) is visible.
 // If a VisibilityChecker is configured (CLOG-based), it delegates to that.
 // Otherwise, falls back to the default range check for backward compatibility.

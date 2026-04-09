@@ -203,6 +203,14 @@ func (env *testEnv) assembleBatch(rootPageID uint64, txnEntry txnapi.WALEntry) *
 	return batch
 }
 
+// noopPageLocker is a no-op PageLocker for single-threaded tests.
+type noopPageLocker struct{}
+
+func (noopPageLocker) RLock(uint64)   {}
+func (noopPageLocker) RUnlock(uint64) {}
+func (noopPageLocker) WLock(uint64)   {}
+func (noopPageLocker) WUnlock(uint64) {}
+
 func (env *testEnv) newVacuum() vacuumapi.Vacuum {
 	return New(
 		env.tree.RootPageID,
@@ -212,6 +220,7 @@ func (env *testEnv) newVacuum() vacuumapi.Vacuum {
 		env.wal,
 		env.pageSegMgr.Sync,
 		env.provider.DrainWALEntries,
+		noopPageLocker{},
 	)
 }
 

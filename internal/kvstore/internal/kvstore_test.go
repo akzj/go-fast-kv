@@ -343,3 +343,77 @@ func TestClose(t *testing.T) {
 		t.Fatalf("double Close: got %v, want ErrClosed", err)
 	}
 }
+
+
+// TestRunVacuum verifies that RunVacuum physically removes deleted entries
+// from B-tree leaf pages, making deleted keys truly invisible (not just
+// logically marked with TxnMax).
+func TestRunVacuum(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(kvstoreapi.Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Put 10 keys
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		val := fmt.Sprintf("v%02d", i)
+		if err := s.Put([]byte(key), []byte(val)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Delete 5 keys — these should become invisible after vacuum
+	deletedKeys := []string{"k01", "k03", "k05", "k07", "k09"}
+	for _, k := range deletedKeys {
+		if err := s.Delete([]byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Verify deleted keys are already logically invisible (pre-vacuum)
+	for _, k := range deletedKeys {
+		if _, err := s.Get([]byte(k)); err != kvstoreapi.ErrKeyNotFound {
+			t.Fatalf("pre-vacuum Get(%s): got %v, want ErrKeyNotFound", k, err)
+		}
+	}
+
+	// Run vacuum
+	stats, err := s.RunVacuum()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Vacuum should have removed at least 5 entries (one per deleted key)
+	if stats.EntriesRemoved < 5 {
+		t.Fatalf("RunVacuum.EntriesRemoved: got %d, want >= 5 (stats: %+v)", stats.EntriesRemoved, stats)
+	}
+	if stats.LeavesScanned == 0 {
+		t.Fatalf("RunVacuum.LeavesScanned: got 0, want > 0")
+	}
+
+	// Verify vacuum doesn't affect the 5 remaining live keys
+	liveKeys := []string{"k00", "k02", "k04", "k06", "k08"}
+	for _, k := range liveKeys {
+		val, err := s.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Get(%s) after vacuum: %v", k, err)
+		}
+		expected := "v" + k[1:] // k00 → v00
+		if string(val) != expected {
+			t.Fatalf("Get(%s): got %q, want %q", k, val, expected)
+		}
+	}
+
+	// Verify deleted keys are still invisible (vacuum worked correctly)
+	for _, k := range deletedKeys {
+		if _, err := s.Get([]byte(k)); err != kvstoreapi.ErrKeyNotFound {
+			t.Fatalf("Get(%s) after vacuum: got %v, want ErrKeyNotFound", k, err)
+		}
+	}
+
+	t.Logf("Vacuum stats: scanned=%d modified=%d removed=%d blobs=%d",
+		stats.LeavesScanned, stats.LeavesModified, stats.EntriesRemoved, stats.BlobsFreed)
+}
