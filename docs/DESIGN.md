@@ -1288,3 +1288,46 @@ Blob segment:  [blobID uint64][size uint32][blob data] = 12 + size bytes per ent
 - GC 时顺序扫描 segment，直接读出 ID，查映射表判断是否存活 — O(1)
 - 如果不存 ID，GC 需要遍历整个映射表找出哪些 VAddr 落在该 segment 内 — O(N)
 - 8 bytes 的空间开销相对于 4KB page 可以忽略（0.2%）
+
+---
+
+## 8. Serializable Snapshot Isolation (v5)
+
+**v5 新增**: Serializable Snapshot Isolation (SSI) 支持，防止 Write Skew 异常。
+
+详细设计见 `docs/SSI_DESIGN.md`。
+
+### 8.1 隔离级别
+
+| 隔离级别 | Write Skew | 性能 |
+|----------|------------|------|
+| SI (默认) | ❌ 允许 | 高 |
+| SSI | ✅ 防止 | 中 |
+
+### 8.2 使用方法
+
+```go
+import kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+
+// 启用 SSI 模式
+cfg := kvstoreapi.Config{
+    Dir:             "/path/to/store",
+    IsolationLevel:  kvstoreapi.IsolationSerializable,
+}
+
+s, _ := kvstoreapi.Open(cfg)
+```
+
+### 8.3 Write Skew 防止
+
+SSI 自动检测和阻止 Write Skew 异常：
+- T1 读取 X, T2 读取 X, T1 写入 Y, T2 写入 Z
+- T1 提交后，T2 检测到冲突并 abort
+
+### 8.4 性能开销
+
+| 工作负载 | SSI 开销 |
+|---------|---------|
+| Sequential writes | ~0% |
+| Concurrent writes | ~12% |
+| Mixed workload | ~13% |
