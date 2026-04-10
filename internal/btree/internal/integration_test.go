@@ -34,7 +34,7 @@ func setupReal(t *testing.T) *realSetup {
 	}
 
 	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
-	provider := NewRealPageProvider(ps)
+	provider := NewRealPageProvider(ps, 0)
 	tree := New(btreeapi.Config{}, provider, nil)
 
 	return &realSetup{
@@ -87,7 +87,7 @@ func (s *realSetup) reopen(t *testing.T) *realSetup {
 	}
 	recovery.SetNextPageID(savedNextPageID)
 
-	provider2 := NewRealPageProvider(ps2)
+	provider2 := NewRealPageProvider(ps2, 0)
 	tree2 := New(btreeapi.Config{}, provider2, nil)
 	tree2.SetRootPageID(savedRootPageID)
 

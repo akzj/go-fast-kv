@@ -130,11 +130,14 @@ type RealPageProvider struct {
 }
 
 // NewRealPageProvider creates a RealPageProvider backed by the given PageStore.
-func NewRealPageProvider(store pagestoreapi.PageStore) *RealPageProvider {
+func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageProvider {
+	if cacheSize <= 0 {
+		cacheSize = 1024
+	}
 	return &RealPageProvider{
 		store:      store,
 		serializer: NewNodeSerializer(),
-		cache:      newPageCache(1024),
+		cache:      newPageCache(cacheSize),
 	}
 }
 

@@ -219,4 +219,10 @@ type Config struct {
 	// Default: 0.1 (10%). Set to 0 to disable ratio-based triggering.
 	// The effective threshold is max(AutoVacuumThreshold, totalEntries * AutoVacuumRatio).
 	AutoVacuumRatio float64
+
+	// PageCacheSize is the maximum number of B-tree page entries to keep in
+	// the LRU page cache. Each entry is ~4KB (one page). Default: 8192 (32MB).
+	// Larger values improve read performance for workloads that exceed the
+	// default 8MB working set. Memory usage is proportional to this setting.
+	PageCacheSize int
 }

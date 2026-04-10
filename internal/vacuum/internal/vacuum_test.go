@@ -93,7 +93,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 	ps := pagestore.New(pagestoreapi.Config{}, pageSegMgr)
 	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
 	tm := txnmod.New()
-	provider := btree.NewRealPageProvider(ps)
+	provider := btree.NewRealPageProvider(ps, 0)
 	ba := &testBlobAdapter{store: bs}
 	tree := btree.New(btreeapi.Config{InlineThreshold: 256}, provider, ba)
 

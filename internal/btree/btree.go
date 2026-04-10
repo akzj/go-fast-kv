@@ -28,8 +28,10 @@ func NewNodeSerializer() btreeapi.NodeSerializer {
 }
 
 // NewRealPageProvider creates a PageProvider backed by a PageStore.
-func NewRealPageProvider(store pagestoreapi.PageStore) *RealPageProvider {
-	return internal.NewRealPageProvider(store)
+// cacheSize is the maximum number of B-tree page entries in the LRU cache.
+// Defaults to 8192 if zero.
+func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageProvider {
+	return internal.NewRealPageProvider(store, cacheSize)
 }
 
 // NewMemPageProvider creates an in-memory PageProvider for testing.

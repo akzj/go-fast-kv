@@ -172,7 +172,11 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	tm := txnmod.New()
 
 	// Create page provider and blob adapter
-	provider := btree.NewRealPageProvider(ps)
+	cacheSize := cfg.PageCacheSize
+	if cacheSize <= 0 {
+		cacheSize = 8192
+	}
+	provider := btree.NewRealPageProvider(ps, cacheSize)
 	ba := &blobWriterAdapter{store: bs}
 
 	// We need a pointer to the store for the VisibilityChecker closure,
