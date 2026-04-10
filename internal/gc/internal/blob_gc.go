@@ -17,6 +17,9 @@ var _ gcapi.BlobGC = (*blobGC)(nil)
 // 8 bytes blobID (big-endian) + 4 bytes size (big-endian) = 12 bytes.
 const blobHeaderSize = 12
 
+// blobChecksumSize is the size of the CRC32 checksum appended to each blob record.
+const blobChecksumSize = 4
+
 // blobGC implements gcapi.BlobGC.
 type blobGC struct {
 	segMgr   segmentapi.SegmentManager
@@ -51,7 +54,7 @@ func NewBlobGC(
 // Algorithm (per DESIGN.md §3.7):
 //  1. Get sealed segments; pick the first one.
 //  2. Get segment size; iterate through variable-length blob records.
-//  3. Each record: [blobID:8][size:4][data:size] — total 12+size bytes.
+//  3. Each record: [blobID:8][size:4][data:size][crc32:4] — total 12+size+4 bytes.
 //  4. Check liveness against blob mapping.
 //  5. Live blobs are re-appended; dead blobs skipped.
 //  6. Sync, WAL batch, update mapping, remove old segment.
@@ -102,7 +105,7 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 
 		blobID := binary.BigEndian.Uint64(header[:8])
 		dataSize := binary.BigEndian.Uint32(header[8:12])
-		fullRecordSize := uint32(blobHeaderSize) + dataSize
+		fullRecordSize := uint32(blobHeaderSize) + dataSize + blobChecksumSize
 
 		// Validate: record must fit within segment.
 		if int64(offset)+int64(fullRecordSize) > segSize {

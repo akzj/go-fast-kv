@@ -21,6 +21,10 @@ var (
 
 	// ErrClosed is returned when operating on a closed BlobStore.
 	ErrClosed = errors.New("blobstore: closed")
+
+	// ErrChecksumMismatch is returned when a blob's CRC32 checksum
+	// does not match the stored value, indicating data corruption.
+	ErrChecksumMismatch = errors.New("blobstore: checksum mismatch")
 )
 
 // ─── Types ──────────────────────────────────────────────────────────

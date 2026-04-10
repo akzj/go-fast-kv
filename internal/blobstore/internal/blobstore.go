@@ -4,11 +4,16 @@
 // Internally it uses a dense array ([]BlobMeta) mapping BlobID → (VAddr, Size),
 // and delegates physical I/O to a SegmentManager.
 //
+// Record format: [blobID:8][size:4][data:N][crc32:4]
+// CRC32 (Castagnoli) covers [blobID:8][size:4][data:N].
+//
 // Design reference: docs/DESIGN.md §3.3
 package internal
 
 import (
 	"encoding/binary"
+	"fmt"
+	"hash/crc32"
 	"sync"
 
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
@@ -26,6 +31,15 @@ const defaultInitialCapacity = 1024
 // blobHeaderSize is the size of the header prepended to each blob in a segment:
 // 8 bytes blobID (big-endian) + 4 bytes size (big-endian) = 12 bytes.
 const blobHeaderSize = 12
+
+// blobChecksumSize is the size of the CRC32 checksum appended to each blob record.
+const blobChecksumSize = 4
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+func crc32c(data []byte) uint32 {
+	return crc32.Checksum(data, crc32cTable)
+}
 
 // blobStore implements blobstoreapi.BlobStore and blobstoreapi.BlobStoreRecovery.
 type blobStore struct {
@@ -57,8 +71,10 @@ func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager) blobstoreapi
 
 // Write allocates a new BlobID and writes the blob data.
 //
-// It prepends a big-endian blobID (8 bytes) + size (4 bytes) header,
-// appends the record to the segment, updates the in-memory mapping,
+// Record format: [blobID:8][size:4][data:N][crc32:4]
+// CRC32 (Castagnoli) covers bytes [0 : 12+N].
+//
+// It appends the record to the segment, updates the in-memory mapping,
 // and returns a WALEntry for the caller to batch.
 func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEntry, error) {
 	bs.mu.Lock()
@@ -72,12 +88,17 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 	blobID := bs.nextBlobID
 	bs.nextBlobID++
 
-	// Build record: [blobID:8][size:4][data]
+	// Build record: [blobID:8][size:4][data:N][crc32:4]
 	dataLen := uint32(len(data))
-	record := make([]byte, blobHeaderSize+len(data))
+	recordSize := blobHeaderSize + len(data) + blobChecksumSize
+	record := make([]byte, recordSize)
 	binary.BigEndian.PutUint64(record[:8], blobID)
 	binary.BigEndian.PutUint32(record[8:12], dataLen)
-	copy(record[12:], data)
+	copy(record[12:12+len(data)], data)
+
+	// CRC32 over [blobID:8][size:4][data:N]
+	checksum := crc32c(record[:blobHeaderSize+len(data)])
+	binary.BigEndian.PutUint32(record[blobHeaderSize+len(data):], checksum)
 
 	// Append to segment
 	vaddr, err := bs.segMgr.Append(record)
@@ -103,8 +124,10 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 
 // Read reads the blob data for the given BlobID.
 //
-// Returns the raw blob data (without blobID/size headers).
+// Reads the full record [blobID:8][size:4][data:N][crc32:4],
+// verifies the CRC32 checksum, and returns the raw blob data.
 // Returns ErrBlobNotFound if the blob has not been allocated or was deleted.
+// Returns ErrChecksumMismatch if the checksum does not match.
 func (bs *blobStore) Read(blobID blobstoreapi.BlobID) ([]byte, error) {
 	bs.mu.Lock()
 	if bs.closed {
@@ -118,15 +141,26 @@ func (bs *blobStore) Read(blobID blobstoreapi.BlobID) ([]byte, error) {
 		return nil, blobstoreapi.ErrBlobNotFound
 	}
 
+	// Read the full record: header + data + checksum
+	totalSize := meta.Size + blobHeaderSize + blobChecksumSize
 	vaddr := segmentapi.UnpackVAddr(meta.VAddr)
-	raw, err := bs.segMgr.ReadAt(vaddr, meta.Size+blobHeaderSize)
+	raw, err := bs.segMgr.ReadAt(vaddr, totalSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// Strip the 12-byte header (blobID + size), return only the blob data
+	// Verify CRC32 checksum
+	payloadEnd := blobHeaderSize + meta.Size
+	storedCRC := binary.BigEndian.Uint32(raw[payloadEnd : payloadEnd+blobChecksumSize])
+	computedCRC := crc32c(raw[:payloadEnd])
+	if storedCRC != computedCRC {
+		return nil, fmt.Errorf("%w: blobID=%d stored=0x%08x computed=0x%08x",
+			blobstoreapi.ErrChecksumMismatch, blobID, storedCRC, computedCRC)
+	}
+
+	// Strip header and checksum, return only the blob data
 	result := make([]byte, meta.Size)
-	copy(result, raw[blobHeaderSize:])
+	copy(result, raw[blobHeaderSize:payloadEnd])
 	return result, nil
 }
 
