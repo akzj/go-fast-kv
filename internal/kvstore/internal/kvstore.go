@@ -246,7 +246,14 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 			bs,
 			w,
 			pageSegMgr.Sync,
-			provider.DrainWALEntries,
+			// Wrap RegisterCollector to return a pointer to the entries slice.
+			// Vacuum's goroutine gets its own collector (keyed by goroutine ID),
+			// so WritePage routes entries there instead of the shared buffer.
+			// This prevents the shared-buffer stealing bug.
+			func() (*[]pagestoreapi.WALEntry, func()) {
+				collector, unreg := provider.RegisterCollector()
+				return &collector.PageEntries, unreg
+			},
 			plp.PageLocks(),
 		)
 	}

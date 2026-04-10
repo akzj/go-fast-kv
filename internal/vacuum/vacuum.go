@@ -21,8 +21,8 @@ func New(
 	blobStore blobstoreapi.BlobStore,
 	wal walapi.WAL,
 	segSync func() error,
-	drainPageWAL func() []pagestoreapi.WALEntry,
+	registerCollector func() (*[]pagestoreapi.WALEntry, func()),
 	pageLocks vacuumapi.PageLocker,
 ) vacuumapi.Vacuum {
-	return internal.New(rootPageIDFn, pages, txnMgr, blobStore, wal, segSync, drainPageWAL, pageLocks)
+	return internal.New(rootPageIDFn, pages, txnMgr, blobStore, wal, segSync, registerCollector, pageLocks)
 }

@@ -27,14 +27,14 @@ var _ vacuumapi.Vacuum = (*vacuumer)(nil)
 
 // vacuumer implements vacuumapi.Vacuum.
 type vacuumer struct {
-	rootPageIDFn func() uint64
-	pages        btreeapi.PageProvider
-	txnMgr       txnapi.TxnManager
-	blobStore    blobstoreapi.BlobStore
-	wal          walapi.WAL
-	segSync      func() error
-	drainPageWAL func() []pagestoreapi.WALEntry
-	pageLocks    vacuumapi.PageLocker // page-level locks for concurrent safety
+	rootPageIDFn      func() uint64
+	pages             btreeapi.PageProvider
+	txnMgr            txnapi.TxnManager
+	blobStore         blobstoreapi.BlobStore
+	wal               walapi.WAL
+	segSync           func() error
+	registerCollector func() (*[]pagestoreapi.WALEntry, func()) // per-goroutine WAL entry collector
+	pageLocks         vacuumapi.PageLocker                      // page-level locks for concurrent safety
 }
 
 // New creates a new Vacuum instance.
@@ -46,7 +46,12 @@ type vacuumer struct {
 //   - blobStore: BlobStore for deleting blobs of removed entries
 //   - wal: WAL for atomic batch writes
 //   - segSync: function to fsync the page segment (e.g. pageSegMgr.Sync)
-//   - drainPageWAL: function to drain page WAL entries (e.g. provider.DrainWALEntries)
+//   - registerCollector: registers a per-goroutine WAL entry collector.
+//     Returns a pointer to the entry slice (populated by WritePage calls)
+//     and an unregister function. This ensures vacuum's WritePage WAL
+//     entries are isolated from concurrent Put/Delete operations, preventing
+//     the shared-buffer stealing bug where DrainWALEntries could drain
+//     entries belonging to other operations.
 //   - pageLocks: PageLocker for acquiring page locks during vacuum.
 //     This prevents concurrent Put/Delete from corrupting data while
 //     vacuum rewrites leaf pages.
@@ -57,18 +62,18 @@ func New(
 	blobStore blobstoreapi.BlobStore,
 	wal walapi.WAL,
 	segSync func() error,
-	drainPageWAL func() []pagestoreapi.WALEntry,
+	registerCollector func() (*[]pagestoreapi.WALEntry, func()),
 	pageLocks vacuumapi.PageLocker,
 ) vacuumapi.Vacuum {
 	return &vacuumer{
-		rootPageIDFn: rootPageIDFn,
-		pages:        pages,
-		txnMgr:       txnMgr,
-		blobStore:    blobStore,
-		wal:          wal,
-		segSync:      segSync,
-		drainPageWAL: drainPageWAL,
-		pageLocks:    pageLocks,
+		rootPageIDFn:      rootPageIDFn,
+		pages:             pages,
+		txnMgr:            txnMgr,
+		blobStore:         blobStore,
+		wal:               wal,
+		segSync:           segSync,
+		registerCollector: registerCollector,
+		pageLocks:         pageLocks,
 	}
 }
 
@@ -95,8 +100,11 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		return nil, err
 	}
 
-	// Drain any stale page WAL entries before starting
-	v.drainPageWAL()
+	// Register a per-goroutine WAL entry collector. This ensures vacuum's
+	// WritePage calls route entries to our own collector (keyed by goroutine ID),
+	// NOT the shared legacy buffer. This prevents the shared-buffer stealing bug.
+	pageEntries, unregCollector := v.registerCollector()
+	defer unregCollector()
 
 	// Collect blob WAL entries across all leaves
 	var blobWALEntries []blobstoreapi.WALEntry
@@ -128,7 +136,9 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		}
 
 		if removed > 0 {
-			// Rewrite the leaf page under the write lock
+			// Rewrite the leaf page under the write lock.
+			// WritePage routes WAL entries to our registered collector
+			// (via goroutine ID), not the shared buffer.
 			if err := v.pages.WritePage(leafPID, node); err != nil {
 				v.pageLocks.WUnlock(leafPID)
 				return nil, err
@@ -157,8 +167,9 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		// Build WAL batch: page mapping updates + blob free entries
 		batch := walapi.NewBatch()
 
-		// Page WAL entries (collected by RealPageProvider during WritePage calls)
-		for _, e := range v.drainPageWAL() {
+		// Page WAL entries (collected by our per-goroutine collector
+		// during WritePage calls above — isolated from concurrent ops)
+		for _, e := range *pageEntries {
 			batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 		}
 

@@ -219,7 +219,12 @@ func (env *testEnv) newVacuum() vacuumapi.Vacuum {
 		env.blobStore,
 		env.wal,
 		env.pageSegMgr.Sync,
-		env.provider.DrainWALEntries,
+		// Wrap RegisterCollector to match the new vacuum API.
+		// Returns a pointer to the entries slice + unregister function.
+		func() (*[]pagestoreapi.WALEntry, func()) {
+			collector, unreg := env.provider.RegisterCollector()
+			return &collector.PageEntries, unreg
+		},
 		noopPageLocker{},
 	)
 }
