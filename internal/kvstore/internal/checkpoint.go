@@ -120,7 +120,27 @@ func (s *store) checkpointLocked() error {
 
 	// Write checkpoint file (atomic: write temp → rename)
 	cpPath := filepath.Join(s.dir, "checkpoint")
-	return writeCheckpoint(cpPath, data)
+	if err := writeCheckpoint(cpPath, data); err != nil {
+		return err
+	}
+
+	// Truncate CLOG to reclaim memory. The checkpoint file now contains
+	// the full CLOG, so old entries are recoverable from the checkpoint.
+	//
+	// safeXID = the oldest XID that any active transaction could reference.
+	// All CLOG entries below safeXID are no longer needed for visibility
+	// checks because no snapshot can reference them.
+	//
+	// Note: checkpoint holds s.mu.Lock() (exclusive), so no Put/Delete/Get/Scan
+	// is running. GetMinActive() returns TxnMaxInfinity when no txns are active.
+	// In that case, we use NextXID() — everything below it is fully resolved.
+	safeXID := s.txnMgr.GetMinActive()
+	if safeXID == txnapi.TxnMaxInfinity {
+		safeXID = s.txnMgr.NextXID()
+	}
+	s.txnMgr.CLOG().Truncate(safeXID)
+
+	return nil
 }
 
 // ─── writeCheckpoint ────────────────────────────────────────────────

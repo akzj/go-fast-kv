@@ -135,10 +135,17 @@ func (tm *txnManager) BeginTxn() (uint64, *txnapi.Snapshot) {
 
 // Commit marks a transaction as committed.
 // Returns a WAL entry for the caller to batch.
+//
+// Both the CLOG update and active-set removal are performed under tm.mu
+// to prevent a snapshot race: without this, a BeginTxn between the CLOG
+// set and the active-set removal would see the xid as both committed
+// (in CLOG) and still active (in ActiveXIDs), causing IsVisible to
+// incorrectly return false — a transient phantom read.
+//
+// Lock ordering: tm.mu → clog.mu (safe — no reverse path exists).
 func (tm *txnManager) Commit(xid uint64) txnapi.WALEntry {
-	tm.clog.Set(xid, txnapi.TxnCommitted)
-
 	tm.mu.Lock()
+	tm.clog.Set(xid, txnapi.TxnCommitted)
 	delete(tm.active, xid)
 	tm.mu.Unlock()
 
@@ -147,10 +154,13 @@ func (tm *txnManager) Commit(xid uint64) txnapi.WALEntry {
 
 // Abort marks a transaction as aborted.
 // Returns a WAL entry for the caller to batch.
+//
+// Both the CLOG update and active-set removal are performed under tm.mu
+// for the same reason as Commit (see above). For Abort the impact is
+// smaller (both paths return "not visible"), but consistency matters.
 func (tm *txnManager) Abort(xid uint64) txnapi.WALEntry {
-	tm.clog.Set(xid, txnapi.TxnAborted)
-
 	tm.mu.Lock()
+	tm.clog.Set(xid, txnapi.TxnAborted)
 	delete(tm.active, xid)
 	tm.mu.Unlock()
 
