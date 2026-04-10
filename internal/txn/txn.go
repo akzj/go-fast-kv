@@ -4,11 +4,20 @@
 package txn
 
 import (
-	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
+	api "github.com/akzj/go-fast-kv/internal/txn/api"
 	"github.com/akzj/go-fast-kv/internal/txn/internal"
 )
 
-// New creates a new TxnManager.
-func New() txnapi.TxnManager {
+// TxnManager is the concrete transaction manager type.
+// Exported so kvstore can call BeginSSITxn().
+type TxnManager = internal.TxnManager
+
+// New creates a new TxnManager (without SSI).
+func New() api.TxnManager {
 	return internal.New()
+}
+
+// NewWithSSI creates a TxnManager with Serializable Snapshot Isolation enabled.
+func NewWithSSI() *TxnManager {
+	return internal.NewWithSSI()
 }

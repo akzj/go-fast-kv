@@ -184,6 +184,21 @@ const (
 
 // ─── Config ─────────────────────────────────────────────────────────
 
+// IsolationLevel defines the transaction isolation level.
+type IsolationLevel int
+
+const (
+	// IsolationAutoCommit uses per-operation auto-commit transactions.
+	// Each Put/Delete operates in its own transaction.
+	// This is the default.
+	IsolationAutoCommit IsolationLevel = iota
+
+	// IsolationSerializable uses Serializable Snapshot Isolation (SSI).
+	// Transactions track read/write sets and detect write skew conflicts.
+	// Conflicting transactions are aborted and must be retried.
+	IsolationSerializable
+)
+
 // Config holds configuration for opening a KVStore.
 type Config struct {
 	// Dir is the root directory for all store data.
@@ -208,6 +223,11 @@ type Config struct {
 	// SyncNone: no per-write fsync — faster writes, risk of data loss on crash.
 	// Close() and Checkpoint() always fsync regardless of this setting.
 	SyncMode SyncMode
+
+	// IsolationLevel sets the transaction isolation mode.
+	// Defaults to IsolationAutoCommit (per-operation transactions).
+	// IsolationSerializable enables SSI with write skew detection.
+	IsolationLevel IsolationLevel
 
 	// AutoVacuumThreshold is the minimum number of Put+Delete operations
 	// before an automatic vacuum pass is triggered.

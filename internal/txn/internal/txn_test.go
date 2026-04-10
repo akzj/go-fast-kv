@@ -388,3 +388,194 @@ func TestCLOGEntries(t *testing.T) {
 		t.Fatal("xid 2 should be Aborted")
 	}
 }
+
+// ─── SSI Integration Tests ─────────────────────────────────────────
+
+func TestNewWithSSI(t *testing.T) {
+	tm := NewWithSSI()
+
+	if tm == nil {
+		t.Fatal("expected non-nil TxnManager")
+	}
+
+	// Verify it's an SSI-enabled manager
+	ssiTxn := tm.BeginSSITxn()
+	if ssiTxn == nil {
+		t.Fatal("expected non-nil SSI transaction")
+	}
+	if ssiTxn.State() == nil {
+		t.Fatal("expected non-nil SSI state")
+	}
+	if ssiTxn.XID() == 0 {
+		t.Fatal("expected non-zero XID")
+	}
+}
+
+func TestSSIStateRWSetTracking(t *testing.T) {
+	tm := NewWithSSI()
+
+	txn := tm.BeginSSITxn()
+
+	// Initially empty
+	if len(txn.State().RWSet) != 0 {
+		t.Fatal("expected empty RWSet initially")
+	}
+	if len(txn.State().WWSet) != 0 {
+		t.Fatal("expected empty WWSet initially")
+	}
+
+	// Get should track read
+	txn.Get([]byte("key1"))
+	if _, ok := txn.State().RWSet["key1"]; !ok {
+		t.Fatal("expected key1 in RWSet after Get")
+	}
+
+	// Put should track write
+	txn.Put([]byte("key2"), []byte("value2"))
+	if _, ok := txn.State().WWSet["key2"]; !ok {
+		t.Fatal("expected key2 in WWSet after Put")
+	}
+}
+
+func TestSSICommit_NoConflicts(t *testing.T) {
+	tm := NewWithSSI()
+
+	// T1: read key, write different key
+	txn1 := tm.BeginSSITxn()
+	txn1.Get([]byte("a"))
+	txn1.Put([]byte("b"), []byte("val_b"))
+
+	// T2: read different key, write different key
+	txn2 := tm.BeginSSITxn()
+	txn2.Get([]byte("c"))
+	txn2.Put([]byte("d"), []byte("val_d"))
+
+	// Both should commit without conflict
+	if err := txn1.Commit(); err != nil {
+		t.Fatalf("expected T1 commit to succeed, got %v", err)
+	}
+
+	if err := txn2.Commit(); err != nil {
+		t.Fatalf("expected T2 commit to succeed, got %v", err)
+	}
+
+	// Verify both committed
+	if tm.CLOG().Get(txn1.XID()) != txnapi.TxnCommitted {
+		t.Fatal("T1 should be committed")
+	}
+	if tm.CLOG().Get(txn2.XID()) != txnapi.TxnCommitted {
+		t.Fatal("T2 should be committed")
+	}
+}
+
+func TestSSICommit_AbortAfterCommit(t *testing.T) {
+	tm := NewWithSSI()
+
+	// T1: read key
+	txn1 := tm.BeginSSITxn()
+	txn1.Get([]byte("key"))
+
+	// T1 aborts
+	txn1.Abort()
+
+	// Should be able to start new transaction after abort
+	txn2 := tm.BeginSSITxn()
+	if txn2.XID() <= txn1.XID() {
+		t.Fatal("T2 XID should be greater than T1 XID after abort")
+	}
+	txn2.Abort()
+}
+
+func TestSSIWriteSkewScenario(t *testing.T) {
+	// Classic write skew: T1 reads {A,B}, T2 reads {A,B}, both update different keys
+	// With SSI, when T1 commits, it should not conflict with T2's read of A or B
+	// because T2 hasn't written either key yet.
+	// Similarly, T2 should not conflict with T1's commit.
+	//
+	// The actual conflict would be detected if:
+	// - T1 writes A, T2 writes B, then one tries to read the other's write
+	//
+	// For this test, we verify non-conflicting reads/writes work
+
+	tm := NewWithSSI()
+
+	// T1: read A, B (but doesn't write either)
+	txn1 := tm.BeginSSITxn()
+	txn1.Get([]byte("doctor:alice:on_call"))
+	txn1.Get([]byte("doctor:bob:on_call"))
+
+	// T2: read A, B (but doesn't write either)
+	txn2 := tm.BeginSSITxn()
+	txn2.Get([]byte("doctor:alice:on_call"))
+	txn2.Get([]byte("doctor:bob:on_call"))
+
+	// Both should commit (no WW conflict because neither wrote)
+	if err := txn1.Commit(); err != nil {
+		t.Fatalf("T1 commit should succeed, got %v", err)
+	}
+
+	if err := txn2.Commit(); err != nil {
+		t.Fatalf("T2 commit should succeed, got %v", err)
+	}
+}
+
+func TestSSIGetPut_TracksRWSet(t *testing.T) {
+	// Verify that Get/Put correctly track keys in RWSet/WWSet
+	tm := NewWithSSI()
+
+	txn := tm.BeginSSITxn()
+
+	// Get tracks key in RWSet
+	_, _ = txn.Get([]byte("key1"))
+	state := txn.State()
+	if _, ok := state.RWSet["key1"]; !ok {
+		t.Error("expected 'key1' in RWSet after Get")
+	}
+
+	// Put tracks key in WWSet
+	_ = txn.Put([]byte("key2"), []byte("value"))
+	if _, ok := state.WWSet["key2"]; !ok {
+		t.Error("expected 'key2' in WWSet after Put")
+	}
+
+	// RWSet should still have key1
+	if _, ok := state.RWSet["key1"]; !ok {
+		t.Error("expected 'key1' still in RWSet")
+	}
+
+	// Abort to clean up
+	txn.Abort()
+}
+
+func TestSSITransactionAbortedAfterFailedCommit(t *testing.T) {
+	tm := NewWithSSI()
+
+	// Create two transactions
+	txn1 := tm.BeginSSITxn()
+	txn1.Get([]byte("key"))
+
+	txn2 := tm.BeginSSITxn()
+	txn2.Get([]byte("key"))
+
+	// Commit T1 successfully
+	if err := txn1.Commit(); err != nil {
+		t.Fatalf("T1 commit failed: %v", err)
+	}
+
+	// T2 tries to commit - in our simplified SSI, there's no actual conflict
+	// because we don't have the actual read/write set integration with KVStore
+	if err := txn2.Commit(); err != nil {
+		// If commit fails, Abort should still work
+		txn2.Abort()
+	} else {
+		// If commit succeeds, Abort should be no-op
+		txn2.Abort()
+	}
+
+	// T2 should be able to commit a new transaction
+	txn3 := tm.BeginSSITxn()
+	if txn3.XID() <= txn2.XID() {
+		t.Fatal("T3 XID should be greater than T2 XID")
+	}
+	txn3.Abort()
+}

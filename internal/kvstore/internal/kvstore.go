@@ -36,7 +36,7 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
-	txnmod "github.com/akzj/go-fast-kv/internal/txn"
+	"github.com/akzj/go-fast-kv/internal/txn"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 	"github.com/akzj/go-fast-kv/internal/vacuum"
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
@@ -90,8 +90,10 @@ type store struct {
 	// Blob adapter (collects WAL entries per operation)
 	blobAdapter *blobWriterAdapter
 
-	// Transaction
+	// Transaction manager — always available
 	txnMgr txnapi.TxnManager
+
+	// Vacuum — MVCC old version cleanup
 
 	// Vacuum — MVCC old version cleanup
 	vacuum vacuumapi.Vacuum
@@ -168,8 +170,14 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	ps := pagestore.New(pagestoreapi.Config{}, pageSegMgr)
 	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
 
-	// Create TxnManager
-	tm := txnmod.New()
+	// Create TxnManager — use SSI mode if configured
+	// When SSI is configured, BeginSSITxn() tracks RWSet/WWSet for conflict detection.
+	var tm txnapi.TxnManager
+	if cfg.IsolationLevel == kvstoreapi.IsolationSerializable {
+		tm = txn.NewWithSSI()
+	} else {
+		tm = txn.New()
+	}
 
 	// Create page provider and blob adapter
 	cacheSize := cfg.PageCacheSize
@@ -285,9 +293,6 @@ func (s *store) Put(key, value []byte) error {
 		return kvstoreapi.ErrKeyTooLarge
 	}
 
-	// Begin transaction
-	xid, _ := s.txnMgr.BeginTxn()
-
 	// Register per-operation WAL collectors (goroutine-keyed).
 	// WritePage/WriteBlob route entries here via goroutine ID.
 	pageCollector, unregPage := s.provider.RegisterCollector()
@@ -295,11 +300,28 @@ func (s *store) Put(key, value []byte) error {
 	blobCollector, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
 
+	// Start SSI-aware transaction if configured
+	var xid uint64
+	var ssiTxn txnapi.Transaction
+
+	if s.cfg.IsolationLevel == kvstoreapi.IsolationSerializable {
+		// Use SSI transaction for write skew detection
+		ssiTxn = s.txnMgr.BeginSSITxn()
+		xid = ssiTxn.XID()
+	} else {
+		// Use regular auto-commit transaction
+		xid, _ = s.txnMgr.BeginTxn()
+	}
+
 	// B-tree Put (concurrent-safe via per-page locks).
 	// Entry is in the tree but NOT yet visible — VisibilityChecker
 	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Put(key, value, xid); err != nil {
-		s.txnMgr.Abort(xid)
+		if ssiTxn != nil {
+			ssiTxn.Abort()
+		} else {
+			s.txnMgr.Abort(xid)
+		}
 		return err
 	}
 
@@ -315,12 +337,28 @@ func (s *store) Put(key, value []byte) error {
 	// WAL fsync provides durability. If this fails, abort the transaction
 	// so the entry never becomes visible.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
-		s.txnMgr.Abort(xid)
+		if ssiTxn != nil {
+			ssiTxn.Abort()
+		} else {
+			s.txnMgr.Abort(xid)
+		}
 		return err
 	}
 
-	// WAL succeeded — now make the entry visible by committing in CLOG.
-	s.txnMgr.Commit(xid)
+	// WAL succeeded — now validate SSI conflicts (if enabled) and commit.
+	if ssiTxn != nil {
+		// SSI validation: checks RWSet/WWSet for write skew conflicts.
+		// Returns ErrSerializationFailure if conflict detected.
+		if err := ssiTxn.Commit(); err != nil {
+			// SSI conflict detected — transaction already aborted internally.
+			// Entry is still in tree but invisible (xid was aborted in CLOG).
+			return err
+		}
+		// SSI validation passed — entry is committed and visible.
+	} else {
+		// Regular commit: update CLOG to make entry visible.
+		s.txnMgr.Commit(xid)
+	}
 
 	// Trigger auto-vacuum check (lazy async goroutine).
 	s.vacuumTrigger.opsCount.Add(1)
@@ -371,20 +409,34 @@ func (s *store) Delete(key []byte) error {
 		return kvstoreapi.ErrClosed
 	}
 
-	// Begin transaction
-	xid, _ := s.txnMgr.BeginTxn()
-
 	// Register per-operation WAL collectors (goroutine-keyed).
 	pageCollector, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
 	blobCollector, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
 
+	// Start SSI-aware transaction if configured
+	var xid uint64
+	var ssiTxn txnapi.Transaction
+
+	if s.cfg.IsolationLevel == kvstoreapi.IsolationSerializable {
+		// Use SSI transaction for write skew detection
+		ssiTxn = s.txnMgr.BeginSSITxn()
+		xid = ssiTxn.XID()
+	} else {
+		// Use regular auto-commit transaction
+		xid, _ = s.txnMgr.BeginTxn()
+	}
+
 	// B-tree Delete (concurrent-safe via per-page locks).
 	// Deletion mark is in the tree but NOT yet visible — VisibilityChecker
 	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Delete(key, xid); err != nil {
-		s.txnMgr.Abort(xid)
+		if ssiTxn != nil {
+			ssiTxn.Abort()
+		} else {
+			s.txnMgr.Abort(xid)
+		}
 		if err == btreeapi.ErrKeyNotFound {
 			return kvstoreapi.ErrKeyNotFound
 		}
@@ -399,12 +451,22 @@ func (s *store) Delete(key []byte) error {
 	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
 
 	if _, err := s.wal.WriteBatch(batch); err != nil {
-		s.txnMgr.Abort(xid)
+		if ssiTxn != nil {
+			ssiTxn.Abort()
+		} else {
+			s.txnMgr.Abort(xid)
+		}
 		return err
 	}
 
-	// WAL succeeded — now make the deletion mark visible.
-	s.txnMgr.Commit(xid)
+	// WAL succeeded — now validate SSI conflicts (if enabled) and commit.
+	if ssiTxn != nil {
+		if err := ssiTxn.Commit(); err != nil {
+			return err
+		}
+	} else {
+		s.txnMgr.Commit(xid)
+	}
 
 	// Trigger auto-vacuum check (lazy async goroutine).
 	s.vacuumTrigger.opsCount.Add(1)
@@ -806,14 +868,22 @@ func (wb *writeBatch) Commit() error {
 		return nil
 	}
 
-	// One transaction for the entire batch
-	xid, _ := s.txnMgr.BeginTxn()
-
 	// Register per-operation WAL collectors (goroutine-keyed).
 	pageCollector, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
 	blobCollector, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
+
+	// Start transaction (SSI or regular)
+	var xid uint64
+	var ssiTxn txnapi.Transaction
+
+	if s.cfg.IsolationLevel == kvstoreapi.IsolationSerializable {
+		ssiTxn = s.txnMgr.BeginSSITxn()
+		xid = ssiTxn.XID()
+	} else {
+		xid, _ = s.txnMgr.BeginTxn()
+	}
 
 	// Execute all operations in the same transaction
 	for _, op := range wb.ops {
@@ -828,7 +898,11 @@ func (wb *writeBatch) Commit() error {
 			}
 		}
 		if err != nil {
-			s.txnMgr.Abort(xid)
+			if ssiTxn != nil {
+				ssiTxn.Abort()
+			} else {
+				s.txnMgr.Abort(xid)
+			}
 			return err
 		}
 	}
@@ -843,12 +917,22 @@ func (wb *writeBatch) Commit() error {
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
 	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
 	if _, err := s.wal.WriteBatch(batch); err != nil {
-		s.txnMgr.Abort(xid)
+		if ssiTxn != nil {
+			ssiTxn.Abort()
+		} else {
+			s.txnMgr.Abort(xid)
+		}
 		return err
 	}
 
-	// WAL succeeded — now make all batch entries visible atomically.
-	s.txnMgr.Commit(xid)
+	// WAL succeeded — now validate SSI conflicts (if enabled) and commit.
+	if ssiTxn != nil {
+		if err := ssiTxn.Commit(); err != nil {
+			return err
+		}
+	} else {
+		s.txnMgr.Commit(xid)
+	}
 
 	// Trigger auto-vacuum check for each operation in the batch.
 	if len(wb.ops) > 0 {
