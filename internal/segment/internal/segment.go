@@ -300,9 +300,38 @@ func (sm *segmentManager) Rotate() error {
 		return fmt.Errorf("segment: sync before rotate: %w", err)
 	}
 
-	// Seal the active segment.
-	sm.active.sealed = true
-	sm.sealed[sm.active.id] = sm.active
+	oldActive := sm.active
+
+	// Seal: close O_RDWR fd, reopen O_RDONLY, then mmap.
+	// Without this, sealed segments use the slow ReadAt syscall path forever
+	// (data=nil). The recover() path mmaps via openSegmentFile(writable=false),
+	// but Rotate() used createSegment which leaves data=nil. This closes that gap:
+	// sealed segments now get the fast mmap path in-process on every Rotate().
+	if err := oldActive.file.Close(); err != nil {
+		return fmt.Errorf("segment: close old fd before rotate: %w", err)
+	}
+	f, err := os.OpenFile(sm.segPath(oldActive.id), os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("segment: reopen old segment for mmap: %w", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("segment: stat old segment: %w", err)
+	}
+	if info.Size() > 0 {
+		data, mmapErr := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
+		if mmapErr != nil {
+			log.Printf("segment: mmap sealed seg %d: %v — falling back to ReadAt", oldActive.id, mmapErr)
+		} else {
+			unix.Madvise(data, unix.MADV_SEQUENTIAL)
+			oldActive.data = data
+		}
+	}
+	oldActive.file = f
+	oldActive.size = info.Size()
+	oldActive.sealed = true
+	sm.sealed[oldActive.id] = oldActive
 
 	// Create new active segment.
 	return sm.createSegment(sm.nextSegmentID)
