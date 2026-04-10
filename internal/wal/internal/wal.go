@@ -607,7 +607,7 @@ func (w *wal) DeleteSegmentsBefore(lsn uint64) error {
 		if seg.isActive {
 			continue
 		}
-		if seg.endLSN < lsn {
+		if seg.endLSN <= lsn {
 			if err := os.Remove(seg.path); err != nil {
 				errs = append(errs, err)
 			}

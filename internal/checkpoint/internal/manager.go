@@ -31,6 +31,7 @@ type CheckpointManager struct {
 
 	// Phase 2 state
 	phase2InProgress atomic.Bool
+	phase2Wg         sync.WaitGroup // Tracks Phase 2 completion for Close coordination
 }
 
 // New creates a new CheckpointManager.
@@ -64,6 +65,9 @@ func (cm *CheckpointManager) RegisterModule(name string, module checkpointapi.Ch
 
 // DoCheckpoint executes the two-phase checkpoint.
 func (cm *CheckpointManager) DoCheckpoint() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
 	// Phase 1: Milliseconds, holds lock
 	metadata, err := cm.doCheckpointPhase1()
 	if err != nil {
@@ -71,16 +75,18 @@ func (cm *CheckpointManager) DoCheckpoint() error {
 	}
 
 	// Phase 2: Background, no lock held
-	go cm.doCheckpointPhase2(metadata)
+	cm.phase2Wg.Add(1)
+	go func() {
+		defer cm.phase2Wg.Done()
+		cm.doCheckpointPhase2(metadata)
+	}()
 
 	return nil
 }
 
 // doCheckpointPhase1 performs the fast phase of checkpoint.
+// Caller must hold cm.mu.
 func (cm *CheckpointManager) doCheckpointPhase1() (*checkpointapi.Metadata, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	if cm.closed {
 		return nil, fmt.Errorf("checkpoint: manager closed")
 	}
@@ -152,7 +158,9 @@ func (cm *CheckpointManager) GetMetadata() *checkpointapi.Metadata {
 // Close closes the checkpoint manager.
 func (cm *CheckpointManager) Close() error {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	cm.closed = true
+	cm.mu.Unlock()
+	// Wait for any in-flight Phase 2 to complete before returning
+	cm.phase2Wg.Wait()
 	return nil
 }
