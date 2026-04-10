@@ -100,8 +100,15 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 	checksum := crc32c(record[:blobHeaderSize+len(data)])
 	binary.BigEndian.PutUint32(record[blobHeaderSize+len(data):], checksum)
 
-	// Append to segment
+	// Append to segment. If the active segment is full, rotate and retry once.
 	vaddr, err := bs.segMgr.Append(record)
+	if err == segmentapi.ErrSegmentFull {
+		if rotErr := bs.segMgr.Rotate(); rotErr != nil {
+			bs.nextBlobID--
+			return 0, blobstoreapi.WALEntry{}, fmt.Errorf("blobstore: rotate on full: %w", rotErr)
+		}
+		vaddr, err = bs.segMgr.Append(record)
+	}
 	if err != nil {
 		// Roll back the BlobID allocation
 		bs.nextBlobID--

@@ -108,6 +108,7 @@ type store struct {
 		totalKeys atomic.Int64 // approximate live entry count
 	}
 	vacuumWg sync.WaitGroup // tracks in-flight vacuum goroutines for Close()
+	closing  atomic.Bool   // set early in Close() to signal vacuum goroutines to exit
 
 	// Read snapshots: maps readTxnID → Snapshot for MVCC visibility.
 	// Get/Scan register a snapshot before reading, unregister after.
@@ -449,6 +450,12 @@ func (s *store) Close() error {
 		return kvstoreapi.ErrClosed
 	}
 
+	// Signal vacuum goroutines to exit early. This is an atomic.Bool
+	// checked by vacuum goroutines WITHOUT holding s.mu, avoiding the
+	// deadlock where Close holds s.mu.Lock and vacuumWg.Wait blocks
+	// while the vacuum goroutine tries s.mu.RLock.
+	s.closing.Store(true)
+
 	// Wait for any in-flight auto-vacuum goroutine to finish.
 	// This ensures vacuum isn't holding page locks when we close
 	// the tree and page store below.
@@ -574,6 +581,15 @@ func (s *store) checkAutoVacuum() {
 			}
 			s.vacuumTrigger.mu.Unlock()
 		}()
+
+		// Guard against TOCTOU race: Close() may have run between the
+		// threshold check and this goroutine starting. Check s.closing
+		// (atomic.Bool set early in Close) to avoid running vacuum on a
+		// closing store. We do NOT use s.mu.RLock here because Close()
+		// holds s.mu.Lock and waits on vacuumWg — using RLock would deadlock.
+		if s.closing.Load() {
+			return
+		}
 
 		// Run vacuum (thread-safe via per-page locks).
 		stats, err := s.vacuum.Run()

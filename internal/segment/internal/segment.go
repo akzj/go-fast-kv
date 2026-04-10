@@ -52,6 +52,9 @@ func New(cfg segmentapi.Config) (segmentapi.SegmentManager, error) {
 	if maxSize <= 0 {
 		maxSize = segmentapi.MaxSegmentSize
 	}
+	if maxSize > (1 << 32) {
+		return nil, segmentapi.ErrMaxSizeOverflow
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("segment: mkdir %s: %w", dir, err)

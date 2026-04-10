@@ -91,8 +91,14 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 	checksum := crc32.ChecksumIEEE(record[:8+pagestoreapi.PageSize])
 	binary.BigEndian.PutUint32(record[8+pagestoreapi.PageSize:], checksum)
 
-	// Append to segment
+	// Append to segment. If the active segment is full, rotate and retry once.
 	vaddr, err := ps.segMgr.Append(record)
+	if err == segmentapi.ErrSegmentFull {
+		if rotErr := ps.segMgr.Rotate(); rotErr != nil {
+			return pagestoreapi.WALEntry{}, fmt.Errorf("pagestore: rotate on full: %w", rotErr)
+		}
+		vaddr, err = ps.segMgr.Append(record)
+	}
 	if err != nil {
 		return pagestoreapi.WALEntry{}, err
 	}

@@ -624,3 +624,11 @@ func TestMmapCloseCleansUp(t *testing.T) {
 
 // suppress unused import warning
 var _ = os.Remove
+
+func TestMaxSizeOverflow(t *testing.T) {
+	dir := t.TempDir()
+	_, err := New(segmentapi.Config{Dir: dir, MaxSize: 1 << 33}) // 8GB > 4GB
+	if err != segmentapi.ErrMaxSizeOverflow {
+		t.Fatalf("expected ErrMaxSizeOverflow, got: %v", err)
+	}
+}

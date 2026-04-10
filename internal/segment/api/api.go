@@ -28,7 +28,8 @@ var (
 	ErrSegmentSealed = errors.New("segment: segment is sealed")
 
 	// ErrClosed is returned when operating on a closed SegmentManager.
-	ErrClosed = errors.New("segment: manager is closed")
+	ErrClosed            = errors.New("segment: manager is closed")
+	ErrMaxSizeOverflow   = errors.New("segment: MaxSize exceeds uint32 limit (4GB per segment)")
 )
 
 // ─── Types ──────────────────────────────────────────────────────────
