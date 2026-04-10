@@ -118,10 +118,20 @@ func (s *store) checkpointLocked() error {
 		return err
 	}
 
-	// Write checkpoint file (atomic: write temp → rename)
+	// Write checkpoint file (atomic: write temp → fsync → rename → dir fsync)
 	cpPath := filepath.Join(s.dir, "checkpoint")
 	if err := writeCheckpoint(cpPath, data); err != nil {
 		return err
+	}
+
+	// Truncate WAL entries at or before the checkpoint LSN. The checkpoint
+	// file is now durable (data fsync'd + rename + dir fsync'd), so all WAL
+	// entries up to data.LSN are recoverable from the checkpoint and no longer
+	// needed in the WAL. Without this, the WAL file grows without bound.
+	if data.LSN > 0 {
+		if err := s.wal.Truncate(data.LSN); err != nil {
+			return err
+		}
 	}
 
 	// Truncate CLOG to reclaim memory. The checkpoint file now contains
@@ -174,6 +184,22 @@ func writeCheckpoint(path string, data *checkpointData) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("checkpoint: rename: %w", err)
 	}
+
+	// Fsync the parent directory to ensure the rename (directory entry update)
+	// is durable. Without this, a power loss after rename could lose the new
+	// checkpoint file from the directory — the data is on disk but the
+	// directory metadata pointing to it is not.
+	dir := filepath.Dir(path)
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("checkpoint: open dir for sync: %w", err)
+	}
+	if err := dirFile.Sync(); err != nil {
+		dirFile.Close()
+		return fmt.Errorf("checkpoint: sync dir: %w", err)
+	}
+	dirFile.Close()
+
 	return nil
 }
 
