@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/akzj/go-fast-kv/internal/blobstore"
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
@@ -95,6 +96,19 @@ type store struct {
 	// Vacuum — MVCC old version cleanup
 	vacuum vacuumapi.Vacuum
 
+	// Vacuum trigger — lazy async goroutine model.
+	// No persistent background goroutine. A goroutine spawns on-demand
+	// when threshold is crossed, cleans up, and exits. Self-triggers
+	// if more garbage accumulated during the pass.
+	vacuumTrigger struct {
+		mu        sync.Mutex   // protects 'running' flag
+		running   bool         // a vacuum goroutine is currently cleaning
+		dirty     atomic.Bool  // opsCount was incremented while running
+		opsCount  atomic.Int64 // total Put+Delete ops since last vacuum
+		totalKeys atomic.Int64 // approximate live entry count
+	}
+	vacuumWg sync.WaitGroup // tracks in-flight vacuum goroutines for Close()
+
 	// Read snapshots: maps readTxnID → Snapshot for MVCC visibility.
 	// Get/Scan register a snapshot before reading, unregister after.
 	readSnaps sync.Map // map[uint64]*txnapi.Snapshot
@@ -112,6 +126,12 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	}
 	if cfg.InlineThreshold <= 0 {
 		cfg.InlineThreshold = defaultInlineThreshold
+	}
+	if cfg.AutoVacuumThreshold <= 0 {
+		cfg.AutoVacuumThreshold = 1000
+	}
+	if cfg.AutoVacuumRatio <= 0 {
+		cfg.AutoVacuumRatio = 0.1
 	}
 
 	// Create subdirectories
@@ -289,6 +309,12 @@ func (s *store) Put(key, value []byte) error {
 
 	// WAL succeeded — now make the entry visible by committing in CLOG.
 	s.txnMgr.Commit(xid)
+
+	// Trigger auto-vacuum check (lazy async goroutine).
+	s.vacuumTrigger.opsCount.Add(1)
+	s.vacuumTrigger.dirty.Store(true)
+	s.checkAutoVacuum()
+
 	return nil
 }
 
@@ -364,8 +390,14 @@ func (s *store) Delete(key []byte) error {
 		return err
 	}
 
-	// WAL succeeded — now make the deletion visible by committing in CLOG.
+	// WAL succeeded — now make the deletion mark visible.
 	s.txnMgr.Commit(xid)
+
+	// Trigger auto-vacuum check (lazy async goroutine).
+	s.vacuumTrigger.opsCount.Add(1)
+	s.vacuumTrigger.dirty.Store(true)
+	s.checkAutoVacuum()
+
 	return nil
 }
 
@@ -408,6 +440,11 @@ func (s *store) Close() error {
 		return kvstoreapi.ErrClosed
 	}
 
+	// Wait for any in-flight auto-vacuum goroutine to finish.
+	// This ensures vacuum isn't holding page locks when we close
+	// the tree and page store below.
+	s.vacuumWg.Wait()
+
 	// Checkpoint before closing to persist all in-memory state.
 	// This ensures the next Open can recover quickly from the checkpoint
 	// rather than replaying the entire WAL. Even if Checkpoint fails,
@@ -415,6 +452,11 @@ func (s *store) Close() error {
 	_ = s.checkpointLocked()
 
 	s.closed = true
+
+	// Wait for any in-flight vacuum goroutines to finish.
+	// This prevents vacuum from running against a closed store.
+	s.vacuumWg.Wait()
+
 	return s.closeAll()
 }
 
@@ -455,6 +497,95 @@ func (s *store) RunVacuum() (*kvstoreapi.VacuumStats, error) {
 	}
 
 	return s.vacuum.Run()
+}
+
+// setVacuumDirty sets the dirty flag if a vacuum goroutine is currently running.
+// This signals that the goroutine should re-trigger after it finishes.
+func (s *store) setVacuumDirty() {
+	s.vacuumTrigger.mu.Lock()
+	if s.vacuumTrigger.running {
+		s.vacuumTrigger.dirty.Store(true)
+	}
+	s.vacuumTrigger.mu.Unlock()
+}
+
+// ─── Auto-vacuum trigger ───────────────────────────────────────────
+
+const defaultAutoVacuumThreshold = 1000
+const defaultAutoVacuumRatio = 0.1
+
+// checkAutoVacuum decides whether to spawn a lazy vacuum goroutine.
+// Called after every Put/Delete. Returns immediately — vacuum runs async.
+//
+// Thread safety: a mutex ensures only one vacuum goroutine runs at a time.
+// If garbage accumulates while vacuum is running, the 'dirty' flag causes
+// a self-trigger after completion.
+func (s *store) checkAutoVacuum() {
+	if s.vacuum == nil {
+		return
+	}
+
+	threshold := int64(s.cfg.AutoVacuumThreshold)
+	if s.cfg.AutoVacuumRatio > 0 {
+		total := s.vacuumTrigger.totalKeys.Load()
+		if adaptive := int64(float64(total) * s.cfg.AutoVacuumRatio); adaptive > threshold {
+			threshold = adaptive
+		}
+	}
+
+	if s.vacuumTrigger.opsCount.Load() < threshold {
+		return
+	}
+
+	// Try to claim the vacuum slot.
+	s.vacuumTrigger.mu.Lock()
+	if s.vacuumTrigger.running {
+		s.vacuumTrigger.mu.Unlock()
+		return
+	}
+	// Double-check threshold under lock (another goroutine may have vacuumed).
+	if s.vacuumTrigger.opsCount.Load() < threshold {
+		s.vacuumTrigger.mu.Unlock()
+		return
+	}
+	s.vacuumTrigger.running = true
+	s.vacuumTrigger.mu.Unlock()
+
+	s.vacuumWg.Add(1)
+	go func() {
+		defer s.vacuumWg.Done()
+		defer func() {
+			s.vacuumTrigger.mu.Lock()
+			s.vacuumTrigger.running = false
+			if s.vacuumTrigger.dirty.Swap(false) {
+				// More garbage accumulated while we ran — self-trigger.
+				s.vacuumTrigger.mu.Unlock()
+				s.checkAutoVacuum()
+				return
+			}
+			s.vacuumTrigger.mu.Unlock()
+		}()
+
+		// Run vacuum (thread-safe via per-page locks).
+		stats, err := s.vacuum.Run()
+		if err != nil || stats == nil {
+			return
+		}
+		// Decrement opsCount by the number of removes we actually performed.
+		// This keeps opsCount proportional to garbage accumulated, not total ops.
+		removed := int64(stats.EntriesRemoved)
+		for {
+			current := s.vacuumTrigger.opsCount.Load()
+			// Cap subtraction: don't go negative.
+			newVal := current - removed
+			if newVal < 0 {
+				newVal = 0
+			}
+			if s.vacuumTrigger.opsCount.CompareAndSwap(current, newVal) {
+				break
+			}
+		}
+	}()
 }
 
 // ─── assembleBatchFromCollectors ────────────────────────────────────
@@ -690,6 +821,14 @@ func (wb *writeBatch) Commit() error {
 
 	// WAL succeeded — now make all batch entries visible atomically.
 	s.txnMgr.Commit(xid)
+
+	// Trigger auto-vacuum check for each operation in the batch.
+	if len(wb.ops) > 0 {
+		s.vacuumTrigger.opsCount.Add(int64(len(wb.ops)))
+		s.vacuumTrigger.dirty.Store(true)
+		s.checkAutoVacuum()
+	}
+
 	return nil
 }
 

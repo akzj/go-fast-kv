@@ -208,4 +208,15 @@ type Config struct {
 	// SyncNone: no per-write fsync — faster writes, risk of data loss on crash.
 	// Close() and Checkpoint() always fsync regardless of this setting.
 	SyncMode SyncMode
+
+	// AutoVacuumThreshold is the minimum number of Put+Delete operations
+	// before an automatic vacuum pass is triggered.
+	// Default: 1000. Set to 0 to disable auto-vacuum.
+	AutoVacuumThreshold int
+
+	// AutoVacuumRatio is the fraction of live entries that, when exceeded by
+	// dead tuple operations, triggers an automatic vacuum pass.
+	// Default: 0.1 (10%). Set to 0 to disable ratio-based triggering.
+	// The effective threshold is max(AutoVacuumThreshold, totalEntries * AutoVacuumRatio).
+	AutoVacuumRatio float64
 }

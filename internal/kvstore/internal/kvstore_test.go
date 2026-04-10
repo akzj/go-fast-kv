@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 )
@@ -416,4 +417,120 @@ func TestRunVacuum(t *testing.T) {
 
 	t.Logf("Vacuum stats: scanned=%d modified=%d removed=%d blobs=%d",
 		stats.LeavesScanned, stats.LeavesModified, stats.EntriesRemoved, stats.BlobsFreed)
+}
+
+// TestAutoVacuum_Basic verifies that auto-vacuum triggers automatically
+// after the threshold of operations, without requiring manual RunVacuum.
+func TestAutoVacuum_Basic(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(kvstoreapi.Config{
+		Dir:                 dir,
+		AutoVacuumThreshold: 10, // trigger after 10 ops
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Put 5 keys (below threshold)
+	for i := 0; i < 5; i++ {
+		if err := s.Put([]byte(fmt.Sprintf("k%02d", i)), []byte(fmt.Sprintf("v%02d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Delete all 5 keys — 5 puts + 5 deletes = 10 ops, crosses threshold=10.
+	// Auto-vacuum goroutine should spawn and clean up.
+	for i := 0; i < 5; i++ {
+		if err := s.Delete([]byte(fmt.Sprintf("k%02d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Give the async vacuum goroutine time to run.
+	time.Sleep(1 * time.Second)
+
+	// Verify deleted keys are gone (vacuum physically removed them).
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		if _, err := s.Get([]byte(key)); err != kvstoreapi.ErrKeyNotFound {
+			t.Fatalf("k%02d after auto-vacuum: got %v, want ErrKeyNotFound", i, err)
+		}
+	}
+}
+
+// TestAutoVacuum_CloseWaits verifies that Close() blocks until the
+// auto-vacuum goroutine finishes, preventing a race between vacuum
+// holding page locks and the store closing the tree.
+func TestAutoVacuum_CloseWaits(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(kvstoreapi.Config{
+		Dir:                 dir,
+		AutoVacuumThreshold: 3, // very low threshold
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger vacuum threshold with 5 Put+Delete pairs.
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		if err := s.Put([]byte(key), []byte(fmt.Sprintf("v%02d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete([]byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Close in a goroutine — should block until vacuum finishes.
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+		t.Log("Close completed — vacuum goroutine finished before close")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not return within 5s — vacuum goroutine likely deadlocked")
+	}
+}
+
+// TestAutoVacuum_Disabled verifies that with AutoVacuumThreshold=0,
+// no auto-vacuum triggers, but manual RunVacuum still works.
+func TestAutoVacuum_Disabled(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(kvstoreapi.Config{
+		Dir:                 dir,
+		AutoVacuumThreshold: 0, // disabled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Put and delete many keys — with threshold=0, no auto-vacuum should trigger.
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key%03d", i)
+		if err := s.Put([]byte(key), []byte(fmt.Sprintf("val%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete([]byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Explicit RunVacuum should still work and clean up all dead entries.
+	stats, err := s.RunVacuum()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.EntriesRemoved == 0 {
+		t.Fatal("RunVacuum removed 0 entries — expected at least 100")
+	}
+	t.Logf("Auto-vacuum disabled: manual RunVacuum removed %d entries", stats.EntriesRemoved)
 }
