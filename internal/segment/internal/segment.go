@@ -8,6 +8,7 @@ package internal
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"sync"
 
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
+	"golang.org/x/sys/unix"
 )
 
 // segmentFile represents a single segment file on disk.
@@ -24,6 +26,7 @@ type segmentFile struct {
 	file   *os.File
 	size   int64
 	sealed bool
+	data   []byte // non-nil = mmap'd slice (read-only); nil = fall back to file.ReadAt
 }
 
 // segmentManager implements segmentapi.SegmentManager.
@@ -116,7 +119,10 @@ func (sm *segmentManager) recover() error {
 }
 
 // openSegmentFile opens an existing segment file. If writable is true,
-// it opens in append mode; otherwise read-only.
+// it opens in append mode; otherwise read-only with mmap.
+//
+// When writable=false, the file is memory-mapped (MAP_SHARED, PROT_READ)
+// for fast zero-syscall reads. If mmap fails, falls back to file.ReadAt.
 func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFile, error) {
 	path := sm.segPath(id)
 	var flag int
@@ -137,19 +143,41 @@ func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFil
 		return nil, fmt.Errorf("segment: stat %s: %w", path, err)
 	}
 
+	sf := &segmentFile{
+		id:   id,
+		file: f,
+		size: info.Size(),
+	}
+
+	// Memory-map read-only files for fast zero-syscall reads.
+	// Active (writable) segments keep using file.ReadAt.
+	if !writable && info.Size() > 0 {
+		data, err := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
+		if err != nil {
+			// Fallback: log warning and fall through to ReadAt.
+			log.Printf("segment: mmap seg %d (%d bytes): %v — falling back to ReadAt", id, info.Size(), err)
+			sf.data = nil
+		} else {
+			sf.data = data
+			// Hint sequential access for sealed segments (read-ahead optimization).
+			unix.Madvise(data, unix.MADV_SEQUENTIAL)
+		}
+	}
+
 	// For writable files, seek to end so Write appends correctly.
+	// Mmap'd files don't need this — the file is read-only.
 	if writable {
 		if _, err := f.Seek(0, io.SeekEnd); err != nil {
+			// Munmap if already mmap'd (shouldn't happen for writable).
+			if sf.data != nil {
+				unix.Munmap(sf.data)
+			}
 			f.Close()
 			return nil, fmt.Errorf("segment: seek end %s: %w", path, err)
 		}
 	}
 
-	return &segmentFile{
-		id:   id,
-		file: f,
-		size: info.Size(),
-	}, nil
+	return sf, nil
 }
 
 // createSegment creates a new segment file and sets it as active.
@@ -225,6 +253,14 @@ func (sm *segmentManager) ReadAt(addr segmentapi.VAddr, size uint32) ([]byte, er
 			addr.Offset, size, sf.size, segmentapi.ErrInvalidVAddr)
 	}
 
+	// Fast path: read from mmap'd slice (no syscall).
+	if sf.data != nil {
+		result := make([]byte, size)
+		copy(result, sf.data[int64(addr.Offset):int64(addr.Offset)+int64(size)])
+		return result, nil
+	}
+
+	// Slow path: syscall ReadAt (active segment, or mmap fallback).
 	buf := make([]byte, size)
 	n, err := sf.file.ReadAt(buf, int64(addr.Offset))
 	if err != nil && err != io.EOF {
@@ -287,6 +323,12 @@ func (sm *segmentManager) RemoveSegment(segID uint32) error {
 		return fmt.Errorf("segment %d not found: %w", segID, segmentapi.ErrInvalidVAddr)
 	}
 
+	// Munmap before closing the file.
+	if sf.data != nil {
+		unix.Munmap(sf.data)
+		sf.data = nil
+	}
+
 	// Close file, delete from disk, remove from map.
 	if err := sf.file.Close(); err != nil {
 		return fmt.Errorf("segment: close %d: %w", segID, err)
@@ -344,28 +386,34 @@ func (sm *segmentManager) Close() error {
 	}
 	sm.closed = true
 
-	// Sync and close active.
+	// Munmap and close all sealed segments.
 	var firstErr error
-	if sm.active != nil {
-		if err := sm.active.file.Sync(); err != nil && firstErr == nil {
-			firstErr = err
+	for _, sf := range sm.sealed {
+		if sf.data != nil {
+			if err := unix.Munmap(sf.data); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("segment: munmap %d: %w", sf.id, err)
+			}
+			sf.data = nil
 		}
-		if err := sm.active.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if err := sf.file.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("segment: close %d: %w", sf.id, err)
 		}
 	}
 
-	// Close all sealed segments.
-	for _, sf := range sm.sealed {
-		if err := sf.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	// Sync and close active.
+	if sm.active != nil {
+		if err := sm.active.file.Sync(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("segment: sync %d: %w", sm.active.id, err)
+		}
+		if err := sm.active.file.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("segment: close %d: %w", sm.active.id, err)
 		}
 	}
 
 	return firstErr
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────
 
 // findSegment returns the segmentFile for the given ID, or nil if not found.
 func (sm *segmentManager) findSegment(id uint32) *segmentFile {

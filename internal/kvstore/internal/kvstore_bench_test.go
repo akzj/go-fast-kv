@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
+	"github.com/akzj/go-fast-kv/internal/segment"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -152,4 +154,85 @@ func BenchmarkKVStoreMixed(b *testing.B) {
 	}
 
 	wg.Wait()
+}
+
+func BenchmarkSegmentMmapRead(b *testing.B) {
+	dir := b.TempDir()
+	sm, err := segment.New(segmentapi.Config{Dir: dir, MaxSize: 64 * 1024 * 1024})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer sm.Close()
+
+	// Write pages to fill a segment (each page = 4108 bytes record)
+	const pageSize = 4108
+	pageData := make([]byte, pageSize)
+	for i := range pageData {
+		pageData[i] = byte(i & 0xff)
+	}
+
+	// Write enough pages to fill the segment (64MB / 4108 ≈ 15728 pages)
+	var addrs []segmentapi.VAddr
+	for i := 0; i < 10000; i++ {
+		addr, err := sm.Append(pageData)
+		if err != nil {
+			b.Fatalf("Append: %v", err)
+		}
+		addrs = append(addrs, addr)
+	}
+
+	// Seal the segment — now reads use mmap path.
+	if err := sm.Rotate(); err != nil {
+		b.Fatalf("Rotate: %v", err)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(int64(len(pageData)))
+	for i := 0; i < b.N; i++ {
+		addr := addrs[i%len(addrs)]
+		_, err := sm.ReadAt(addr, pageSize)
+		if err != nil {
+			b.Fatalf("ReadAt: %v", err)
+		}
+	}
+}
+
+// ─── BenchmarkSegmentReadAt — measures ReadAt (active/unsealed segment) ──
+// Same as BenchmarkSegmentMmapRead but reads from the ACTIVE (writable)
+// segment, which uses file.ReadAt syscalls instead of mmap.
+// This is the comparison baseline.
+
+func BenchmarkSegmentReadAt(b *testing.B) {
+	dir := b.TempDir()
+	sm, err := segment.New(segmentapi.Config{Dir: dir, MaxSize: 64 * 1024 * 1024})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer sm.Close()
+
+	const pageSize = 4108
+	pageData := make([]byte, pageSize)
+	for i := range pageData {
+		pageData[i] = byte(i & 0xff)
+	}
+
+	// Write pages — STAYS in active segment (no Rotate).
+	var addrs []segmentapi.VAddr
+	for i := 0; i < 10000; i++ {
+		addr, err := sm.Append(pageData)
+		if err != nil {
+			b.Fatalf("Append: %v", err)
+		}
+		addrs = append(addrs, addr)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(int64(len(pageData)))
+	for i := 0; i < b.N; i++ {
+		addr := addrs[i%len(addrs)]
+		_, err := sm.ReadAt(addr, pageSize)
+		if err != nil {
+			b.Fatalf("ReadAt: %v", err)
+		}
+	}
 }

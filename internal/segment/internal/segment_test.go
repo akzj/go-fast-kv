@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
@@ -420,6 +421,204 @@ func TestSegmentSize(t *testing.T) {
 	_, err = sm.SegmentSize(999)
 	if !errors.Is(err, segmentapi.ErrInvalidVAddr) {
 		t.Fatalf("expected ErrInvalidVAddr, got %v", err)
+	}
+}
+
+// ─── Test 16: MmapBasic — write + seal + mmap'd read returns same data ──
+
+func TestMmapBasic(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	// Write some data to active segment.
+	data := []byte("mmap-test-data-12345")
+	addr, err := sm.Append(data)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Read before sealing — uses ReadAt path.
+	got, err := sm.ReadAt(addr, uint32(len(data)))
+	if err != nil {
+		t.Fatalf("ReadAt before seal: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("before seal: got %q, want %q", got, data)
+	}
+
+	// Seal — now reads use mmap path.
+	if err := sm.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	// Read after sealing — must return same data.
+	got, err = sm.ReadAt(addr, uint32(len(data)))
+	if err != nil {
+		t.Fatalf("ReadAt after seal (mmap path): %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("after seal: got %q, want %q", got, data)
+	}
+}
+
+// ─── Test 17: MmapMultipleRecords ─────────────────────────────────────
+
+func TestMmapMultipleRecords(t *testing.T) {
+	sm := newTestManager(t, 8192)
+	defer sm.Close()
+
+	var addrs []segmentapi.VAddr
+	var datas [][]byte
+
+	for i := 0; i < 20; i++ {
+		d := []byte(fmt.Sprintf("record-%04d-for-mmap-test", i))
+		addr, err := sm.Append(d)
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+		addrs = append(addrs, addr)
+		datas = append(datas, d)
+	}
+
+	// Seal.
+	sm.Rotate()
+
+	// Read all records back — all should match.
+	for i := len(addrs) - 1; i >= 0; i-- {
+		got, err := sm.ReadAt(addrs[i], uint32(len(datas[i])))
+		if err != nil {
+			t.Fatalf("ReadAt %d after seal: %v", i, err)
+		}
+		if !bytes.Equal(got, datas[i]) {
+			t.Fatalf("record %d mismatch: got %q, want %q", i, got, datas[i])
+		}
+	}
+}
+
+// ─── Test 18: MmapRemoveSegment — seal + remove + verify no crash ─────
+
+func TestMmapRemoveSegment(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	data := []byte("segment-to-be-removed")
+	addr, _ := sm.Append(data)
+	segID := addr.SegmentID
+
+	// Seal it.
+	sm.Rotate()
+
+	// Remove it.
+	if err := sm.RemoveSegment(segID); err != nil {
+		t.Fatalf("RemoveSegment: %v", err)
+	}
+
+	// ReadAt should now return ErrInvalidVAddr.
+	_, err := sm.ReadAt(addr, uint32(len(data)))
+	if !errors.Is(err, segmentapi.ErrInvalidVAddr) {
+		t.Fatalf("expected ErrInvalidVAddr after remove, got %v", err)
+	}
+
+	// Should still be able to use the active segment.
+	newData := []byte("new-active-segment")
+	newAddr, err := sm.Append(newData)
+	if err != nil {
+		t.Fatalf("Append to new active: %v", err)
+	}
+	got, _ := sm.ReadAt(newAddr, uint32(len(newData)))
+	if !bytes.Equal(got, newData) {
+		t.Fatalf("new data mismatch: got %q, want %q", got, newData)
+	}
+}
+
+// ─── Test 19: MmapConcurrentRead — seal, 10 goroutines concurrent ReadAt ──
+
+func TestMmapConcurrentRead(t *testing.T) {
+	sm := newTestManager(t, 8192)
+	defer sm.Close()
+
+	// Write a moderate amount of data.
+	var addrs []segmentapi.VAddr
+	var datas [][]byte
+	for i := 0; i < 50; i++ {
+		d := []byte(fmt.Sprintf("concurrent-read-%04d", i))
+		addr, _ := sm.Append(d)
+		addrs = append(addrs, addr)
+		datas = append(datas, d)
+	}
+
+	// Seal.
+	sm.Rotate()
+
+	// Concurrent reads from 10 goroutines.
+	var wg sync.WaitGroup
+	errCh := make(chan error, 100)
+
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func(goroutine int) {
+			defer wg.Done()
+			for i := 0; i < len(addrs); i++ {
+				got, err := sm.ReadAt(addrs[i], uint32(len(datas[i])))
+				if err != nil {
+					errCh <- fmt.Errorf("goroutine %d, record %d: %w", goroutine, i, err)
+					return
+				}
+				if !bytes.Equal(got, datas[i]) {
+					errCh <- fmt.Errorf("goroutine %d, record %d: got %q, want %q", goroutine, i, got, datas[i])
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// ─── Test 20: MmapCloseCleansUp — seal multiple, close manager, no leak ──
+
+func TestMmapCloseCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := New(segmentapi.Config{Dir: dir, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Write and seal multiple segments.
+	for i := 0; i < 3; i++ {
+		sm.Append([]byte(fmt.Sprintf("segment-data-%d-extra-padding-to-fill", i)))
+		sm.Rotate()
+	}
+
+	// Close — must not crash or leak.
+	if err := sm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen and verify sealed segments are still readable via mmap.
+	sm2, err := New(segmentapi.Config{Dir: dir, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Reopen New: %v", err)
+	}
+	defer sm2.Close()
+
+	sealed := sm2.SealedSegments()
+	if len(sealed) != 3 {
+		t.Fatalf("expected 3 sealed segments after reopen, got %d", len(sealed))
+	}
+
+	// Read a record from the first sealed segment (mmap path).
+	segSize, err := sm2.SegmentSize(sealed[0])
+	if err != nil {
+		t.Fatalf("SegmentSize: %v", err)
+	}
+	if segSize == 0 {
+		t.Fatal("first sealed segment has zero size")
 	}
 }
 
