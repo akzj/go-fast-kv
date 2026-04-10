@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 	"sync/atomic"
 
 	"github.com/akzj/go-fast-kv/internal/blobstore"
@@ -476,6 +477,51 @@ func (s *store) Delete(key []byte) error {
 	return nil
 }
 
+
+// DeleteRange removes all keys in [start, end).
+// Uses WriteBatch internally for efficiency.
+// Returns the number of keys deleted.
+func (s *store) DeleteRange(start, end []byte) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return 0, kvstoreapi.ErrClosed
+	}
+
+	// Use WriteBatch for atomicity and efficiency
+	batch := s.NewWriteBatch()
+	count := 0
+
+	// Scan the range and delete each key
+	iter := s.Scan(start, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		key := iter.Key()
+		if err := batch.Delete(key); err != nil {
+			batch.Discard()
+			return count, err
+		}
+		count++
+	}
+
+	if err := iter.Err(); err != nil {
+		batch.Discard()
+		return count, err
+	}
+
+	if count == 0 {
+		return 0, nil
+	}
+
+	if err := batch.Commit(); err != nil {
+		return count, err
+	}
+
+	return count, nil
+}
+
 // ─── Scan ───────────────────────────────────────────────────────────
 
 func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
@@ -506,6 +552,18 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 	}
 }
 
+
+// SetTTL sets a key with expiration time.
+// Currently a stub - TTL is stored in value metadata.
+func (s *store) SetTTL(key []byte, ttl time.Duration) error {
+	return kvstoreapi.ErrNotImplemented
+}
+
+// TTL returns the remaining time for a key.
+// Currently a stub.
+func (s *store) TTL(key []byte) (time.Duration, error) {
+	return 0, kvstoreapi.ErrNotImplemented
+}
 // ─── Close ──────────────────────────────────────────────────────────
 
 func (s *store) Close() error {

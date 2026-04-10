@@ -8,6 +8,7 @@ package kvstoreapi
 
 import (
 	"errors"
+	"time"
 
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 )
@@ -25,6 +26,9 @@ var (
 	ErrClosed = errors.New("kvstore: closed")
 
 	// ErrBatchCommitted is returned when operating on a committed or discarded batch.
+
+	// ErrNotImplemented is returned for features not yet implemented.
+	ErrNotImplemented = errors.New("kvstore: not implemented")
 	ErrBatchCommitted = errors.New("kvstore: batch already committed or discarded")
 )
 
@@ -157,9 +161,23 @@ type Store interface {
 	// block the entire store.
 	RunVacuum() (*VacuumStats, error)
 
+	// DeleteRange removes all keys in [start, end).
+	// Uses WriteBatch internally for efficiency.
+	// Returns the number of keys deleted.
+	DeleteRange(start, end []byte) (int, error)
+
 	// Close flushes all data and closes the store.
 	// After Close, all operations return ErrClosed.
 	Close() error
+
+	// SetTTL sets a key-value pair with expiration time.
+	// The key will be automatically deleted after duration.
+	// Returns error if key does not exist (for update, use Put with TTL).
+	SetTTL(key []byte, ttl time.Duration) error
+
+	// TTL returns the remaining time until key expires.
+	// Returns 0 if key has no expiration, negative if expired.
+	TTL(key []byte) (time.Duration, error)
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────
