@@ -6,6 +6,11 @@
 // a single fsync. The fsync latency is the natural batching window —
 // no artificial sleep is needed.
 //
+// Shutdown safety: Close() never closes reqCh (sending on a closed channel
+// panics). Instead, Close() closes a separate stopCh. The consumer detects
+// stopCh, drains any remaining requests from reqCh, processes them, and
+// exits. WriteBatch detects shutdown via doneCh (closed when consumer exits).
+//
 // Design reference: docs/DESIGN.md §3.6
 package internal
 
@@ -55,9 +60,10 @@ type wal struct {
 	closed     atomic.Bool
 	syncMode   int // 0=SyncAlways, 1=SyncNone
 
-	// Group commit channel and consumer lifecycle.
+	// Group commit channel and lifecycle channels.
 	reqCh  chan walRequest
-	doneCh chan struct{} // closed when consumer goroutine exits
+	stopCh chan struct{} // closed by Close() to signal consumer to drain and exit
+	doneCh chan struct{} // closed by consumer goroutine when it exits
 }
 
 const reqChBufferSize = 1024
@@ -82,6 +88,7 @@ func New(cfg walapi.Config) (walapi.WAL, error) {
 		file:     f,
 		syncMode: cfg.SyncMode,
 		reqCh:    make(chan walRequest, reqChBufferSize),
+		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
 
@@ -129,6 +136,10 @@ func (w *wal) recover() error {
 // It submits the batch to the consumer goroutine via channel and
 // waits for the result. Multiple concurrent WriteBatch calls share
 // a single fsync (group commit).
+//
+// Shutdown safety: WriteBatch never sends on a closed channel. The reqCh
+// is never closed. Shutdown is detected via doneCh (closed when the
+// consumer goroutine exits after processing all remaining requests).
 func (w *wal) WriteBatch(batch *walapi.Batch) (uint64, error) {
 	if w.closed.Load() {
 		return 0, walapi.ErrClosed
@@ -142,16 +153,23 @@ func (w *wal) WriteBatch(batch *walapi.Batch) (uint64, error) {
 		result: make(chan walResult, 1),
 	}
 
-	// Submit to consumer. If channel is closed (shutdown), recover from panic.
+	// Submit to consumer. doneCh is closed when the consumer exits,
+	// which only happens after Close() signals stopCh and the consumer
+	// drains all remaining requests. This select can never panic because
+	// reqCh is never closed — only stopCh/doneCh are used for shutdown.
 	select {
 	case w.reqCh <- req:
+		// submitted successfully
+	case <-w.doneCh:
+		return 0, walapi.ErrClosed
 	default:
-		// Channel full or closed — check closed flag.
-		if w.closed.Load() {
+		// Channel buffer full — block until consumer drains or shuts down.
+		select {
+		case w.reqCh <- req:
+			// submitted successfully
+		case <-w.doneCh:
 			return 0, walapi.ErrClosed
 		}
-		// Channel full — block.
-		w.reqCh <- req
 	}
 
 	res := <-req.result
@@ -161,11 +179,15 @@ func (w *wal) WriteBatch(batch *walapi.Batch) (uint64, error) {
 // ─── Consumer Loop (Group Commit) ───────────────────────────────────
 
 // consumeLoop is the single consumer goroutine. It:
-// 1. Blocks waiting for the first request
+// 1. Blocks waiting for the first request (or shutdown signal)
 // 2. Drains all pending requests from the channel (non-blocking)
 // 3. Serializes all batches + writes to file + single fsync
 // 4. Notifies all producers
 // 5. Repeats
+//
+// On shutdown (stopCh closed by Close()), the consumer drains any remaining
+// requests from reqCh, processes them, and exits. This ensures all
+// in-flight WriteBatch calls get a response before Close() returns.
 //
 // The fsync latency (~50μs SSD, ~5ms HDD) is the natural batching window.
 // During fsync, new producers fill the channel buffer. When fsync returns,
@@ -174,10 +196,19 @@ func (w *wal) consumeLoop() {
 	defer close(w.doneCh)
 
 	for {
-		// 1. Block wait for the first request.
-		req, ok := <-w.reqCh
-		if !ok {
-			return // channel closed → shutdown
+		// 1. Block wait for the first request or shutdown signal.
+		var req walRequest
+		var ok bool
+		select {
+		case req, ok = <-w.reqCh:
+			if !ok {
+				// reqCh closed unexpectedly (should not happen in normal operation).
+				return
+			}
+		case <-w.stopCh:
+			// Shutdown requested. Drain remaining requests from reqCh.
+			w.drainAndProcess()
+			return
 		}
 
 		// 2. Drain: non-blocking read all pending requests.
@@ -185,21 +216,58 @@ func (w *wal) consumeLoop() {
 	drain:
 		for {
 			select {
-			case r, ok := <-w.reqCh:
-				if !ok {
-					// Channel closed during drain. Process what we have, then exit.
-					w.processBatch(pending)
-					return
-				}
+			case r := <-w.reqCh:
 				pending = append(pending, r)
+			case <-w.stopCh:
+				// Shutdown during drain. Process what we have + drain remaining.
+				w.safeProcessBatch(pending)
+				w.drainAndProcess()
+				return
 			default:
 				break drain // channel empty → stop collecting
 			}
 		}
 
 		// 3. Process the batch: serialize + write + fsync + notify.
-		w.processBatch(pending)
+		w.safeProcessBatch(pending)
 	}
+}
+
+// drainAndProcess drains all remaining requests from reqCh and processes them.
+// Called during shutdown to ensure all in-flight WriteBatch calls get a response.
+func (w *wal) drainAndProcess() {
+	var remaining []walRequest
+	for {
+		select {
+		case req := <-w.reqCh:
+			remaining = append(remaining, req)
+		default:
+			if len(remaining) > 0 {
+				w.safeProcessBatch(remaining)
+			}
+			return
+		}
+	}
+}
+
+// safeProcessBatch wraps processBatch with panic recovery so that a panic
+// (e.g., OOM, nil pointer) doesn't kill the consumer goroutine — which
+// would hang all waiting producers forever.
+func (w *wal) safeProcessBatch(pending []walRequest) {
+	defer func() {
+		if r := recover(); r != nil {
+			// processBatch panicked — unblock all waiting producers
+			// with an error so they don't hang forever.
+			panicErr := fmt.Errorf("wal: consumer panic: %v", r)
+			for _, p := range pending {
+				select {
+				case p.result <- walResult{err: panicErr}:
+				default:
+				}
+			}
+		}
+	}()
+	w.processBatch(pending)
 }
 
 // processBatch serializes all pending batches, writes them to the file,
@@ -533,17 +601,22 @@ func (w *wal) Truncate(upToLSN uint64) error {
 // ─── Close ──────────────────────────────────────────────────────────
 
 // Close shuts down the WAL:
-// 1. Sets closed flag (rejects new WriteBatch calls)
-// 2. Closes the request channel (consumer drains remaining, then exits)
-// 3. Waits for consumer goroutine to finish
+// 1. Sets closed flag (rejects new WriteBatch calls at the fast path)
+// 2. Closes stopCh (signals consumer to drain remaining requests and exit)
+// 3. Waits for consumer goroutine to finish (doneCh)
 // 4. Final fsync + close file
+//
+// Shutdown safety: reqCh is NEVER closed. This eliminates the "send on
+// closed channel" panic that would occur if WriteBatch and Close race.
+// The consumer detects shutdown via stopCh, drains reqCh, and exits.
+// WriteBatch detects shutdown via doneCh (closed after consumer exits).
 func (w *wal) Close() error {
 	if w.closed.Swap(true) {
 		return walapi.ErrClosed // already closed
 	}
 
-	// Close the channel to signal consumer to stop.
-	close(w.reqCh)
+	// Signal consumer to drain remaining requests and exit.
+	close(w.stopCh)
 
 	// Wait for consumer goroutine to finish processing remaining requests.
 	<-w.doneCh
