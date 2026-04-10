@@ -159,10 +159,19 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 }
 
 func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64) {
-	// Mark old visible version
+	// Mark the current visible version as superseded by this transaction.
+	// The page write lock guarantees only one writer modifies the leaf at a time,
+	// so there is at most one entry with TxnMax == TxnMaxInfinity for a given key.
+	//
+	// Note: we do NOT filter by e.TxnMin <= txnID. When concurrent writers race
+	// for the same leaf, a higher-txnID writer may acquire the lock first. If a
+	// lower-txnID writer then acquires the lock, it must still mark the existing
+	// entry as superseded — otherwise both entries retain TxnMax=∞ and vacuum
+	// can never reclaim the "losing" version. The MVCC visibility rules and
+	// abort-restoration in vacuum handle all commit/abort orderings correctly.
 	for i := range leaf.Entries {
 		e := &leaf.Entries[i]
-		if bytes.Equal(e.Key, key) && e.TxnMax == btreeapi.TxnMaxInfinity && e.TxnMin <= txnID {
+		if bytes.Equal(e.Key, key) && e.TxnMax == btreeapi.TxnMaxInfinity {
 			e.TxnMax = txnID
 			break
 		}

@@ -272,6 +272,57 @@ func (v *vacuumer) processLeaf(
 		keep[i] = true
 	}
 
+	// Case 3: Duplicate committed versions — safety net for the concurrent Put
+	// bug (H4) where two writers could both create entries with TxnMax=∞.
+	// For each key with multiple committed TxnMax=∞ entries, keep only the
+	// one with the highest TxnMin (most recent writer). This handles any
+	// pre-existing data created before the btree fix was applied.
+	//
+	// Algorithm: build a map of key → best entry index (highest committed TxnMin
+	// with TxnMax=∞). Then mark all other same-key TxnMax=∞ entries as removed.
+	type bestEntry struct {
+		index  int
+		txnMin uint64
+	}
+	bestMap := make(map[string]bestEntry)
+	for i := range node.Entries {
+		if !keep[i] {
+			continue
+		}
+		e := &node.Entries[i]
+		if e.TxnMax != math.MaxUint64 {
+			continue
+		}
+		// Only consider committed entries for dedup
+		if clog.Get(e.TxnMin) != txnapi.TxnCommitted {
+			continue
+		}
+		keyStr := string(e.Key)
+		if prev, ok := bestMap[keyStr]; ok {
+			// Keep the one with highest TxnMin (most recent committed version)
+			if e.TxnMin > prev.txnMin {
+				// Current entry is newer — remove the previous best
+				keep[prev.index] = false
+				removed++
+				if node.Entries[prev.index].Value.BlobID > 0 {
+					entry := v.blobStore.Delete(node.Entries[prev.index].Value.BlobID)
+					blobEntries = append(blobEntries, entry)
+				}
+				bestMap[keyStr] = bestEntry{index: i, txnMin: e.TxnMin}
+			} else {
+				// Previous best is newer — remove current entry
+				keep[i] = false
+				removed++
+				if e.Value.BlobID > 0 {
+					entry := v.blobStore.Delete(e.Value.BlobID)
+					blobEntries = append(blobEntries, entry)
+				}
+			}
+		} else {
+			bestMap[keyStr] = bestEntry{index: i, txnMin: e.TxnMin}
+		}
+	}
+
 	if removed == 0 {
 		return 0, nil, nil
 	}

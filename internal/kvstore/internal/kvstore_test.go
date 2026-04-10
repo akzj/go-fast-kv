@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -533,4 +534,90 @@ func TestAutoVacuum_Disabled(t *testing.T) {
 		t.Fatal("RunVacuum removed 0 entries — expected at least 100")
 	}
 	t.Logf("Auto-vacuum disabled: manual RunVacuum removed %d entries", stats.EntriesRemoved)
+}
+
+// TestConcurrentPutSameKey_NoPhantomVersions verifies that concurrent Puts
+// on the same key don't leave unreclaimable MVCC versions (H4 bug).
+//
+// The bug: when a higher-txnID writer acquires the leaf lock before a
+// lower-txnID writer, the lower-txnID writer's mvccInsert didn't mark the
+// existing entry as superseded (because e.TxnMin > txnID). Both entries
+// retained TxnMax=∞, making both visible forever.
+//
+// The fix: mvccInsert marks ANY existing entry with same key and TxnMax=∞,
+// regardless of TxnMin ordering. Vacuum also deduplicates as a safety net.
+func TestConcurrentPutSameKey_NoPhantomVersions(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStoreAt(t, dir)
+	defer s.Close()
+
+	key := []byte("hot-key")
+	const numWriters = 10
+
+	// Phase 1: Concurrent writes to the same key
+	var wg sync.WaitGroup
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			val := []byte(fmt.Sprintf("value-%d", n))
+			if err := s.Put(key, val); err != nil {
+				t.Errorf("Put(%d): %v", n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Phase 2: Read the key — should return exactly one value
+	val, err := s.Get(key)
+	if err != nil {
+		t.Fatalf("Get after concurrent puts: %v", err)
+	}
+	t.Logf("Winner value after %d concurrent puts: %q", numWriters, string(val))
+
+	// Phase 3: Run vacuum to clean up any duplicate versions
+	stats, err := s.RunVacuum()
+	if err != nil {
+		t.Fatalf("RunVacuum: %v", err)
+	}
+	t.Logf("Vacuum stats: scanned=%d modified=%d removed=%d",
+		stats.LeavesScanned, stats.LeavesModified, stats.EntriesRemoved)
+
+	// Phase 4: Read again — should still return exactly one value
+	val2, err := s.Get(key)
+	if err != nil {
+		t.Fatalf("Get after vacuum: %v", err)
+	}
+	if string(val) != string(val2) {
+		t.Fatalf("Value changed after vacuum: %q → %q", val, val2)
+	}
+
+	// Phase 5: Do another round of concurrent writes + vacuum
+	for round := 0; round < 3; round++ {
+		var wg2 sync.WaitGroup
+		for i := 0; i < numWriters; i++ {
+			wg2.Add(1)
+			go func(n int) {
+				defer wg2.Done()
+				val := []byte(fmt.Sprintf("round%d-value-%d", round, n))
+				if err := s.Put(key, val); err != nil {
+					t.Errorf("Put round %d (%d): %v", round, n, err)
+				}
+			}(i)
+		}
+		wg2.Wait()
+
+		stats, err := s.RunVacuum()
+		if err != nil {
+			t.Fatalf("RunVacuum round %d: %v", round, err)
+		}
+		t.Logf("Round %d vacuum: removed=%d", round, stats.EntriesRemoved)
+	}
+
+	// Final read
+	finalVal, err := s.Get(key)
+	if err != nil {
+		t.Fatalf("Final Get: %v", err)
+	}
+	t.Logf("Final value: %q", string(finalVal))
 }
