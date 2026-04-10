@@ -34,9 +34,9 @@ func TestWriteBatchAndReplay(t *testing.T) {
 	defer w.Close()
 
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordPageMap, 1, 0x0001_00000010, 0)
-	batch.Add(walapi.RecordBlobMap, 2, 0x0001_00001000, 4096)
-	batch.Add(walapi.RecordSetRoot, 1, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordPageMap, 1, 0x0001_00000010, 0)
+	batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, 2, 0x0001_00001000, 4096)
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, 1, 0, 0)
 
 	lastLSN, err := w.WriteBatch(batch)
 	if err != nil {
@@ -76,8 +76,8 @@ func TestMultipleBatches(t *testing.T) {
 
 	for i := uint64(1); i <= 5; i++ {
 		batch := walapi.NewBatch()
-		batch.Add(walapi.RecordPageMap, i, i*100, 0)
-		batch.Add(walapi.RecordPageMap, i+100, i*200, 0)
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, i, i*100, 0)
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, i+100, i*200, 0)
 		if _, err := w.WriteBatch(batch); err != nil {
 			t.Fatalf("WriteBatch %d: %v", i, err)
 		}
@@ -103,7 +103,7 @@ func TestLSNMonotonic(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		batch := walapi.NewBatch()
-		batch.Add(walapi.RecordPageMap, uint64(i), 0, 0)
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, uint64(i), 0, 0)
 		if _, err := w.WriteBatch(batch); err != nil {
 			t.Fatalf("WriteBatch: %v", err)
 		}
@@ -133,7 +133,7 @@ func TestReplayAfterLSN(t *testing.T) {
 	// Write 3 batches, 1 record each → LSN 1, 2, 3
 	for i := uint64(1); i <= 3; i++ {
 		batch := walapi.NewBatch()
-		batch.Add(walapi.RecordPageMap, i, 0, 0)
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, i, 0, 0)
 		if _, err := w.WriteBatch(batch); err != nil {
 			t.Fatalf("WriteBatch: %v", err)
 		}
@@ -163,20 +163,20 @@ func TestCorruptBatch(t *testing.T) {
 
 	// Write 2 batches.
 	batch1 := walapi.NewBatch()
-	batch1.Add(walapi.RecordPageMap, 1, 100, 0)
+	batch1.Add(walapi.ModuleTree, walapi.RecordPageMap, 1, 100, 0)
 	if _, err := w.WriteBatch(batch1); err != nil {
 		t.Fatalf("WriteBatch 1: %v", err)
 	}
 
 	batch2 := walapi.NewBatch()
-	batch2.Add(walapi.RecordPageMap, 2, 200, 0)
+	batch2.Add(walapi.ModuleTree, walapi.RecordPageMap, 2, 200, 0)
 	if _, err := w.WriteBatch(batch2); err != nil {
 		t.Fatalf("WriteBatch 2: %v", err)
 	}
 	w.Close()
 
 	// Corrupt the last byte of the file.
-	path := filepath.Join(dir, walFileName)
+	path := filepath.Join(dir, "wal.00000000000000000001.active.log")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -206,26 +206,40 @@ func TestCorruptBatch(t *testing.T) {
 	}
 }
 
-// Test 6: Truncate then replay
+// Test 6: DeleteSegmentsBefore with segmented WAL
 func TestTruncate(t *testing.T) {
 	w := newTestWAL(t)
 	defer w.Close()
 
-	// Write 3 batches → LSN 1, 2, 3
+	// Write 3 records → LSN 1, 2, 3
 	for i := uint64(1); i <= 3; i++ {
 		batch := walapi.NewBatch()
-		batch.Add(walapi.RecordPageMap, i, i*100, 0)
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, i, i*100, 0)
 		if _, err := w.WriteBatch(batch); err != nil {
 			t.Fatalf("WriteBatch: %v", err)
 		}
 	}
 
-	// Truncate LSN <= 2
-	if err := w.Truncate(2); err != nil {
-		t.Fatalf("Truncate: %v", err)
+	// Force rotate to seal the current segment
+	if err := w.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
 	}
 
-	// Replay should only return LSN 3
+	// Write more records in new segment → LSN 4, 5
+	for i := uint64(4); i <= 5; i++ {
+		batch := walapi.NewBatch()
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, i, i*100, 0)
+		if _, err := w.WriteBatch(batch); err != nil {
+			t.Fatalf("WriteBatch: %v", err)
+		}
+	}
+
+	// Delete segments with end_lsn < 4 (should delete first segment)
+	if err := w.DeleteSegmentsBefore(4); err != nil {
+		t.Fatalf("DeleteSegmentsBefore: %v", err)
+	}
+
+	// Replay should return LSN 4, 5
 	var records []walapi.Record
 	err := w.Replay(0, func(r walapi.Record) error {
 		records = append(records, r)
@@ -234,21 +248,20 @@ func TestTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if len(records) != 1 {
-		t.Fatalf("expected 1 record after truncate, got %d", len(records))
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records after delete, got %d", len(records))
 	}
-	if records[0].LSN != 3 {
-		t.Errorf("expected LSN=3, got %d", records[0].LSN)
+	if records[0].LSN != 4 || records[1].LSN != 5 {
+		t.Errorf("expected LSN 4,5, got %d,%d", records[0].LSN, records[1].LSN)
 	}
 }
 
-// Test 7: Close then operations return ErrClosed
 func TestCloseReturnsErrClosed(t *testing.T) {
 	w := newTestWAL(t)
 	w.Close()
 
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordPageMap, 1, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordPageMap, 1, 0, 0)
 	_, err := w.WriteBatch(batch)
 	if err != walapi.ErrClosed {
 		t.Errorf("WriteBatch after close: expected ErrClosed, got %v", err)
@@ -276,8 +289,8 @@ func TestRestartRecovery(t *testing.T) {
 	w := newTestWALWithDir(t, dir)
 
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordPageMap, 42, 0x0002_00000100, 0)
-	batch.Add(walapi.RecordTxnCommit, 7, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordPageMap, 42, 0x0002_00000100, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordTxnCommit, 7, 0, 0)
 	if _, err := w.WriteBatch(batch); err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
@@ -296,7 +309,7 @@ func TestRestartRecovery(t *testing.T) {
 
 	// Write another batch — LSN should continue from 3.
 	batch2 := walapi.NewBatch()
-	batch2.Add(walapi.RecordPageFree, 99, 0, 0)
+	batch2.Add(walapi.ModuleTree, walapi.RecordPageFree, 99, 0, 0)
 	lastLSN, err := w2.WriteBatch(batch2)
 	if err != nil {
 		t.Fatalf("WriteBatch after reopen: %v", err)
@@ -330,15 +343,15 @@ func TestCRCCorrectness(t *testing.T) {
 	w := newTestWALWithDir(t, dir)
 
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordPageMap, 1, 100, 0)
-	batch.Add(walapi.RecordBlobMap, 2, 200, 512)
+	batch.Add(walapi.ModuleTree, walapi.RecordPageMap, 1, 100, 0)
+	batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, 2, 200, 512)
 	if _, err := w.WriteBatch(batch); err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
 	w.Close()
 
 	// Read raw file and manually verify CRCs.
-	path := filepath.Join(dir, walFileName)
+	path := filepath.Join(dir, "wal.00000000000000000001.active.log")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -358,8 +371,8 @@ func TestCRCCorrectness(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		off := walapi.BatchHeaderSize + uint32(i)*walapi.RecordSize
 		recBytes := data[off : off+walapi.RecordSize]
-		storedRecCRC := binary.LittleEndian.Uint32(recBytes[29:33])
-		computedRecCRC := crc32c(recBytes[0:29])
+		storedRecCRC := binary.LittleEndian.Uint32(recBytes[30:34])
+		computedRecCRC := crc32c(recBytes[0:30])
 		if storedRecCRC != computedRecCRC {
 			t.Errorf("record[%d] CRC mismatch: stored=%d, computed=%d", i, storedRecCRC, computedRecCRC)
 		}
@@ -388,8 +401,8 @@ func TestWriteAfterTruncate(t *testing.T) {
 
 	// Write batch → LSN 1, 2
 	batch1 := walapi.NewBatch()
-	batch1.Add(walapi.RecordPageMap, 1, 100, 0)
-	batch1.Add(walapi.RecordPageMap, 2, 200, 0)
+	batch1.Add(walapi.ModuleTree, walapi.RecordPageMap, 1, 100, 0)
+	batch1.Add(walapi.ModuleTree, walapi.RecordPageMap, 2, 200, 0)
 	if _, err := w.WriteBatch(batch1); err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
@@ -401,7 +414,7 @@ func TestWriteAfterTruncate(t *testing.T) {
 
 	// Write more — LSN should continue from 3
 	batch2 := walapi.NewBatch()
-	batch2.Add(walapi.RecordPageMap, 3, 300, 0)
+	batch2.Add(walapi.ModuleTree, walapi.RecordPageMap, 3, 300, 0)
 	lastLSN, err := w.WriteBatch(batch2)
 	if err != nil {
 		t.Fatalf("WriteBatch after truncate: %v", err)

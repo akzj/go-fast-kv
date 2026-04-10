@@ -20,8 +20,8 @@ func newBenchWAL(b *testing.B) walapi.WAL {
 
 func makeBatch(id uint64) *walapi.Batch {
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordPageMap, id, 0x0001_00000010, 0)
-	batch.Add(walapi.RecordSetRoot, id, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordPageMap, id, 0x0001_00000010, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, id, 0, 0)
 	return batch
 }
 

@@ -22,6 +22,35 @@ var (
 	ErrClosed = errors.New("wal: closed")
 )
 
+// ─── Module Types ───────────────────────────────────────────────────
+
+// ModuleType identifies which module owns this WAL record.
+// Each module tracks its own checkpoint_lsn independently.
+// WAL deletion uses the minimum checkpoint_lsn across all modules.
+type ModuleType uint8
+
+const (
+	// ModuleTree represents B-link tree page records.
+	ModuleTree ModuleType = 1
+	// ModuleBlob represents BlobStore data records.
+	ModuleBlob ModuleType = 2
+	// ModuleLSM represents LSM Store (mapping) records.
+	ModuleLSM ModuleType = 3
+)
+
+func (m ModuleType) String() string {
+	switch m {
+	case ModuleTree:
+		return "Tree"
+	case ModuleBlob:
+		return "Blob"
+	case ModuleLSM:
+		return "LSM"
+	default:
+		return "Unknown"
+	}
+}
+
 // ─── Record Types ───────────────────────────────────────────────────
 
 // RecordType identifies the kind of WAL record.
@@ -80,25 +109,27 @@ func (t RecordType) String() string {
 // ─── Record ─────────────────────────────────────────────────────────
 
 // RecordSize is the fixed size of a single WAL record in bytes.
-const RecordSize = 33
+const RecordSize = 34
 
-// Record is a single WAL record. All records are fixed-size (33 bytes).
+// Record is a single WAL record. All records are fixed-size (34 bytes).
 //
 // Wire format:
 //
-//	[0:8]   uint64  LSN       — Log Sequence Number (assigned by WAL)
-//	[8]     uint8   Type      — RecordType
-//	[9:17]  uint64  ID        — pageID / blobID / xid / rootPageID (depends on Type)
-//	[17:25] uint64  VAddr     — packed VAddr (segID<<32 | offset), or 0 if unused
-//	[25:29] uint32  Size      — blob size (RecordBlobMap only), 0 otherwise
-//	[29:33] uint32  CRC       — CRC32-C of bytes [0:29]
+//	[0:8]   uint64  LSN         — Log Sequence Number (assigned by WAL)
+//	[8]     uint8   ModuleType   — ModuleType (0=Tree for backward compat)
+//	[9]     uint8   Type        — RecordType
+//	[10:18] uint64  ID          — pageID / blobID / xid / rootPageID (depends on Type)
+//	[18:26] uint64  VAddr       — packed VAddr (segID<<32 | offset), or 0 if unused
+//	[26:30] uint32  Size        — blob size (RecordBlobMap only), 0 otherwise
+//	[30:34] uint32  CRC         — CRC32-C of bytes [0:30]
 type Record struct {
-	LSN   uint64
-	Type  RecordType
-	ID    uint64 // pageID, blobID, xid, or rootPageID depending on Type
-	VAddr uint64 // packed VAddr (segmentID<<32 | offset), 0 if not applicable
-	Size  uint32 // blob data size (RecordBlobMap only)
-	CRC   uint32 // CRC32-C, computed over bytes [0:29] of the serialized record
+	LSN        uint64
+	ModuleType ModuleType // which module owns this record
+	Type       RecordType
+	ID         uint64 // pageID, blobID, xid, or rootPageID depending on Type
+	VAddr      uint64 // packed VAddr (segmentID<<32 | offset), 0 if not applicable
+	Size       uint32 // blob data size (RecordBlobMap only)
+	CRC        uint32 // CRC32-C, computed over bytes [0:30] of the serialized record
 }
 
 // ─── Batch ──────────────────────────────────────────────────────────
@@ -113,7 +144,7 @@ const BatchHeaderSize = 12
 //	[0:4]   uint32  RecordCount
 //	[4:8]   uint32  TotalSize   — BatchHeaderSize + RecordCount * RecordSize
 //	[8:12]  uint32  BatchCRC    — CRC32-C of entire batch (this field zeroed during computation)
-//	[12:..] records             — RecordCount × 33 bytes each
+//	[12:..] records             — RecordCount × 34 bytes each
 //
 // Atomicity guarantee: during recovery, if BatchCRC validation fails,
 // the entire batch (and all subsequent data) is discarded.
@@ -128,13 +159,19 @@ func NewBatch() *Batch {
 
 // Add appends a record to the batch. The LSN and CRC fields are
 // populated by the WAL when the batch is written — callers should
-// only set Type, ID, VAddr, and Size.
-func (b *Batch) Add(typ RecordType, id uint64, vaddr uint64, size uint32) {
+// only set ModuleType, Type, ID, VAddr, and Size.
+//
+// If moduleType is 0, it defaults to ModuleTree (backward compatibility).
+func (b *Batch) Add(moduleType ModuleType, typ RecordType, id uint64, vaddr uint64, size uint32) {
+	if moduleType == 0 {
+		moduleType = ModuleTree // backward compatibility
+	}
 	b.Records = append(b.Records, Record{
-		Type:  typ,
-		ID:    id,
-		VAddr: vaddr,
-		Size:  size,
+		ModuleType: moduleType,
+		Type:      typ,
+		ID:        id,
+		VAddr:     vaddr,
+		Size:      size,
 	})
 }
 
@@ -157,7 +194,7 @@ type WAL interface {
 	//
 	// The WAL assigns monotonically increasing LSNs to each record,
 	// computes per-record CRC and batch CRC, writes the batch to the
-	// WAL file, and calls fsync to ensure durability.
+	// active segment file, and calls fsync to ensure durability.
 	//
 	// After WriteBatch returns successfully, all records are durable.
 	// The caller can then safely update in-memory state.
@@ -165,16 +202,16 @@ type WAL interface {
 	// Returns the LSN of the last record written.
 	WriteBatch(batch *Batch) (lastLSN uint64, err error)
 
-	// Replay reads all valid batches from the WAL file starting after
+	// Replay reads all valid batches from WAL segment files starting after
 	// the given LSN, calling fn for each record in order.
 	//
 	// If a batch fails CRC validation, it and all subsequent data are
-	// discarded (the WAL is truncated to the last valid batch).
+	// discarded (the segment is truncated to the last valid batch).
 	//
 	// afterLSN = 0 means replay from the beginning.
 	//
 	// Used during crash recovery:
-	//   wal.Replay(checkpoint.LSN, func(r Record) error {
+	//   wal.Replay(0, func(r Record) error {
 	//       switch r.Type {
 	//       case RecordPageMap: ...
 	//       case RecordTxnCommit: ...
@@ -188,11 +225,27 @@ type WAL interface {
 
 	// Truncate removes all WAL data at or before the given LSN.
 	//
-	// Called after a successful checkpoint to reclaim WAL space.
-	// Records with LSN <= upToLSN are discarded.
+	// Deprecated: This method now delegates to DeleteSegmentsBefore.
+	// For backward compatibility, it deletes segments where end_lsn < upToLSN.
 	Truncate(upToLSN uint64) error
 
-	// Close flushes and closes the WAL file.
+	// Rotate closes the current active segment and starts a new one.
+	// The old active segment is renamed to include its end LSN.
+	// Call this to force a segment boundary before deleting old WAL data.
+	Rotate() error
+
+	// DeleteSegmentsBefore deletes all WAL segment files where the
+	// end LSN is less than the given threshold.
+	//
+	// The active segment is never deleted.
+	// This is the primary method for reclaiming WAL space after checkpoint.
+	DeleteSegmentsBefore(lsn uint64) error
+
+	// ListSegments returns the names of all WAL segment files in the
+	// directory, sorted by begin LSN.
+	ListSegments() []string
+
+	// Close flushes and closes the WAL.
 	// After Close, all operations return ErrClosed.
 	Close() error
 }
@@ -201,8 +254,8 @@ type WAL interface {
 
 // Config holds configuration for the WAL.
 type Config struct {
-	// Dir is the directory where the WAL file is stored.
-	// The WAL file is named "wal.log" within this directory.
+	// Dir is the directory where WAL segment files are stored.
+	// Files are named "wal.{begin_lsn}.{end_lsn}.log" or "wal.{begin_lsn}.active.log".
 	// The directory is created if it does not exist.
 	Dir string
 
@@ -211,4 +264,9 @@ type Config struct {
 	// 1 = SyncNone: no per-write fsync (data in OS page cache only).
 	// Close() always fsyncs regardless of this setting.
 	SyncMode int
+
+	// SegmentSize is the maximum size of a WAL segment file in bytes.
+	// When a segment reaches this size, it is rotated (closed and renamed).
+	// Default is 64MB (64 * 1024 * 1024).
+	SegmentSize int64
 }
