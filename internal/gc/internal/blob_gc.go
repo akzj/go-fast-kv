@@ -145,6 +145,14 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 	}
 
 	// 5. Sync, WAL batch, apply updates, remove old segment.
+	// First Sync: flush the old sealed segment being collected.
+	if err := gc.segMgr.Sync(); err != nil {
+		return nil, err
+	}
+	// Second Sync: flush the active segment with newly copied live data
+	// BEFORE writing WAL record that references it. Without this, a crash
+	// after WAL write but before the next segment sync would lose the data
+	// referenced by the WAL record (silent data corruption).
 	if err := gc.segMgr.Sync(); err != nil {
 		return nil, err
 	}
