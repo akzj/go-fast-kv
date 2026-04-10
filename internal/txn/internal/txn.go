@@ -172,6 +172,47 @@ func (tm *txnManager) IsVisible(snap *txnapi.Snapshot, txnMin, txnMax uint64) bo
 	return snap.IsVisible(txnMin, txnMax, tm.clog)
 }
 
+// ReadSnapshot creates a read-only snapshot WITHOUT allocating a XID.
+// Returns a logical readID (equal to nextXID at snapshot time) and a
+// frozen Snapshot. The readID is NOT added to the active set and NO
+// CLOG entry is created. No Abort() call is needed for cleanup.
+//
+// This avoids inflating the CLOG and active set under high read load.
+// The snapshot captures the same consistent view as BeginTxn but without
+// the write-transaction overhead.
+func (tm *txnManager) ReadSnapshot() (uint64, *txnapi.Snapshot) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	// Use nextXID as the logical readID — it's guaranteed to be higher
+	// than any currently allocated XID, so it won't conflict with any
+	// real transaction. We do NOT increment nextXID or add to active set.
+	readID := tm.nextXID
+
+	// Freeze the active set (same as BeginTxn)
+	activeXIDs := make(map[uint64]struct{}, len(tm.active))
+	for id := range tm.active {
+		activeXIDs[id] = struct{}{}
+	}
+
+	// Xmin: smallest active XID
+	xmin := tm.nextXID // default if no active txns
+	for id := range activeXIDs {
+		if id < xmin {
+			xmin = id
+		}
+	}
+
+	snap := &txnapi.Snapshot{
+		XID:        readID,
+		Xmin:       xmin,
+		Xmax:       tm.nextXID,
+		ActiveXIDs: activeXIDs,
+	}
+
+	return readID, snap
+}
+
 // GetMinActive returns the smallest active XID.
 // Returns TxnMaxInfinity if no active transactions.
 func (tm *txnManager) GetMinActive() uint64 {

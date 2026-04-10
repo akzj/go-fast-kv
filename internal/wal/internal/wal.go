@@ -275,6 +275,12 @@ func (w *wal) safeProcessBatch(pending []walRequest) {
 func (w *wal) processBatch(pending []walRequest) {
 	w.mu.Lock()
 
+	// Save currentLSN before serialization. If the write fails, we restore it
+	// so that LSNs are not consumed for data that never reached disk. Without
+	// this, a write failure would create gaps in the LSN sequence, potentially
+	// causing recovery to fail or replay incorrectly.
+	savedLSN := w.currentLSN
+
 	// Serialize all batches and collect results.
 	type batchResult struct {
 		lsn uint64
@@ -300,6 +306,10 @@ func (w *wal) processBatch(pending []walRequest) {
 	if len(combinedBuf) > 0 {
 		if _, writeErr = w.file.Write(combinedBuf); writeErr != nil {
 			writeErr = fmt.Errorf("wal: write: %w", writeErr)
+			// Restore LSN — the data never reached disk, so these LSNs
+			// must not be considered allocated. The next successful write
+			// will reuse them.
+			w.currentLSN = savedLSN
 		} else if w.syncMode == 0 { // SyncAlways
 			if syncErr = w.file.Sync(); syncErr != nil {
 				syncErr = fmt.Errorf("wal: sync: %w", syncErr)

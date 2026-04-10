@@ -252,7 +252,17 @@ func BeginTxn(xidMgr XIDManager) (uint64, *Snapshot) {
 type TxnManager interface {
 	// BeginTxn atomically allocates an XID and creates a snapshot.
 	// Returns the XID and a Snapshot for visibility checks.
+	// Use for write transactions (Put, Delete, WriteBatch).
 	BeginTxn() (uint64, *Snapshot)
+
+	// ReadSnapshot creates a read-only snapshot WITHOUT allocating a XID.
+	// Returns a logical readID (equal to nextXID at snapshot time) and a
+	// frozen Snapshot. The readID is NOT added to the active set and NO
+	// CLOG entry is created. No Abort() call is needed for cleanup.
+	//
+	// Use for read-only operations (Get, Scan) to avoid inflating the
+	// CLOG and active set under high read load.
+	ReadSnapshot() (uint64, *Snapshot)
 
 	// Commit marks a transaction as committed.
 	// Order: WAL.Append(TxnCommit) → clog.Set(Committed) → xidMgr.Remove(xid)

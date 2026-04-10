@@ -335,14 +335,15 @@ func (s *store) Get(key []byte) ([]byte, error) {
 		return nil, kvstoreapi.ErrClosed
 	}
 
-	// Snapshot read: begin a real transaction to get a consistent snapshot.
+	// Snapshot read: create a read-only snapshot WITHOUT allocating a XID.
+	// This avoids inflating the CLOG and active set under high read load.
 	// The snapshot captures ActiveXIDs at this moment, making visibility
 	// immune to concurrent commits (true point-in-time isolation).
-	readXID, snap := s.txnMgr.BeginTxn()
+	readXID, snap := s.txnMgr.ReadSnapshot()
 	s.readSnaps.Store(readXID, snap)
 	defer func() {
 		s.readSnaps.Delete(readXID)
-		s.txnMgr.Abort(readXID) // read-only txn — always abort (no WAL entry needed)
+		// No Abort() needed — ReadSnapshot doesn't allocate a real XID
 	}()
 
 	val, err := s.tree.Get(key, readXID)
@@ -418,10 +419,11 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 		return &errIterator{err: kvstoreapi.ErrClosed}
 	}
 
-	// Snapshot read: begin a real transaction to get a consistent snapshot.
+	// Snapshot read: create a read-only snapshot WITHOUT allocating a XID.
+	// This avoids inflating the CLOG and active set under high read load.
 	// The snapshot captures ActiveXIDs at this moment, providing true
 	// point-in-time isolation for the entire scan (immune to concurrent commits).
-	readXID, snap := s.txnMgr.BeginTxn()
+	readXID, snap := s.txnMgr.ReadSnapshot()
 	s.readSnaps.Store(readXID, snap)
 
 	// B-tree Scan is concurrent-safe (per-page RwLocks).
@@ -702,10 +704,9 @@ func (it *snapshotIterator) Value() []byte { return it.inner.Value() }
 func (it *snapshotIterator) Err() error    { return it.inner.Err() }
 func (it *snapshotIterator) Close() {
 	it.inner.Close()
-	// Clean up the read snapshot so the VisibilityChecker no longer references it,
-	// and abort the read-only transaction to remove it from the active set.
+	// Clean up the read snapshot so the VisibilityChecker no longer references it.
+	// No Abort() needed — ReadSnapshot doesn't allocate a real XID.
 	it.store.readSnaps.Delete(it.readXID)
-	it.store.txnMgr.Abort(it.readXID)
 }
 
 // errIterator is returned when the store is closed.
