@@ -130,7 +130,7 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 			}
 
 			newPacked := newAddr.Pack()
-			batch.Add(walapi.RecordBlobMap, blobID, newPacked, dataSize)
+			batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, blobID, newPacked, dataSize)
 			updates = append(updates, mappingUpdate{blobID: blobID, vaddr: newPacked, size: dataSize})
 
 			liveMap[blobID] = newPacked

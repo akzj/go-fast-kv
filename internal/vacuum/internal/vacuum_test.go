@@ -193,13 +193,13 @@ func (env *testEnv) deleteAndCommit(t *testing.T, key []byte) uint64 {
 func (env *testEnv) assembleBatch(rootPageID uint64, txnEntry txnapi.WALEntry) *walapi.Batch {
 	batch := walapi.NewBatch()
 	for _, e := range env.provider.DrainWALEntries() {
-		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 	for _, e := range env.blobAdapter.drain() {
-		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
-	batch.Add(walapi.RecordSetRoot, rootPageID, 0, 0)
-	batch.Add(walapi.RecordType(txnEntry.Type), txnEntry.ID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordType(txnEntry.Type), txnEntry.ID, 0, 0)
 	return batch
 }
 

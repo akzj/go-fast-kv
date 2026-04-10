@@ -115,7 +115,7 @@ func (s *store) checkpointLocked() error {
 
 	// Write checkpoint record to WAL
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordCheckpoint, data.LSN, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordCheckpoint, data.LSN, 0, 0)
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		return err
 	}

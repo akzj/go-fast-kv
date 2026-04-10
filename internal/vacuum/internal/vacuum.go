@@ -170,12 +170,12 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		// Page WAL entries (collected by our per-goroutine collector
 		// during WritePage calls above — isolated from concurrent ops)
 		for _, e := range *pageEntries {
-			batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+			batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 		}
 
 		// Blob free WAL entries
 		for _, e := range blobWALEntries {
-			batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+			batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 		}
 
 		if batch.Len() > 0 {

@@ -631,19 +631,19 @@ func assembleBatchFromCollectors(
 
 	// Page WAL entries
 	for _, e := range pageCollector.PageEntries {
-		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
 	// Blob WAL entries
 	for _, e := range blobCollector.Entries {
-		batch.Add(walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
 	// Root pointer change
-	batch.Add(walapi.RecordSetRoot, rootPageID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
 
 	// Transaction commit/abort
-	batch.Add(walapi.RecordType(commitEntry.Type), commitEntry.ID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordType(commitEntry.Type), commitEntry.ID, 0, 0)
 
 	return batch
 }

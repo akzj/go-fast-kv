@@ -120,7 +120,7 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 			}
 
 			newPacked := newAddr.Pack()
-			batch.Add(walapi.RecordPageMap, pageID, newPacked, 0)
+			batch.Add(walapi.ModuleTree, walapi.RecordPageMap, pageID, newPacked, 0)
 			updates = append(updates, mappingUpdate{pageID: pageID, vaddr: newPacked})
 
 			// Update liveMap so subsequent records for the same pageID

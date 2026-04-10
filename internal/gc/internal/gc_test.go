@@ -63,7 +63,7 @@ func writePageViaStore(t *testing.T, ps pagestoreapi.PageStore, w walapi.WAL, se
 		t.Fatalf("Sync: %v", err)
 	}
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordType(entry.Type), entry.ID, entry.VAddr, entry.Size)
+	batch.Add(walapi.ModuleTree, walapi.RecordType(entry.Type), entry.ID, entry.VAddr, entry.Size)
 	if _, err := w.WriteBatch(batch); err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
@@ -80,7 +80,7 @@ func writeBlobViaStore(t *testing.T, bs blobstoreapi.BlobStore, w walapi.WAL, se
 		t.Fatalf("Sync: %v", err)
 	}
 	batch := walapi.NewBatch()
-	batch.Add(walapi.RecordType(entry.Type), entry.ID, entry.VAddr, entry.Size)
+	batch.Add(walapi.ModuleTree, walapi.RecordType(entry.Type), entry.ID, entry.VAddr, entry.Size)
 	if _, err := w.WriteBatch(batch); err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
