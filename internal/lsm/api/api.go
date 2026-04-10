@@ -44,6 +44,10 @@ type Config struct {
 	// Default is 64MB.
 	MemtableSize int64
 
+	// CompactInterval is the interval between compaction checks in milliseconds.
+	// Default is 1000ms (1 second).
+	CompactInterval int64
+
 	// SegmentSize is the size threshold for triggering compaction.
 	// Default is 64MB.
 	SegmentSize int64

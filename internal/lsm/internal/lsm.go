@@ -6,13 +6,14 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
 
 // ─── LSM Store ─────────────────────────────────────────────────────
 
-// lsm implements the LSM-based mapping store.
+// lsm implements the LSM-based mapping store with automatic compaction.
 type lsm struct {
 	mu     sync.RWMutex
 	dir    string
@@ -32,9 +33,15 @@ type lsm struct {
 
 	// Checkpoint LSN
 	checkpointLSN uint64
+
+	// Auto-compaction
+	compactInterval time.Duration // interval between compaction checks
+	stopCh          chan struct{}  // stop compaction goroutine
+	stopped         atomic.Bool
 }
 
 const defaultMemtableSize = 64 * 1024 * 1024 // 64MB
+const defaultCompactInterval = 1 * time.Second
 
 // New creates a new LSM store.
 func New(cfg lsmapi.Config) (*lsm, error) {
@@ -47,17 +54,27 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 		memSize = defaultMemtableSize
 	}
 
+	compactInterval := time.Duration(cfg.CompactInterval) * time.Millisecond
+	if compactInterval <= 0 {
+		compactInterval = defaultCompactInterval
+	}
+
 	manifest, err := newManifest(cfg.Dir)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: %w", err)
 	}
 
 	s := &lsm{
-		dir:           cfg.Dir,
-		active:        newMemtable(),
-		manifest:      manifest,
-		memtableSize:  memSize,
+		dir:              cfg.Dir,
+		active:          newMemtable(),
+		manifest:        manifest,
+		memtableSize:    memSize,
+		compactInterval: compactInterval,
+		stopCh:          make(chan struct{}),
 	}
+
+	// Start background compaction goroutine
+	go s.backgroundCompaction()
 
 	return s, nil
 }
@@ -222,6 +239,24 @@ func (s *lsm) MaybeCompact() error {
 	return nil
 }
 
+// backgroundCompaction runs compaction checks in the background.
+func (s *lsm) backgroundCompaction() {
+	ticker := time.NewTicker(s.compactInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if s.closed.Load() {
+				return
+			}
+			s.MaybeCompact()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
 // compact flushes the active memtable to SSTable.
 func (s *lsm) compact() error {
 	s.mu.Lock()
@@ -280,6 +315,9 @@ func (s *lsm) Close() error {
 	if s.closed.Swap(true) {
 		return lsmapi.ErrClosed
 	}
+
+	// Stop background compaction
+	close(s.stopCh)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
