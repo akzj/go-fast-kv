@@ -2,9 +2,12 @@ package internal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -293,6 +296,124 @@ func TestRecoveryAfterCheckpointOnly(t *testing.T) {
 		if !bytes.Equal(val, testValue(i)) {
 			t.Fatalf("Recovery Get(%d): got %q, want %q", i, val, testValue(i))
 		}
+	}
+}
+
+// ─── TestCheckpointFormatVersion ─────────────────────────────────────
+
+func TestCheckpointFormatVersion(t *testing.T) {
+	// Verify that the checkpoint binary format includes a version byte at offset 0
+	// and that deserializeCheckpoint validates it.
+	dir := t.TempDir()
+	s := openTestStoreAt(t, dir)
+
+	// Write some data and checkpoint.
+	for i := 0; i < 5; i++ {
+		if err := s.Put(testKey(i), testValue(i)); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	s.Close()
+
+	// Read raw bytes and verify version byte at offset 0.
+	cpPath := dir + "/checkpoint"
+	raw, err := os.ReadFile(cpPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	// Version byte must be 1.
+	if len(raw) < 1 {
+		t.Fatal("checkpoint file is empty")
+	}
+	if raw[0] != 1 {
+		t.Fatalf("version byte: got %d, want 1", raw[0])
+	}
+
+	// Verify that deserialization reads and validates the version.
+	// (loadCheckpoint wraps deserializeCheckpoint with CRC check first.)
+	data, err := loadCheckpoint(cpPath)
+	if err != nil {
+		t.Fatalf("loadCheckpoint: %v", err)
+	}
+	if data.LSN == 0 {
+		t.Fatal("LSN should be non-zero after checkpoint")
+	}
+}
+
+// ─── TestCheckpointUnknownVersionRejected ────────────────────────────
+
+func TestCheckpointUnknownVersionRejected(t *testing.T) {
+	// Manually construct a v2 checkpoint buffer (version byte = 2)
+	// to simulate a future unsupported format.
+	// Header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
+	//              + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + reserved(4)
+	//              = 57 bytes, then CRC32(4) = 61 bytes total for zero-data checkpoint.
+	buf := make([]byte, 57+4)
+	buf[0] = 2                          // version = 2 (unsupported)
+	binary.LittleEndian.PutUint64(buf[1:], 100)   // LSN
+	binary.LittleEndian.PutUint64(buf[9:], 10)    // NextXID
+	binary.LittleEndian.PutUint64(buf[17:], 1)   // RootPageID
+	binary.LittleEndian.PutUint64(buf[25:], 2)   // NextPageID
+	binary.LittleEndian.PutUint64(buf[33:], 3)   // NextBlobID
+	binary.LittleEndian.PutUint32(buf[41:], 0)    // PageCount = 0
+	binary.LittleEndian.PutUint32(buf[45:], 0)    // BlobCount = 0
+	binary.LittleEndian.PutUint32(buf[49:], 0)    // CLOGCount = 0
+	// reserved = 0 already
+
+	// Compute and write CRC (covers bytes 0-60).
+	crc := crc32.Checksum(buf[:57], crc32.MakeTable(crc32.Castagnoli))
+	binary.LittleEndian.PutUint32(buf[57:], crc)
+
+	// Try to deserialize — should fail with version mismatch.
+	_, err := deserializeCheckpoint(buf)
+	if err == nil {
+		t.Fatal("deserializeCheckpoint: expected error for unknown version, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported version") {
+		t.Fatalf("deserializeCheckpoint: error should mention 'unsupported version', got: %v", err)
+	}
+}
+
+// ─── TestCheckpointCRCIncludesVersion ────────────────────────────────
+
+func TestCheckpointCRCIncludesVersion(t *testing.T) {
+	// Verify that the CRC covers the version byte. Tampering with the
+	// version byte should cause a CRC mismatch detected by loadCheckpoint.
+	dir := t.TempDir()
+	s := openTestStoreAt(t, dir)
+
+	for i := 0; i < 3; i++ {
+		if err := s.Put(testKey(i), testValue(i)); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	s.Close()
+
+	cpPath := dir + "/checkpoint"
+	raw, err := os.ReadFile(cpPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	// Flip a bit in the version byte (offset 0).
+	raw[0] ^= 0xFF
+
+	// Write corrupted file back.
+	if err := os.WriteFile(cpPath, raw, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// loadCheckpoint must detect CRC mismatch.
+	_, err = loadCheckpoint(cpPath)
+	if err == nil {
+		t.Fatal("loadCheckpoint: expected CRC mismatch error, got nil")
 	}
 }
 

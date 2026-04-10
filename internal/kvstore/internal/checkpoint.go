@@ -46,19 +46,21 @@ type clogEntry struct {
 
 // ─── Checkpoint header layout ───────────────────────────────────────
 //
-// [0:8]   uint64  LSN
-// [8:16]  uint64  NextXID
-// [16:24] uint64  RootPageID
-// [24:32] uint64  NextPageID
-// [32:40] uint64  NextBlobID
-// [40:44] uint32  PageCount
-// [44:48] uint32  BlobCount
-// [48:52] uint32  CLOGCount
-// [52:56] uint32  reserved (padding)
+// [0:1]   byte    Version (1 = current)
+// [1:9]   uint64  LSN
+// [9:17]  uint64  NextXID
+// [17:25] uint64  RootPageID
+// [25:33] uint64  NextPageID
+// [33:41] uint64  NextBlobID
+// [41:45] uint32  PageCount
+// [45:49] uint32  BlobCount
+// [49:53] uint32  CLOGCount
+// [53:57] uint32  reserved (padding)
 //
-// Total header: 56 bytes
+// Total header: 57 bytes
 
-const checkpointHeaderSize = 56
+const checkpointHeaderSize = 57
+const checkpointVersion = 1
 
 // ─── Store.Checkpoint ───────────────────────────────────────────────
 
@@ -209,7 +211,7 @@ func serializeCheckpoint(data *checkpointData) []byte {
 	clogCount := uint32(len(data.CLOGEntries))
 
 	// Calculate total size:
-	// header(56) + pages(16 each) + blobs(20 each) + clog(9 each) + crc(4)
+	// header(57) + pages(16 each) + blobs(20 each) + clog(9 each) + crc(4)
 	totalSize := checkpointHeaderSize +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
@@ -219,7 +221,9 @@ func serializeCheckpoint(data *checkpointData) []byte {
 	buf := make([]byte, totalSize)
 	off := 0
 
-	// Header
+	// Header: version byte first, then fields shifted by +1
+	buf[off] = checkpointVersion // Version at offset 0
+	off += 1
 	binary.LittleEndian.PutUint64(buf[off:], data.LSN)
 	off += 8
 	binary.LittleEndian.PutUint64(buf[off:], data.NextXID)
@@ -266,7 +270,7 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off++
 	}
 
-	// CRC32-C over everything before the CRC field
+	// CRC32-C over everything before the CRC field (includes version byte)
 	crc := crc32.Checksum(buf[:off], crc32.MakeTable(crc32.Castagnoli))
 	binary.LittleEndian.PutUint32(buf[off:], crc)
 
@@ -299,6 +303,17 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 	off := 0
 	data := &checkpointData{}
 
+	// Version byte first
+	if len(buf) < 1 {
+		return nil, fmt.Errorf("checkpoint: file too small for version byte")
+	}
+	version := buf[off]
+	off += 1
+	if version != checkpointVersion {
+		return nil, fmt.Errorf("checkpoint: unsupported version %d (expected %d)", version, checkpointVersion)
+	}
+
+	// Fields now start at offset 1 (shifted +1 from v0)
 	data.LSN = binary.LittleEndian.Uint64(buf[off:])
 	off += 8
 	data.NextXID = binary.LittleEndian.Uint64(buf[off:])
