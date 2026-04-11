@@ -173,4 +173,8 @@ type Config struct {
 	// Defaults to 1024 if zero.
 	// Design reference: docs/DESIGN.md §7.6
 	InitialCapacity int
+
+	// PageCacheSize is the number of pages to cache (LRU).
+	// 0 or negative means no cache. Default is 0 (cache disabled).
+	PageCacheSize int
 }

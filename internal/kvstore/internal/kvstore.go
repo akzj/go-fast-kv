@@ -168,7 +168,7 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	}
 
 	// Create PageStore and BlobStore
-	ps := pagestore.New(pagestoreapi.Config{}, pageSegMgr)
+	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize}, pageSegMgr)
 	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
 
 	// Create TxnManager — use SSI mode if configured
