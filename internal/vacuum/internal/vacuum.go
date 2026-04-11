@@ -35,6 +35,10 @@ type vacuumer struct {
 	segSync           func() error
 	registerCollector func() (*[]pagestoreapi.WALEntry, func()) // per-goroutine WAL entry collector
 	pageLocks         vacuumapi.PageLocker                      // page-level locks for concurrent safety
+
+	// Incremental vacuum progress: last processed leaf PID.
+	// 0 = start of a new pass (will find leftmost leaf).
+	lastLeafPID uint64
 }
 
 // New creates a new Vacuum instance.
@@ -174,6 +178,126 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		}
 
 		// Blob free WAL entries
+		for _, e := range blobWALEntries {
+			batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		}
+
+		if batch.Len() > 0 {
+			if _, err := v.wal.WriteBatch(batch); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return stats, nil
+}
+
+// RunIncremental performs an incremental vacuum pass.
+// It processes at most targetPages leaf pages.
+// If lastLeafPID=0 (start of a new pass), it finds the leftmost leaf first.
+// Otherwise it continues from where the last call left off.
+func (v *vacuumer) RunIncremental(targetPages int) (*vacuumapi.VacuumStats, error) {
+	stats := &vacuumapi.VacuumStats{}
+
+	// 1. Determine safe cleanup boundary
+	safeXID := v.txnMgr.GetMinActive()
+	if safeXID == math.MaxUint64 {
+		safeXID = v.txnMgr.NextXID()
+	}
+
+	// 2. Check root
+	rootPID := v.rootPageIDFn()
+	if rootPID == 0 {
+		return nil, vacuumapi.ErrNoLeaves
+	}
+
+	// 3. Find starting leaf
+	// If lastLeafPID=0, start from the leftmost leaf (new pass).
+	// Otherwise, continue from lastLeafPID.
+	if v.lastLeafPID == 0 {
+		leftmost, err := v.findLeftmostLeaf(rootPID)
+		if err != nil {
+			return nil, err
+		}
+		v.lastLeafPID = leftmost
+		if v.lastLeafPID == 0 {
+			// Empty tree
+			return stats, nil
+		}
+	}
+
+	// 4. Register per-goroutine WAL collector
+	pageEntries, unregCollector := v.registerCollector()
+	defer unregCollector()
+
+	// Collect blob WAL entries across processed leaves
+	var blobWALEntries []blobstoreapi.WALEntry
+
+	// 5. Process up to targetPages leaves
+	leafPID := v.lastLeafPID
+	pagesProcessed := 0
+
+	for leafPID != 0 && pagesProcessed < targetPages {
+		v.pageLocks.WLock(leafPID)
+
+		node, err := v.pages.ReadPage(leafPID)
+		if err != nil {
+			v.pageLocks.WUnlock(leafPID)
+			return nil, err
+		}
+		if !node.IsLeaf {
+			v.pageLocks.WUnlock(leafPID)
+			break
+		}
+
+		stats.LeavesScanned++
+
+		// Process this leaf
+		removed, blobEntries, err := v.processLeaf(node, leafPID, safeXID)
+		if err != nil {
+			v.pageLocks.WUnlock(leafPID)
+			return nil, err
+		}
+
+		if removed > 0 {
+			if err := v.pages.WritePage(leafPID, node); err != nil {
+				v.pageLocks.WUnlock(leafPID)
+				return nil, err
+			}
+			stats.LeavesModified++
+			stats.EntriesRemoved += removed
+			stats.BlobsFreed += len(blobEntries)
+			blobWALEntries = append(blobWALEntries, blobEntries...)
+		}
+
+		// Capture next PID under lock, then unlock
+		nextPID := node.Next
+		v.pageLocks.WUnlock(leafPID)
+
+		leafPID = nextPID
+		pagesProcessed++
+
+		// If we reached the end of the tree, reset lastLeafPID for next pass
+		if leafPID == 0 {
+			v.lastLeafPID = 0
+		} else {
+			v.lastLeafPID = leafPID
+		}
+	}
+
+	// 6. If we stopped early (pagesProcessed >= targetPages), save position
+	// lastLeafPID is already set above
+
+	// 7. If any leaves were modified, flush WAL batch
+	if stats.LeavesModified > 0 {
+		if err := v.segSync(); err != nil {
+			return nil, err
+		}
+
+		batch := walapi.NewBatch()
+		for _, e := range *pageEntries {
+			batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		}
 		for _, e := range blobWALEntries {
 			batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 		}

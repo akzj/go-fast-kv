@@ -595,3 +595,109 @@ func BenchmarkBulkLoadUnsorted(b *testing.B) {
 		tree.Close()
 	}
 }
+
+// Debug: test page count
+func TestBulkLoadPageCountDebug(t *testing.T) {
+    mp := NewMemPageProvider()
+    tree := New(btreeapi.Config{}, mp, nil)
+    defer tree.Close()
+    
+    entries := make([]btreeapi.KVPair, 200)
+    for i := 0; i < 200; i++ {
+        entries[i] = btreeapi.KVPair{
+            Key:   []byte(fmt.Sprintf("k%04d", i)),
+            Value: []byte(fmt.Sprintf("v%04d", i)),
+        }
+    }
+    
+    loader := tree.NewBulkLoader(btreeapi.BulkModeFast)
+    loader.AddSorted(entries)
+    rootPID, _ := loader.Build()
+    tree.SetRootPageID(rootPID)
+    
+    t.Logf("Root PID: %d, Total pages allocated: %d", rootPID, mp.PageCount())
+    
+    // Get first and last entries
+    _, err := tree.Get([]byte("k0000"), 0)
+    t.Logf("Get k0000: %v", err)
+    
+    _, err = tree.Get([]byte("k0199"), 0)
+    t.Logf("Get k0199: %v", err)
+    
+    // Find which keys work
+    for i := 0; i < 200; i++ {
+        key := []byte(fmt.Sprintf("k%04d", i))
+        _, err := tree.Get(key, 0)
+        if err != nil {
+            t.Logf("First missing: k%04d", i)
+            break
+        }
+    }
+}
+
+func TestBulkLoadKeyRange(t *testing.T) {
+    mp := NewMemPageProvider()
+    tree := New(btreeapi.Config{}, mp, nil)
+    defer tree.Close()
+    
+    entries := make([]btreeapi.KVPair, 200)
+    for i := 0; i < 200; i++ {
+        entries[i] = btreeapi.KVPair{
+            Key:   []byte(fmt.Sprintf("k%04d", i)),
+            Value: []byte(fmt.Sprintf("v%04d", i)),
+        }
+    }
+    
+    loader := tree.NewBulkLoader(btreeapi.BulkModeFast)
+    loader.AddSorted(entries)
+    rootPID, _ := loader.Build()
+    tree.SetRootPageID(rootPID)
+    
+    t.Logf("Pages: %d, Root: %d", mp.PageCount(), rootPID)
+    
+    // Test every 20th key
+    for i := 0; i < 200; i += 20 {
+        key := []byte(fmt.Sprintf("k%04d", i))
+        _, err := tree.Get(key, 0)
+        status := "OK"
+        if err != nil {
+            status = "MISS"
+        }
+        t.Logf("k%04d: %s", i, status)
+    }
+}
+
+func TestBulkLoadEntryDistribution(t *testing.T) {
+    mp := NewMemPageProvider()
+    tree := New(btreeapi.Config{}, mp, nil)
+    defer tree.Close()
+    
+    entries := make([]btreeapi.KVPair, 200)
+    for i := 0; i < 200; i++ {
+        entries[i] = btreeapi.KVPair{
+            Key:   []byte(fmt.Sprintf("k%04d", i)),
+            Value: []byte(fmt.Sprintf("v%04d", i)),
+        }
+    }
+    
+    loader := tree.NewBulkLoader(btreeapi.BulkModeFast)
+    loader.AddSorted(entries)
+    rootPID, _ := loader.Build()
+    tree.SetRootPageID(rootPID)
+    
+    // Check root structure
+    root, _ := mp.ReadPage(rootPID)
+    t.Logf("Root: IsLeaf=%v, Count=%d, HighKey=%v", root.IsLeaf, root.Count, root.HighKey)
+    
+    if !root.IsLeaf {
+        t.Logf("Keys: %v", root.Keys)
+        t.Logf("Children: %v", root.Children)
+        
+        // Check each child
+        for i, childPID := range root.Children {
+            child, _ := mp.ReadPage(childPID)
+            t.Logf("Child[%d]: IsLeaf=%v, Count=%d, HighKey=%v, Next=%d",
+                i, child.IsLeaf, child.Count, child.HighKey, child.Next)
+        }
+    }
+}

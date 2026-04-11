@@ -82,4 +82,16 @@ type Vacuum interface {
 	//
 	// Returns ErrNoLeaves if the tree is empty.
 	Run() (*VacuumStats, error)
+
+	// RunIncremental performs an incremental vacuum pass.
+	// It processes at most targetPages leaf pages.
+	// If this is the start of a new pass (internal state reset),
+	// it starts from the leftmost leaf. Otherwise it continues
+	// from where the last call left off.
+	//
+	// Use Run() for a full pass, RunIncremental() for non-blocking
+	// batch processing when the tree is too large for a single pass.
+	//
+	// Returns ErrNoLeaves if the tree is empty.
+	RunIncremental(targetPages int) (*VacuumStats, error)
 }

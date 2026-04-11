@@ -833,3 +833,55 @@ func TestVacuum_Idempotent(t *testing.T) {
 	t.Logf("Idempotent: run1 removed=%d, run2 removed=%d",
 		stats1.EntriesRemoved, stats2.EntriesRemoved)
 }
+
+
+// TestVacuum_Incremental tests RunIncremental with batch processing.
+func TestVacuum_Incremental(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Insert enough keys to cause multiple leaf splits
+	numKeys := 100
+	for i := 0; i < numKeys; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		val := []byte(fmt.Sprintf("val-%03d-%s", i, strings.Repeat("x", 150)))
+		env.putAndCommit(t, key, val)
+	}
+
+	// Overwrite half the keys to create dead versions
+	for i := 0; i < numKeys; i += 2 {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		val := []byte(fmt.Sprintf("val-%03d-updated-%s", i, strings.Repeat("y", 150)))
+		env.putAndCommit(t, key, val)
+	}
+
+	leafCount := env.countLeaves(t)
+	t.Logf("Tree has %d leaves", leafCount)
+
+	// Run incremental vacuum with batch of all leaves
+	v := env.newVacuum()
+	stats, err := v.RunIncremental(leafCount + 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("Incremental vacuum: removed=%d, leaves scanned=%d", stats.EntriesRemoved, stats.LeavesScanned)
+
+	// Expected: 50 entries removed (half the keys were overwritten)
+	if stats.EntriesRemoved != numKeys/2 {
+		t.Errorf("removed %d, expected %d", stats.EntriesRemoved, numKeys/2)
+	}
+
+	// Should have scanned all leaves
+	if stats.LeavesScanned != leafCount {
+		t.Errorf("scanned %d leaves, expected %d", stats.LeavesScanned, leafCount)
+	}
+
+	// Second call should scan 0 leaves (pass complete)
+	stats2, err := v.RunIncremental(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.LeavesScanned != 0 {
+		t.Errorf("second call scanned %d leaves, expected 0", stats2.LeavesScanned)
+	}
+}

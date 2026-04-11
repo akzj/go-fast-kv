@@ -198,7 +198,7 @@ func (bl *BulkLoader) buildLeaves(txnID uint64) ([]uint64, error) {
 
 	newLeaf()
 
-	for i, pair := range bl.entries {
+	for _, pair := range bl.entries {
 		// Create entry
 		entry := btreeapi.LeafEntry{
 			Key:    pair.Key,
@@ -210,7 +210,6 @@ func (bl *BulkLoader) buildLeaves(txnID uint64) ([]uint64, error) {
 		if bl.tree.blobs != nil && len(pair.Value) > bl.tree.inlineThres {
 			blobID, err := bl.tree.blobs.WriteBlob(pair.Value)
 			if err != nil {
-				// Fall back to inline if blob write fails
 				entry.Value.Inline = cloneBytes(pair.Value)
 			} else {
 				entry.Value.BlobID = blobID
@@ -219,41 +218,41 @@ func (bl *BulkLoader) buildLeaves(txnID uint64) ([]uint64, error) {
 			entry.Value.Inline = cloneBytes(pair.Value)
 		}
 
+		// Calculate new entry count
+		// newCount = len(currentLeaf.Entries) + 1
+
+		// Check if we would exceed page size with this entry
+		// by temporarily adding and checking
+		originalEntries := currentLeaf.Entries
 		currentLeaf.Entries = append(currentLeaf.Entries, entry)
-		entriesInCurrentLeaf++
 
-		// Update high key
-		currentLeaf.HighKey = cloneBytes(pair.Key)
-
-		// Check if leaf is full
 		if bl.tree.serializer.SerializedSize(currentLeaf) > btreeapi.PageSize {
-			// Remove the last entry (it doesn't fit)
-			currentLeaf.Entries = currentLeaf.Entries[:len(currentLeaf.Entries)-1]
-			entriesInCurrentLeaf--
+			// Would exceed - restore and flush current leaf
+			currentLeaf.Entries = originalEntries
 
-			// Set high key to previous entry's key
+			// Set HighKey to last entry in current leaf
 			if len(currentLeaf.Entries) > 0 {
 				currentLeaf.HighKey = cloneBytes(currentLeaf.Entries[len(currentLeaf.Entries)-1].Key)
 			}
 
-			// Flush current leaf and start new one
+			// Flush current leaf
 			if err := flushLeaf(); err != nil {
 				return nil, err
 			}
 
-			// The last entry goes to the next leaf
+			// Start new leaf - continue to process same entry
 			newLeaf()
-			i-- // reprocess this entry
 			continue
 		}
 
-		// Link B-link for last entry (except if it's the very last overall)
-		if i == len(bl.entries)-1 {
-			// Last entry, no next pointer needed
-		}
+		// Entry fits - keep it and update HighKey
+		entriesInCurrentLeaf++
+		currentLeaf.HighKey = cloneBytes(pair.Key)
 	}
 
 	// Flush the last leaf
+	// The rightmost leaf has HighKey=nil (meaning +∞) for proper B-link traversal
+	currentLeaf.HighKey = nil
 	if err := flushLeaf(); err != nil {
 		return nil, err
 	}
@@ -305,23 +304,25 @@ func (bl *BulkLoader) buildInternalLevel(childPIDs []uint64) ([]uint64, error) {
 	newParent()
 
 	for i, childPID := range childPIDs {
-		// Get the high key of this child to use as separator
+		// Read this child
 		childNode, err := bl.tree.pages.ReadPage(childPID)
 		if err != nil {
 			return nil, err
 		}
 
-		// First child of a new internal node doesn't need a key
+		// First child: no key needed, but set HighKey for future separator
 		if childrenInCurrentParent == 0 {
 			currentParent.Children = append(currentParent.Children, childPID)
+			currentParent.HighKey = cloneBytes(childNode.HighKey) // Save for next iteration
 			childrenInCurrentParent++
 		} else {
-			// Add key + child
-			separatorKey := cloneBytes(childNode.HighKey)
-			
-			// Update high key of parent
-			currentParent.HighKey = cloneBytes(separatorKey)
-			
+			// The separator key for this child is the HIGH KEY of the previous child
+			// (stored in currentParent.HighKey from the previous iteration)
+			separatorKey := cloneBytes(currentParent.HighKey)
+
+			// Update parent's high key to this child's high key for next iteration
+			currentParent.HighKey = cloneBytes(childNode.HighKey)
+
 			currentParent.Keys = append(currentParent.Keys, separatorKey)
 			currentParent.Children = append(currentParent.Children, childPID)
 			keysInCurrentParent++
@@ -358,6 +359,8 @@ func (bl *BulkLoader) buildInternalLevel(childPIDs []uint64) ([]uint64, error) {
 	}
 
 	// Flush the last parent
+	// The rightmost child has HighKey=nil (meaning +∞)
+	currentParent.HighKey = nil
 	if err := flushParent(); err != nil {
 		return nil, err
 	}
