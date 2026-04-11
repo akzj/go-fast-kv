@@ -39,6 +39,10 @@ type vacuumer struct {
 	// Incremental vacuum progress: last processed leaf PID.
 	// 0 = start of a new pass (will find leftmost leaf).
 	lastLeafPID uint64
+
+	// passComplete is true when the last incremental pass reached the end.
+	// When true, next RunIncremental starts fresh from leftmost leaf.
+	passComplete bool
 }
 
 // New creates a new Vacuum instance.
@@ -212,8 +216,13 @@ func (v *vacuumer) RunIncremental(targetPages int) (*vacuumapi.VacuumStats, erro
 	}
 
 	// 3. Find starting leaf
-	// If lastLeafPID=0, start from the leftmost leaf (new pass).
-	// Otherwise, continue from lastLeafPID.
+	// If passComplete=true, the last pass completed - nothing to do.
+	// If lastLeafPID=0, start fresh from leftmost leaf.
+	// Otherwise continue from lastLeafPID.
+	if v.passComplete {
+		// Already completed a full pass, nothing new to do
+		return stats, nil
+	}
 	if v.lastLeafPID == 0 {
 		leftmost, err := v.findLeftmostLeaf(rootPID)
 		if err != nil {
@@ -221,7 +230,8 @@ func (v *vacuumer) RunIncremental(targetPages int) (*vacuumapi.VacuumStats, erro
 		}
 		v.lastLeafPID = leftmost
 		if v.lastLeafPID == 0 {
-			// Empty tree
+			// Empty tree - mark complete
+			v.passComplete = true
 			return stats, nil
 		}
 	}
@@ -277,9 +287,10 @@ func (v *vacuumer) RunIncremental(targetPages int) (*vacuumapi.VacuumStats, erro
 		leafPID = nextPID
 		pagesProcessed++
 
-		// If we reached the end of the tree, reset lastLeafPID for next pass
+		// If we reached the end of the tree, reset for next pass
 		if leafPID == 0 {
 			v.lastLeafPID = 0
+			v.passComplete = true
 		} else {
 			v.lastLeafPID = leafPID
 		}
