@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"os"
 	"testing"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
@@ -398,5 +400,22 @@ func BenchmarkSegmentReadAt(b *testing.B) {
 		if err != nil {
 			b.Fatalf("ReadAt: %v", err)
 		}
+	}
+}
+
+func BenchmarkBulkLoad1K(b *testing.B) {
+	dir := b.TempDir()
+	defer os.RemoveAll(dir)
+	store, _ := Open(kvstoreapi.Config{Dir: dir})
+	defer store.Close()
+
+	pairs := make([]btreeapi.KVPair, 1000)
+	for i := 0; i < 1000; i++ {
+		pairs[i] = btreeapi.KVPair{Key: []byte(fmt.Sprintf("k%08d", i)), Value: []byte(fmt.Sprintf("v%08d", i))}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.BulkLoad(pairs)
 	}
 }
