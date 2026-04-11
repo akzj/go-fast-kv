@@ -57,6 +57,19 @@ func (t *bTree) PageLocks() *lock.PageRWLocks {
 	return t.pageLocks
 }
 
+// NewBulkLoader creates a new BulkLoader for efficient bulk loading.
+// Entries should be sorted by key before calling Build(), or the loader
+// will sort them automatically.
+func (t *bTree) NewBulkLoader(mode btreeapi.BulkMode) btreeapi.BulkLoader {
+	return newBulkLoader(t, mode, 0)
+}
+
+// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID
+// for MVCC mode. All loaded entries will have the given TxnMin.
+func (t *bTree) NewBulkLoaderWithTxn(mode btreeapi.BulkMode, txnID uint64) btreeapi.BulkLoader {
+	return newBulkLoader(t, mode, txnID)
+}
+
 // isVisible checks if a version (txnMin, txnMax) is visible.
 // If a VisibilityChecker is configured (CLOG-based), it delegates to that.
 // Otherwise, falls back to the default range check for backward compatibility.

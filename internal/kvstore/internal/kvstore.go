@@ -204,6 +204,13 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 			clog := tm.CLOG()
 
 			// Try to find a registered read snapshot for this readTxnID.
+
+			// BulkLoad entries have txnMin=0, treated as "always committed".
+			// This allows Delete to find entries loaded via BulkLoad.
+			if txnMin == 0 {
+				return txnMax == txnapi.TxnMaxInfinity
+			}
+
 			if storeRef != nil {
 				if snapVal, ok := storeRef.readSnaps.Load(readTxnID); ok {
 					snap := snapVal.(*txnapi.Snapshot)
@@ -365,6 +372,82 @@ func (s *store) Put(key, value []byte) error {
 	s.vacuumTrigger.opsCount.Add(1)
 	s.vacuumTrigger.dirty.Store(true)
 	s.checkAutoVacuum()
+
+	return nil
+}
+
+// ─── BulkLoad ───────────────────────────────────────────────────────
+
+// BulkLoad performs a fast bulk import of pre-sorted key-value pairs.
+// All entries are loaded with TxnMin=0, TxnMax=MaxUint64 (visible to all readers).
+//
+// This bypasses the normal O(log n) insert path, achieving O(n) complexity.
+// Individual page writes are NOT logged to WAL for performance.
+func (s *store) BulkLoad(pairs []btreeapi.KVPair) error {
+	return s.bulkLoad(pairs, btreeapi.BulkModeFast, 0)
+}
+
+// BulkLoadMVCC performs a bulk import with MVCC versioning.
+// Entries are committed to CLOG, making them immediately visible to all readers.
+// The startTxnID parameter is used only for CLOG tracking.
+func (s *store) BulkLoadMVCC(pairs []btreeapi.KVPair, startTxnID uint64) error {
+	// Use BulkModeFast (txnMin=0) so entries are visible to all readers immediately.
+	// Then commit startTxnID to CLOG for proper transaction accounting.
+	// The startTxnID is committed but not used as the visibility boundary
+	// (since readTxnID from ReadSnapshot will be larger than startTxnID).
+	return s.bulkLoad(pairs, btreeapi.BulkModeFast, startTxnID)
+}
+
+func (s *store) bulkLoad(pairs []btreeapi.KVPair, mode btreeapi.BulkMode, txnID uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	// Create bulk loader
+	var loader btreeapi.BulkLoader
+	if mode == btreeapi.BulkModeFast || txnID == 0 {
+		// Fast mode: txnMin=0, visible to all readers immediately
+		loader = s.tree.NewBulkLoader(mode)
+	} else {
+		// MVCC mode: txnMin=txnID
+		loader = s.tree.NewBulkLoaderWithTxn(mode, txnID)
+	}
+
+	// Add all pairs
+	if err := loader.AddSorted(pairs); err != nil {
+		loader.Close()
+		return err
+	}
+
+	// Build the tree
+	newRootPID, err := loader.Build()
+	if err != nil {
+		loader.Close()
+		return err
+	}
+
+	// Atomic root swap
+	s.tree.SetRootPageID(newRootPID)
+
+	// Write WAL entry for crash recovery
+	// We write a root-change entry so recovery knows to use the new root
+	batch := walapi.NewBatch()
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, newRootPID, 0, 0)
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		return err
+	}
+
+	// For MVCC mode: commit txnID in CLOG so entries become visible
+	if txnID > 0 {
+		s.txnMgr.Commit(txnID)
+	}
 
 	return nil
 }

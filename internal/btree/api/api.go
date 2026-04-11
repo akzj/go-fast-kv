@@ -250,6 +250,81 @@ type BTree interface {
 
 	// Close releases resources held by the BTree.
 	Close() error
+
+	// NewBulkLoader creates a BulkLoader for efficient bulk loading.
+	// Entries should be sorted by key before calling Build(), or the loader
+	// will sort them automatically.
+	//
+	// Bulk loading bypasses the normal O(log n) insert path by building
+	// the tree bottom-up, achieving O(n) complexity.
+	//
+	// Thread safety: the returned BulkLoader is NOT thread-safe.
+	NewBulkLoader(mode BulkMode) BulkLoader
+
+	// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID
+	// for MVCC mode. All loaded entries will have the given TxnMin.
+	NewBulkLoaderWithTxn(mode BulkMode, txnID uint64) BulkLoader
+}
+
+// ─── BulkLoader ─────────────────────────────────────────────────────
+
+// BulkMode determines MVCC behavior during bulk loading.
+type BulkMode int
+
+const (
+	// BulkModeFast loads entries without MVCC versioning.
+	// All entries have TxnMin=0, TxnMax=MaxUint64 (visible to all readers).
+	// Suitable for single-writer bulk imports.
+	BulkModeFast BulkMode = iota
+
+	// BulkModeMVCC loads entries with MVCC versioning.
+	// Each entry gets the provided startTxnID.
+	// Suitable for loading historical data that needs version tracking.
+	BulkModeMVCC
+)
+
+// KVPair represents a key-value pair for bulk loading.
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
+// BulkLoader builds a B-tree bottom-up for efficient bulk loading.
+// It bypasses the normal insert path to achieve O(n) complexity.
+//
+// Thread safety: BulkLoader is NOT thread-safe. Create one per goroutine.
+type BulkLoader interface {
+	// Add adds a key-value pair to the bulk load.
+	// Entries should be added in sorted order by key.
+	Add(key, value []byte) error
+
+	// AddSorted adds a pre-sorted slice of entries.
+	// Use this for maximum efficiency when entries are already sorted.
+	AddSorted(pairs []KVPair) error
+
+	// Sort sorts the entries by key.
+	// Call this if entries were added out of order.
+	Sort()
+
+	// IsSorted returns true if entries are sorted by key.
+	IsSorted() bool
+
+	// Build executes the bulk load, constructing a new B-tree from the entries.
+	// Returns the new root page ID on success.
+	//
+	// The load is atomic: either all entries are loaded or none.
+	// During loading, readers see the old tree; after completion, they see the new tree.
+	//
+	// In Fast mode, all entries get TxnMin=0, TxnMax=MaxUint64 (visible to all).
+	// In MVCC mode, all entries get the provided txnID (or 1 if not set).
+	Build() (uint64, error)
+
+	// Close releases resources held by the BulkLoader.
+	// Call this if Build() is not called or fails.
+	Close() error
+
+	// EntryCount returns the number of entries added to the loader.
+	EntryCount() int
 }
 
 // ─── PageProvider ───────────────────────────────────────────────────

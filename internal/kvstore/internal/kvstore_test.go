@@ -13,6 +13,7 @@ import (
 	"time"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -741,4 +742,40 @@ func TestConcurrentPutSameKey_NoPhantomVersions(t *testing.T) {
 		t.Fatalf("Final Get: %v", err)
 	}
 	t.Logf("Final value: %q", string(finalVal))
+}
+
+
+func TestKVStoreBulkLoad(t *testing.T) {
+	store := openTestStore(t)
+	pairs := make([]btreeapi.KVPair, 1000)
+	for i := 0; i < 1000; i++ {
+		pairs[i] = btreeapi.KVPair{Key: []byte(fmt.Sprintf("key-%05d", i)), Value: []byte(fmt.Sprintf("value-%d", i))}
+	}
+	start := time.Now()
+	if err := store.BulkLoad(pairs); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("BulkLoad 1K: %v", time.Since(start))
+	for i := 0; i < 100; i++ {
+		val, err := store.Get([]byte(fmt.Sprintf("key-%05d", i)))
+		if err != nil || string(val) != fmt.Sprintf("value-%d", i) {
+			t.Errorf("key-%05d mismatch", i)
+		}
+	}
+}
+
+func TestKVStoreBulkLoadMVCC(t *testing.T) {
+	store := openTestStore(t)
+	pairs := []btreeapi.KVPair{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+		{Key: []byte("c"), Value: []byte("3")},
+	}
+	if err := store.BulkLoadMVCC(pairs, 100); err != nil {
+		t.Fatal(err)
+	}
+	val, _ := store.Get([]byte("b"))
+	if string(val) != "2" {
+		t.Errorf("got %s, want 2", val)
+	}
 }

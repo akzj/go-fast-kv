@@ -10,6 +10,7 @@ import (
 	"errors"
 	"time"
 
+	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 )
 
@@ -165,6 +166,29 @@ type Store interface {
 	// Uses WriteBatch internally for efficiency.
 	// Returns the number of keys deleted.
 	DeleteRange(start, end []byte) (int, error)
+
+	// BulkLoad performs a fast bulk import of pre-sorted key-value pairs.
+	// Entries should be sorted by key for best performance.
+	//
+	// This bypasses the normal O(log n) insert path, achieving O(n) complexity.
+	// All entries are loaded with TxnMin=0, TxnMax=MaxUint64 (visible to all readers).
+	//
+	// Thread safety: BulkLoad holds a write lock during the operation.
+	// Get/Scan can run concurrently (snapshot semantics).
+	//
+	// WAL: A single root-change WAL entry is written for crash recovery.
+	// Individual page writes are NOT logged (performance optimization).
+	BulkLoad(pairs []btreeapi.KVPair) error
+
+	// BulkLoadMVCC performs a bulk import with MVCC versioning.
+	// All loaded entries have TxnMin=startTxnID.
+	// Use this when loading historical data that needs version tracking.
+	//
+	// Thread safety: BulkLoadMVCC holds a write lock during the operation.
+	// Get/Scan can run concurrently (snapshot semantics).
+	//
+	// WAL: A single root-change WAL entry is written for crash recovery.
+	BulkLoadMVCC(pairs []btreeapi.KVPair, startTxnID uint64) error
 
 	// Close flushes all data and closes the store.
 	// After Close, all operations return ErrClosed.
