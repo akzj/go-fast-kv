@@ -16,65 +16,65 @@ type TokenType int
 
 const (
 	// Literals
-	TokInteger TokenType = iota // 42
-	TokFloat                    // 3.14
-	TokString                   // 'hello'
-	TokIdent                    // users, name, age
+	TokInteger TokenType = 0  // 42
+	TokFloat   TokenType = 1  // 3.14
+	TokString  TokenType = 2  // 'hello'
+	TokIdent   TokenType = 3  // users, name, age
 
 	// Keywords
-	TokSelect
-	TokFrom
-	TokWhere
-	TokInsert
-	TokInto
-	TokValues
-	TokDelete
-	TokUpdate
-	TokSet
-	TokCreate
-	TokDrop
-	TokTable
-	TokIndex
-	TokOn
-	TokAnd
-	TokOr
-	TokNot
-	TokNull
-	TokIs
-	TokOrder
-	TokBy
-	TokAsc
-	TokDesc
-	TokLimit
-	TokIntKw    // INT type keyword
-	TokTextKw   // TEXT type keyword
-	TokFloatKw  // FLOAT type keyword
-	TokBlobKw   // BLOB type keyword
-	TokPrimary
-	TokKey
-	TokUnique
-	TokIf
-	TokExists
-	TokInteger2 // INTEGER type keyword (alias for INT)
+	TokSelect   TokenType = 4
+	TokFrom     TokenType = 5
+	TokWhere    TokenType = 6
+	TokInsert   TokenType = 7
+	TokInto     TokenType = 8
+	TokValues   TokenType = 9
+	TokDelete   TokenType = 10
+	TokUpdate   TokenType = 11
+	TokSet      TokenType = 12
+	TokCreate   TokenType = 13
+	TokDrop     TokenType = 14
+	TokTable    TokenType = 15
+	TokIndex    TokenType = 16
+	TokOn       TokenType = 17
+	TokAnd      TokenType = 18
+	TokOr       TokenType = 19
+	TokNot      TokenType = 20
+	TokNull     TokenType = 21
+	TokIs       TokenType = 22
+	TokOrder    TokenType = 23
+	TokBy       TokenType = 24
+	TokAsc      TokenType = 25
+	TokDesc     TokenType = 26
+	TokLimit    TokenType = 27
+	TokIntKw    TokenType = 28 // INT type keyword
+	TokTextKw   TokenType = 29 // TEXT type keyword
+	TokFloatKw  TokenType = 30 // FLOAT type keyword
+	TokBlobKw   TokenType = 31 // BLOB type keyword
+	TokPrimary  TokenType = 32
+	TokKey      TokenType = 33
+	TokUnique   TokenType = 34
+	TokIf       TokenType = 35
+	TokExists   TokenType = 36
+	TokInteger2 TokenType = 37 // INTEGER type keyword (alias for INT)
 
 	// Operators
-	TokEQ        // =
-	TokNE        // != or <>
-	TokLT        // <
-	TokLE        // <=
-	TokGT        // >
-	TokGE        // >=
-	TokPlus      // +
-	TokMinus     // -
-	TokStar      // *
-	TokComma     // ,
-	TokLParen    // (
-	TokRParen    // )
-	TokSemicolon // ;
+	TokEQ        TokenType = 38 // =
+	TokNE        TokenType = 39 // != or <>
+	TokLT        TokenType = 40 // <
+	TokLE        TokenType = 41 // <=
+	TokGT        TokenType = 42 // >
+	TokGE        TokenType = 43 // >=
+	TokPlus      TokenType = 44 // +
+	TokMinus     TokenType = 45 // -
+	TokStar      TokenType = 46 // *
+	TokComma     TokenType = 47 // ,
+	TokLParen    TokenType = 48 // (
+	TokRParen    TokenType = 49 // )
+	TokSemicolon TokenType = 50 // ;
 
 	// Special
-	TokEOF
-	TokIllegal
+	TokEOF     TokenType = 51
+	TokIllegal TokenType = 52
 )
 
 // Token represents a single lexical token.
@@ -223,14 +223,14 @@ func (*BinaryExpr) exprNode() {}
 type BinaryOp int
 
 const (
-	BinEQ  BinaryOp = iota // =
-	BinNE                   // !=
-	BinLT                   // <
-	BinLE                   // <=
-	BinGT                   // >
-	BinGE                   // >=
-	BinAnd                  // AND
-	BinOr                   // OR
+	BinEQ  BinaryOp = 0 // =
+	BinNE  BinaryOp = 1 // !=
+	BinLT  BinaryOp = 2 // <
+	BinLE  BinaryOp = 3 // <=
+	BinGT  BinaryOp = 4 // >
+	BinGE  BinaryOp = 5 // >=
+	BinAnd BinaryOp = 6 // AND
+	BinOr  BinaryOp = 7 // OR
 )
 
 // UnaryExpr: op operand (e.g. NOT x, -42)
@@ -245,8 +245,8 @@ func (*UnaryExpr) exprNode() {}
 type UnaryOp int
 
 const (
-	UnaryNot   UnaryOp = iota // NOT
-	UnaryMinus                 // -
+	UnaryNot   UnaryOp = 0 // NOT
+	UnaryMinus UnaryOp = 1 // -
 )
 
 // IsNullExpr: expr IS [NOT] NULL

@@ -33,12 +33,12 @@ var (
 type CompareOp int
 
 const (
-	OpEQ CompareOp = iota // =
-	OpNE                  // !=
-	OpLT                  // <
-	OpLE                  // <=
-	OpGT                  // >
-	OpGE                  // >=
+	OpEQ CompareOp = 0 // =
+	OpNE CompareOp = 1 // !=
+	OpLT CompareOp = 2 // <
+	OpLE CompareOp = 3 // <=
+	OpGT CompareOp = 4 // >
+	OpGE CompareOp = 5 // >=
 )
 
 // ─── Key Encoding ───────────────────────────────────────────────────

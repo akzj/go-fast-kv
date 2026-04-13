@@ -11,11 +11,11 @@ import "errors"
 type Type int
 
 const (
-	TypeNull Type = iota
-	TypeInt
-	TypeFloat
-	TypeText
-	TypeBlob
+	TypeNull  Type = 0
+	TypeInt   Type = 1
+	TypeFloat Type = 2
+	TypeText  Type = 3
+	TypeBlob  Type = 4
 )
 
 // Value represents a typed SQL value.
@@ -107,4 +107,8 @@ type CatalogManager interface {
 
 	// ListTables returns all table names.
 	ListTables() ([]string, error)
+
+	// ListIndexes returns all index schemas for a given table.
+	// Returns an empty slice (not error) if the table has no indexes.
+	ListIndexes(tableName string) ([]*IndexSchema, error)
 }

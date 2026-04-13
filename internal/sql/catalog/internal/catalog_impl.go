@@ -207,3 +207,25 @@ func (c *Catalog) ListTables() ([]string, error) {
 	}
 	return tables, iter.Err()
 }
+
+func (c *Catalog) ListIndexes(tableName string) ([]*api.IndexSchema, error) {
+	upperTable := strings.ToUpper(tableName)
+	prefix := tableIndexPrefix(upperTable)
+	end := append(append([]byte{}, prefix...), 0xFF)
+
+	var indexes []*api.IndexSchema
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		var schema api.IndexSchema
+		if err := json.Unmarshal(iter.Value(), &schema); err != nil {
+			return nil, err
+		}
+		indexes = append(indexes, &schema)
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return indexes, nil
+}
