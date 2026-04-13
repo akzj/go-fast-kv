@@ -21,6 +21,7 @@
 package sql
 
 import (
+	"fmt"
 	"sync"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
@@ -52,8 +53,9 @@ type Value = catalogapi.Value
 // All SQL operations are serialized via a single-writer mutex.
 // The underlying KV store is NOT closed when DB.Close() is called.
 type DB struct {
-	mu       sync.Mutex
-	store    kvstoreapi.Store
+	closed bool
+	mu     sync.Mutex
+	store  kvstoreapi.Store
 	catalog  catalogapi.CatalogManager
 	parser   parserapi.Parser
 	planner  plannerapi.Planner
@@ -124,18 +126,21 @@ func (db *DB) Query(sql string) (*Result, error) {
 }
 
 // Close releases SQL layer resources.
-//
 // Close does NOT close the underlying KV store — the caller
 // is responsible for calling store.Close() separately.
 func (db *DB) Close() error {
+	db.mu.Lock()
+	db.closed = true
+	db.mu.Unlock()
 	return nil
 }
-
-// ─── internal ───────────────────────────────────────────────────────
 
 // exec is the shared implementation for Exec and Query.
 // Caller must hold db.mu.
 func (db *DB) exec(sql string) (*Result, error) {
+	if db.closed {
+		return nil, fmt.Errorf("sql: database is closed")
+	}
 	// Parse SQL → AST
 	stmt, err := db.parser.Parse(sql)
 	if err != nil {

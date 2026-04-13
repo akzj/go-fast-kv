@@ -143,6 +143,21 @@ func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.
 }
 
 func (p *planner) planDropIndex(stmt *parserapi.DropIndexStmt) (*plannerapi.DropIndexPlan, error) {
+	// Validate table exists
+	_, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		return nil, err
+	}
+	// Validate index exists (unless IF EXISTS)
+	if !stmt.IfExists {
+		_, err := p.catalog.GetIndex(stmt.Table, stmt.Index)
+		if err == catalogapi.ErrIndexNotFound {
+			return nil, catalogapi.ErrIndexNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &plannerapi.DropIndexPlan{
 		IndexName: stmt.Index,
 		TableName: stmt.Table,

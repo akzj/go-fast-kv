@@ -40,6 +40,15 @@ func (ie *indexEngine) Delete(index *catalogapi.IndexSchema, tableID uint32, ind
 	return err
 }
 
+func (ie *indexEngine) InsertBatch(key []byte, batch kvstoreapi.WriteBatch) error {
+	return batch.Put(key, []byte{})
+}
+
+func (ie *indexEngine) EncodeIndexKey(tableID uint32, indexID uint32,
+	value catalogapi.Value, rowID uint64) []byte {
+	return ie.encoder.EncodeIndexKey(tableID, indexID, value, rowID)
+}
+
 func (ie *indexEngine) Scan(tableID uint32, indexID uint32, op encodingapi.CompareOp,
 	value catalogapi.Value) (engineapi.RowIDIterator, error) {
 

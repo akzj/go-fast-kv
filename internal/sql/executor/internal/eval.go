@@ -180,7 +180,7 @@ func evalUnaryExpr(expr *parserapi.UnaryExpr, row *engineapi.Row, columns []cata
 		}
 		switch operand.Type {
 		case catalogapi.TypeInt:
-			return catalogapi.Value{Type: catalogapi.TypeInt, Int: -operand.Int}, nil
+			if operand.Int == -9223372036854775808 { return catalogapi.Value{}, fmt.Errorf("%w: integer overflow: cannot negate %d", executorapi.ErrExecFailed, operand.Int) }; return catalogapi.Value{Type: catalogapi.TypeInt, Int: -operand.Int}, nil
 		case catalogapi.TypeFloat:
 			return catalogapi.Value{Type: catalogapi.TypeFloat, Float: -operand.Float}, nil
 		default:

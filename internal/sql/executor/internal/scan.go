@@ -16,7 +16,7 @@ import (
 // ─── Scan Helpers ───────────────────────────────────────────────────
 
 // scanRows collects rows matching a scan plan.
-func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan, _ interface{}) ([]*engineapi.Row, error) {
+func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan) ([]*engineapi.Row, error) {
 	switch s := scan.(type) {
 	case *plannerapi.TableScanPlan:
 		return e.tableScan(table, s.Filter)
@@ -27,16 +27,27 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 	}
 }
 
-// scanRowsForDML collects rows for DELETE/UPDATE (with filter from scan).
+// scanRowsForDML delegates to scanRows (consolidation: S1).
 func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi.ScanPlan) ([]*engineapi.Row, error) {
-	switch s := scan.(type) {
-	case *plannerapi.TableScanPlan:
-		return e.tableScan(table, s.Filter)
-	case *plannerapi.IndexScanPlan:
-		return e.indexScan(table, s)
-	default:
-		return nil, fmt.Errorf("%w: unsupported scan type %T", executorapi.ErrExecFailed, scan)
+	return e.scanRows(table, scan)
+}
+
+// filterRows applies a residual filter to already-scanned rows (used by execSelect for SelectPlan.Filter).
+func filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []catalogapi.ColumnDef) []*engineapi.Row {
+	if filter == nil || len(rows) == 0 {
+		return rows
 	}
+	filtered := rows[:0]
+	for _, row := range rows {
+		match, err := matchFilter(filter, row, columns)
+		if err != nil {
+			continue
+		}
+		if match {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered
 }
 
 // tableScan iterates all rows and applies a filter.

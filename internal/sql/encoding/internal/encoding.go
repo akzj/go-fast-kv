@@ -240,6 +240,12 @@ func (e *keyEncoder) EncodeIndexPrefixEnd(tableID uint32, indexID uint32) []byte
 	binary.BigEndian.PutUint32(buf[1:5], tableID)
 	buf[5] = tagIndex
 	// Increment indexID by 1 for exclusive end.
+	// Handle overflow: if indexID == MaxUint32, wrapping to 0 would
+	// produce a prefix lower than the start. Use table-level boundary.
+	if indexID == math.MaxUint32 {
+		buf[5] = tagIndex + 1 // 'i' + 1 = 'j' — past any valid index
+		return buf[:6]
+	}
 	binary.BigEndian.PutUint32(buf[6:10], indexID+1)
 	return buf
 }

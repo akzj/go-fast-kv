@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -14,9 +15,10 @@ var _ api.Parser = (*parser)(nil)
 
 // parser is a recursive descent SQL parser.
 type parser struct {
-	lex  *lexer
-	cur  api.Token // current token
-	peek api.Token // lookahead token
+	lex   *lexer
+	cur   api.Token // current token
+	peek  api.Token // lookahead token
+	depth int       // recursion depth for stack overflow prevention
 }
 
 // New creates a new Parser.
@@ -543,6 +545,11 @@ func (p *parser) parseUpdate() (api.Statement, error) {
 
 // parseExpr: entry point = or_expr
 func (p *parser) parseExpr() (api.Expr, error) {
+	if p.depth > 1000 {
+		return nil, p.errorf("expression too deeply nested (max 1000 levels)")
+	}
+	p.depth++
+	defer func() { p.depth-- }()
 	return p.parseOrExpr()
 }
 
@@ -643,6 +650,12 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 
 // primary = literal | ident ["." ident] | "(" expr ")" | "-" primary | "*"
 func (p *parser) parsePrimary() (api.Expr, error) {
+	if p.depth > 1000 {
+		return nil, p.errorf("expression too deeply nested (max 1000 levels)")
+	}
+	p.depth++
+	defer func() { p.depth-- }()
+
 	switch p.cur.Type {
 	case api.TokInteger:
 		val, err := strconv.ParseInt(p.cur.Literal, 10, 64)
@@ -672,10 +685,6 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
-		// Check for table.column
-		if p.cur.Type == api.TokEQ && false {
-			// Not a dot — this is handled elsewhere
-		}
 		return &api.ColumnRef{Column: name}, nil
 
 	case api.TokStar:
@@ -683,6 +692,9 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		return &api.StarExpr{}, nil
 
 	case api.TokLParen:
+		if p.depth > 1000 {
+			return nil, p.errorf("expression too deeply nested (max 1000 levels)")
+		}
 		p.advance()
 		expr, err := p.parseExpr()
 		if err != nil {
@@ -694,19 +706,47 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		return expr, nil
 
 	case api.TokMinus:
-		p.advance()
+		// Check depth for unary minus before descending into operand.
+		// We deliberately do NOT call parsePrimary recursively here to avoid
+		// depth double-counting: parsePrimary already increments depth.
+		// Instead, inline the integer literal fast path.
+		if p.peek.Type == api.TokInteger {
+			// Fast path: -<integer literal>. Parse the token, fold the negation.
+			litTok := p.peek
+			val, err := strconv.ParseInt(litTok.Literal, 10, 64)
+			if err != nil {
+				// Overflow: e.g. -9223372036854775808 where lexer gave us 9223372036854775808
+				// Check if this is MaxInt64 being negated to MinInt64.
+				if litTok.Literal == "9223372036854775808" {
+					p.advance() // consume '-'
+					p.advance() // consume TokInteger
+					return &api.Literal{Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: math.MinInt64}}, nil
+				}
+				return nil, p.errorf("invalid integer: %s", litTok.Literal)
+			}
+			// Normal negation with overflow check
+			if val == math.MinInt64 {
+				return nil, p.errorf("integer overflow: cannot negate %d", math.MinInt64)
+			}
+			p.advance() // consume '-'
+			p.advance() // consume TokInteger
+			return &api.Literal{Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: -val}}, nil
+		}
+		// General case: recurse for non-integer operands (column refs, parens, etc.)
 		operand, err := p.parsePrimary()
 		if err != nil {
 			return nil, err
 		}
-		// Optimization: fold negative integer/float literals
 		if lit, ok := operand.(*api.Literal); ok {
 			switch lit.Value.Type {
-			case catalogapi.TypeInt:
-				lit.Value.Int = -lit.Value.Int
-				return lit, nil
 			case catalogapi.TypeFloat:
 				lit.Value.Float = -lit.Value.Float
+				return lit, nil
+			case catalogapi.TypeInt:
+				if lit.Value.Int == math.MinInt64 {
+					return nil, p.errorf("integer overflow: cannot negate %d", math.MinInt64)
+				}
+				lit.Value.Int = -lit.Value.Int
 				return lit, nil
 			}
 		}

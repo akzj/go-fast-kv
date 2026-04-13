@@ -2,7 +2,6 @@ package internal
 
 import (
 	"strings"
-	"unicode"
 
 	"github.com/akzj/go-fast-kv/internal/sql/parser/api"
 )
@@ -43,6 +42,7 @@ var keywords = map[string]api.TokenType{
 	"UNIQUE":  api.TokUnique,
 	"IF":      api.TokIf,
 	"EXISTS":  api.TokExists,
+	"AS":      api.TokIdent, // also a keyword but handled as alias separator in SELECT
 }
 
 // lexer tokenizes SQL input.
@@ -235,6 +235,5 @@ func isIdentStart(ch byte) bool {
 }
 
 func isIdentPart(ch byte) bool {
-	r := rune(ch)
-	return isIdentStart(ch) || isDigit(ch) || unicode.IsDigit(r)
+	return isIdentStart(ch) || isDigit(ch)
 }

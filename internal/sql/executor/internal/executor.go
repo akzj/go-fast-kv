@@ -203,11 +203,17 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
 	}
+	batch := e.store.NewWriteBatch()
 	for _, row := range existingRows {
 		val := row.Values[colIdx]
-		if err := e.indexEngine.Insert(&schema, tbl.TableID, schema.IndexID, val, row.RowID); err != nil {
+		idxKey := e.indexEngine.EncodeIndexKey(tbl.TableID, schema.IndexID, val, row.RowID)
+		if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+			batch.Discard()
 			return nil, fmt.Errorf("%w: backfill insert index: %v", executorapi.ErrExecFailed, err)
 		}
+	}
+	if err := batch.Commit(); err != nil {
+		return nil, fmt.Errorf("%w: backfill commit: %v", executorapi.ErrExecFailed, err)
 	}
 
 	return &executorapi.Result{RowsAffected: 0}, nil
@@ -293,10 +299,15 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 }
 
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
-	// Collect matching rows
-	rows, err := e.scanRows(plan.Table, plan.Scan, plan.Filter)
+	// Collect matching rows via scan
+	rows, err := e.scanRows(plan.Table, plan.Scan)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply residual filter from SelectPlan (handles index scan + residual)
+	if plan.Filter != nil {
+		rows = filterRows(rows, plan.Filter, plan.Table.Columns)
 	}
 
 	// ORDER BY (sort raw rows BEFORE projection so all columns are available)
