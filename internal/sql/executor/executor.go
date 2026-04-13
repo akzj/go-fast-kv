@@ -3,9 +3,11 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	"github.com/akzj/go-fast-kv/internal/sql/catalog"
+	"github.com/akzj/go-fast-kv/internal/sql/parser"
 	"github.com/akzj/go-fast-kv/internal/sql/planner"
 	"github.com/akzj/go-fast-kv/internal/sql/value"
 )
@@ -126,47 +128,152 @@ func (e *Executor) execInsert(plan *planner.InsertPlan) (int64, error) {
 
 // execUpdate updates rows.
 func (e *Executor) execUpdate(plan *planner.UpdatePlan) (int64, error) {
-	// TODO: Implement update
-	return 0, nil
+	// Look up table schema
+	table, err := e.cata.GetTable(plan.Table)
+	if err != nil {
+		return 0, err
+	}
+
+	// Find column index (case-insensitive)
+	colIdx := -1
+	for i, col := range table.Columns {
+		if strings.EqualFold(col.Name, plan.Column) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return 0, fmt.Errorf("executor: column %s not found", plan.Column)
+	}
+
+	// Scan and update matching rows
+	var count int64
+	prefix := plan.Table + ":"
+	start := []byte(prefix)
+	end := []byte(prefix + ":\xff")
+
+	iter := e.kv.Scan(start, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		// Decode row
+		rowValues, err := decodeRow(table.Columns, iter.Value())
+		if err != nil {
+			continue
+		}
+
+		// Check WHERE condition
+		if plan.Where != nil && !matchCondition(rowValues, table.Columns, plan.Where) {
+			continue
+		}
+
+		// Update the column
+		rowValues[colIdx] = plan.Value
+
+		// Re-encode and store
+		newData := encodeRow(rowValues)
+		if err := e.kv.Put(iter.Key(), newData); err != nil {
+			return count, err
+		}
+		count++
+	}
+
+	return count, iter.Err()
 }
 
 // execDelete deletes rows.
 func (e *Executor) execDelete(plan *planner.DeletePlan) (int64, error) {
-	// TODO: Implement delete
-	return 0, nil
+	// Look up table schema
+	table, err := e.cata.GetTable(plan.Table)
+	if err != nil {
+		return 0, err
+	}
+
+	// Scan and delete matching rows
+	var count int64
+	prefix := plan.Table + ":"
+	start := []byte(prefix)
+	end := []byte(prefix + ":\xff")
+
+	iter := e.kv.Scan(start, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		// Decode row
+		rowValues, err := decodeRow(table.Columns, iter.Value())
+		if err != nil {
+			continue
+		}
+
+		// Check WHERE condition
+		if plan.Where != nil && !matchCondition(rowValues, table.Columns, plan.Where) {
+			continue
+		}
+
+		// Delete the row
+		if err := e.kv.Delete(iter.Key()); err != nil {
+			return count, err
+		}
+		count++
+	}
+
+	return count, iter.Err()
 }
 
 // execTableScan performs a full table scan.
 func (e *Executor) execTableScan(plan *planner.TableScanPlan) (Iterator, error) {
+	// Look up table schema for column definitions
+	table, err := e.cata.GetTable(plan.Table)
+	if err != nil {
+		return nil, err
+	}
+
 	prefix := plan.Table + ":"
 	start := []byte(prefix)
 	end := []byte(prefix + ":\xff")
 
 	iter := e.kv.Scan(start, end)
 	return &tableScanIter{
-		kv:    e.kv,
-		iter:  iter,
-		table: plan.Table,
+		kv:      e.kv,
+		iter:    iter,
+		table:   plan.Table,
+		where:   plan.Where,
+		columns: table.Columns,
 	}, nil
 }
 
 type tableScanIter struct {
-	kv    kvstoreapi.Store
-	iter  kvstoreapi.Iterator
-	table string
-	row   Row
-	err   error
+	kv      kvstoreapi.Store
+	iter    kvstoreapi.Iterator
+	table   string
+	where   *parser.Condition
+	columns []catalog.ColumnDef
+	row     Row
+	err     error
 }
 
 func (i *tableScanIter) Next() bool {
-	if !i.iter.Next() {
-		return false
+	for i.iter.Next() {
+		// Decode row
+		rowValues, err := decodeRow(i.columns, i.iter.Value())
+		if err != nil {
+			i.err = err
+			continue
+		}
+
+		// Apply WHERE filter (case-insensitive column matching)
+		if i.where != nil && !matchCondition(rowValues, i.columns, i.where) {
+			continue
+		}
+
+		i.row = Row{
+			Values: rowValues,
+		}
+		return true
 	}
 
-	// Decode row
-	// TODO: proper decoding
-
-	return true
+	i.err = i.iter.Err()
+	return false
 }
 
 func (i *tableScanIter) Row() Row {
@@ -197,9 +304,8 @@ func encodeValue(v value.Value, targetType value.Type) string {
 }
 
 // encodeRow encodes values into binary format.
-// Format: [numCols:1][type1:1][len1:2][data1:N]...
+// Format: values separated by '\x00'
 func encodeRow(values []value.Value) []byte {
-	// Simple text encoding for now: values separated by '\x00'
 	result := make([]byte, 0, len(values)*16)
 	for _, v := range values {
 		switch v.Type {
@@ -214,4 +320,75 @@ func encodeRow(values []value.Value) []byte {
 		}
 	}
 	return result
+}
+
+// decodeRow decodes values from binary format.
+func decodeRow(columns []catalog.ColumnDef, data []byte) ([]value.Value, error) {
+	if len(data) == 0 {
+		return make([]value.Value, len(columns)), nil
+	}
+
+	// Split by null delimiter
+	parts := strings.Split(string(data), "\x00")
+	if len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+
+	values := make([]value.Value, 0, len(columns))
+	for i := 0; i < len(columns); i++ {
+		if i < len(parts) {
+			switch columns[i].Type {
+			case value.TypeInt:
+				var vi int64
+				fmt.Sscanf(parts[i], "%d", &vi)
+				values = append(values, value.NewInt(vi))
+			case value.TypeFloat:
+				var vf float64
+				fmt.Sscanf(parts[i], "%f", &vf)
+				values = append(values, value.NewFloat(vf))
+			default:
+				values = append(values, value.NewText(parts[i]))
+			}
+		} else {
+			values = append(values, value.NewText(""))
+		}
+	}
+
+	return values, nil
+}
+
+// matchCondition checks if a row matches the WHERE condition.
+// Uses case-insensitive column name matching.
+func matchCondition(rowValues []value.Value, columns []catalog.ColumnDef, cond *parser.Condition) bool {
+	// Find column index (case-insensitive)
+	colIdx := -1
+	for i, col := range columns {
+		if strings.EqualFold(col.Name, cond.Column) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 || colIdx >= len(rowValues) {
+		return false
+	}
+
+	rowVal := rowValues[colIdx]
+	condVal := cond.Value
+
+	switch cond.Op {
+	case "=":
+		return rowVal.Compare(condVal) == 0
+	case "!=":
+		return rowVal.Compare(condVal) != 0
+	case ">":
+		return rowVal.Compare(condVal) > 0
+	case "<":
+		return rowVal.Compare(condVal) < 0
+	case ">=":
+		return rowVal.Compare(condVal) >= 0
+	case "<=":
+		return rowVal.Compare(condVal) <= 0
+	default:
+		return false
+	}
 }

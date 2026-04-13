@@ -81,6 +81,7 @@ func (p *DeletePlan) Kind() PlanKind { return PlanDelete }
 // TableScanPlan for full table scan.
 type TableScanPlan struct {
 	Table string
+	Where *parser.Condition // optional WHERE condition
 }
 
 func (p *TableScanPlan) Kind() PlanKind { return PlanTableScan }
@@ -136,7 +137,7 @@ func (p *Planner) Plan(node parser.Node) (PlanNode, error) {
 func (p *Planner) planSelect(stmt *parser.SelectStmt) (PlanNode, error) {
 	// TODO: Implement index selection
 	// For now, always use table scan
-	return &TableScanPlan{Table: stmt.Table}, nil
+	return &TableScanPlan{Table: stmt.Table, Where: stmt.Where}, nil
 }
 
 func (p *Planner) planInsert(stmt *parser.InsertStmt) (PlanNode, error) {
