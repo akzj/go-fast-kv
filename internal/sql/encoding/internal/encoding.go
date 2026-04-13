@@ -124,12 +124,22 @@ func (e *keyEncoder) EncodeValue(v catalogapi.Value) []byte {
 	case catalogapi.TypeFloat:
 		buf := make([]byte, 9)
 		buf[0] = tagFloat
-		bits := math.Float64bits(v.Float)
-		if v.Float < 0 || math.IsNaN(v.Float) {
-			// Negative or NaN: flip all bits.
+		f := v.Float
+		// Normalize: -0.0 → +0.0 (IEEE 754 -0.0 == +0.0 in SQL semantics)
+		if f == 0 {
+			f = 0
+		}
+		// Normalize: all NaN → canonical positive NaN
+		// This ensures consistent encoding regardless of NaN payload/sign.
+		if math.IsNaN(f) {
+			f = math.NaN() // canonical: 0x7FF8000000000001
+		}
+		bits := math.Float64bits(f)
+		if math.Signbit(f) {
+			// Negative (including -Inf): flip all bits.
 			bits = ^bits
 		} else {
-			// Positive or zero: flip sign bit.
+			// Positive, +0.0, +Inf, NaN: flip sign bit only.
 			bits ^= 1 << 63
 		}
 		binary.BigEndian.PutUint64(buf[1:], bits)
@@ -480,16 +490,18 @@ func CompareValues(a, b catalogapi.Value) (int, error) {
 			return 0, nil
 		default:
 			// NaN cases: NaN is not equal to anything including itself.
-			// For ordering purposes, treat NaN == NaN as 0.
+			// For ordering: NaN sorts AFTER all non-NaN values (consistent
+			// with EncodeValue where NaN encodes to 0xFFF8... which is the
+			// highest encoded float value).
 			aNaN := math.IsNaN(a.Float)
 			bNaN := math.IsNaN(b.Float)
 			if aNaN && bNaN {
 				return 0, nil
 			}
 			if aNaN {
-				return -1, nil // NaN sorts before non-NaN
+				return 1, nil // NaN sorts after non-NaN
 			}
-			return 1, nil
+			return -1, nil
 		}
 
 	case catalogapi.TypeText:

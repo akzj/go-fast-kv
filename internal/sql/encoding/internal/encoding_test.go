@@ -471,7 +471,7 @@ func TestCompareValues(t *testing.T) {
 		{"float_lt", catalogapi.Value{Type: catalogapi.TypeFloat, Float: -1.0}, catalogapi.Value{Type: catalogapi.TypeFloat, Float: 1.0}, -1, false},
 		{"float_gt", catalogapi.Value{Type: catalogapi.TypeFloat, Float: 100.0}, catalogapi.Value{Type: catalogapi.TypeFloat, Float: 1.0}, 1, false},
 		{"float_nan_nan", catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.NaN()}, catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.NaN()}, 0, false},
-		{"float_nan_lt_num", catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.NaN()}, catalogapi.Value{Type: catalogapi.TypeFloat, Float: 0}, -1, false},
+		{"float_nan_gt_num", catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.NaN()}, catalogapi.Value{Type: catalogapi.TypeFloat, Float: 0}, 1, false},
 
 		// Text comparisons.
 		{"text_eq", catalogapi.Value{Type: catalogapi.TypeText, Text: "abc"}, catalogapi.Value{Type: catalogapi.TypeText, Text: "abc"}, 0, false},
