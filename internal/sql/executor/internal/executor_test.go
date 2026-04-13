@@ -412,3 +412,42 @@ func TestExec_FullLifecycle(t *testing.T) {
 		t.Fatalf("after drop: expected ErrTableNotFound, got %v", err)
 	}
 }
+
+
+func TestExec_Like(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 'bob@work.org')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Carol', 'carol@example.com')")
+
+	// LIKE with % suffix
+	result := env.execSQL(t, "SELECT name FROM users WHERE email LIKE '%@example.com'")
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(result.Rows))
+	}
+
+	// LIKE with exact pattern
+	result = env.execSQL(t, "SELECT name FROM users WHERE name LIKE 'Bob'")
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(result.Rows))
+	}
+
+	// LIKE with % prefix
+	result = env.execSQL(t, "SELECT name FROM users WHERE name LIKE '%ice'")
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (Alice)", len(result.Rows))
+	}
+
+	// LIKE no match
+	result = env.execSQL(t, "SELECT name FROM users WHERE email LIKE '%.gov'")
+	if len(result.Rows) != 0 {
+		t.Fatalf("rows = %d, want 0", len(result.Rows))
+	}
+
+	// LIKE with _ wildcard (Carol matches Ca__)
+	result = env.execSQL(t, "SELECT name FROM users WHERE name LIKE 'Ca___'")
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (Carol)", len(result.Rows))
+	}
+}

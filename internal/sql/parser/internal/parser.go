@@ -653,6 +653,17 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		return &api.IsNullExpr{Expr: left, Not: not}, nil
 	}
 
+	// LIKE
+	if p.cur.Type == api.TokLike {
+		p.advance()
+		if p.cur.Type != api.TokString {
+			return nil, p.errorf("expected string pattern after LIKE")
+		}
+		pattern := p.cur.Literal
+		p.advance()
+		return &api.LikeExpr{Expr: left, Pattern: pattern}, nil
+	}
+
 	// Comparison operators
 	var op api.BinaryOp
 	switch p.cur.Type {

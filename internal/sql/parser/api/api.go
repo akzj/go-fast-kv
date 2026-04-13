@@ -61,6 +61,7 @@ const (
 	TokAvg     TokenType = 41 // AVG
 	TokMin     TokenType = 42 // MIN
 	TokMax     TokenType = 43 // MAX
+	TokLike    TokenType = 44 // LIKE
 	TokExists  TokenType = 44 // EXISTS (moved from 36)
 	TokInteger2 TokenType = 37 // INTEGER type keyword (alias for INT)
 
@@ -278,6 +279,15 @@ type AggregateCallExpr struct {
 }
 
 func (*AggregateCallExpr) exprNode() {}
+
+// LikeExpr: col LIKE 'pattern'
+type LikeExpr struct {
+	Expr    Expr  // the column expression
+	Pattern string // pattern string
+	Escape  byte  // escape char (0 = none)
+}
+
+func (*LikeExpr) exprNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

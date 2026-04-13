@@ -27,6 +27,7 @@ var keywords = map[string]api.TokenType{
 	"NOT":     api.TokNot,
 	"NULL":    api.TokNull,
 	"IS":      api.TokIs,
+	"LIKE":    api.TokLike,
 	"GROUP":   api.TokGroup,
 	"HAVING":  api.TokHaving,
 	"ORDER":   api.TokOrder,

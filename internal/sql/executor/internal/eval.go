@@ -27,6 +27,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalUnaryExpr(e, row, columns)
 	case *parserapi.IsNullExpr:
 		return evalIsNullExpr(e, row, columns)
+	case *parserapi.LikeExpr:
+		return evalLikeExpr(e, row, columns)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
@@ -267,4 +269,71 @@ func binOpToCompareOp(op parserapi.BinaryOp) (encodingapi.CompareOp, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// evalLikeExpr evaluates a LIKE expression.
+// Returns true (1), false (0), or NULL if the input is NULL.
+func evalLikeExpr(expr *parserapi.LikeExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	val, err := evalExpr(expr.Expr, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL result
+	if val.IsNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
+	}
+	// Must be text
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("LIKE requires text, got %v", val.Type)
+	}
+	matched := matchLike(val.Text, expr.Pattern, expr.Escape)
+	if matched {
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}, nil
+}
+
+// matchLike implements LIKE pattern matching.
+// Wildcards: % matches any sequence (incl. empty), _ matches exactly one char.
+// Escape char (non-zero) disables special meaning of % and _.
+func matchLike(value, pattern string, escape byte) bool {
+	// Dynamic programming: dp[i][j] = does pattern[:j] match value[:i]?
+	// dp[0][0] = true (empty pattern matches empty value)
+	// dp[0][j] = dp[0][j-1] && pattern[j-1] == '%'  (trailing % matches empty)
+	pLen, vLen := len(pattern), len(value)
+	dp := make([][]bool, vLen+1)
+	for i := range dp {
+		dp[i] = make([]bool, pLen+1)
+	}
+	dp[0][0] = true
+	// Empty value against non-empty pattern: only % can match
+	for j := 1; j <= pLen; j++ {
+		dp[0][j] = dp[0][j-1] && pattern[j-1] == '%'
+	}
+	for i := 1; i <= vLen; i++ {
+		for j := 1; j <= pLen; j++ {
+			pat := pattern[j-1]
+			if escape != 0 && pat == escape {
+				// Escape: treat next char literally
+				if j == pLen {
+					// Trailing escape: treat as literal escape char
+					dp[i][j] = dp[i-1][j-1] && i > 0 && value[i-1] == escape
+				} else {
+					// Escape the next character
+					nextPat := pattern[j]
+					dp[i][j] = dp[i-1][j-1] && value[i-1] == nextPat
+				}
+			} else if pat == '%' {
+				// % matches: empty sequence OR one more char from value
+				dp[i][j] = dp[i][j-1] || dp[i-1][j]
+			} else if pat == '_' {
+				// _ matches any single char
+				dp[i][j] = dp[i-1][j-1]
+			} else {
+				// Literal match
+				dp[i][j] = dp[i-1][j-1] && value[i-1] == pat
+			}
+		}
+	}
+	return dp[vLen][pLen]
 }
