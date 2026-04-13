@@ -169,6 +169,26 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Backfill: index all existing rows in the table.
+	tbl, err := e.catalog.GetTable(schema.Table)
+	if err != nil {
+		return nil, fmt.Errorf("%w: backfill get table: %v", executorapi.ErrExecFailed, err)
+	}
+	colIdx := findColumnIndex(tbl, schema.Column)
+	if colIdx < 0 {
+		return nil, fmt.Errorf("%w: backfill column %q not found", executorapi.ErrExecFailed, schema.Column)
+	}
+	existingRows, err := e.tableScan(tbl, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
+	}
+	for _, row := range existingRows {
+		val := row.Values[colIdx]
+		if err := e.indexEngine.Insert(&schema, tbl.TableID, schema.IndexID, val, row.RowID); err != nil {
+			return nil, fmt.Errorf("%w: backfill insert index: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
 	return &executorapi.Result{RowsAffected: 0}, nil
 }
 
@@ -239,19 +259,19 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return nil, err
 	}
 
+	// ORDER BY (sort raw rows BEFORE projection so all columns are available)
+	if plan.OrderBy != nil {
+		sortRawRows(rows, plan.OrderBy)
+	}
+
+	// LIMIT (apply before projection for efficiency)
+	if plan.Limit >= 0 && plan.Limit < len(rows) {
+		rows = rows[:plan.Limit]
+	}
+
 	// Project columns
 	colNames := buildColumnNames(plan.Table, plan.Columns)
 	projected := projectRows(rows, plan.Columns)
-
-	// ORDER BY
-	if plan.OrderBy != nil {
-		sortRows(projected, plan.OrderBy, plan.Columns)
-	}
-
-	// LIMIT
-	if plan.Limit >= 0 && plan.Limit < len(projected) {
-		projected = projected[:plan.Limit]
-	}
 
 	return &executorapi.Result{
 		Columns: colNames,

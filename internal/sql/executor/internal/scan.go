@@ -159,38 +159,20 @@ func projectRows(rows []*engineapi.Row, colIndices []int) [][]catalogapi.Value {
 	return result
 }
 
-// sortRows sorts projected rows by the ORDER BY column.
-func sortRows(rows [][]catalogapi.Value, orderBy *plannerapi.OrderByPlan, colIndices []int) {
-	// Map the OrderBy column index to the projected column index
-	projIdx := -1
-	if len(colIndices) == 0 {
-		// SELECT * — projected index == table column index
-		projIdx = orderBy.ColumnIndex
-	} else {
-		for i, ci := range colIndices {
-			if ci == orderBy.ColumnIndex {
-				projIdx = i
-				break
-			}
-		}
-	}
-	if projIdx < 0 {
-		// ORDER BY column not in projection — sort by the column index directly
-		projIdx = orderBy.ColumnIndex
-	}
+// sortRawRows sorts raw engine rows by the ORDER BY column BEFORE projection.
+// This ensures ORDER BY works even when the sort column is not in the SELECT list.
+func sortRawRows(rows []*engineapi.Row, orderBy *plannerapi.OrderByPlan) {
+	colIdx := orderBy.ColumnIndex
 
 	sort.SliceStable(rows, func(i, j int) bool {
-		a := rows[i]
-		b := rows[j]
-
 		var va, vb catalogapi.Value
-		if projIdx < len(a) {
-			va = a[projIdx]
+		if colIdx < len(rows[i].Values) {
+			va = rows[i].Values[colIdx]
 		} else {
 			va = catalogapi.Value{IsNull: true}
 		}
-		if projIdx < len(b) {
-			vb = b[projIdx]
+		if colIdx < len(rows[j].Values) {
+			vb = rows[j].Values[colIdx]
 		} else {
 			vb = catalogapi.Value{IsNull: true}
 		}
@@ -200,10 +182,10 @@ func sortRows(rows [][]catalogapi.Value, orderBy *plannerapi.OrderByPlan, colInd
 			return false
 		}
 		if va.IsNull {
-			return !orderBy.Desc // NULL first in ASC
+			return !orderBy.Desc
 		}
 		if vb.IsNull {
-			return orderBy.Desc // NULL last in ASC
+			return orderBy.Desc
 		}
 
 		cmp, err := encoding.CompareValues(va, vb)
