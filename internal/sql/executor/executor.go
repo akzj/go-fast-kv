@@ -51,6 +51,8 @@ func (e *Executor) Query(plan planner.PlanNode) (Iterator, error) {
 	switch p := plan.(type) {
 	case *planner.TableScanPlan:
 		return e.execTableScan(p)
+	case *planner.IndexScanPlan:
+		return e.execIndexScan(p)
 	default:
 		return nil, fmt.Errorf("executor: unsupported query plan type %T", plan)
 	}
@@ -121,7 +123,26 @@ func (e *Executor) execInsert(plan *planner.InsertPlan) (int64, error) {
 		return 0, err
 	}
 
-	// TODO: Update indexes
+	// Update indexes
+	indexes, err := e.cata.ListIndexesByTable(plan.Table)
+	if err == nil {
+		for _, idx := range indexes {
+			// Find column index
+			colIdx := -1
+			for ci, col := range table.Columns {
+				if strings.EqualFold(col.Name, idx.Column) {
+					colIdx = ci
+					break
+				}
+			}
+			if colIdx >= 0 && colIdx < len(plan.Values) {
+				// Store index entry: "{table}:__idx:{indexName}:{colVal}" -> "{rowKey}"
+				idxKey := fmt.Sprintf("%s:__idx:%s:%s", plan.Table, idx.Name,
+					encodeValue(plan.Values[colIdx], table.Columns[colIdx].Type))
+				e.kv.Put([]byte(idxKey), []byte(rowKey))
+			}
+		}
+	}
 
 	return 1, nil
 }
@@ -146,6 +167,18 @@ func (e *Executor) execUpdate(plan *planner.UpdatePlan) (int64, error) {
 		return 0, fmt.Errorf("executor: column %s not found", plan.Column)
 	}
 
+	// Check if this column has an index
+	indexedCol := false
+	var indexName string
+	indexes, _ := e.cata.ListIndexesByTable(plan.Table)
+	for _, idx := range indexes {
+		if strings.EqualFold(idx.Column, plan.Column) {
+			indexedCol = true
+			indexName = idx.Name
+			break
+		}
+	}
+
 	// Scan and update matching rows
 	var count int64
 	prefix := plan.Table + ":"
@@ -167,6 +200,13 @@ func (e *Executor) execUpdate(plan *planner.UpdatePlan) (int64, error) {
 			continue
 		}
 
+		// Delete old index entry if column is indexed
+		if indexedCol {
+			oldIdxKey := fmt.Sprintf("%s:__idx:%s:%s", plan.Table, indexName,
+				encodeValue(rowValues[colIdx], table.Columns[colIdx].Type))
+			e.kv.Delete([]byte(oldIdxKey))
+		}
+
 		// Update the column
 		rowValues[colIdx] = plan.Value
 
@@ -175,6 +215,14 @@ func (e *Executor) execUpdate(plan *planner.UpdatePlan) (int64, error) {
 		if err := e.kv.Put(iter.Key(), newData); err != nil {
 			return count, err
 		}
+
+		// Insert new index entry if column is indexed
+		if indexedCol {
+			newIdxKey := fmt.Sprintf("%s:__idx:%s:%s", plan.Table, indexName,
+				encodeValue(plan.Value, table.Columns[colIdx].Type))
+			e.kv.Put([]byte(newIdxKey), iter.Key())
+		}
+
 		count++
 	}
 
@@ -210,6 +258,24 @@ func (e *Executor) execDelete(plan *planner.DeletePlan) (int64, error) {
 			continue
 		}
 
+		// Delete all index entries pointing to this row
+		indexes, _ := e.cata.ListIndexesByTable(plan.Table)
+		for _, idx := range indexes {
+			// Find column index
+			colIdx := -1
+			for ci, col := range table.Columns {
+				if strings.EqualFold(col.Name, idx.Column) {
+					colIdx = ci
+					break
+				}
+			}
+			if colIdx >= 0 && colIdx < len(rowValues) {
+				idxKey := fmt.Sprintf("%s:__idx:%s:%s", plan.Table, idx.Name,
+					encodeValue(rowValues[colIdx], table.Columns[colIdx].Type))
+				e.kv.Delete([]byte(idxKey))
+			}
+		}
+
 		// Delete the row
 		if err := e.kv.Delete(iter.Key()); err != nil {
 			return count, err
@@ -240,6 +306,145 @@ func (e *Executor) execTableScan(plan *planner.TableScanPlan) (Iterator, error) 
 		where:   plan.Where,
 		columns: table.Columns,
 	}, nil
+}
+
+// execIndexScan performs an index scan to find matching rows.
+// Index format: "{table}:__idx:{indexName}:{columnValue}" -> "{rowKey}"
+func (e *Executor) execIndexScan(plan *planner.IndexScanPlan) (Iterator, error) {
+	// Look up table schema
+	table, err := e.cata.GetTable(plan.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	// Look up index to get column position
+	idx, err := e.cata.GetIndex(plan.Table, plan.Index)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find column index
+	colIdx := -1
+	for i, col := range table.Columns {
+		if strings.EqualFold(col.Name, idx.Column) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return nil, fmt.Errorf("execIndexScan: column %s not found in table", idx.Column)
+	}
+
+	// Scan index: "{table}:__idx:{indexName}:{prefix}"
+	prefix := fmt.Sprintf("%s:__idx:%s:", plan.Table, plan.Index)
+	start := []byte(prefix)
+	end := []byte(prefix + "\xff")
+
+	iter := e.kv.Scan(start, end)
+	return &indexScanIter{
+		kv:      e.kv,
+		iter:    iter,
+		table:   plan.Table,
+		columns: table.Columns,
+		colIdx:  colIdx,
+		op:      plan.Op,
+		value:   plan.Value,
+	}, nil
+}
+
+type indexScanIter struct {
+	kv      kvstoreapi.Store
+	iter    kvstoreapi.Iterator
+	table   string
+	columns []catalog.ColumnDef
+	colIdx  int
+	op      string
+	value   value.Value
+	row     Row
+	err     error
+}
+
+func (i *indexScanIter) Next() bool {
+	for i.iter.Next() {
+		// Index entry: key = "{table}:__idx:{idx}:{colVal}", value = "{rowKey}"
+		// We need to find rows where column matches the condition
+
+		// First, extract the column value from the index key
+		// Index key format: "{table}:__idx:{indexName}:{columnValue}"
+		key := string(i.iter.Key())
+		parts := strings.Split(key, ":")
+		if len(parts) < 4 {
+			continue
+		}
+
+		// parts[3] is the column value stored in index
+		idxColValue := parts[len(parts)-1]
+
+		// Check if it matches our condition
+		condVal := i.value.String()
+		if !compareIndexValue(idxColValue, condVal, i.op) {
+			continue
+		}
+
+		// Get row key from index value
+		rowKey := string(i.iter.Value())
+
+		// Fetch the actual row
+		data, err := i.kv.Get([]byte(rowKey))
+		if err != nil {
+			// Row might have been deleted
+			continue
+		}
+
+		// Decode row
+		rowValues, err := decodeRow(i.columns, data)
+		if err != nil {
+			i.err = err
+			continue
+		}
+
+		i.row = Row{
+			Values: rowValues,
+		}
+		return true
+	}
+
+	i.err = i.iter.Err()
+	return false
+}
+
+func compareIndexValue(idxVal, condVal, op string) bool {
+	switch op {
+	case "=":
+		return idxVal == condVal
+	case "!=":
+		return idxVal != condVal
+	case ">":
+		return idxVal > condVal
+	case "<":
+		return idxVal < condVal
+	case ">=":
+		return idxVal >= condVal
+	case "<=":
+		return idxVal <= condVal
+	default:
+		return false
+	}
+}
+
+func (i *indexScanIter) Row() Row {
+	return i.row
+}
+
+func (i *indexScanIter) Err() error {
+	if i.err != nil {
+		return i.err
+	}
+	return i.iter.Err()
+}
+
+func (i *indexScanIter) Close() {
+	i.iter.Close()
 }
 
 type tableScanIter struct {

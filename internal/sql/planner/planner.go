@@ -135,8 +135,25 @@ func (p *Planner) Plan(node parser.Node) (PlanNode, error) {
 }
 
 func (p *Planner) planSelect(stmt *parser.SelectStmt) (PlanNode, error) {
-	// TODO: Implement index selection
-	// For now, always use table scan
+	// Check if WHERE clause can use an index
+	if stmt.Where != nil {
+		// Try to find an index on the WHERE column
+		idx, err := p.catalog.GetIndexByColumn(stmt.Table, stmt.Where.Column)
+		if err == nil {
+			// Index found - use index scan
+			// For now, we need to scan the index to find matching row keys
+			// The executor will handle reading the index data
+			return &IndexScanPlan{
+				Table:  stmt.Table,
+				Index:  idx.Name,
+				Column: idx.Column,
+				Op:     stmt.Where.Op,
+				Value:  stmt.Where.Value,
+			}, nil
+		}
+	}
+
+	// Fall back to table scan
 	return &TableScanPlan{Table: stmt.Table, Where: stmt.Where}, nil
 }
 

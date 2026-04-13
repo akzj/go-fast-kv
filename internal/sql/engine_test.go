@@ -420,3 +420,29 @@ func TestCheckpoint(t *testing.T) {
 		t.Errorf("expected 2 rows, found %d", len(foundIDs))
 	}
 }
+
+func TestIndexScan(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := kvstore.Open(kvstoreapi.Config{Dir: dir})
+	engine, _ := Open(Config{KVStore: store})
+	defer func() { engine.Close(); store.Close() }()
+
+	engine.Exec("CREATE TABLE users (id INT, name TEXT, age INT)")
+	engine.Exec("INSERT INTO users VALUES (1, 'Alice', 30)")
+	engine.Exec("INSERT INTO users VALUES (2, 'Bob', 25)")
+	engine.Exec("INSERT INTO users VALUES (3, 'Charlie', 30)")
+	engine.Exec("CREATE INDEX idx_age ON users (age)")
+
+	iter, err := engine.Query("SELECT * FROM users WHERE age = 30")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 2 {
+		t.Errorf("expected 2 rows, got %d", count)
+	}
+}
