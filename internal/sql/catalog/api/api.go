@@ -54,6 +54,7 @@ type TableSchema struct {
 	Name       string
 	Columns    []ColumnDef
 	PrimaryKey string // column name, optional
+	TableID    uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
 }
 
 // ColumnDef describes a single column in a table.
@@ -64,10 +65,11 @@ type ColumnDef struct {
 
 // IndexSchema describes an index on a table.
 type IndexSchema struct {
-	Name   string
-	Table  string
-	Column string // indexed column
-	Unique bool
+	Name    string
+	Table   string
+	Column  string // indexed column
+	Unique  bool
+	IndexID uint32 // persistent ID for key encoding (assigned at CREATE INDEX)
 }
 
 // ─── Interfaces ────────────────────────────────────────────────────
