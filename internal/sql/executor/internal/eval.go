@@ -29,6 +29,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalIsNullExpr(e, row, columns)
 	case *parserapi.LikeExpr:
 		return evalLikeExpr(e, row, columns)
+	case *parserapi.AggregateCallExpr:
+		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, e.Func)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}

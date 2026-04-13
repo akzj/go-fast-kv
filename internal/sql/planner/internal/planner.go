@@ -279,6 +279,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 
 	return &plannerapi.SelectPlan{
 		Table: tbl, Scan: scan, Columns: colIndices,
+		SelectColumns: stmt.Columns,
 		Filter: residualFilter, GroupByExprs: stmt.GroupBy,
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit,
 	}, nil
@@ -433,15 +434,19 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 
 	indices := make([]int, len(cols))
 	for i, sc := range cols {
-		ref, ok := sc.Expr.(*parserapi.ColumnRef)
-		if !ok {
-			return nil, fmt.Errorf("%w: SELECT expression must be a column reference", plannerapi.ErrUnsupportedExpr)
+		switch expr := sc.Expr.(type) {
+		case *parserapi.ColumnRef:
+			idx := findColumnIndex(tbl, expr.Column)
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, expr.Column)
+			}
+			indices[i] = idx
+		case *parserapi.AggregateCallExpr:
+			// Aggregates are not column indices; set -1 as sentinel (executor handles them via SelectColumns).
+			indices[i] = -1
+		default:
+			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
 		}
-		idx := findColumnIndex(tbl, ref.Column)
-		if idx < 0 {
-			return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, ref.Column)
-		}
-		indices[i] = idx
 	}
 	return indices, nil
 }

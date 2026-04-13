@@ -4,12 +4,17 @@ package internal
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
+	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
+	encoding "github.com/akzj/go-fast-kv/internal/sql/encoding"
+	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
 )
 
 // Compile-time interface check.
@@ -25,6 +30,7 @@ type executor struct {
 	store       kvstoreapi.Store
 	catalog     catalogapi.CatalogManager
 	tableEngine engineapi.TableEngine
+	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
 }
 
@@ -36,6 +42,7 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		catalog:     catalog,
 		tableEngine: tableEngine,
 		indexEngine: indexEngine,
+		keyEncoder:  encoding.NewKeyEncoder(),
 	}
 }
 
@@ -310,8 +317,19 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		rows = filterRows(rows, plan.Filter, plan.Table.Columns)
 	}
 
-	// TODO: GROUP BY execution — group rows by groupByExprs, compute aggregates
-	// After filter, before ORDER BY
+	// GROUP BY: group rows by encoded key, then compute aggregates per group.
+	if plan.GroupByExprs != nil {
+		grouped, err := e.groupByRows(rows, plan)
+		if err != nil {
+			return nil, err
+		}
+		rows = grouped
+
+		// HAVING: filter grouped rows
+		if plan.Having != nil {
+			rows = filterRows(rows, plan.Having, plan.Table.Columns)
+		}
+	}
 
 	// ORDER BY (sort raw rows BEFORE projection so all columns are available)
 	if plan.OrderBy != nil {
@@ -324,8 +342,27 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	}
 
 	// Project columns
-	colNames := buildColumnNames(plan.Table, plan.Columns)
-	projected := projectRows(rows, plan.Columns)
+	var projected [][]catalogapi.Value
+	var colNames []string
+	if plan.GroupByExprs != nil {
+		// After GROUP BY, rows are already projected via projectGroupedRow
+		// — just extract the pre-projected values and names
+		projected = make([][]catalogapi.Value, len(rows))
+		for i, row := range rows {
+			projected[i] = row.Values
+		}
+		colNames = make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				colNames[i] = ref.Column
+			} else {
+				colNames[i] = "count(...)"
+			}
+		}
+	} else {
+		colNames = buildColumnNames(plan.Table, plan.Columns)
+		projected = projectRows(rows, plan.Columns)
+	}
 
 	return &executorapi.Result{
 		Columns: colNames,
@@ -453,3 +490,315 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	return &executorapi.Result{RowsAffected: count}, nil
 }
 
+// groupByRows groups input rows by GROUP BY expressions and computes aggregates.
+// plan.SelectColumns tells us which output columns are group keys vs aggregates.
+// Returns []*engineapi.Row where each row has len(SelectColumns) values.
+func (e *executor) groupByRows(rows []*engineapi.Row, plan *plannerapi.SelectPlan) ([]*engineapi.Row, error) {
+	// Phase 1: group rows by encoded key into a slice of groups (to preserve key for sorting)
+	type group struct {
+		key  []byte
+		rows []*engineapi.Row
+	}
+	groups := make([]group, 0)
+	groupMap := make(map[string]int) // key -> index in groups
+
+	for _, row := range rows {
+		key, err := e.encodeGroupKey(row, plan.GroupByExprs, plan.Table.Columns)
+		if err != nil {
+			return nil, fmt.Errorf("%w: group key: %v", executorapi.ErrExecFailed, err)
+		}
+		keyStr := string(key)
+		if idx, ok := groupMap[keyStr]; ok {
+			groups[idx].rows = append(groups[idx].rows, row)
+		} else {
+			groupMap[keyStr] = len(groups)
+			groups = append(groups, group{key: key, rows: []*engineapi.Row{row}})
+		}
+	}
+
+	// Phase 2: project each group and sort by encoded key
+	result := make([]*engineapi.Row, 0, len(groups))
+	for _, g := range groups {
+		vals, err := projectGroupedRow(g.rows, plan)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, &engineapi.Row{Values: vals})
+	}
+
+	// Sort by encoded key (deterministic, stable)
+	sort.SliceStable(result, func(i, j int) bool {
+		return string(groups[i].key) < string(groups[j].key)
+	})
+	return result, nil
+}
+
+
+// encodeGroupKey computes a unique encoded key from GROUP BY expression values.
+func (e *executor) encodeGroupKey(row *engineapi.Row, exprs []parserapi.Expr, columns []catalogapi.ColumnDef) ([]byte, error) {
+	var buf []byte
+	for _, expr := range exprs {
+		val, err := evalExpr(expr, row, columns)
+		if err != nil {
+			return nil, err
+		}
+		if val.IsNull {
+			buf = append(buf, 0xFF) // NULL sentinel
+		} else {
+			buf = e.keyEncoder.EncodeValue(val)
+		}
+		buf = append(buf, 0) // separator between exprs
+	}
+	return buf, nil
+}
+
+
+// groupKeyColIndices returns the set of column indices that are group-key expressions.
+func groupKeyColIndices(plan *plannerapi.SelectPlan) map[int]bool {
+	groupCols := make(map[int]bool)
+	for _, sc := range plan.SelectColumns {
+		if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+			for _, gb := range plan.GroupByExprs {
+				if gbRef, ok := gb.(*parserapi.ColumnRef); ok {
+					if strings.EqualFold(ref.Column, gbRef.Column) {
+						idx := findColumnIndex(plan.Table, ref.Column)
+						if idx >= 0 {
+							groupCols[idx] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	return groupCols
+}
+
+// computeAggregate computes the aggregate value for an AggregateCallExpr across a group of rows.
+func computeAggregate(agg *parserapi.AggregateCallExpr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	switch strings.ToUpper(agg.Func) {
+	case "COUNT":
+		if agg.Arg == nil {
+			return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(rows))}, nil
+		}
+		colRef, ok := agg.Arg.(*parserapi.ColumnRef)
+		if !ok {
+			return catalogapi.Value{}, fmt.Errorf("%w: COUNT argument must be a column", executorapi.ErrExecFailed)
+		}
+		idx := findColumnIndexByName(columns, colRef.Column)
+		var count int64
+		for _, row := range rows {
+			if idx >= 0 && idx < len(row.Values) && !row.Values[idx].IsNull {
+				count++
+			}
+		}
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: count}, nil
+
+	case "SUM":
+		colRef, ok := agg.Arg.(*parserapi.ColumnRef)
+		if !ok {
+			return catalogapi.Value{}, fmt.Errorf("%w: SUM argument must be a column", executorapi.ErrExecFailed)
+		}
+		idx := findColumnIndexByName(columns, colRef.Column)
+		var sum int64
+		for _, row := range rows {
+			if idx >= 0 && idx < len(row.Values) {
+				val := row.Values[idx]
+				if !val.IsNull && val.Type == catalogapi.TypeInt {
+					sum += val.Int
+				}
+			}
+		}
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: sum}, nil
+
+	case "AVG":
+		colRef, ok := agg.Arg.(*parserapi.ColumnRef)
+		if !ok {
+			return catalogapi.Value{}, fmt.Errorf("%w: AVG argument must be a column", executorapi.ErrExecFailed)
+		}
+		idx := findColumnIndexByName(columns, colRef.Column)
+		var sum float64
+		var count int64
+		for _, row := range rows {
+			if idx >= 0 && idx < len(row.Values) {
+				val := row.Values[idx]
+				if !val.IsNull {
+					if val.Type == catalogapi.TypeInt {
+						sum += float64(val.Int)
+					} else if val.Type == catalogapi.TypeFloat {
+						sum += val.Float
+					}
+					count++
+				}
+			}
+		}
+		if count == 0 {
+			return catalogapi.Value{Type: catalogapi.TypeFloat, IsNull: true}, nil
+		}
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: sum / float64(count)}, nil
+
+	case "MIN":
+		colRef, ok := agg.Arg.(*parserapi.ColumnRef)
+		if !ok {
+			return catalogapi.Value{}, fmt.Errorf("%w: MIN argument must be a column", executorapi.ErrExecFailed)
+		}
+		idx := findColumnIndexByName(columns, colRef.Column)
+		return minValueForColumn(rows, idx), nil
+
+	case "MAX":
+		colRef, ok := agg.Arg.(*parserapi.ColumnRef)
+		if !ok {
+			return catalogapi.Value{}, fmt.Errorf("%w: MAX argument must be a column", executorapi.ErrExecFailed)
+		}
+		idx := findColumnIndexByName(columns, colRef.Column)
+		return maxValueForColumn(rows, idx), nil
+
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unsupported aggregate function %s", executorapi.ErrExecFailed, agg.Func)
+	}
+}
+
+// minValueForColumn returns the MIN value for a column across rows (NULLs ignored).
+func minValueForColumn(rows []*engineapi.Row, colIdx int) catalogapi.Value {
+	var minInt int64 = 9223372036854775807
+	var minFloat float64 = 1e300
+	var minText string
+	hasValue := false
+	valType := catalogapi.Type(0)
+
+	for _, row := range rows {
+		if colIdx >= len(row.Values) {
+			continue
+		}
+		val := row.Values[colIdx]
+		if val.IsNull {
+			continue
+		}
+		if valType == 0 {
+			valType = val.Type
+		}
+		switch val.Type {
+		case catalogapi.TypeInt:
+			if val.Int < minInt {
+				minInt = val.Int
+			}
+			hasValue = true
+		case catalogapi.TypeFloat:
+			if val.Float < minFloat {
+				minFloat = val.Float
+			}
+			hasValue = true
+		case catalogapi.TypeText:
+			if !hasValue || val.Text < minText {
+				minText = val.Text
+			}
+			hasValue = true
+		}
+	}
+
+	if !hasValue {
+		return catalogapi.Value{Type: valType, IsNull: true}
+	}
+	switch valType {
+	case catalogapi.TypeInt:
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: minInt}
+	case catalogapi.TypeFloat:
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: minFloat}
+	case catalogapi.TypeText:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: minText}
+	}
+	return catalogapi.Value{IsNull: true}
+}
+
+// maxValueForColumn returns the MAX value for a column across rows (NULLs ignored).
+func maxValueForColumn(rows []*engineapi.Row, colIdx int) catalogapi.Value {
+	var maxInt int64 = -9223372036854775808
+	var maxFloat float64 = -1e300
+	var maxText string
+	hasValue := false
+	valType := catalogapi.Type(0)
+
+	for _, row := range rows {
+		if colIdx >= len(row.Values) {
+			continue
+		}
+		val := row.Values[colIdx]
+		if val.IsNull {
+			continue
+		}
+		if valType == 0 {
+			valType = val.Type
+		}
+		switch val.Type {
+		case catalogapi.TypeInt:
+			if val.Int > maxInt {
+				maxInt = val.Int
+			}
+			hasValue = true
+		case catalogapi.TypeFloat:
+			if val.Float > maxFloat {
+				maxFloat = val.Float
+			}
+			hasValue = true
+		case catalogapi.TypeText:
+			if !hasValue || val.Text > maxText {
+				maxText = val.Text
+			}
+			hasValue = true
+		}
+	}
+
+	if !hasValue {
+		return catalogapi.Value{Type: valType, IsNull: true}
+	}
+	switch valType {
+	case catalogapi.TypeInt:
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: maxInt}
+	case catalogapi.TypeFloat:
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: maxFloat}
+	case catalogapi.TypeText:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: maxText}
+	}
+	return catalogapi.Value{IsNull: true}
+}
+
+// findColumnIndexByName returns the index of a column by name (case-insensitive).
+func findColumnIndexByName(columns []catalogapi.ColumnDef, name string) int {
+	upper := strings.ToUpper(name)
+	for i, col := range columns {
+		if strings.ToUpper(col.Name) == upper {
+			return i
+		}
+	}
+	return -1
+}
+
+// projectGroupedRow builds the output row for a group by evaluating each SelectColumn.
+func projectGroupedRow(groupRows []*engineapi.Row, plan *plannerapi.SelectPlan) ([]catalogapi.Value, error) {
+	groupCols := groupKeyColIndices(plan)
+	result := make([]catalogapi.Value, len(plan.SelectColumns))
+
+	for i, sc := range plan.SelectColumns {
+		switch expr := sc.Expr.(type) {
+		case *parserapi.ColumnRef:
+			if groupCols[plan.Columns[i]] {
+				idx := plan.Columns[i]
+				if idx >= 0 && idx < len(groupRows[0].Values) {
+					result[i] = groupRows[0].Values[idx]
+				} else {
+					result[i] = catalogapi.Value{IsNull: true}
+				}
+			} else {
+				result[i] = catalogapi.Value{IsNull: true}
+			}
+		case *parserapi.AggregateCallExpr:
+			val, err := computeAggregate(expr, groupRows, plan.Table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		default:
+			return nil, fmt.Errorf("%w: GROUP BY SELECT expression must be column or aggregate", executorapi.ErrExecFailed)
+		}
+	}
+	return result, nil
+}
