@@ -3,6 +3,7 @@ package internal
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sync"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -105,8 +106,15 @@ func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi
 		}
 	}
 
+	// F-C3: save counter BEFORE any update for rollback.
+	oldCounter := te.rowCounters[tableID]
+
 	if pkColIdx >= 0 && pkColIdx < len(values) && !values[pkColIdx].IsNull {
 		// Use the PK value as rowID.
+		// F-W2: validate non-negative.
+		if values[pkColIdx].Int < 0 {
+			return 0, fmt.Errorf("engine: primary key must be non-negative, got %d", values[pkColIdx].Int)
+		}
 		rowID = uint64(values[pkColIdx].Int)
 
 		// Check for duplicates.
@@ -137,7 +145,7 @@ func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi
 		te.rowCounters[tableID] = next + 1
 	}
 
-	// Encode and write atomically.
+	// Encode and write atomically. Persist the current (possibly updated) counter.
 	rowKey := te.encoder.EncodeRowKey(tableID, rowID)
 	rowVal := te.codec.EncodeRow(values)
 
@@ -151,6 +159,73 @@ func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi
 		return 0, err
 	}
 	if err := batch.Commit(); err != nil {
+		// F-C3: rollback counter to saved value and discard batch.
+		te.rowCounters[tableID] = oldCounter
+		batch.Discard()
+		return 0, err
+	}
+
+	return rowID, nil
+}
+
+// InsertInto inserts a row into a provided WriteBatch.
+// Counter is updated in-memory but NOT persisted; caller must add
+// counter persistence to the batch if needed.
+// Returns the assigned rowID.
+func (te *tableEngine) InsertInto(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, values []catalogapi.Value) (uint64, error) {
+	if table.TableID == 0 {
+		return 0, engineapi.ErrTableIDNotSet
+	}
+	tableID := table.TableID
+
+	te.mu.Lock()
+	defer te.mu.Unlock()
+
+	var rowID uint64
+
+	pkColIdx := -1
+	if table.PrimaryKey != "" {
+		for i, col := range table.Columns {
+			if col.Name == table.PrimaryKey && col.Type == catalogapi.TypeInt {
+				pkColIdx = i
+				break
+			}
+		}
+	}
+
+	if pkColIdx >= 0 && pkColIdx < len(values) && !values[pkColIdx].IsNull {
+		if values[pkColIdx].Int < 0 {
+			return 0, fmt.Errorf("engine: primary key must be non-negative, got %d", values[pkColIdx].Int)
+		}
+		rowID = uint64(values[pkColIdx].Int)
+		// Check for duplicates via store.Get (not batch-safe for read-your-own-writes in batch)
+		rowKey := te.encoder.EncodeRowKey(tableID, rowID)
+		_, err := te.store.Get(rowKey)
+		if err == nil {
+			return 0, engineapi.ErrDuplicateKey
+		}
+		if err != kvstoreapi.ErrKeyNotFound {
+			return 0, err
+		}
+		next, err := te.nextRowID(tableID)
+		if err != nil {
+			return 0, err
+		}
+		if rowID >= next {
+			te.rowCounters[tableID] = rowID + 1
+		}
+	} else {
+		next, err := te.nextRowID(tableID)
+		if err != nil {
+			return 0, err
+		}
+		rowID = next
+		te.rowCounters[tableID] = next + 1
+	}
+
+	rowKey := te.encoder.EncodeRowKey(tableID, rowID)
+	rowVal := te.codec.EncodeRow(values)
+	if err := batch.Put(rowKey, rowVal); err != nil {
 		return 0, err
 	}
 
@@ -208,6 +283,16 @@ func (te *tableEngine) Delete(table *catalogapi.TableSchema, rowID uint64) error
 	return te.store.Delete(rowKey)
 }
 
+// DeleteFrom deletes a row via a provided WriteBatch.
+// Does NOT check existence. Caller is responsible for the batch lifecycle.
+func (te *tableEngine) DeleteFrom(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, rowID uint64) error {
+	if table.TableID == 0 {
+		return engineapi.ErrTableIDNotSet
+	}
+	rowKey := te.encoder.EncodeRowKey(table.TableID, rowID)
+	return batch.Delete(rowKey)
+}
+
 func (te *tableEngine) Update(table *catalogapi.TableSchema, rowID uint64, values []catalogapi.Value) error {
 	if table.TableID == 0 {
 		return engineapi.ErrTableIDNotSet
@@ -223,6 +308,17 @@ func (te *tableEngine) Update(table *catalogapi.TableSchema, rowID uint64, value
 	}
 	rowVal := te.codec.EncodeRow(values)
 	return te.store.Put(rowKey, rowVal)
+}
+
+// UpdateIn updates a row via a provided WriteBatch.
+// Does NOT check existence. Caller is responsible for the batch lifecycle.
+func (te *tableEngine) UpdateIn(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, rowID uint64, values []catalogapi.Value) error {
+	if table.TableID == 0 {
+		return engineapi.ErrTableIDNotSet
+	}
+	rowKey := te.encoder.EncodeRowKey(table.TableID, rowID)
+	rowVal := te.codec.EncodeRow(values)
+	return batch.Put(rowKey, rowVal)
 }
 
 func (te *tableEngine) DropTableData(tableID uint32) error {

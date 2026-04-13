@@ -12,6 +12,7 @@ import (
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
+	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -101,6 +102,14 @@ type TableEngine interface {
 	// The row data and counter update are written atomically via WriteBatch.
 	Insert(table *catalogapi.TableSchema, values []catalogapi.Value) (uint64, error)
 
+	// InsertInto inserts a row into a provided WriteBatch.
+	// Does NOT create its own batch. Caller manages batch lifecycle.
+	// The batch is used only for the row data; counter is updated in-memory.
+	// Caller is responsible for adding counter persistence to the batch.
+	//
+	// Returns the assigned rowID.
+	InsertInto(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, values []catalogapi.Value) (uint64, error)
+
 	// Get retrieves a single row by rowID.
 	// Returns ErrRowNotFound if the row does not exist.
 	Get(table *catalogapi.TableSchema, rowID uint64) (*Row, error)
@@ -113,9 +122,17 @@ type TableEngine interface {
 	// Returns ErrRowNotFound if the row does not exist.
 	Delete(table *catalogapi.TableSchema, rowID uint64) error
 
+	// DeleteFrom deletes a row via a provided WriteBatch.
+	// Does NOT check existence. Caller manages batch lifecycle.
+	DeleteFrom(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, rowID uint64) error
+
 	// Update replaces a row's values (same rowID).
 	// Returns ErrRowNotFound if the row does not exist.
 	Update(table *catalogapi.TableSchema, rowID uint64, values []catalogapi.Value) error
+
+	// UpdateIn replaces a row's values via a provided WriteBatch.
+	// Does NOT check existence. Caller manages batch lifecycle.
+	UpdateIn(table *catalogapi.TableSchema, batch kvstoreapi.WriteBatch, rowID uint64, values []catalogapi.Value) error
 
 	// DropTableData deletes all row data and the metadata key for a table.
 	// Uses kvstore.DeleteRange for efficiency.

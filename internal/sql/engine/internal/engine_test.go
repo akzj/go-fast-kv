@@ -566,3 +566,20 @@ func TestIndexEngine_ScanRange(t *testing.T) {
 		t.Errorf("expected 5 entries for full scan, got %d", count)
 	}
 }
+
+func TestTableEngine_InsertNegativePK(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTableWithPK()
+
+	// F-W2: negative PK should be rejected.
+	values := []catalogapi.Value{intVal(-1), textVal("Bad"), intVal(99)}
+	_, err := te.Insert(table, values)
+	if err == nil {
+		t.Fatal("expected error for negative PK, got nil")
+	}
+	// Verify row was NOT inserted.
+	_, err = te.Get(table, 0) // rowID 0 doesn't exist
+	if err != engineapi.ErrRowNotFound {
+		t.Fatalf("expected ErrRowNotFound for rowID 0, got %v", err)
+	}
+}
