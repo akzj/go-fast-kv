@@ -15,7 +15,7 @@ import (
 // Executor executes plan nodes.
 type Executor struct {
 	kv   kvstoreapi.Store
-	cata *catalog.Catalog
+	cata catalog.CatalogManager
 }
 
 // New creates a new Executor.

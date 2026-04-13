@@ -101,7 +101,7 @@ func (p *IndexScanPlan) Kind() PlanKind { return PlanIndexScan }
 // Planner creates execution plans from AST.
 type Planner struct {
 	kv      kvstoreapi.Store
-	catalog *catalog.Catalog
+	catalog catalog.CatalogManager
 }
 
 // New creates a new Planner.
