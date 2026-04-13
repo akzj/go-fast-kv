@@ -329,3 +329,34 @@ func TestMultiplePagesReadWrite(t *testing.T) {
 		}
 	}
 }
+
+// TestLRUCacheBasic tests basic LRU cache operations.
+func TestLRUCacheBasic(t *testing.T) {
+	cache := newLRUCache(2)
+	
+	// Empty cache
+	if cache.Get(1) != nil {
+		t.Error("empty cache should return nil")
+	}
+	
+	// Add entries
+	cache.Put(1, []byte("one"))
+	cache.Put(2, []byte("two"))
+	
+	// Access 1 to make it recent
+	cache.Get(1)
+	
+	// Add new entry - should evict 2
+	cache.Put(3, []byte("three"))
+	
+	// 1 should be present, 2 should be evicted
+	if cache.Get(1) == nil {
+		t.Error("1 should be cached")
+	}
+	if cache.Get(2) != nil {
+		t.Error("2 should be evicted")
+	}
+	if cache.Get(3) == nil {
+		t.Error("3 should be cached")
+	}
+}
