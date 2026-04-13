@@ -7,13 +7,20 @@ A high-performance embedded key-value store written in Go.
 ## Features
 
 - **B-link tree** with per-page locking — true concurrent reads and writes
-- **MVCC** — readers never block writers, writers never block readers
+- **MVCC + SSI** — readers never block writers; Serializable Snapshot Isolation prevents write skew
 - **WAL group commit** — fsync latency is the natural batching window, zero artificial delay
+- **WAL segmentation** — O(k) deletion instead of O(n), enables efficient WAL pruning
 - **WriteBatch API** — group multiple Put/Delete into one atomic batch with one fsync
+- **Bulk loading** — fast B-tree bulk import with optional MVCC visibility
 - **SyncMode** — choose between maximum durability (`SyncAlways`) or maximum performance (`SyncNone`)
 - **Page checksums** — CRC32-IEEE on every page record, detects torn writes and silent corruption
+- **LRU page cache** — hot page caching reduces disk I/O for repeated reads
+- **Bloom filter** — skip irrelevant segments during point lookups
+- **Auto compaction** — background compaction when fragmentation exceeds threshold
 - **Append-only storage** — no in-place updates, crash-safe by design
 - **Checkpoint + WAL recovery** — full crash recovery with bounded replay window
+- **Incremental vacuum** — non-blocking segment compaction, process in configurable batches
+- **Metrics** — Prometheus-compatible metrics for WAL, compaction, transactions, and operations
 - **GC / Vacuum** — reclaim space from deleted and overwritten entries
 
 ## Quick Start
@@ -197,15 +204,19 @@ All benchmarks on Intel Core i7-14700KF, Linux, GOMAXPROCS=4.
 ```
 internal/
 ├── kvstore/          # Top-level KVStore API (Put/Get/Delete/Scan/WriteBatch)
-├── btree/            # B-link tree with MVCC, per-page locks, LRU cache
-├── pagestore/        # PageID → VAddr mapping + CRC32 checksums
-├── blobstore/        # BlobID → VAddr mapping (large values)
-├── segment/          # Append-only segment file manager
-├── wal/              # Write-ahead log with channel-based group commit
-├── txn/              # MVCC transaction manager (BeginTxn/Commit/Abort)
-├── gc/               # Garbage collection (page GC + blob GC)
+│   └── api/          # Config, options, exported types
+├── btree/            # B-link tree with MVCC, per-page locks, LRU cache, bulk loading
+│   └── api/          # Public API
+│   └── internal/     # Implementation: bulk.go (BulkLoad / BulkLoadMVCC)
+├── pagestore/        # PageID → VAddr mapping + CRC32 checksums + WAL segments
+│   └── api/          # Config
+│   └── internal/     # Implementation: LRU page cache
 ├── vacuum/           # Segment compaction and space reclamation
-├── lock/             # Per-page read-write lock manager
+│   └── api/          # RunIncremental API
+│   └── internal/     # Incremental vacuum implementation
+├── wal/              # Write-ahead log with channel-based group commit + CheckpointManager
+├── txn/              # MVCC transaction manager + SSI (SIndex / TIndex)
+├── metrics/          # Prometheus-compatible metrics (WAL, compaction, txn, operations)
 └── bench/            # Benchmark suite (vs BoltDB, vs Badger)
 ```
 
@@ -252,9 +263,9 @@ go test ./internal/wal/internal/ -race -count=1
 
 | Metric | Value |
 |--------|-------|
-| Production code | 6,380 lines |
-| Test code | 7,237 lines |
-| Test count | 168 |
+| Production code | ~15,000 lines |
+| Test code | ~10,000 lines |
+| Test packages | 15 |
 | Modules | 10 |
 | Go version | 1.23+ |
 
