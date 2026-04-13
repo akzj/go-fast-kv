@@ -835,3 +835,52 @@ func TestVacuum_Idempotent(t *testing.T) {
 }
 
 
+
+// TestVacuum_Incremental tests RunIncremental batch processing.
+func TestVacuum_Incremental(t *testing.T) {
+	env := setupTestEnv(t)
+	
+	// Insert 30 keys to create multiple leaves
+	for i := 0; i < 30; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		val := []byte(fmt.Sprintf("val-%03d", i))
+		env.putAndCommit(t, key, val)
+	}
+	
+	// Overwrite half to create dead versions
+	for i := 0; i < 30; i += 2 {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		val := []byte(fmt.Sprintf("updated-%03d", i))
+		env.putAndCommit(t, key, val)
+	}
+	
+	leafCount := env.countLeaves(t)
+	t.Logf("Tree has %d leaves", leafCount)
+	
+	v := env.newVacuum()
+	
+	// First incremental pass - process 1 page at a time
+	totalRemoved := 0
+	for i := 0; i < 20; i++ {
+		stats, err := v.RunIncremental(1)
+		if err != nil {
+			if err == vacuumapi.ErrNoLeaves {
+				break
+			}
+			t.Fatal(err)
+		}
+		totalRemoved += stats.EntriesRemoved
+		t.Logf("Pass %d: scanned=%d, removed=%d", i+1, stats.LeavesScanned, stats.EntriesRemoved)
+	}
+	
+	t.Logf("Total removed after incremental: %d", totalRemoved)
+	
+	// Second call should be no-op (pass complete)
+	stats2, err := v.RunIncremental(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.LeavesScanned != 0 {
+		t.Errorf("second pass should scan 0 leaves, got %d", stats2.LeavesScanned)
+	}
+}

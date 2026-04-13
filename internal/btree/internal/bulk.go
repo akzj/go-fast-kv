@@ -240,8 +240,12 @@ func (bl *BulkLoader) buildLeaves(txnID uint64) ([]uint64, error) {
 				return nil, err
 			}
 
-			// Start new leaf - continue to process same entry
+			// Start new leaf and add the overflow entry to it
 			newLeaf()
+			currentLeaf.Entries = append(currentLeaf.Entries, entry)
+			entriesInCurrentLeaf++
+			currentLeaf.HighKey = cloneBytes(pair.Key)
+			// Skip normal path since entry was already added above
 			continue
 		}
 
