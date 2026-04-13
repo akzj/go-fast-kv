@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	"github.com/akzj/go-fast-kv/internal/sql/api"
 	"github.com/akzj/go-fast-kv/internal/sql/catalog"
 	"github.com/akzj/go-fast-kv/internal/sql/executor"
 	"github.com/akzj/go-fast-kv/internal/sql/parser"
@@ -14,9 +15,9 @@ import (
 // Engine is the SQL engine on top of go-fast-kv.
 type Engine struct {
 	kv        kvstoreapi.Store
-	catalog   *catalog.Catalog
+	catalog   api.CatalogManager
 	parser    *parser.Parser
-	planner   *planner.Planner
+	planner   api.QueryPlanner
 	executor  *executor.Executor
 }
 
@@ -72,7 +73,7 @@ func (e *Engine) Query(sql string) (executor.Iterator, error) {
 }
 
 // Catalog returns the catalog for metadata management.
-func (e *Engine) Catalog() *catalog.Catalog {
+func (e *Engine) Catalog() api.CatalogManager {
 	return e.catalog
 }
 
