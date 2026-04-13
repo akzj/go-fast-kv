@@ -584,7 +584,7 @@ func (p *parser) parseAndExpr() (api.Expr, error) {
 func (p *parser) parseNotExpr() (api.Expr, error) {
 	if p.cur.Type == api.TokNot {
 		p.advance()
-		operand, err := p.parseCompareExpr()
+		operand, err := p.parseNotExpr() // recursive — supports NOT NOT x
 		if err != nil {
 			return nil, err
 		}

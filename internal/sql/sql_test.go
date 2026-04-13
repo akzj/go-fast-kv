@@ -191,3 +191,111 @@ func TestEndToEnd_NullHandling(t *testing.T) {
 		t.Fatalf("expected id=2 for non-NULL val, got %v", res.Rows)
 	}
 }
+
+func TestEndToEnd_ThreeValuedLogic(t *testing.T) {
+	db, _ := openTestDB(t)
+
+	db.Exec("CREATE TABLE tvl (id INTEGER, a INTEGER, b INTEGER)")
+	db.Exec("INSERT INTO tvl VALUES (1, 1, NULL)")    // a=true, b=NULL
+	db.Exec("INSERT INTO tvl VALUES (2, 0, NULL)")    // a=false, b=NULL
+	db.Exec("INSERT INTO tvl VALUES (3, NULL, 1)")    // a=NULL, b=true
+	db.Exec("INSERT INTO tvl VALUES (4, NULL, 0)")    // a=NULL, b=false
+	db.Exec("INSERT INTO tvl VALUES (5, NULL, NULL)") // a=NULL, b=NULL
+	db.Exec("INSERT INTO tvl VALUES (6, 1, 1)")       // a=true, b=true
+	db.Exec("INSERT INTO tvl VALUES (7, 0, 0)")       // a=false, b=false
+
+	// NULL AND TRUE → NULL → excluded; TRUE AND NULL → NULL → excluded
+	// FALSE AND NULL → FALSE → excluded; TRUE AND TRUE → TRUE → included
+	t.Run("and_with_null", func(t *testing.T) {
+		res, err := db.Query("SELECT id FROM tvl WHERE a AND b")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if len(res.Rows) != 1 || res.Rows[0][0].Int != 6 {
+			ids := make([]int64, len(res.Rows))
+			for i, r := range res.Rows {
+				ids[i] = r[0].Int
+			}
+			t.Fatalf("expected [6], got %v", ids)
+		}
+	})
+
+	// NULL OR TRUE → TRUE → included; TRUE OR NULL → TRUE → included
+	// NULL OR FALSE → NULL → excluded; FALSE OR NULL → NULL → excluded
+	// TRUE OR TRUE → TRUE → included; FALSE OR FALSE → FALSE → excluded
+	t.Run("or_with_null", func(t *testing.T) {
+		res, err := db.Query("SELECT id FROM tvl WHERE a OR b ORDER BY id")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if len(res.Rows) != 3 {
+			ids := make([]int64, len(res.Rows))
+			for i, r := range res.Rows {
+				ids[i] = r[0].Int
+			}
+			t.Fatalf("expected 3 rows [1,3,6], got %v", ids)
+		}
+		expected := []int64{1, 3, 6}
+		for i, want := range expected {
+			if res.Rows[i][0].Int != want {
+				t.Errorf("row %d: expected id=%d, got %d", i, want, res.Rows[i][0].Int)
+			}
+		}
+	})
+
+	// NOT NULL → NULL → excluded; NOT TRUE → FALSE → excluded; NOT FALSE → TRUE → included
+	t.Run("not_null", func(t *testing.T) {
+		res, err := db.Query("SELECT id FROM tvl WHERE NOT a ORDER BY id")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		// Rows with a=0: row 2, row 7. Rows with a=NULL: excluded (NOT NULL = NULL)
+		if len(res.Rows) != 2 {
+			ids := make([]int64, len(res.Rows))
+			for i, r := range res.Rows {
+				ids[i] = r[0].Int
+			}
+			t.Fatalf("expected 2 rows [2,7], got %v", ids)
+		}
+		if res.Rows[0][0].Int != 2 || res.Rows[1][0].Int != 7 {
+			t.Errorf("expected [2,7], got [%d,%d]", res.Rows[0][0].Int, res.Rows[1][0].Int)
+		}
+	})
+
+	// NOT (NULL OR FALSE) → NOT NULL → NULL → excluded (was bug: returned TRUE)
+	t.Run("not_null_or_false", func(t *testing.T) {
+		res, err := db.Query("SELECT id FROM tvl WHERE NOT (a OR b) ORDER BY id")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		// Only row 7: NOT (FALSE OR FALSE) = NOT FALSE = TRUE
+		if len(res.Rows) != 1 || res.Rows[0][0].Int != 7 {
+			ids := make([]int64, len(res.Rows))
+			for i, r := range res.Rows {
+				ids[i] = r[0].Int
+			}
+			t.Fatalf("expected [7], got %v", ids)
+		}
+	})
+}
+
+func TestEndToEnd_NotNot(t *testing.T) {
+	db, _ := openTestDB(t)
+
+	db.Exec("CREATE TABLE nn (id INTEGER, flag INTEGER)")
+	db.Exec("INSERT INTO nn VALUES (1, 1)")
+	db.Exec("INSERT INTO nn VALUES (2, 0)")
+	db.Exec("INSERT INTO nn VALUES (3, 1)")
+
+	// NOT NOT flag = double negation → same as flag
+	res, err := db.Query("SELECT id FROM nn WHERE NOT NOT flag ORDER BY id")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if res.Rows[0][0].Int != 1 || res.Rows[1][0].Int != 3 {
+		t.Errorf("expected [1,3], got [%d,%d]", res.Rows[0][0].Int, res.Rows[1][0].Int)
+	}
+}

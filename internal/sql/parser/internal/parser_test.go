@@ -686,6 +686,51 @@ func TestParse_WhereExpressions(t *testing.T) {
 		}
 	})
 
+	t.Run("not_not", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE NOT NOT a = 1")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		// Should be NOT(NOT(a = 1))
+		outer, ok := sel.Where.(*api.UnaryExpr)
+		if !ok || outer.Op != api.UnaryNot {
+			t.Fatalf("expected outer NOT, got %T", sel.Where)
+		}
+		inner, ok := outer.Operand.(*api.UnaryExpr)
+		if !ok || inner.Op != api.UnaryNot {
+			t.Fatalf("expected inner NOT, got %T", outer.Operand)
+		}
+		// Inner operand should be comparison a = 1
+		cmp, ok := inner.Operand.(*api.BinaryExpr)
+		if !ok || cmp.Op != api.BinEQ {
+			t.Fatalf("expected comparison inside NOT NOT, got %T", inner.Operand)
+		}
+	})
+
+	t.Run("not_not_not", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE NOT NOT NOT a = 1")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		// Should be NOT(NOT(NOT(a = 1)))
+		n1, ok := sel.Where.(*api.UnaryExpr)
+		if !ok || n1.Op != api.UnaryNot {
+			t.Fatalf("expected NOT at level 1, got %T", sel.Where)
+		}
+		n2, ok := n1.Operand.(*api.UnaryExpr)
+		if !ok || n2.Op != api.UnaryNot {
+			t.Fatalf("expected NOT at level 2, got %T", n1.Operand)
+		}
+		n3, ok := n2.Operand.(*api.UnaryExpr)
+		if !ok || n3.Op != api.UnaryNot {
+			t.Fatalf("expected NOT at level 3, got %T", n2.Operand)
+		}
+	})
+
 	t.Run("is_null", func(t *testing.T) {
 		p := newParser()
 		stmt, err := p.Parse("SELECT * FROM t WHERE name IS NULL")

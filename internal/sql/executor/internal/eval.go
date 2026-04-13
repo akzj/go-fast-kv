@@ -48,21 +48,37 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 
 // evalBinaryExpr evaluates a binary expression (AND, OR, comparisons).
 func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
-	// Short-circuit AND/OR
+	// SQL three-valued logic for AND/OR:
+	//   AND: FALSE AND x → FALSE; TRUE AND x → x; NULL AND FALSE → FALSE; NULL AND TRUE → NULL; NULL AND NULL → NULL
+	//   OR:  TRUE OR x → TRUE; FALSE OR x → x; NULL OR TRUE → TRUE; NULL OR FALSE → NULL; NULL OR NULL → NULL
 	switch expr.Op {
 	case parserapi.BinAnd:
 		left, err := evalExpr(expr.Left, row, columns)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
-		if !isTruthy(left) {
+		leftNull := left.IsNull
+		leftTrue := !leftNull && isTruthy(left)
+		if !leftNull && !leftTrue {
+			// Left is definitely FALSE → result is FALSE regardless of right
 			return intVal(0), nil
 		}
 		right, err := evalExpr(expr.Right, row, columns)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
-		if isTruthy(right) {
+		rightNull := right.IsNull
+		rightTrue := !rightNull && isTruthy(right)
+		if !rightNull && !rightTrue {
+			// Right is definitely FALSE → result is FALSE
+			return intVal(0), nil
+		}
+		if leftNull || rightNull {
+			// At least one side is NULL, neither side is FALSE → result is NULL
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// Both are TRUE
+		if leftTrue && rightTrue {
 			return intVal(1), nil
 		}
 		return intVal(0), nil
@@ -72,16 +88,27 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
-		if isTruthy(left) {
+		leftNull := left.IsNull
+		leftTrue := !leftNull && isTruthy(left)
+		if leftTrue {
+			// Left is definitely TRUE → result is TRUE regardless of right
 			return intVal(1), nil
 		}
 		right, err := evalExpr(expr.Right, row, columns)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
-		if isTruthy(right) {
+		rightNull := right.IsNull
+		rightTrue := !rightNull && isTruthy(right)
+		if rightTrue {
+			// Right is definitely TRUE → result is TRUE
 			return intVal(1), nil
 		}
+		if leftNull || rightNull {
+			// At least one side is NULL, neither side is TRUE → result is NULL
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// Both are FALSE
 		return intVal(0), nil
 	}
 
