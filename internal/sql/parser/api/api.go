@@ -54,7 +54,14 @@ const (
 	TokKey      TokenType = 33
 	TokUnique   TokenType = 34
 	TokIf       TokenType = 35
-	TokExists   TokenType = 36
+	TokGroup   TokenType = 37 // GROUP
+	TokHaving  TokenType = 38 // HAVING
+	TokCount   TokenType = 39 // COUNT
+	TokSum     TokenType = 40 // SUM
+	TokAvg     TokenType = 41 // AVG
+	TokMin     TokenType = 42 // MIN
+	TokMax     TokenType = 43 // MAX
+	TokExists  TokenType = 44 // EXISTS (moved from 36)
 	TokInteger2 TokenType = 37 // INTEGER type keyword (alias for INT)
 
 	// Operators
@@ -152,6 +159,8 @@ type SelectStmt struct {
 	Columns []SelectColumn
 	Table   string
 	Where   Expr            // nil if no WHERE
+	GroupBy []Expr          // nil if no GROUP BY
+	Having  Expr            // nil if no HAVING
 	OrderBy *OrderByClause  // nil if no ORDER BY
 	Limit   Expr            // nil if no LIMIT
 }
@@ -261,6 +270,14 @@ func (*IsNullExpr) exprNode() {}
 type StarExpr struct{}
 
 func (*StarExpr) exprNode() {}
+
+// AggregateCallExpr: COUNT(*), COUNT(col), SUM(col), AVG(col), MIN(col), MAX(col)
+type AggregateCallExpr struct {
+	Func string // "COUNT", "SUM", "AVG", "MIN", "MAX"
+	Arg  Expr  // nil for COUNT(*), ColumnRef for others
+}
+
+func (*AggregateCallExpr) exprNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

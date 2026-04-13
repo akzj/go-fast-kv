@@ -101,12 +101,14 @@ func (*InsertPlan) planNode() {}
 
 // SelectPlan selects rows from a table.
 type SelectPlan struct {
-	Table   *catalogapi.TableSchema
-	Scan    ScanPlan
-	Columns []int          // column indices to project; empty = all (SELECT *)
-	Filter  parserapi.Expr // residual filter not handled by index; nil = no filter
-	OrderBy *OrderByPlan   // nil if no ORDER BY
-	Limit   int            // -1 if no LIMIT
+	Table        *catalogapi.TableSchema
+	Scan         ScanPlan
+	Columns      []int            // column indices to project; empty = all (SELECT *)
+	Filter       parserapi.Expr   // residual filter not handled by index; nil = no filter
+	GroupByExprs []parserapi.Expr // nil if no GROUP BY
+	Having       parserapi.Expr   // nil if no HAVING
+	OrderBy      *OrderByPlan     // nil if no ORDER BY
+	Limit        int              // -1 if no LIMIT
 }
 
 func (*SelectPlan) planNode() {}

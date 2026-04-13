@@ -310,6 +310,9 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		rows = filterRows(rows, plan.Filter, plan.Table.Columns)
 	}
 
+	// TODO: GROUP BY execution — group rows by groupByExprs, compute aggregates
+	// After filter, before ORDER BY
+
 	// ORDER BY (sort raw rows BEFORE projection so all columns are available)
 	if plan.OrderBy != nil {
 		sortRawRows(rows, plan.OrderBy)

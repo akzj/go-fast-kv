@@ -432,6 +432,37 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		stmt.Where = expr
 	}
 
+	// Optional GROUP BY
+	if p.cur.Type == api.TokGroup {
+		p.advance()
+		if err := p.expect(api.TokBy); err != nil {
+			return nil, err
+		}
+		// Parse GROUP BY column [, column ...]
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name in GROUP BY")
+			}
+			colExpr := &api.ColumnRef{Column: p.cur.Literal}
+			p.advance()
+			stmt.GroupBy = append(stmt.GroupBy, colExpr)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	// Optional HAVING
+	if p.cur.Type == api.TokHaving {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Having = expr
+	}
+
 	// Optional ORDER BY
 	if p.cur.Type == api.TokOrder {
 		p.advance()

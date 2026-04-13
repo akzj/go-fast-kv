@@ -279,7 +279,8 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 
 	return &plannerapi.SelectPlan{
 		Table: tbl, Scan: scan, Columns: colIndices,
-		Filter: residualFilter, OrderBy: orderBy, Limit: limit,
+		Filter: residualFilter, GroupByExprs: stmt.GroupBy,
+		Having: stmt.Having, OrderBy: orderBy, Limit: limit,
 	}, nil
 }
 
