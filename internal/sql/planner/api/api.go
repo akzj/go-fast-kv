@@ -53,6 +53,7 @@ type Plan interface {
 // ScanPlan describes how to find rows in a table.
 type ScanPlan interface {
 	scanNode()
+	planNode() // also implement Plan for executor compatibility
 }
 
 // ─── DDL Plans ──────────────────────────────────────────────────────
@@ -143,7 +144,8 @@ type TableScanPlan struct {
 	Filter  parserapi.Expr // nil = no filter (return all rows)
 }
 
-func (*TableScanPlan) scanNode() {}
+func (*TableScanPlan) scanNode()  {}
+func (*TableScanPlan) planNode() {}
 
 // IndexScanPlan uses an index to narrow the scan.
 type IndexScanPlan struct {
@@ -155,7 +157,8 @@ type IndexScanPlan struct {
 	ResidualFilter parserapi.Expr // remaining filter conditions; nil = none
 }
 
-func (*IndexScanPlan) scanNode() {}
+func (*IndexScanPlan) scanNode()  {}
+func (*IndexScanPlan) planNode() {}
 
 // IndexRangePlan uses an index range scan for LIKE 'prefix%' optimization.
 // Encodes LIKE 'abc%' as start='abc' (inclusive), end='abd' (exclusive).
@@ -168,7 +171,8 @@ type IndexRangePlan struct {
 	ResidualFilter parserapi.Expr // remaining non-indexed conditions
 }
 
-func (*IndexRangePlan) scanNode() {}
+func (*IndexRangePlan) scanNode()  {}
+func (*IndexRangePlan) planNode() {}
 
 // OrderByPlan describes an ORDER BY clause.
 type OrderByPlan struct {

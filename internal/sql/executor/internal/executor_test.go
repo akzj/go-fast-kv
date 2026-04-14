@@ -689,3 +689,66 @@ func TestExec_ScalarSubquery(t *testing.T) {
 		}
 	})
 }
+
+func TestExec_Join(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Setup two tables
+	env.execSQL(t, "CREATE TABLE users (id INT, name TEXT)")
+	env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'carol')")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+	env.execSQL(t, "INSERT INTO orders VALUES (3, 50)")
+	// user_id=2 has no orders (should NOT appear in INNER JOIN)
+
+	t.Run("inner_join_basic", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id")
+		// Expected: alice/100, alice/200, carol/50 (3 rows, no bob)
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		// Check column names include both tables
+		if len(result.Columns) != 2 {
+			t.Fatalf("columns = %d, want 2", len(result.Columns))
+		}
+	})
+
+	t.Run("inner_join_with_where", func(t *testing.T) {
+		// WHERE after JOIN — use SELECT * to avoid projection complexity
+		result := env.execSQL(t, "SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.id = 1")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		// Result has all 4 columns: users.id, users.name, orders.user_id, orders.amount
+		// Column order: id(0), name(1), user_id(2), amount(3)
+		if result.Rows[0][3].Int != 100 {
+			t.Errorf("amount[0] = %d, want 100", result.Rows[0][3].Int)
+		}
+	})
+
+	t.Run("inner_join_no_match", func(t *testing.T) {
+		// bob (id=2) has no orders — should not appear
+		result := env.execSQL(t, "SELECT users.id FROM users JOIN orders ON users.id = orders.user_id")
+		ids := make(map[int64]bool)
+		for _, row := range result.Rows {
+			ids[row[0].Int] = true
+		}
+		if ids[2] {
+			t.Errorf("bob (id=2) should NOT be in results — he has no orders")
+		}
+	})
+
+	t.Run("single_table_still_works", func(t *testing.T) {
+		// Verify backward compat — single table queries unchanged
+		result := env.execSQL(t, "SELECT name FROM users WHERE id = 1")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Text != "alice" {
+			t.Errorf("name = %s, want alice", result.Rows[0][0].Text)
+		}
+	})
+}

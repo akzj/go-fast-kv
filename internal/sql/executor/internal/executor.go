@@ -63,7 +63,12 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 	case *plannerapi.InsertPlan:
 		return e.execInsert(p)
 	case *plannerapi.SelectPlan:
+		if p.Join != nil {
+			return e.execJoinSelect(p)
+		}
 		return e.execSelect(p)
+	case *plannerapi.JoinPlan:
+		return e.execJoin(p)
 	case *plannerapi.DeletePlan:
 		return e.execDelete(p)
 	case *plannerapi.UpdatePlan:
@@ -347,6 +352,297 @@ func isSubqueryInListContext(sq *parserapi.SubqueryExpr, root parserapi.Expr) bo
 		}
 	})
 	return inList
+}
+
+// ─── JOIN EXECUTION ────────────────────────────────────────────────
+
+// execJoinSelect handles SELECT ... FROM t1 JOIN t2 ON ...
+func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
+	jplan := plan.Join
+
+	leftRows, err := e.collectRows(jplan.LeftTable, jplan.Left, nil)
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := e.collectRows(jplan.RightTable, jplan.Right, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	colNames := make([]string, 0, len(jplan.LeftTable.Columns)+len(jplan.RightTable.Columns))
+	for _, col := range jplan.LeftTable.Columns {
+		colNames = append(colNames, jplan.LeftTable.Name+"."+col.Name)
+	}
+	for _, col := range jplan.RightTable.Columns {
+		colNames = append(colNames, jplan.RightTable.Name+"."+col.Name)
+	}
+
+	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+	if jplan.On != nil {
+		e.walkExprForJoinSubqueries(jplan.On, subqueryResults)
+	}
+
+	var mergedRows [][]catalogapi.Value
+	leftLen := len(jplan.LeftTable.Columns)
+	rightLen := len(jplan.RightTable.Columns)
+	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
+	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
+	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
+
+	for _, left := range leftRows {
+		for _, right := range rightRows {
+			combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+			copy(combinedVals, left.Values)
+			copy(combinedVals[leftLen:], right.Values)
+			combinedRow := &engineapi.Row{Values: combinedVals}
+
+			if jplan.On != nil {
+				result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
+				if err != nil {
+					return nil, fmt.Errorf("join ON evaluation: %w", err)
+				}
+				if !isTruthy(result) {
+					continue
+				}
+			}
+			mergedRows = append(mergedRows, combinedVals)
+		}
+	}
+
+	// Apply WHERE filter on merged rows
+	if plan.Filter != nil {
+		mergedRows = filterJoinRows(mergedRows, plan.Filter, combinedCols)
+	}
+
+	if plan.OrderBy != nil {
+		sortJoinRows(mergedRows, plan.OrderBy, combinedCols)
+	}
+
+	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
+		mergedRows = mergedRows[:plan.Limit]
+	}
+
+	projected, projCols := projectJoinRows(mergedRows, colNames, plan)
+
+	return &executorapi.Result{
+		Columns: projCols,
+		Rows:    projected,
+	}, nil
+}
+
+// execJoin handles a bare JoinPlan (used for EXPLAIN or subquery JOINs).
+func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, error) {
+	leftRows, err := e.collectRows(jplan.LeftTable, jplan.Left, nil)
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := e.collectRows(jplan.RightTable, jplan.Right, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	colNames := make([]string, 0, len(jplan.LeftTable.Columns)+len(jplan.RightTable.Columns))
+	for _, col := range jplan.LeftTable.Columns {
+		colNames = append(colNames, jplan.LeftTable.Name+"."+col.Name)
+	}
+	for _, col := range jplan.RightTable.Columns {
+		colNames = append(colNames, jplan.RightTable.Name+"."+col.Name)
+	}
+
+	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+	if jplan.On != nil {
+		e.walkExprForJoinSubqueries(jplan.On, subqueryResults)
+	}
+
+	var mergedRows [][]catalogapi.Value
+	leftLen := len(jplan.LeftTable.Columns)
+	rightLen := len(jplan.RightTable.Columns)
+	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
+	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
+	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
+
+	for _, left := range leftRows {
+		for _, right := range rightRows {
+			combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+			copy(combinedVals, left.Values)
+			copy(combinedVals[leftLen:], right.Values)
+			combinedRow := &engineapi.Row{Values: combinedVals}
+
+			if jplan.On != nil {
+				result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
+				if err != nil {
+					return nil, fmt.Errorf("join ON evaluation: %w", err)
+				}
+				if !isTruthy(result) {
+					continue
+				}
+			}
+			mergedRows = append(mergedRows, combinedVals)
+		}
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    mergedRows,
+	}, nil
+}
+
+// collectRows executes a scan plan and returns all rows.
+func (e *executor) collectRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
+	return e.scanRows(table, scan, subqueryResults)
+}
+
+// walkExprForJoinSubqueries finds SubqueryExpr nodes and pre-computes them.
+func (ex *executor) walkExprForJoinSubqueries(expr parserapi.Expr,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) {
+	if expr == nil {
+		return
+	}
+	switch node := expr.(type) {
+	case *parserapi.SubqueryExpr:
+		if _, ok := subqueryResults[node]; ok {
+			return
+		}
+		subplan, err := ex.planner.Plan(node.Stmt)
+		if err != nil {
+			return
+		}
+		subResult, err := ex.Execute(subplan)
+		if err != nil {
+			return
+		}
+		var values []catalogapi.Value
+		for _, row := range subResult.Rows {
+			if len(row) > 0 {
+				values = append(values, row[0])
+			}
+		}
+		subqueryResults[node] = values
+	case *parserapi.BinaryExpr:
+		ex.walkExprForJoinSubqueries(node.Left, subqueryResults)
+		ex.walkExprForJoinSubqueries(node.Right, subqueryResults)
+	case *parserapi.UnaryExpr:
+		ex.walkExprForJoinSubqueries(node.Operand, subqueryResults)
+	case *parserapi.InExpr:
+		ex.walkExprForJoinSubqueries(node.Expr, subqueryResults)
+		for _, v := range node.Values {
+			ex.walkExprForJoinSubqueries(v, subqueryResults)
+		}
+	case *parserapi.LikeExpr:
+		ex.walkExprForJoinSubqueries(node.Expr, subqueryResults)
+		// Pattern is a string literal, not an Expr
+	case *parserapi.BetweenExpr:
+		ex.walkExprForJoinSubqueries(node.Expr, subqueryResults)
+		ex.walkExprForJoinSubqueries(node.Low, subqueryResults)
+		ex.walkExprForJoinSubqueries(node.High, subqueryResults)
+	case *parserapi.IsNullExpr:
+		ex.walkExprForJoinSubqueries(node.Expr, subqueryResults)
+	}
+}
+
+// filterJoinRows applies a WHERE filter to merged join rows.
+func filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Expr, columns []catalogapi.ColumnDef) [][]catalogapi.Value {
+	if filter == nil || len(rows) == 0 {
+		return rows
+	}
+	filtered := rows[:0]
+	for _, row := range rows {
+		engineRow := &engineapi.Row{Values: row}
+		match, err := matchFilter(filter, engineRow, columns, nil)
+		if err != nil {
+			continue
+		}
+		if match {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered
+}
+
+// sortJoinRows sorts merged rows by ORDER BY columns.
+func sortJoinRows(rows [][]catalogapi.Value, orderBy *plannerapi.OrderByPlan, columns []catalogapi.ColumnDef) {
+	if orderBy == nil || len(rows) == 0 {
+		return
+	}
+	colIdx := orderBy.ColumnIndex
+	desc := orderBy.Desc
+	sort.Slice(rows, func(i, j int) bool {
+		a := rows[i][colIdx]
+		b := rows[j][colIdx]
+		if a.IsNull && b.IsNull {
+			return false
+		}
+		if a.IsNull {
+			return true
+		}
+		if b.IsNull {
+			return false
+		}
+		cmp := compareValues(a, b)
+		if desc {
+			cmp = -cmp
+		}
+		return cmp < 0
+	})
+}
+
+// compareValues compares two catalogapi.Value.
+func compareValues(a, b catalogapi.Value) int {
+	if a.Type != b.Type {
+		return int(a.Type) - int(b.Type)
+	}
+	switch a.Type {
+	case catalogapi.TypeInt:
+		if a.Int < b.Int {
+			return -1
+		}
+		if a.Int > b.Int {
+			return 1
+		}
+		return 0
+	case catalogapi.TypeFloat:
+		if a.Float < b.Float {
+			return -1
+		}
+		if a.Float > b.Float {
+			return 1
+		}
+		return 0
+	case catalogapi.TypeText:
+		if a.Text < b.Text {
+			return -1
+		}
+		if a.Text > b.Text {
+			return 1
+		}
+		return 0
+	}
+	return 0
+}
+
+// projectJoinRows projects columns from merged rows.
+func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *plannerapi.SelectPlan) ([][]catalogapi.Value, []string) {
+	if len(plan.Columns) == 0 {
+		return rows, colNames
+	}
+	projected := make([][]catalogapi.Value, len(rows))
+	for i, row := range rows {
+		vals := make([]catalogapi.Value, len(plan.Columns))
+		for j, idx := range plan.Columns {
+			if idx < len(row) {
+				vals[j] = row[idx]
+			}
+		}
+		projected[i] = vals
+	}
+	projNames := make([]string, len(plan.Columns))
+	for i, idx := range plan.Columns {
+		if idx < len(colNames) {
+			projNames[i] = colNames[idx]
+		}
+	}
+	return projected, projNames
 }
 
 // precomputeSubqueries finds all SubqueryExpr nodes in the plan's WHERE/HAVING

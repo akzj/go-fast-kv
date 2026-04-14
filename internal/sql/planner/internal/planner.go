@@ -369,20 +369,17 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 	}
 
 	// ORDER BY and LIMIT for JOIN — Phase 4
-	var orderBy *plannerapi.OrderByPlan
-	var limit int = -1
-
 	return &plannerapi.SelectPlan{
 		Table:         leftTbl,
 		Scan:          nil,
 		Join:          joinPlan,
 		Columns:       colIndices,
 		SelectColumns: stmt.Columns,
-		Filter:        nil,
+		Filter:        stmt.Where, // WHERE applied on merged rows in executor
 		GroupByExprs:  nil,
 		Having:        nil,
-		OrderBy:       orderBy,
-		Limit:         limit,
+		OrderBy:       nil,
+		Limit:         -1,
 	}, nil
 }
 
