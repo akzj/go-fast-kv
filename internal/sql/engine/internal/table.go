@@ -82,6 +82,25 @@ func persistCounter(batch kvstoreapi.WriteBatch, tableID uint32, nextID uint64) 
 	return batch.Put(metaKey, buf)
 }
 
+
+// NextRowID returns the current counter value without advancing it.
+func (te *tableEngine) NextRowID(tableID uint32) uint64 {
+	te.mu.Lock()
+	defer te.mu.Unlock()
+	return te.rowCounters[tableID]
+}
+
+// PersistCounter writes the current row counter value into a WriteBatch.
+func (te *tableEngine) PersistCounter(batch kvstoreapi.WriteBatch, tableID uint32) error {
+	te.mu.Lock()
+	nextID := te.rowCounters[tableID]
+	te.mu.Unlock()
+	metaKey := encodeMetaKey(tableID)
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, nextID)
+	return batch.Put(metaKey, buf)
+}
+
 // ─── TableEngine implementation ─────────────────────────────────────
 
 func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi.Value) (uint64, error) {

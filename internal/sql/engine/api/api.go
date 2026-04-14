@@ -137,6 +137,12 @@ type TableEngine interface {
 	// DropTableData deletes all row data and the metadata key for a table.
 	// Uses kvstore.DeleteRange for efficiency.
 	DropTableData(tableID uint32) error
+
+	// NextRowID returns the current counter value without advancing it.
+	NextRowID(tableID uint32) uint64
+
+	// PersistCounter writes the current row counter value into a WriteBatch.
+	PersistCounter(batch kvstoreapi.WriteBatch, tableID uint32) error
 }
 
 // ─── IndexEngine ────────────────────────────────────────────────────

@@ -192,12 +192,8 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	schema := plan.Schema
 	schema.IndexID = indexID
 
-	err = e.catalog.CreateIndex(schema)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
-	}
-
-	// Backfill: index all existing rows in the table.
+	// CR-C: Backfill FIRST, then create catalog entry. If crash during backfill,
+	// catalog has no stale entry. A catalog entry always means fully-built index.
 	tbl, err := e.catalog.GetTable(schema.Table)
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill get table: %v", executorapi.ErrExecFailed, err)
@@ -221,6 +217,11 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	}
 	if err := batch.Commit(); err != nil {
 		return nil, fmt.Errorf("%w: backfill commit: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// CR-C: Catalog entry created only after successful backfill.
+	if err := e.catalog.CreateIndex(schema); err != nil {
+		return nil, fmt.Errorf("%w: create catalog entry: %v", executorapi.ErrExecFailed, err)
 	}
 
 	return &executorapi.Result{RowsAffected: 0}, nil
@@ -282,21 +283,28 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				continue
 			}
 			val := row[colIdx]
-			// IndexEngine.Insert uses auto-commit; we need to encode directly into batch.
-			// Get the encoded index key from the index engine's encoder context.
-			// Since IndexEngine.Insert doesn't support batch, we encode the key manually.
-			// For now: insert index entry via the index engine (auto-commit per entry).
-			// This is acceptable — the row data is in the batch, index entries are separate.
-			// The row batch ensures row data is atomic. Index entries can be rebuilt.
-			// TODO(F-W3): Add IndexEngine.InsertBatch for full atomicity.
-			if err := e.indexEngine.Insert(idx, plan.Table.TableID, idx.IndexID, val, rowID); err != nil {
+			// TODO(CR-B): IndexEngine.InsertBatch and EncodeIndexKey are available, but
+			// they encode only (tableID, indexID, value, rowID). The index engine's
+			// internal state (prefix tree) is NOT updated within the batch. Full atomicity
+			// requires engine support for batch-based state updates. Rows can exist
+			// without index entries on crash; index can be rebuilt via backfill.
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 			}
 		}
 	}
 
-	// Commit the row batch atomically.
+	// CR-A: Add counter to the batch BEFORE commit. InsertInto updates the counter
+	// in-memory but does NOT persist it. By including persistCounter in the same
+	// batch, rows, indexes, AND counter are committed atomically.
+	if err := e.tableEngine.PersistCounter(batch, plan.Table.TableID); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Commit rows + indexes + counter atomically.
 	if err := batch.Commit(); err != nil {
 		batch.Discard()
 		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
