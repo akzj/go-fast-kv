@@ -425,20 +425,30 @@ func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi
 		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 	}
 	// col = val1 OR col = val2 OR ...
+	anyNull := false
 	for _, valExpr := range expr.Values {
 		eq, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinEQ, Right: valExpr}, row, columns)
 		if err != nil {
 			// Type mismatch: col and val can't be compared — treat as no match, continue
 			continue
 		}
-		if eq.Type == catalogapi.TypeInt && !eq.IsNull && eq.Int == 1 {
+		// CR-F: track NULL comparisons (standard SQL: any NULL in IN/NOT IN list → NULL)
+		if eq.IsNull {
+			anyNull = true
+			continue
+		}
+		if eq.Type == catalogapi.TypeInt && eq.Int == 1 {
 			// TRUE match found
 			if expr.Not {
 				return intVal(0), nil // NOT IN: match -> false
 			}
 			return intVal(1), nil
 		}
-		// eq is either FALSE or NULL — continue checking
+		// eq is FALSE — continue checking
+	}
+	// CR-F: NOT IN with NULL → NULL (standard SQL three-valued logic)
+	if expr.Not && anyNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 	}
 	// No TRUE match found; result is FALSE
 	if expr.Not {
