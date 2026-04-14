@@ -194,7 +194,22 @@ func (*JoinPlan) planNode() {}
 
 // String returns a human-readable description of the join.
 func (p *JoinPlan) String() string {
-	return fmt.Sprintf("JOIN [type=%s] ON [%v]", p.Type, p.On)
+	var b strings.Builder
+	b.WriteString(p.Type + " JOIN")
+	if p.LeftTable != nil && p.RightTable != nil {
+		b.WriteString(" " + p.LeftTable.Name + " × " + p.RightTable.Name)
+	}
+	b.WriteString("\n")
+	if p.On != nil {
+		b.WriteString("├─ ON: " + formatExpr(p.On) + "\n")
+	}
+	if p.Left != nil {
+		b.WriteString("└─ LEFT: " + scanString(p.Left))
+	}
+	if p.Right != nil {
+		b.WriteString("\n└─ RIGHT: " + scanString(p.Right))
+	}
+	return b.String()
 }
 
 
@@ -306,10 +321,12 @@ func (p *SelectPlan) String() string {
 	} else {
 		b.WriteString(fmt.Sprintf(" %d columns", len(p.Columns)))
 	}
-	if p.Table != nil {
+	if p.Table != nil && p.Join == nil {
 		b.WriteString(" FROM " + p.Table.Name)
 	}
-	if p.Scan != nil {
+	if p.Join != nil {
+		b.WriteString(" FROM " + p.Join.String())
+	} else if p.Scan != nil {
 		b.WriteString("\n└─ " + scanString(p.Scan))
 	}
 	if p.Filter != nil {
