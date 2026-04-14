@@ -1092,3 +1092,84 @@ func TestParse_BetweenExpr(t *testing.T) {
 	})
 }
 
+
+func TestParse_Subquery(t *testing.T) {
+	p := newParser()
+
+	t.Run("scalar_subquery_in_comparison", func(t *testing.T) {
+		// Use bare column — aggregate functions not yet supported in parsePrimary
+		stmt, err := p.Parse("SELECT * FROM t WHERE id = (SELECT id FROM t2)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		bin, ok := sel.Where.(*api.BinaryExpr)
+		if !ok || bin.Op != api.BinEQ {
+			t.Fatalf("expected EQ comparison, got %T", sel.Where)
+		}
+		subq, ok := bin.Right.(*api.SubqueryExpr)
+		if !ok {
+			t.Fatalf("expected SubqueryExpr on right, got %T", bin.Right)
+		}
+		innerSel, ok := subq.Stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt inside subquery, got %T", subq.Stmt)
+		}
+		if innerSel.Table != "T2" {
+			t.Errorf("expected inner table T2, got %s", innerSel.Table)
+		}
+	})
+
+	t.Run("in_with_subquery", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM t WHERE id IN (SELECT id FROM t2)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		in, ok := sel.Where.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr, got %T", sel.Where)
+		}
+		if in.Not {
+			t.Error("expected Not=false for IN")
+		}
+		if len(in.Values) != 1 {
+			t.Fatalf("expected 1 value (subquery), got %d", len(in.Values))
+		}
+		subq, ok := in.Values[0].(*api.SubqueryExpr)
+		if !ok {
+			t.Fatalf("expected SubqueryExpr in IN values, got %T", in.Values[0])
+		}
+		_ = subq
+	})
+
+	t.Run("not_in_with_subquery", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM t WHERE id NOT IN (SELECT id FROM t2)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		in, ok := sel.Where.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr, got %T", sel.Where)
+		}
+		if !in.Not {
+			t.Error("expected Not=true for NOT IN")
+		}
+	})
+
+	t.Run("parenthesized_expression_still_works", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM t WHERE (id) = 5")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		bin, ok := sel.Where.(*api.BinaryExpr)
+		if !ok || bin.Op != api.BinEQ {
+			t.Fatalf("expected EQ comparison, got %T", sel.Where)
+		}
+		if _, ok := bin.Left.(*api.SubqueryExpr); ok {
+			t.Error("expected ColumnRef, not SubqueryExpr for (id)")
+		}
+	})
+}

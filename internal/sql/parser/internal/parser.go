@@ -498,6 +498,126 @@ func (p *parser) parseSelect() (api.Statement, error) {
 
 // ─── DELETE ───────────────────────────────────────────────────────
 
+
+// parseSubquerySelect parses a SELECT statement inside a parenthesized expression
+// (e.g., (SELECT col FROM t2 WHERE ...)). It stops at the closing ')' so the
+// caller can consume it. Unlike parseSelect, it does NOT consume TokRParen.
+func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
+	if p.cur.Type != api.TokSelect {
+		return nil, p.errorf("expected SELECT in subquery")
+	}
+	p.advance() // consume SELECT
+	stmt := &api.SelectStmt{}
+
+	// Columns
+	if p.cur.Type == api.TokStar {
+		stmt.Columns = []api.SelectColumn{{Expr: &api.StarExpr{}}}
+		p.advance()
+	} else {
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			col := api.SelectColumn{Expr: expr}
+			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+				p.advance()
+				if p.cur.Type != api.TokIdent {
+					return nil, p.errorf("expected alias name after AS")
+				}
+				col.Alias = p.cur.Literal
+				p.advance()
+			}
+			stmt.Columns = append(stmt.Columns, col)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	// FROM
+	if err := p.expect(api.TokFrom); err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after FROM in subquery")
+	}
+	stmt.Table = p.cur.Literal
+	p.advance()
+
+	// Optional WHERE
+	if p.cur.Type == api.TokWhere {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = expr
+	}
+
+	// Optional GROUP BY
+	if p.cur.Type == api.TokGroup {
+		p.advance()
+		if err := p.expect(api.TokBy); err != nil {
+			return nil, err
+		}
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name in GROUP BY")
+			}
+			stmt.GroupBy = append(stmt.GroupBy, &api.ColumnRef{Column: p.cur.Literal})
+			p.advance()
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	// Optional HAVING
+	if p.cur.Type == api.TokHaving {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Having = expr
+	}
+
+	// Optional ORDER BY
+	if p.cur.Type == api.TokOrder {
+		p.advance()
+		if err := p.expect(api.TokBy); err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name after ORDER BY")
+		}
+		stmt.OrderBy = &api.OrderByClause{Column: p.cur.Literal}
+		p.advance()
+		if p.cur.Type == api.TokDesc {
+			stmt.OrderBy.Desc = true
+			p.advance()
+		} else if p.cur.Type == api.TokAsc {
+			p.advance()
+		}
+	}
+
+	// Optional LIMIT
+	if p.cur.Type == api.TokLimit {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Limit = expr
+	}
+
+	// NOTE: Do NOT consume the trailing TokRParen. Callers handle it.
+	return stmt, nil
+}
+
 func (p *parser) parseDelete() (api.Statement, error) {
 	p.advance() // consume DELETE
 	if err := p.expect(api.TokFrom); err != nil {
@@ -698,15 +818,31 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		if p.cur.Type != api.TokLParen {
 			return nil, p.errorf("expected ( after IN")
 		}
-		p.advance()
+		p.advance() // consume '(' — now at first element
 		var values []api.Expr
 		if p.cur.Type != api.TokRParen {
 			for {
-				val, err := p.parseCompareExpr()
-				if err != nil {
-					return nil, err
+				// Subquery: ( SELECT ... ) in IN list
+				if p.cur.Type == api.TokSelect {
+					subq, err := p.parseSubquerySelect()
+					if err != nil {
+						return nil, err
+					}
+					// parseSubquerySelect consumed the subquery's ')' — add result and break.
+					// If there's a comma, advance and continue for more elements.
+					values = append(values, &api.SubqueryExpr{Stmt: subq})
+					if p.cur.Type == api.TokComma {
+						p.advance()
+						continue
+					}
+					break // at ')' of IN list
+				} else {
+					val, err := p.parseCompareExpr()
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, val)
 				}
-				values = append(values, val)
 				if p.cur.Type == api.TokRParen {
 					break
 				}
@@ -795,6 +931,19 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 	case api.TokLParen:
 		if p.depth > 1000 {
 			return nil, p.errorf("expression too deeply nested (max 1000 levels)")
+		}
+		// Subquery: ( SELECT ... ) — check peek since cur is TokLParen.
+		// parseSubquerySelect stops at ')', so consume it here.
+		if p.peek.Type == api.TokSelect {
+			p.advance() // consume '('
+			subq, err := p.parseSubquerySelect()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(api.TokRParen); err != nil {
+				return nil, err
+			}
+			return &api.SubqueryExpr{Stmt: subq}, nil
 		}
 		p.advance()
 		expr, err := p.parseExpr()

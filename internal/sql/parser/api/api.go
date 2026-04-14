@@ -311,6 +311,13 @@ type BetweenExpr struct {
 
 func (*BetweenExpr) exprNode() {}
 
+// SubqueryExpr represents a subquery in an expression context, e.g. (SELECT ...).
+type SubqueryExpr struct {
+	Stmt Statement // the subquery (always SelectStmt at parse time)
+}
+
+func (*SubqueryExpr) exprNode() {}
+
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 
 // ColumnDef represents a column definition in CREATE TABLE (parser's own type).

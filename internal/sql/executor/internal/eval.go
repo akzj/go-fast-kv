@@ -35,6 +35,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalBetweenExpr(e, row, columns)
 	case *parserapi.InExpr:
 		return evalInExpr(e, row, columns)
+	case *parserapi.SubqueryExpr:
+		return catalogapi.Value{}, fmt.Errorf("%w: subqueries in expression context not yet supported", executorapi.ErrExecFailed)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
