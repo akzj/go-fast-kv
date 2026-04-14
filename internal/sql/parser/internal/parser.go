@@ -438,8 +438,20 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	if p.cur.Type != api.TokIdent {
 		return nil, p.errorf("expected table name after FROM")
 	}
-	stmt.Table = p.cur.Literal
+	leftTable := p.cur.Literal
 	p.advance()
+
+	// Check for JOIN (INNER, LEFT, RIGHT, CROSS all start with their own token)
+	if p.cur.Type == api.TokJoin || p.cur.Type == api.TokLeft ||
+		p.cur.Type == api.TokRight || p.cur.Type == api.TokCross {
+		join, err := p.parseJoin(leftTable)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Join = join
+	} else {
+		stmt.Table = leftTable
+	}
 
 	// Optional WHERE
 	if p.cur.Type == api.TokWhere {
@@ -960,6 +972,60 @@ func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
 }
 
 // primary = literal | ident ["." ident] | "(" expr ")" | "-" primary | "*"
+func (p *parser) parseJoin(leftTable string) (*api.JoinExpr, error) {
+	// Check for LEFT/RIGHT/CROSS prefix
+	joinType := api.JoinType("INNER")
+	if p.cur.Type == api.TokLeft {
+		joinType = api.JoinType("LEFT")
+		p.advance()
+	} else if p.cur.Type == api.TokRight {
+		joinType = api.JoinType("RIGHT")
+		p.advance()
+	} else if p.cur.Type == api.TokCross {
+		joinType = api.JoinType("CROSS")
+		p.advance()
+	}
+
+	// Now expect JOIN keyword (not consumed yet for bare JOIN)
+	if p.cur.Type != api.TokJoin {
+		return nil, p.errorf("expected JOIN")
+	}
+	p.advance()
+
+	// CROSS JOIN — no ON
+	if joinType == api.JoinType("CROSS") {
+		// No ON clause for CROSS JOIN
+	}
+
+	// Parse right table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after JOIN")
+	}
+	rightTable := p.cur.Literal
+	p.advance()
+
+	// Parse ON condition (not for CROSS JOIN)
+	var on api.Expr
+	if joinType != api.JoinType("CROSS") {
+		if p.cur.Type != api.TokOn {
+			return nil, p.errorf("expected ON after JOIN")
+		}
+		p.advance()
+		var err error
+		on, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &api.JoinExpr{
+		Left:  leftTable,
+		Right: rightTable,
+		Type:  joinType,
+		On:    on,
+	}, nil
+}
+
 func (p *parser) parsePrimary() (api.Expr, error) {
 	if p.depth > 1000 {
 		return nil, p.errorf("expression too deeply nested (max 1000 levels)")
@@ -1019,6 +1085,16 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
+		// Qualified name: ident.ident (e.g., t1.id)
+		if p.cur.Type == api.TokDot {
+			p.advance()
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name after .")
+			}
+			col := p.cur.Literal
+			p.advance()
+			return &api.ColumnRef{Table: name, Column: col}, nil
+		}
 		// Function call: ident followed by '('
 		if p.cur.Type == api.TokLParen {
 			args, err := p.parseFunctionArgs()

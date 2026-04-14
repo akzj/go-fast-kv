@@ -28,6 +28,11 @@ var keywords = map[string]api.TokenType{
 	"OR":       api.TokOr,
 	"EXPLAIN":  api.TokExplain,
 	"ANALYZE":  api.TokAnalyze,
+	"JOIN":     api.TokJoin,
+	"LEFT":     api.TokLeft,
+	"RIGHT":    api.TokRight,
+	"CROSS":    api.TokCross,
+	"INNER":    api.TokJoin,
 	"NOT":     api.TokNot,
 	"NULL":    api.TokNull,
 	"IS":      api.TokIs,
@@ -96,6 +101,9 @@ func (l *lexer) nextToken() api.Token {
 	case ';':
 		l.pos++
 		return api.Token{Type: api.TokSemicolon, Literal: ";", Pos: startPos}
+	case '.':
+		l.pos++
+		return api.Token{Type: api.TokDot, Literal: ".", Pos: startPos}
 	case '+':
 		l.pos++
 		return api.Token{Type: api.TokPlus, Literal: "+", Pos: startPos}

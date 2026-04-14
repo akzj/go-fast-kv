@@ -81,10 +81,15 @@ const (
 	TokLParen    TokenType = 48 // (
 	TokRParen    TokenType = 49 // )
 	TokSemicolon TokenType = 50 // ;
+	TokDot       TokenType = 60 // .
 
 	// Special
-	TokExplain  TokenType = 53 // EXPLAIN
-	TokAnalyze  TokenType = 54 // ANALYZE
+	TokExplain  TokenType = 54 // EXPLAIN
+	TokAnalyze  TokenType = 55 // ANALYZE
+	TokJoin     TokenType = 56 // JOIN
+	TokLeft     TokenType = 57 // LEFT
+	TokRight    TokenType = 58 // RIGHT
+	TokCross    TokenType = 59 // CROSS
 	TokEOF      TokenType = 51
 	TokIllegal  TokenType = 52
 )
@@ -160,14 +165,26 @@ type InsertStmt struct {
 func (*InsertStmt) stmtNode() {}
 
 // SelectStmt: SELECT columns FROM table [WHERE expr] [ORDER BY col] [LIMIT n]
+// JoinType represents the type of JOIN.
+type JoinType string
+
+// JoinExpr represents a JOIN ... ON ... clause in FROM.
+type JoinExpr struct {
+	Left  string   // left table name
+	Right string   // right table name
+	Type  JoinType // "INNER", "LEFT", "RIGHT", "CROSS"
+	On    Expr     // join condition (nil for CROSS)
+}
+
 type SelectStmt struct {
 	Columns []SelectColumn
-	Table   string
-	Where   Expr            // nil if no WHERE
-	GroupBy []Expr          // nil if no GROUP BY
-	Having  Expr            // nil if no HAVING
-	OrderBy *OrderByClause  // nil if no ORDER BY
-	Limit   Expr            // nil if no LIMIT
+	Table   string      // single table name (used when Join is nil)
+	Join    *JoinExpr   // non-nil means this is a JOIN query
+	Where   Expr        // nil if no WHERE
+	GroupBy []Expr      // nil if no GROUP BY
+	Having  Expr        // nil if no HAVING
+	OrderBy *OrderByClause // nil if no ORDER BY
+	Limit   Expr        // nil if no LIMIT
 }
 
 func (*SelectStmt) stmtNode() {}

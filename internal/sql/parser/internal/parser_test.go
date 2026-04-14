@@ -1350,3 +1350,132 @@ func TestParse_Explain(t *testing.T) {
 		}
 	})
 }
+
+
+func TestParse_Join(t *testing.T) {
+	t.Run("inner join basic", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.Join == nil {
+			t.Fatal("expected Join to be set")
+		}
+		if sel.Join.Left != "T1" {
+			t.Errorf("expected left=T1, got %s", sel.Join.Left)
+		}
+		if sel.Join.Right != "T2" {
+			t.Errorf("expected right=T2, got %s", sel.Join.Right)
+		}
+		if sel.Join.Type != api.JoinType("INNER") {
+			t.Errorf("expected type=INNER, got %s", sel.Join.Type)
+		}
+		if sel.Join.On == nil {
+			t.Fatal("expected On to be set")
+		}
+		// t1.id = t2.t1_id is a BinaryExpr
+		binOp, ok := sel.Join.On.(*api.BinaryExpr)
+		if !ok {
+			t.Fatalf("expected BinaryExpr in ON, got %T", sel.Join.On)
+		}
+		if binOp.Op != api.BinEQ {
+			t.Errorf("expected op=BinEQ, got %v", binOp.Op)
+		}
+	})
+
+	t.Run("left join", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Join.Type != api.JoinType("LEFT") {
+			t.Errorf("expected type=LEFT, got %s", sel.Join.Type)
+		}
+		if sel.Join.Left != "USERS" || sel.Join.Right != "ORDERS" {
+			t.Errorf("unexpected tables: %s %s", sel.Join.Left, sel.Join.Right)
+		}
+	})
+
+	t.Run("right join", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t1 RIGHT JOIN t2 ON t1.id = t2.id")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Join.Type != api.JoinType("RIGHT") {
+			t.Errorf("expected type=RIGHT, got %s", sel.Join.Type)
+		}
+	})
+
+	t.Run("cross join", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t1 CROSS JOIN t2")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Join.Type != api.JoinType("CROSS") {
+			t.Errorf("expected type=CROSS, got %s", sel.Join.Type)
+		}
+		if sel.Join.On != nil {
+			t.Error("CROSS JOIN should have nil On")
+		}
+	})
+
+	t.Run("join with where", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.x = 1")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Join == nil {
+			t.Fatal("expected Join to be set")
+		}
+		if sel.Where == nil {
+			t.Fatal("expected WHERE to be set")
+		}
+	})
+
+	t.Run("qualified columns in join", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.id = t2.t1_id")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if len(sel.Columns) != 2 {
+			t.Fatalf("expected 2 columns, got %d", len(sel.Columns))
+		}
+		col1, ok := sel.Columns[0].Expr.(*api.ColumnRef)
+		if !ok {
+			t.Fatalf("expected ColumnRef, got %T", sel.Columns[0].Expr)
+		}
+		if col1.Table != "T1" || col1.Column != "ID" {
+			t.Errorf("expected T1.ID, got %s.%s", col1.Table, col1.Column)
+		}
+	})
+
+	t.Run("single table still works", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users WHERE id = 1")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Join != nil {
+			t.Error("single table should have nil Join")
+		}
+		if sel.Table != "USERS" {
+			t.Errorf("expected Table=USERS, got %s", sel.Table)
+		}
+	})
+}
