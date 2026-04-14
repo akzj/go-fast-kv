@@ -377,9 +377,16 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 				return
 			}
 			// Plan and execute the subquery (may trigger nested execSelect with same map)
-			subplan, err := e.planner.Plan(sq.Stmt)
-			if err != nil {
-				return
+			// Planner already set sq.Plan — use it. Otherwise fallback to executor planning.
+			var subplan plannerapi.Plan
+			if sq.Plan != nil {
+				subplan = sq.Plan.(plannerapi.Plan)
+			} else {
+				var err error
+				subplan, err = e.planner.Plan(sq.Stmt)
+				if err != nil {
+					return
+			}
 			}
 			result, err := e.Execute(subplan)
 			if err != nil {

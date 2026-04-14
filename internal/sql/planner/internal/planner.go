@@ -278,6 +278,14 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		limit = int(val.Int)
 	}
 
+
+	// NEW: plan subqueries in WHERE and HAVING
+	if err := p.planSubqueries(residualFilter); err != nil {
+		return nil, fmt.Errorf("planning subquery in WHERE: %w", err)
+	}
+	if err := p.planSubqueries(stmt.Having); err != nil {
+		return nil, fmt.Errorf("planning subquery in HAVING: %w", err)
+	}
 	return &plannerapi.SelectPlan{
 		Table: tbl, Scan: scan, Columns: colIndices,
 		SelectColumns: stmt.Columns,
@@ -569,4 +577,62 @@ func isInGroupBy(colName string, groupByExprs []parserapi.Expr) bool {
 		}
 	}
 	return false
+}
+
+// planSubqueries walks expr AST and plans each SubqueryExpr found.
+func (p *planner) planSubqueries(expr parserapi.Expr) error {
+	return walkExprForSubqueries(expr, p)
+}
+
+// walkExprForSubqueries traverses an expression AST and sets sq.Plan for each SubqueryExpr.
+func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *parserapi.SubqueryExpr:
+		// Already planned? (nested call during subquery planning)
+		if e.Plan != nil {
+			return nil
+		}
+		subplan, err := p.Plan(e.Stmt)
+		if err != nil {
+			return err
+		}
+		e.Plan = subplan
+	case *parserapi.BinaryExpr:
+		if err := walkExprForSubqueries(e.Left, p); err != nil {
+			return err
+		}
+		return walkExprForSubqueries(e.Right, p)
+	case *parserapi.UnaryExpr:
+		return walkExprForSubqueries(e.Operand, p)
+	case *parserapi.InExpr:
+		if err := walkExprForSubqueries(e.Expr, p); err != nil {
+			return err
+		}
+		for _, v := range e.Values {
+			if err := walkExprForSubqueries(v, p); err != nil {
+				return err
+			}
+		}
+	case *parserapi.LikeExpr:
+		// Pattern is a string literal, not a subquery
+		return walkExprForSubqueries(e.Expr, p)
+	case *parserapi.BetweenExpr:
+		if err := walkExprForSubqueries(e.Expr, p); err != nil {
+			return err
+		}
+		if err := walkExprForSubqueries(e.Low, p); err != nil {
+			return err
+		}
+		return walkExprForSubqueries(e.High, p)
+	case *parserapi.IsNullExpr:
+		return walkExprForSubqueries(e.Expr, p)
+	case *parserapi.AggregateCallExpr:
+		// No subquery inside aggregates
+	case *parserapi.Literal, *parserapi.ColumnRef, *parserapi.StarExpr:
+		// Leaf nodes
+	}
+	return nil
 }
