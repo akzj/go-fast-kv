@@ -488,6 +488,20 @@ func TestExec_Between(t *testing.T) {
 			t.Fatalf("rows = %d, want 2 (Apple, Banana, Cherry)", len(result.Rows))
 		}
 	})
+	t.Run("not_between_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE price NOT BETWEEN 30 AND 70")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (Date only)", len(result.Rows))
+		}
+	})
+
+	t.Run("not_between_no_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE price NOT BETWEEN 20 AND 100")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0", len(result.Rows))
+		}
+	})
+
 }
 
 func TestExec_In(t *testing.T) {
@@ -533,4 +547,20 @@ func TestExec_In(t *testing.T) {
 			t.Fatalf("rows = %d, want 0 (type mismatch)", len(result.Rows))
 		}
 	})
+
+	// NOT IN tests (verify UnaryNot(InExpr) chain works correctly)
+	t.Run("not_in_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE id NOT IN (1, 3)")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (Banana, Date)", len(result.Rows))
+		}
+	})
+
+	t.Run("not_in_no_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE id NOT IN (1, 2, 3, 4)")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0", len(result.Rows))
+		}
+	})
+
 }

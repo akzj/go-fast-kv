@@ -665,8 +665,13 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 	}
 
 	// BETWEEN ... AND ...
-	if p.cur.Type == api.TokBetween {
-		p.advance()
+	if p.cur.Type == api.TokBetween || (p.cur.Type == api.TokNot && p.peek.Type == api.TokBetween) {
+		not := false
+		if p.cur.Type == api.TokNot {
+			not = true
+			p.advance()
+		}
+		p.advance() // consume TokBetween
 		low, err := p.parseCompareExpr()
 		if err != nil {
 			return nil, err
@@ -679,12 +684,17 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &api.BetweenExpr{Expr: left, Low: low, High: high, Not: false}, nil
+		return &api.BetweenExpr{Expr: left, Low: low, High: high, Not: not}, nil
 	}
 
 	// [NOT] IN (...)
-	if p.cur.Type == api.TokIn {
-		p.advance()
+	if p.cur.Type == api.TokIn || (p.cur.Type == api.TokNot && p.peek.Type == api.TokIn) {
+		not := false
+		if p.cur.Type == api.TokNot {
+			not = true
+			p.advance()
+		}
+		p.advance() // consume TokIn
 		if p.cur.Type != api.TokLParen {
 			return nil, p.errorf("expected ( after IN")
 		}
@@ -710,7 +720,7 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 			return nil, p.errorf("expected ) after IN list")
 		}
 		p.advance()
-		return &api.InExpr{Expr: left, Values: values, Not: false}, nil
+		return &api.InExpr{Expr: left, Values: values, Not: not}, nil
 	}
 
 	// Comparison operators

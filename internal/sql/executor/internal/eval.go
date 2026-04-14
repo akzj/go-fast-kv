@@ -381,6 +381,10 @@ func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []
 		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 	}
 	if !isTruthy(geLow) {
+		// col < low
+		if expr.Not {
+			return intVal(1), nil // NOT BETWEEN: outside range → true
+		}
 		return intVal(0), nil
 	}
 	// col <= high
@@ -392,7 +396,14 @@ func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []
 		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 	}
 	if isTruthy(leHigh) {
+		if expr.Not {
+			return intVal(0), nil // NOT BETWEEN: in range → false
+		}
 		return intVal(1), nil
+	}
+	// col > high
+	if expr.Not {
+		return intVal(1), nil // NOT BETWEEN: outside range → true
 	}
 	return intVal(0), nil
 }
@@ -422,10 +433,16 @@ func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi
 		}
 		if eq.Type == catalogapi.TypeInt && !eq.IsNull && eq.Int == 1 {
 			// TRUE match found
+			if expr.Not {
+				return intVal(0), nil // NOT IN: match -> false
+			}
 			return intVal(1), nil
 		}
 		// eq is either FALSE or NULL — continue checking
 	}
 	// No TRUE match found; result is FALSE
+	if expr.Not {
+		return intVal(1), nil // NOT IN: no match -> true
+	}
 	return intVal(0), nil
 }
