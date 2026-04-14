@@ -87,7 +87,7 @@ func Open(store kvstoreapi.Store) *DB {
 	pl := planner.New(cat)
 
 	// Layer 5: executor (plan → result)
-	ex := executor.New(store, cat, tbl, idx)
+	ex := executor.New(store, cat, tbl, idx, pl)
 
 	return &DB{
 		store:    store,

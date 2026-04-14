@@ -14,29 +14,78 @@ import (
 
 // ─── Expression Evaluation ──────────────────────────────────────────
 
+// walkExpr recursively visits all Expr nodes in an expression tree,
+// calling fn on each one.
+func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
+	if expr == nil {
+		return
+	}
+	fn(expr)
+	switch e := expr.(type) {
+	case *parserapi.BinaryExpr:
+		walkExpr(e.Left, fn)
+		walkExpr(e.Right, fn)
+	case *parserapi.UnaryExpr:
+		walkExpr(e.Operand, fn)
+	case *parserapi.IsNullExpr:
+		walkExpr(e.Expr, fn)
+	case *parserapi.LikeExpr:
+		walkExpr(e.Expr, fn)
+	case *parserapi.BetweenExpr:
+		walkExpr(e.Expr, fn)
+		walkExpr(e.Low, fn)
+		walkExpr(e.High, fn)
+	case *parserapi.InExpr:
+		walkExpr(e.Expr, fn)
+		for _, v := range e.Values {
+			walkExpr(v, fn)
+		}
+	case *parserapi.SubqueryExpr:
+		// Subquery body not walked here (would need Statement visitor)
+	}
+}
+
 // evalExpr evaluates an expression against a row and returns a Value.
-func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+// subqueryResults provides pre-computed values for SubqueryExpr nodes.
+func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
 	switch e := expr.(type) {
 	case *parserapi.ColumnRef:
 		return evalColumnRef(e, row, columns)
 	case *parserapi.Literal:
 		return e.Value, nil
 	case *parserapi.BinaryExpr:
-		return evalBinaryExpr(e, row, columns)
+		return evalBinaryExpr(e, row, columns, subqueryResults)
 	case *parserapi.UnaryExpr:
-		return evalUnaryExpr(e, row, columns)
+		return evalUnaryExpr(e, row, columns, subqueryResults)
 	case *parserapi.IsNullExpr:
-		return evalIsNullExpr(e, row, columns)
+		return evalIsNullExpr(e, row, columns, subqueryResults)
 	case *parserapi.LikeExpr:
-		return evalLikeExpr(e, row, columns)
+		return evalLikeExpr(e, row, columns, subqueryResults)
 	case *parserapi.AggregateCallExpr:
 		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, e.Func)
 	case *parserapi.BetweenExpr:
-		return evalBetweenExpr(e, row, columns)
+		return evalBetweenExpr(e, row, columns, subqueryResults)
 	case *parserapi.InExpr:
-		return evalInExpr(e, row, columns)
+		return evalInExpr(e, row, columns, subqueryResults)
 	case *parserapi.SubqueryExpr:
-		return catalogapi.Value{}, fmt.Errorf("%w: subqueries in expression context not yet supported", executorapi.ErrExecFailed)
+		// Pre-computed by execSelect pre-plan pass
+		if vals, ok := subqueryResults[e]; ok {
+			if vals == nil {
+				return catalogapi.Value{IsNull: true}, nil
+			}
+			// vals is []catalogapi.Value (for IN) or catalogapi.Value (for scalar)
+			switch v := vals.(type) {
+			case catalogapi.Value:
+				return v, nil
+			case []catalogapi.Value:
+				// Shouldn't reach here directly — evalInExpr handles list lookups
+				return catalogapi.Value{IsNull: true}, nil
+			default:
+				return catalogapi.Value{IsNull: true}, nil
+			}
+		}
+		return catalogapi.Value{}, fmt.Errorf("%w: subquery not pre-computed", executorapi.ErrExecFailed)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
@@ -57,13 +106,13 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 }
 
 // evalBinaryExpr evaluates a binary expression (AND, OR, comparisons).
-func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
 	// SQL three-valued logic for AND/OR:
 	//   AND: FALSE AND x → FALSE; TRUE AND x → x; NULL AND FALSE → FALSE; NULL AND TRUE → NULL; NULL AND NULL → NULL
 	//   OR:  TRUE OR x → TRUE; FALSE OR x → x; NULL OR TRUE → TRUE; NULL OR FALSE → NULL; NULL OR NULL → NULL
 	switch expr.Op {
 	case parserapi.BinAnd:
-		left, err := evalExpr(expr.Left, row, columns)
+		left, err := evalExpr(expr.Left, row, columns, subqueryResults)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
@@ -73,7 +122,7 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 			// Left is definitely FALSE → result is FALSE regardless of right
 			return intVal(0), nil
 		}
-		right, err := evalExpr(expr.Right, row, columns)
+		right, err := evalExpr(expr.Right, row, columns, subqueryResults)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
@@ -94,7 +143,7 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		return intVal(0), nil
 
 	case parserapi.BinOr:
-		left, err := evalExpr(expr.Left, row, columns)
+		left, err := evalExpr(expr.Left, row, columns, subqueryResults)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
@@ -104,7 +153,7 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 			// Left is definitely TRUE → result is TRUE regardless of right
 			return intVal(1), nil
 		}
-		right, err := evalExpr(expr.Right, row, columns)
+		right, err := evalExpr(expr.Right, row, columns, subqueryResults)
 		if err != nil {
 			return catalogapi.Value{}, err
 		}
@@ -123,11 +172,11 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 	}
 
 	// Comparison operators
-	left, err := evalExpr(expr.Left, row, columns)
+	left, err := evalExpr(expr.Left, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
-	right, err := evalExpr(expr.Right, row, columns)
+	right, err := evalExpr(expr.Right, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -168,8 +217,8 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 }
 
 // evalUnaryExpr evaluates NOT and unary minus.
-func evalUnaryExpr(expr *parserapi.UnaryExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
-	operand, err := evalExpr(expr.Operand, row, columns)
+func evalUnaryExpr(expr *parserapi.UnaryExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
+	operand, err := evalExpr(expr.Operand, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -203,8 +252,8 @@ func evalUnaryExpr(expr *parserapi.UnaryExpr, row *engineapi.Row, columns []cata
 }
 
 // evalIsNullExpr evaluates IS NULL / IS NOT NULL.
-func evalIsNullExpr(expr *parserapi.IsNullExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
-	inner, err := evalExpr(expr.Expr, row, columns)
+func evalIsNullExpr(expr *parserapi.IsNullExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
+	inner, err := evalExpr(expr.Expr, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -246,13 +295,23 @@ func intVal(n int64) catalogapi.Value {
 	return catalogapi.Value{Type: catalogapi.TypeInt, Int: n}
 }
 
+// literalToExpr converts a catalogapi.Value to a parserapi.Literal Expr.
+// Returns nil for NULL values (no point adding NULL to IN list).
+func literalToExpr(v catalogapi.Value) parserapi.Expr {
+	if v.IsNull {
+		return nil
+	}
+	return &parserapi.Literal{Value: v}
+}
+
 // matchFilter evaluates a filter expression against a row.
 // Returns true if the row passes the filter (or filter is nil).
-func matchFilter(filter parserapi.Expr, row *engineapi.Row, columns []catalogapi.ColumnDef) (bool, error) {
+func matchFilter(filter parserapi.Expr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) (bool, error) {
 	if filter == nil {
 		return true, nil
 	}
-	val, err := evalExpr(filter, row, columns)
+	val, err := evalExpr(filter, row, columns, subqueryResults)
 	if err != nil {
 		return false, err
 	}
@@ -281,8 +340,8 @@ func binOpToCompareOp(op parserapi.BinaryOp) (encodingapi.CompareOp, bool) {
 
 // evalLikeExpr evaluates a LIKE expression.
 // Returns true (1), false (0), or NULL if the input is NULL.
-func evalLikeExpr(expr *parserapi.LikeExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
-	val, err := evalExpr(expr.Expr, row, columns)
+func evalLikeExpr(expr *parserapi.LikeExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
+	val, err := evalExpr(expr.Expr, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -349,16 +408,16 @@ func matchLike(value, pattern string, escape byte) bool {
 // evalBetweenExpr evaluates col BETWEEN low AND high.
 // Semantics: col >= low AND col <= low. Returns int(1) or int(0).
 // If col, low, or high is NULL, the result is NULL.
-func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
-	col, err := evalExpr(expr.Expr, row, columns)
+func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
+	col, err := evalExpr(expr.Expr, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
-	low, err := evalExpr(expr.Low, row, columns)
+	low, err := evalExpr(expr.Low, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
-	high, err := evalExpr(expr.High, row, columns)
+	high, err := evalExpr(expr.High, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -375,7 +434,7 @@ func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []
 		return intVal(0), nil
 	}
 	// col >= low
-	geLow, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinGE, Right: expr.Low}, row, columns)
+	geLow, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinGE, Right: expr.Low}, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -390,7 +449,7 @@ func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []
 		return intVal(0), nil
 	}
 	// col <= high
-	leHigh, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinLE, Right: expr.High}, row, columns)
+	leHigh, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinLE, Right: expr.High}, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -411,14 +470,14 @@ func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []
 }
 
 // evalInExpr evaluates col IN (val1, val2, ...).
-// Phase 1: all values are Literals. Semantics: col = val1 OR col = val2 OR ...
-// NULL: if col is NULL, result is NULL. If any val is NULL, comparison yields NULL (three-valued logic).
-func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+// Semantics: col = val1 OR col = val2 OR ...
+// NULL: if col is NULL, result is NULL. If any val is NULL, comparison yields NULL.
+// SubqueryExpr in Values: subqueryResults map provides pre-computed subquery value lists.
+func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) (catalogapi.Value, error) {
 	if len(expr.Values) == 0 {
-		// Empty IN list — reject at eval time (parser should have caught this)
 		return catalogapi.Value{}, fmt.Errorf("%w: IN list cannot be empty", executorapi.ErrExecFailed)
 	}
-	col, err := evalExpr(expr.Expr, row, columns)
+	col, err := evalExpr(expr.Expr, row, columns, subqueryResults)
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -426,12 +485,35 @@ func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi
 	if col.IsNull {
 		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 	}
+
+	// Build the full list of values to check: literals + subquery results
+	var valuesToCheck []parserapi.Expr
+	for _, valExpr := range expr.Values {
+		if sq, ok := valExpr.(*parserapi.SubqueryExpr); ok {
+			// Expand subquery results into individual values
+			if vals, ok := subqueryResults[sq]; ok {
+				switch v := vals.(type) {
+				case []catalogapi.Value:
+					for _, subVal := range v {
+						lit := literalToExpr(subVal)
+						if lit != nil {
+							valuesToCheck = append(valuesToCheck, lit)
+						}
+					}
+				}
+			} else {
+			}
+		} else {
+			valuesToCheck = append(valuesToCheck, valExpr)
+		}
+	}
+
 	// col = val1 OR col = val2 OR ...
 	anyNull := false
-	for _, valExpr := range expr.Values {
-		eq, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinEQ, Right: valExpr}, row, columns)
+	for _, valExpr := range valuesToCheck {
+		eq, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinEQ, Right: valExpr}, row, columns, subqueryResults)
 		if err != nil {
-			// Type mismatch: col and val can't be compared — treat as no match, continue
+			// Type mismatch: treat as no match, continue
 			continue
 		}
 		// CR-F: track NULL comparisons (standard SQL: any NULL in IN/NOT IN list → NULL)

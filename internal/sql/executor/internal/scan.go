@@ -16,32 +16,35 @@ import (
 // ─── Scan Helpers ───────────────────────────────────────────────────
 
 // scanRows collects rows matching a scan plan.
-func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan) ([]*engineapi.Row, error) {
+func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
 	switch s := scan.(type) {
 	case *plannerapi.TableScanPlan:
-		return e.tableScan(table, s.Filter)
+		return e.tableScan(table, s.Filter, subqueryResults)
 	case *plannerapi.IndexScanPlan:
-		return e.indexScan(table, s)
+		return e.indexScan(table, s, subqueryResults)
 	case *plannerapi.IndexRangePlan:
-		return e.indexRangeScan(s)
+		return e.indexRangeScan(s, subqueryResults)
 	default:
 		return nil, fmt.Errorf("%w: unsupported scan type %T", executorapi.ErrExecFailed, scan)
 	}
 }
 
 // scanRowsForDML delegates to scanRows (consolidation: S1).
-func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi.ScanPlan) ([]*engineapi.Row, error) {
-	return e.scanRows(table, scan)
+func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
+	return e.scanRows(table, scan, subqueryResults)
 }
 
 // filterRows applies a residual filter to already-scanned rows (used by execSelect for SelectPlan.Filter).
-func filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []catalogapi.ColumnDef) []*engineapi.Row {
+func filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) []*engineapi.Row {
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
 	filtered := rows[:0]
 	for _, row := range rows {
-		match, err := matchFilter(filter, row, columns)
+		match, err := matchFilter(filter, row, columns, subqueryResults)
 		if err != nil {
 			continue
 		}
@@ -53,7 +56,8 @@ func filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []cataloga
 }
 
 // tableScan iterates all rows and applies a filter.
-func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Expr) ([]*engineapi.Row, error) {
+func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Expr,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
 	iter, err := e.tableEngine.Scan(table)
 	if err != nil {
 		return nil, fmt.Errorf("%w: scan: %v", executorapi.ErrExecFailed, err)
@@ -66,7 +70,7 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 
 		// Apply filter if present
 		if filter != nil {
-			pass, err := matchFilter(filter, row, table.Columns)
+			pass, err := matchFilter(filter, row, table.Columns, subqueryResults)
 			if err != nil {
 				return nil, err
 			}
@@ -91,7 +95,7 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 }
 
 // indexScan uses an index to find matching rows.
-func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.IndexScanPlan) ([]*engineapi.Row, error) {
+func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.IndexScanPlan, subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
 	rowIDIter, err := e.indexEngine.Scan(scan.TableID, scan.IndexID, scan.Op, scan.Value)
 	if err != nil {
 		return nil, fmt.Errorf("%w: index scan: %v", executorapi.ErrExecFailed, err)
@@ -111,7 +115,7 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 
 		// Apply residual filter
 		if scan.ResidualFilter != nil {
-			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns)
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults)
 			if err != nil {
 				return nil, err
 			}
@@ -130,7 +134,7 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 }
 
 // indexRangeScan uses an index range scan for LIKE 'prefix%' optimization.
-func (e *executor) indexRangeScan(scan *plannerapi.IndexRangePlan) ([]*engineapi.Row, error) {
+func (e *executor) indexRangeScan(scan *plannerapi.IndexRangePlan, subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
 	startVal := catalogapi.Value{Type: catalogapi.TypeText, Text: scan.StartPrefix}
 	endVal := catalogapi.Value{Type: catalogapi.TypeText, Text: scan.EndPrefix}
 	iter, err := e.indexEngine.ScanRange(scan.TableID, scan.IndexID, &startVal, &endVal)
@@ -155,7 +159,7 @@ func (e *executor) indexRangeScan(scan *plannerapi.IndexRangePlan) ([]*engineapi
 			return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
 		}
 		if scan.ResidualFilter != nil {
-			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns)
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults)
 			if err != nil {
 				return nil, err
 			}

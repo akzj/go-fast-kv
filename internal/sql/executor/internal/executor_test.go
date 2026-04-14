@@ -41,7 +41,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	ex := New(store, cat, tbl, idx)
+	ex := New(store, cat, tbl, idx, pl)
 
 	return &testEnv{
 		store:   store,
@@ -563,4 +563,58 @@ func TestExec_In(t *testing.T) {
 		}
 	})
 
+}
+
+func TestExec_Subquery(t *testing.T) {
+	env := newTestEnv(t)
+	// Set up two tables
+	env.execSQL(t, "CREATE TABLE t1 (id INT, name TEXT)")
+	env.execSQL(t, "CREATE TABLE t2 (id INT, val TEXT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'one')")
+	env.execSQL(t, "INSERT INTO t1 VALUES (2, 'two')")
+	env.execSQL(t, "INSERT INTO t1 VALUES (3, 'three')")
+	env.execSQL(t, "INSERT INTO t1 VALUES (4, 'four')")
+	env.execSQL(t, "INSERT INTO t2 VALUES (1, 'a')")
+	env.execSQL(t, "INSERT INTO t2 VALUES (3, 'c')")
+	env.execSQL(t, "INSERT INTO t2 VALUES (5, 'e')")
+
+	t.Run("in_with_subquery", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT id, name FROM t1 WHERE id IN (SELECT id FROM t2)")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (id 1, id 3)", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 1 {
+			t.Errorf("row[0].id = %d, want 1", result.Rows[0][0].Int)
+		}
+		if result.Rows[1][0].Int != 3 {
+			t.Errorf("row[1].id = %d, want 3", result.Rows[1][0].Int)
+		}
+	})
+
+	t.Run("not_in_with_subquery", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT id, name FROM t1 WHERE id NOT IN (SELECT id FROM t2)")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (id 2, id 4)", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 2 {
+			t.Errorf("row[0].id = %d, want 2", result.Rows[0][0].Int)
+		}
+		if result.Rows[1][0].Int != 4 {
+			t.Errorf("row[1].id = %d, want 4", result.Rows[1][0].Int)
+		}
+	})
+
+	t.Run("in_subquery_no_matches", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2 WHERE id < 0)")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0 (subquery returns empty)", len(result.Rows))
+		}
+	})
+
+	t.Run("in_subquery_text_column", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT id FROM t1 WHERE name IN (SELECT val FROM t2)")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0 (no text overlap)", len(result.Rows))
+		}
+	})
 }

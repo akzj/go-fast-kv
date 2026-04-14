@@ -32,17 +32,20 @@ type executor struct {
 	tableEngine engineapi.TableEngine
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
+	planner     plannerapi.Planner
 }
 
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
-	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine) *executor {
+	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
+	planner plannerapi.Planner) *executor {
 	return &executor{
 		store:       store,
 		catalog:     catalog,
 		tableEngine: tableEngine,
 		indexEngine: indexEngine,
 		keyEncoder:  encoding.NewKeyEncoder(),
+		planner:     planner,
 	}
 }
 
@@ -202,7 +205,7 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	if colIdx < 0 {
 		return nil, fmt.Errorf("%w: backfill column %q not found", executorapi.ErrExecFailed, schema.Column)
 	}
-	existingRows, err := e.tableScan(tbl, nil)
+	existingRows, err := e.tableScan(tbl, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
 	}
@@ -317,16 +320,65 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
 }
 
+// precomputeSubqueries finds all SubqueryExpr nodes in the plan's WHERE/HAVING
+// and executes them, caching results in subqueryResults.
+// This is called with the OUTER subqueryResults map so that nested subqueries
+// don't re-execute infinitely (they share the parent's cache).
+func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) {
+	// Collect all expressions that might contain SubqueryExpr
+	var exprs []parserapi.Expr
+	if plan.Filter != nil {
+		exprs = append(exprs, plan.Filter)
+	}
+	if plan.Having != nil {
+		exprs = append(exprs, plan.Having)
+	}
+
+	for _, expr := range exprs {
+		walkExpr(expr, func(expr parserapi.Expr) {
+			sq, ok := expr.(*parserapi.SubqueryExpr)
+			if !ok {
+				return
+			}
+			// Already computed by an ancestor execSelect call?
+			if _, exists := subqueryResults[sq]; exists {
+				return
+			}
+			// Plan and execute the subquery (may trigger nested execSelect with same map)
+			subplan, err := e.planner.Plan(sq.Stmt)
+			if err != nil {
+				return
+			}
+			result, err := e.Execute(subplan)
+			if err != nil {
+				return
+			}
+			var vals []catalogapi.Value
+			for _, row := range result.Rows {
+				if len(row) > 0 {
+					vals = append(vals, row[0])
+				}
+			}
+			subqueryResults[sq] = vals
+		})
+	}
+}
+
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
-	// Collect matching rows via scan
-	rows, err := e.scanRows(plan.Table, plan.Scan)
+	// Pre-compute subquery results BEFORE scanning — needed for filter during scan.
+	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+	e.precomputeSubqueries(plan, subqueryResults)
+
+	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
+	rows, err := e.scanRows(plan.Table, plan.Scan, subqueryResults)
 	if err != nil {
 		return nil, err
 	}
 
 	// Apply residual filter from SelectPlan (handles index scan + residual)
 	if plan.Filter != nil {
-		rows = filterRows(rows, plan.Filter, plan.Table.Columns)
+		rows = filterRows(rows, plan.Filter, plan.Table.Columns, subqueryResults)
 	}
 
 	// GROUP BY: group rows by encoded key, then compute aggregates per group.
@@ -339,7 +391,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
-			rows = filterRows(rows, plan.Having, plan.Table.Columns)
+			rows = filterRows(rows, plan.Having, plan.Table.Columns, subqueryResults)
 		}
 	}
 
@@ -390,7 +442,7 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 	}
 
 	// Scan for rows to delete
-	rows, err := e.scanRowsForDML(plan.Table, plan.Scan)
+	rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +495,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		changedCols[colIdx] = true
 	}
 
-	rows, err := e.scanRowsForDML(plan.Table, plan.Scan)
+	rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +605,7 @@ func (e *executor) groupByRows(rows []*engineapi.Row, plan *plannerapi.SelectPla
 func (e *executor) encodeGroupKey(row *engineapi.Row, exprs []parserapi.Expr, columns []catalogapi.ColumnDef) ([]byte, error) {
 	var buf []byte
 	for _, expr := range exprs {
-		val, err := evalExpr(expr, row, columns)
+		val, err := evalExpr(expr, row, columns, nil)
 		if err != nil {
 			return nil, err
 		}
