@@ -3,6 +3,7 @@ package internal
 
 import (
 	"fmt"
+	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
@@ -246,7 +247,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		return nil, err
 	}
 
-	colIndices, err := p.resolveSelectColumns(tbl, stmt.Columns)
+	colIndices, err := p.resolveSelectColumns(tbl, stmt.Columns, stmt.GroupBy)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +426,7 @@ func (p *planner) extractIndexCandidate(tbl *catalogapi.TableSchema, expr parser
 
 // ─── Column Resolution ──────────────────────────────────────────────
 
-func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parserapi.SelectColumn) ([]int, error) {
+func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parserapi.SelectColumn, groupByExprs []parserapi.Expr) ([]int, error) {
 	if len(cols) == 1 {
 		if _, ok := cols[0].Expr.(*parserapi.StarExpr); ok {
 			return nil, nil
@@ -436,6 +437,10 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 	for i, sc := range cols {
 		switch expr := sc.Expr.(type) {
 		case *parserapi.ColumnRef:
+			// CR-E: if GROUP BY present, validate column is in GROUP BY or is an aggregate
+			if len(groupByExprs) > 0 && !isInGroupBy(expr.Column, groupByExprs) {
+				return nil, fmt.Errorf("%w: column %q must appear in the GROUP BY clause or be used in an aggregate function", plannerapi.ErrUnsupportedExpr, expr.Column)
+			}
 			idx := findColumnIndex(tbl, expr.Column)
 			if idx < 0 {
 				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, expr.Column)
@@ -449,4 +454,16 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 		}
 	}
 	return indices, nil
+}
+
+// isInGroupBy checks if a column name appears in the GROUP BY expression list.
+func isInGroupBy(colName string, groupByExprs []parserapi.Expr) bool {
+	for _, gb := range groupByExprs {
+		if gbRef, ok := gb.(*parserapi.ColumnRef); ok {
+			if strings.EqualFold(colName, gbRef.Column) {
+				return true
+			}
+		}
+	}
+	return false
 }
