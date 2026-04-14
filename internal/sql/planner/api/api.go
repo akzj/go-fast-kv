@@ -112,6 +112,8 @@ type SelectPlan struct {
 	Having        parserapi.Expr             // nil if no HAVING
 	OrderBy       *OrderByPlan               // nil if no ORDER BY
 	Limit         int                        // -1 if no LIMIT
+
+	Join          *JoinPlan               // nil for non-join; non-nil for JOIN
 }
 
 func (*SelectPlan) planNode() {}
@@ -173,6 +175,24 @@ type OrderByPlan struct {
 	ColumnIndex int
 	Desc        bool
 }
+// JoinPlan represents a two-table join.
+type JoinPlan struct {
+	Left         ScanPlan                  // Scan plan for left table
+	Right        ScanPlan                  // Scan plan for right table
+	LeftTable    *catalogapi.TableSchema   // Left table schema (columns)
+	RightTable   *catalogapi.TableSchema  // Right table schema (columns)
+	On           parserapi.Expr            // join condition (e.g. BinaryExpr t1.id = t2.t1_id)
+	Type         string                    // "INNER", "LEFT", "RIGHT", "CROSS"
+}
+
+func (*JoinPlan) planNode() {}
+
+// String returns a human-readable description of the join.
+func (p *JoinPlan) String() string {
+	return fmt.Sprintf("JOIN [type=%s] ON [%v]", p.Type, p.On)
+}
+
+
 
 // ─── Planner Interface ──────────────────────────────────────────────
 

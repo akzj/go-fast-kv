@@ -241,6 +241,12 @@ func (p *planner) resolveInsertRow(tbl *catalogapi.TableSchema, columns []string
 }
 
 func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
+	// Handle JOIN queries
+	if stmt.Join != nil {
+		return p.planJoinSelect(stmt)
+	}
+
+	// Single-table SELECT
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {
 		if err == catalogapi.ErrTableNotFound {
@@ -295,6 +301,141 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit,
 	}, nil
 }
+
+// planJoinSelect handles SELECT ... FROM t1 JOIN t2 ON ...
+func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
+	j := stmt.Join
+
+	// Get left table
+	leftTbl, err := p.catalog.GetTable(j.Left)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, j.Left)
+	}
+	// Get right table
+	rightTbl, err := p.catalog.GetTable(j.Right)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, j.Right)
+	}
+
+	// Plan scans for both tables
+	leftScan, _, err := p.planScan(leftTbl, nil)
+	if err != nil {
+		return nil, fmt.Errorf("join left scan: %w", err)
+	}
+	rightScan, _, err := p.planScan(rightTbl, nil)
+	if err != nil {
+		return nil, fmt.Errorf("join right scan: %w", err)
+	}
+
+	// Validate ON condition: qualified column names only
+	if err := validateJoinOn(j.On, j.Left, j.Right); err != nil {
+		return nil, fmt.Errorf("join ON: %w", err)
+	}
+
+	// Plan subqueries in ON
+	if err := p.planSubqueries(j.On); err != nil {
+		return nil, fmt.Errorf("planning subquery in ON: %w", err)
+	}
+
+	joinPlan := &plannerapi.JoinPlan{
+		Left:       leftScan,
+		Right:      rightScan,
+		LeftTable:  leftTbl,
+		RightTable: rightTbl,
+		On:         j.On,
+		Type:       string(j.Type),
+	}
+
+	// Resolve select columns for both tables
+	colIndices := []int{}
+	for _, col := range stmt.Columns {
+		if colExpr, ok := col.Expr.(*parserapi.ColumnRef); ok {
+			idx := -1
+			if colExpr.Table == j.Left {
+				idx = findColumnIndex(leftTbl, colExpr.Column)
+			} else if colExpr.Table == j.Right {
+				idx = findColumnIndex(rightTbl, colExpr.Column)
+			} else if colExpr.Table == "" {
+				idx = findColumnIndex(leftTbl, colExpr.Column)
+				if idx < 0 {
+					idx = findColumnIndex(rightTbl, colExpr.Column)
+				}
+			}
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, colExpr.Column)
+			}
+			colIndices = append(colIndices, idx)
+		}
+	}
+
+	// ORDER BY and LIMIT for JOIN — Phase 4
+	var orderBy *plannerapi.OrderByPlan
+	var limit int = -1
+
+	return &plannerapi.SelectPlan{
+		Table:         leftTbl,
+		Scan:          nil,
+		Join:          joinPlan,
+		Columns:       colIndices,
+		SelectColumns: stmt.Columns,
+		Filter:        nil,
+		GroupByExprs:  nil,
+		Having:        nil,
+		OrderBy:       orderBy,
+		Limit:         limit,
+	}, nil
+}
+
+// validateJoinOn checks that all column references in the ON condition
+// are qualified with a table name and that the table is one of the join tables.
+func validateJoinOn(expr parserapi.Expr, leftTable, rightTable string) error {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *parserapi.ColumnRef:
+		if e.Table == "" {
+			return fmt.Errorf("join ON must use qualified column names (table.column), got %q", e.Column)
+		}
+		if e.Table != leftTable && e.Table != rightTable {
+			return fmt.Errorf("join ON references unknown table %q (expected %q or %q)", e.Table, leftTable, rightTable)
+		}
+	case *parserapi.BinaryExpr:
+		if err := validateJoinOn(e.Left, leftTable, rightTable); err != nil {
+			return err
+		}
+		return validateJoinOn(e.Right, leftTable, rightTable)
+	case *parserapi.UnaryExpr:
+		return validateJoinOn(e.Operand, leftTable, rightTable)
+	case *parserapi.InExpr:
+		if err := validateJoinOn(e.Expr, leftTable, rightTable); err != nil {
+			return err
+		}
+		for _, v := range e.Values {
+			if err := validateJoinOn(v, leftTable, rightTable); err != nil {
+				return err
+			}
+		}
+	case *parserapi.LikeExpr:
+		if err := validateJoinOn(e.Expr, leftTable, rightTable); err != nil {
+			return err
+		}
+		// LikeExpr.Pattern is a string, not an Expr — no recursive validation needed
+	case *parserapi.BetweenExpr:
+		if err := validateJoinOn(e.Expr, leftTable, rightTable); err != nil {
+			return err
+		}
+		if err := validateJoinOn(e.Low, leftTable, rightTable); err != nil {
+			return err
+		}
+		return validateJoinOn(e.High, leftTable, rightTable)
+	case *parserapi.IsNullExpr:
+		return validateJoinOn(e.Expr, leftTable, rightTable)
+	case *parserapi.SubqueryExpr, *parserapi.AggregateCallExpr, *parserapi.Literal:
+	}
+	return nil
+}
+
 
 func (p *planner) planDelete(stmt *parserapi.DeleteStmt) (*plannerapi.DeletePlan, error) {
 	tbl, err := p.catalog.GetTable(stmt.Table)
