@@ -389,24 +389,13 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
 	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
 
-	for _, left := range leftRows {
-		for _, right := range rightRows {
-			combinedVals := make([]catalogapi.Value, leftLen+rightLen)
-			copy(combinedVals, left.Values)
-			copy(combinedVals[leftLen:], right.Values)
-			combinedRow := &engineapi.Row{Values: combinedVals}
-
-			if jplan.On != nil {
-				result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
-				if err != nil {
-					return nil, fmt.Errorf("join ON evaluation: %w", err)
-				}
-				if !isTruthy(result) {
-					continue
-				}
-			}
-			mergedRows = append(mergedRows, combinedVals)
-		}
+	switch jplan.Type {
+	case "LEFT":
+		mergedRows = e.execLeftJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+	case "RIGHT":
+		mergedRows = e.execRightJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+	default:
+		mergedRows = e.execInnerJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
 	}
 
 	// Apply WHERE filter on merged rows
@@ -461,30 +450,125 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
 	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
 
-	for _, left := range leftRows {
-		for _, right := range rightRows {
-			combinedVals := make([]catalogapi.Value, leftLen+rightLen)
-			copy(combinedVals, left.Values)
-			copy(combinedVals[leftLen:], right.Values)
-			combinedRow := &engineapi.Row{Values: combinedVals}
-
-			if jplan.On != nil {
-				result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
-				if err != nil {
-					return nil, fmt.Errorf("join ON evaluation: %w", err)
-				}
-				if !isTruthy(result) {
-					continue
-				}
-			}
-			mergedRows = append(mergedRows, combinedVals)
-		}
+	switch jplan.Type {
+	case "LEFT":
+		mergedRows = e.execLeftJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+	case "RIGHT":
+		mergedRows = e.execRightJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+	default:
+		mergedRows = e.execInnerJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
 	}
 
 	return &executorapi.Result{
 		Columns: colNames,
 		Rows:    mergedRows,
 	}, nil
+}
+
+// execInnerJoin emits only rows where ON=TRUE.
+func (e *executor) execInnerJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
+	var merged [][]catalogapi.Value
+	for _, left := range leftRows {
+		for _, right := range rightRows {
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
+			}
+		}
+	}
+	return merged
+}
+
+// execLeftJoin emits all left rows; unmatched left rows get NULL for right columns.
+func (e *executor) execLeftJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
+	var merged [][]catalogapi.Value
+	for _, left := range leftRows {
+		matched := false
+		for _, right := range rightRows {
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+				matched = true
+				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
+			}
+		}
+		if !matched {
+			merged = append(merged, e.mergeLeftWithNull(left, rightLen))
+		}
+	}
+	return merged
+}
+
+// execRightJoin emits all right rows; unmatched right rows get NULL for left columns.
+func (e *executor) execRightJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
+	var merged [][]catalogapi.Value
+	matchedRight := make([]bool, len(rightRows))
+
+	for _, left := range leftRows {
+		for j, right := range rightRows {
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+				matchedRight[j] = true
+				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
+			}
+		}
+	}
+
+	// Emit unmatched right rows with NULL left columns.
+	for j, right := range rightRows {
+		if !matchedRight[j] {
+			merged = append(merged, e.mergeNullWithRight(right, leftLen))
+		}
+	}
+	return merged
+}
+
+// mergeRows concatenates left and right values.
+func (e *executor) mergeRows(left, right *engineapi.Row, leftLen, rightLen int) []catalogapi.Value {
+	result := make([]catalogapi.Value, leftLen+rightLen)
+	copy(result, left.Values)
+	copy(result[leftLen:], right.Values)
+	return result
+}
+
+// mergeLeftWithNull produces left values + NULLs for right.
+func (e *executor) mergeLeftWithNull(left *engineapi.Row, rightLen int) []catalogapi.Value {
+	nullRight := make([]catalogapi.Value, rightLen)
+	for i := range nullRight {
+		nullRight[i] = catalogapi.Value{Type: catalogapi.TypeNull, IsNull: true}
+	}
+	result := make([]catalogapi.Value, len(left.Values)+rightLen)
+	copy(result, left.Values)
+	copy(result[len(left.Values):], nullRight)
+	return result
+}
+
+// mergeNullWithRight produces NULLs for left + right values.
+func (e *executor) mergeNullWithRight(right *engineapi.Row, leftLen int) []catalogapi.Value {
+	nullLeft := make([]catalogapi.Value, leftLen)
+	for i := range nullLeft {
+		nullLeft[i] = catalogapi.Value{Type: catalogapi.TypeNull, IsNull: true}
+	}
+	result := make([]catalogapi.Value, leftLen+len(right.Values))
+	copy(result, nullLeft)
+	copy(result[leftLen:], right.Values)
+	return result
+}
+
+// joinMatch evaluates the ON condition for a left/right row pair.
+func (e *executor) joinMatch(left, right *engineapi.Row, jplan *plannerapi.JoinPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen int, combinedCols []catalogapi.ColumnDef) bool {
+	if jplan.On == nil {
+		return true
+	}
+	combinedVals := make([]catalogapi.Value, leftLen+len(right.Values))
+	copy(combinedVals, left.Values)
+	copy(combinedVals[leftLen:], right.Values)
+	combinedRow := &engineapi.Row{Values: combinedVals}
+	result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
+	if err != nil {
+		return false
+	}
+	return isTruthy(result)
 }
 
 // collectRows executes a scan plan and returns all rows.

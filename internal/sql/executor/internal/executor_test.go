@@ -751,4 +751,66 @@ func TestExec_Join(t *testing.T) {
 			t.Errorf("name = %s, want alice", result.Rows[0][0].Text)
 		}
 	})
+
+	t.Run("left_join", func(t *testing.T) {
+		// LEFT JOIN with SELECT *: all users, bob (id=2) has no orders → NULL for order columns
+		result := env.execSQL(t, "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id")
+		// users: id(0), name(1); orders: user_id(2), amount(3)
+		// Expected: alice/100, alice/200, bob/NULL, carol/50 (4 rows)
+		if len(result.Rows) != 4 {
+			t.Fatalf("rows = %d, want 4", len(result.Rows))
+		}
+		// Find bob's row (id=2) — should have NULL for orders columns (indices 2,3)
+		var bobRow []catalogapi.Value
+		for _, row := range result.Rows {
+			if row[0].Int == 2 {
+				bobRow = row
+				break
+			}
+		}
+		if bobRow == nil {
+			t.Fatalf("bob (id=2) not found in results")
+		}
+		// orders columns (user_id=2, amount=3) should be NULL
+		if !bobRow[2].IsNull {
+			t.Errorf("bob's user_id should be NULL, got %v", bobRow[2])
+		}
+		if !bobRow[3].IsNull {
+			t.Errorf("bob's amount should be NULL, got %v", bobRow[3])
+		}
+		// Carol's row (id=3) — should have amount=50
+		var carolRow []catalogapi.Value
+		for _, row := range result.Rows {
+			if row[0].Int == 3 {
+				carolRow = row
+				break
+			}
+		}
+		if carolRow == nil {
+			t.Fatalf("carol (id=3) not found")
+		}
+		if carolRow[3].Int != 50 {
+			t.Errorf("carol's amount = %d, want 50", carolRow[3].Int)
+		}
+	})
+
+	t.Run("right_join", func(t *testing.T) {
+		// RIGHT JOIN with SELECT *: all orders, with user info
+		// All orders have matching users, so no NULLs on user side
+		result := env.execSQL(t, "SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id")
+		// users: id(0), name(1); orders: user_id(2), amount(3)
+		// All 3 orders have matching users → 3 rows, no NULLs on user side
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		// No NULLs in user columns (all orders have matching users)
+		for i, row := range result.Rows {
+			if row[0].IsNull {
+				t.Errorf("row %d: user id should NOT be NULL", i)
+			}
+			if row[1].IsNull {
+				t.Errorf("row %d: user name should NOT be NULL", i)
+			}
+		}
+	})
 }
