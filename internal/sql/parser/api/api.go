@@ -41,6 +41,8 @@ const (
 	TokNot      TokenType = 20
 	TokNull     TokenType = 21
 	TokIs       TokenType = 22
+	TokIn       TokenType = 24
+	TokBetween  TokenType = 53 // BETWEEN
 	TokOrder    TokenType = 23
 	TokBy       TokenType = 24
 	TokAsc      TokenType = 25
@@ -240,7 +242,8 @@ const (
 	BinGT  BinaryOp = 4 // >
 	BinGE  BinaryOp = 5 // >=
 	BinAnd BinaryOp = 6 // AND
-	BinOr  BinaryOp = 7 // OR
+	BinOr      BinaryOp = 7  // OR
+	BinBetween BinaryOp = 8  // BETWEEN
 )
 
 // UnaryExpr: op operand (e.g. NOT x, -42)
@@ -288,6 +291,25 @@ type LikeExpr struct {
 }
 
 func (*LikeExpr) exprNode() {}
+
+// InExpr: col IN (val1, val2, ...) — Phase 1 only supports literal values.
+type InExpr struct {
+	Expr   Expr   // the column expression
+	Values []Expr // the IN values (literals for Phase 1)
+	Not    bool   // true for NOT IN
+}
+
+func (*InExpr) exprNode() {}
+
+// BetweenExpr: col BETWEEN low AND high
+type BetweenExpr struct {
+	Expr Expr // the column expression
+	Low  Expr // lower bound
+	High Expr // upper bound
+	Not  bool // true for NOT BETWEEN
+}
+
+func (*BetweenExpr) exprNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

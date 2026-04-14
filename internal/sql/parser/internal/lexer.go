@@ -21,6 +21,8 @@ var keywords = map[string]api.TokenType{
 	"DROP":    api.TokDrop,
 	"TABLE":   api.TokTable,
 	"INDEX":   api.TokIndex,
+	"IN":       api.TokIn,
+	"BETWEEN":  api.TokBetween,
 	"ON":      api.TokOn,
 	"AND":     api.TokAnd,
 	"OR":      api.TokOr,

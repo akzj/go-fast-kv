@@ -451,3 +451,86 @@ func TestExec_Like(t *testing.T) {
 		t.Fatalf("rows = %d, want 1 (Carol)", len(result.Rows))
 	}
 }
+
+func TestExec_Between(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)")
+	env.execSQL(t, "INSERT INTO products VALUES (1, 'Apple', 50)")
+	env.execSQL(t, "INSERT INTO products VALUES (2, 'Banana', 30)")
+	env.execSQL(t, "INSERT INTO products VALUES (3, 'Cherry', 70)")
+	env.execSQL(t, "INSERT INTO products VALUES (4, 'Date', 90)")
+
+	t.Run("between_in_range", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE price BETWEEN 40 AND 70")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (Apple, Cherry)", len(result.Rows))
+		}
+	})
+
+	t.Run("between_boundary_inclusive", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE price BETWEEN 30 AND 70")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 (Apple, Banana, Cherry)", len(result.Rows))
+		}
+	})
+
+	t.Run("between_reversed_bounds", func(t *testing.T) {
+		// Standard SQL: BETWEEN with reversed bounds returns 0 rows
+		result := env.execSQL(t, "SELECT name FROM products WHERE price BETWEEN 70 AND 30")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0", len(result.Rows))
+		}
+	})
+
+	t.Run("between_text", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE name BETWEEN 'A' AND 'C'")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (Apple, Banana, Cherry)", len(result.Rows))
+		}
+	})
+}
+
+func TestExec_In(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)")
+	env.execSQL(t, "INSERT INTO products VALUES (1, 'Apple', 50)")
+	env.execSQL(t, "INSERT INTO products VALUES (2, 'Banana', 30)")
+	env.execSQL(t, "INSERT INTO products VALUES (3, 'Cherry', 70)")
+	env.execSQL(t, "INSERT INTO products VALUES (4, 'Date', 90)")
+
+	t.Run("in_int_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE id IN (1, 3)")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (Apple, Cherry)", len(result.Rows))
+		}
+	})
+
+	t.Run("in_text_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE name IN ('Banana', 'Date')")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (Banana, Date)", len(result.Rows))
+		}
+	})
+
+	t.Run("in_single_value", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE price IN (50)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (Apple)", len(result.Rows))
+		}
+	})
+
+	t.Run("in_no_match", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT name FROM products WHERE id IN (99, 100)")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0", len(result.Rows))
+		}
+	})
+
+	t.Run("in_mixed_types", func(t *testing.T) {
+		// Mixed types: int id IN text values — pragmatically evaluates to 0 rows
+		result := env.execSQL(t, "SELECT name FROM products WHERE id IN ('a', 'b')")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0 (type mismatch)", len(result.Rows))
+		}
+	})
+}

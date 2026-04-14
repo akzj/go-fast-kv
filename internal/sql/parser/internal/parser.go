@@ -664,6 +664,55 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		return &api.LikeExpr{Expr: left, Pattern: pattern}, nil
 	}
 
+	// BETWEEN ... AND ...
+	if p.cur.Type == api.TokBetween {
+		p.advance()
+		low, err := p.parseCompareExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokAnd {
+			return nil, p.errorf("expected AND after BETWEEN low value")
+		}
+		p.advance()
+		high, err := p.parseCompareExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &api.BetweenExpr{Expr: left, Low: low, High: high, Not: false}, nil
+	}
+
+	// [NOT] IN (...)
+	if p.cur.Type == api.TokIn {
+		p.advance()
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after IN")
+		}
+		p.advance()
+		var values []api.Expr
+		if p.cur.Type != api.TokRParen {
+			for {
+				val, err := p.parseCompareExpr()
+				if err != nil {
+					return nil, err
+				}
+				values = append(values, val)
+				if p.cur.Type == api.TokRParen {
+					break
+				}
+				if p.cur.Type != api.TokComma {
+					return nil, p.errorf("expected , or ) in IN list")
+				}
+				p.advance()
+			}
+		}
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after IN list")
+		}
+		p.advance()
+		return &api.InExpr{Expr: left, Values: values, Not: false}, nil
+	}
+
 	// Comparison operators
 	var op api.BinaryOp
 	switch p.cur.Type {

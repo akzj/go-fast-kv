@@ -31,6 +31,10 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalLikeExpr(e, row, columns)
 	case *parserapi.AggregateCallExpr:
 		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, e.Func)
+	case *parserapi.BetweenExpr:
+		return evalBetweenExpr(e, row, columns)
+	case *parserapi.InExpr:
+		return evalInExpr(e, row, columns)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
@@ -338,4 +342,90 @@ func matchLike(value, pattern string, escape byte) bool {
 		}
 	}
 	return dp[vLen][pLen]
+}
+
+// evalBetweenExpr evaluates col BETWEEN low AND high.
+// Semantics: col >= low AND col <= low. Returns int(1) or int(0).
+// If col, low, or high is NULL, the result is NULL.
+func evalBetweenExpr(expr *parserapi.BetweenExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	col, err := evalExpr(expr.Expr, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	low, err := evalExpr(expr.Low, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	high, err := evalExpr(expr.High, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL result
+	if col.IsNull || low.IsNull || high.IsNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
+	}
+	// low > high → 0 rows (standard SQL semantics, no auto-swap)
+	cmp, err := encoding.CompareValues(low, high)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if cmp > 0 {
+		return intVal(0), nil
+	}
+	// col >= low
+	geLow, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinGE, Right: expr.Low}, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if geLow.IsNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
+	}
+	if !isTruthy(geLow) {
+		return intVal(0), nil
+	}
+	// col <= high
+	leHigh, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinLE, Right: expr.High}, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if leHigh.IsNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
+	}
+	if isTruthy(leHigh) {
+		return intVal(1), nil
+	}
+	return intVal(0), nil
+}
+
+// evalInExpr evaluates col IN (val1, val2, ...).
+// Phase 1: all values are Literals. Semantics: col = val1 OR col = val2 OR ...
+// NULL: if col is NULL, result is NULL. If any val is NULL, comparison yields NULL (three-valued logic).
+func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(expr.Values) == 0 {
+		// Empty IN list — reject at eval time (parser should have caught this)
+		return catalogapi.Value{}, fmt.Errorf("%w: IN list cannot be empty", executorapi.ErrExecFailed)
+	}
+	col, err := evalExpr(expr.Expr, row, columns)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL column → NULL result
+	if col.IsNull {
+		return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
+	}
+	// col = val1 OR col = val2 OR ...
+	for _, valExpr := range expr.Values {
+		eq, err := evalBinaryExpr(&parserapi.BinaryExpr{Left: expr.Expr, Op: parserapi.BinEQ, Right: valExpr}, row, columns)
+		if err != nil {
+			// Type mismatch: col and val can't be compared — treat as no match, continue
+			continue
+		}
+		if eq.Type == catalogapi.TypeInt && !eq.IsNull && eq.Int == 1 {
+			// TRUE match found
+			return intVal(1), nil
+		}
+		// eq is either FALSE or NULL — continue checking
+	}
+	// No TRUE match found; result is FALSE
+	return intVal(0), nil
 }

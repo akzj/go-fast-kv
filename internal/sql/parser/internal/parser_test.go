@@ -982,4 +982,113 @@ func TestParse_LiteralTypes(t *testing.T) {
 			t.Error("expected IsNull=true")
 		}
 	})
+
 }
+
+func TestParse_InExpr(t *testing.T) {
+	t.Run("in_single", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE id IN (1)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		in, ok := sel.Where.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr, got %T", sel.Where)
+		}
+		if in.Not {
+			t.Error("expected Not=false")
+		}
+		if len(in.Values) != 1 {
+			t.Fatalf("values len = %d, want 1", len(in.Values))
+		}
+	})
+
+	t.Run("in_multiple", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE name IN ('a', 'b', 'c')")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		in, ok := sel.Where.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr, got %T", sel.Where)
+		}
+		if len(in.Values) != 3 {
+			t.Fatalf("values len = %d, want 3", len(in.Values))
+		}
+	})
+
+	t.Run("in_in_expression", func(t *testing.T) {
+		// id IN (1,2) AND status = 'active'
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE id IN (1, 2) AND status = 'active'")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		and, ok := sel.Where.(*api.BinaryExpr)
+		if !ok || and.Op != api.BinAnd {
+			t.Fatalf("expected AND, got %T op=%v", sel.Where, and.Op)
+		}
+		in, ok := and.Left.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr on left, got %T", and.Left)
+		}
+		if len(in.Values) != 2 {
+			t.Fatalf("values len = %d, want 2", len(in.Values))
+		}
+	})
+}
+
+func TestParse_BetweenExpr(t *testing.T) {
+	t.Run("between", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE age BETWEEN 18 AND 65")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		be, ok := sel.Where.(*api.BetweenExpr)
+		if !ok {
+			t.Fatalf("expected BetweenExpr, got %T", sel.Where)
+		}
+		if be.Not {
+			t.Error("expected Not=false")
+		}
+		ref, ok := be.Expr.(*api.ColumnRef)
+		t.Logf("got ref.Column=%q", ref.Column)
+		if !ok || ref.Column != "AGE" {
+			t.Errorf("expected AGE column ref, got %q", ref.Column)
+		}
+	})
+
+	t.Run("between_requires_and", func(t *testing.T) {
+		p := newParser()
+		_, err := p.Parse("SELECT * FROM t WHERE age BETWEEN 18")
+		if err == nil {
+			t.Error("expected error: BETWEEN without AND")
+		}
+	})
+
+	t.Run("between_in_expression", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE price BETWEEN 10 AND 100 AND category = 'food'")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		and, ok := sel.Where.(*api.BinaryExpr)
+		if !ok || and.Op != api.BinAnd {
+			t.Fatalf("expected AND, got %T", sel.Where)
+		}
+		be, ok := and.Left.(*api.BetweenExpr)
+		if !ok {
+			t.Fatalf("expected BetweenExpr on left, got %T", and.Left)
+		}
+		_ = be // suppress unused warning
+	})
+}
+
