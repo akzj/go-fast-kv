@@ -622,24 +622,53 @@ func compareValues(a, b catalogapi.Value) int {
 }
 
 // projectJoinRows projects columns from merged rows.
+// For JOIN queries (plan.Join != nil), plan.Columns contains per-table indices.
+// Right-table columns need offset by plan.LeftColumnCount to find the
+// correct position in the globally-merged row.
 func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *plannerapi.SelectPlan) ([][]catalogapi.Value, []string) {
 	if len(plan.Columns) == 0 {
 		return rows, colNames
+	}
+	isJoin := plan.Join != nil
+	leftLen := 0
+	if isJoin {
+		leftLen = plan.LeftColumnCount
 	}
 	projected := make([][]catalogapi.Value, len(rows))
 	for i, row := range rows {
 		vals := make([]catalogapi.Value, len(plan.Columns))
 		for j, idx := range plan.Columns {
-			if idx < len(row) {
-				vals[j] = row[idx]
+			globalIdx := idx
+			if isJoin {
+				// For JOIN, determine which table this column comes from.
+				// plan.SelectColumns[j].Expr.(*ColumnRef).Table tells us the table.
+				// Right-table columns need offset by leftLen.
+				if j < len(plan.SelectColumns) {
+					if ref, ok := plan.SelectColumns[j].Expr.(*parserapi.ColumnRef); ok && ref.Table != "" {
+						if ref.Table == plan.Join.RightTable.Name {
+							globalIdx = leftLen + idx
+						}
+						// Left-table: globalIdx = idx (no offset needed)
+					}
+				}
+			}
+			if globalIdx < len(row) {
+				vals[j] = row[globalIdx]
 			}
 		}
 		projected[i] = vals
 	}
 	projNames := make([]string, len(plan.Columns))
-	for i, idx := range plan.Columns {
+	for j, idx := range plan.Columns {
+		if isJoin && j < len(plan.SelectColumns) {
+			// For JOIN, use the qualified column name from SelectColumns
+			if ref, ok := plan.SelectColumns[j].Expr.(*parserapi.ColumnRef); ok {
+				projNames[j] = ref.Table + "." + ref.Column
+				continue
+			}
+		}
 		if idx < len(colNames) {
-			projNames[i] = colNames[idx]
+			projNames[j] = colNames[idx]
 		}
 	}
 	return projected, projNames

@@ -370,16 +370,17 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 
 	// ORDER BY and LIMIT for JOIN — Phase 4
 	return &plannerapi.SelectPlan{
-		Table:         leftTbl,
-		Scan:          nil,
-		Join:          joinPlan,
-		Columns:       colIndices,
-		SelectColumns: stmt.Columns,
-		Filter:        stmt.Where, // WHERE applied on merged rows in executor
-		GroupByExprs:  nil,
-		Having:        nil,
-		OrderBy:       nil,
-		Limit:         -1,
+		Table:            leftTbl,
+		Scan:             nil,
+		Join:             joinPlan,
+		Columns:          colIndices,
+		SelectColumns:    stmt.Columns,
+		Filter:           stmt.Where, // WHERE applied on merged rows in executor
+		GroupByExprs:     nil,
+		Having:           nil,
+		OrderBy:          nil,
+		Limit:            -1,
+		LeftColumnCount:  len(leftTbl.Columns),
 	}, nil
 }
 

@@ -114,7 +114,8 @@ type SelectPlan struct {
 	OrderBy       *OrderByPlan               // nil if no ORDER BY
 	Limit         int                        // -1 if no LIMIT
 
-	Join          *JoinPlan               // nil for non-join; non-nil for JOIN
+	Join            *JoinPlan               // nil for non-join; non-nil for JOIN
+	LeftColumnCount int                    // number of columns in left table (for JOIN projection)
 }
 
 func (*SelectPlan) planNode() {}
