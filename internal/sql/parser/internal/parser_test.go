@@ -1307,3 +1307,46 @@ func TestParse_Aggregates(t *testing.T) {
 		}
 	})
 }
+
+func TestParse_Explain(t *testing.T) {
+	t.Run("explain select", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("EXPLAIN SELECT id FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		explain, ok := stmt.(*api.ExplainStmt)
+		if !ok {
+			t.Fatalf("expected ExplainStmt, got %T", stmt)
+		}
+		if explain.Analyze {
+			t.Error("expected Analyze=false")
+		}
+		sel, ok := explain.Statement.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", explain.Statement)
+		}
+		if len(sel.Columns) != 1 {
+			t.Fatalf("expected 1 column, got %d", len(sel.Columns))
+		}
+	})
+
+	t.Run("explain analyze select", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("EXPLAIN ANALYZE SELECT id FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		explain, ok := stmt.(*api.ExplainStmt)
+		if !ok {
+			t.Fatalf("expected ExplainStmt, got %T", stmt)
+		}
+		if !explain.Analyze {
+			t.Error("expected Analyze=true")
+		}
+		_, ok = explain.Statement.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", explain.Statement)
+		}
+	})
+}

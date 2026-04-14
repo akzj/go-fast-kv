@@ -9,6 +9,8 @@ package api
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
@@ -180,4 +182,141 @@ type Planner interface {
 	// Returns an error if the statement references non-existent tables/columns,
 	// has type mismatches, or uses unsupported expressions.
 	Plan(stmt parserapi.Statement) (Plan, error)
+}
+
+// ─── EXPLAIN formatting ─────────────────────────────────────────────
+
+// formatExpr returns a human-readable string for an expression.
+func formatExpr(expr parserapi.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *parserapi.Literal:
+		return fmt.Sprintf("%v", e.Value)
+	case *parserapi.ColumnRef:
+		return e.Column
+	case *parserapi.SubqueryExpr:
+		if e.Plan != nil {
+			return "(subquery)"
+		}
+		return "(subquery [unplanned])"
+	case *parserapi.BinaryExpr:
+		return fmt.Sprintf("(%s %s %s)", formatExpr(e.Left), fmt.Sprintf("%v", e.Op), formatExpr(e.Right))
+	case *parserapi.UnaryExpr:
+		return fmt.Sprintf("%s %s", fmt.Sprintf("%v", e.Op), formatExpr(e.Operand))
+	case *parserapi.InExpr:
+		return fmt.Sprintf("%s IN (...)", formatExpr(e.Expr))
+	case *parserapi.LikeExpr:
+		return fmt.Sprintf("%s LIKE %s", formatExpr(e.Expr), e.Pattern)
+	case *parserapi.BetweenExpr:
+		return fmt.Sprintf("%s BETWEEN %s AND %s", formatExpr(e.Expr), formatExpr(e.Low), formatExpr(e.High))
+	case *parserapi.IsNullExpr:
+		return fmt.Sprintf("%s IS NULL", formatExpr(e.Expr))
+	case *parserapi.AggregateCallExpr:
+		return fmt.Sprintf("%s(%s)", e.Func, formatExpr(e.Arg))
+	default:
+		return fmt.Sprintf("%T", expr)
+	}
+}
+
+// walkExprForExplain walks an expression and appends subquery details to b.
+func walkExprForExplain(expr parserapi.Expr, b *strings.Builder) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *parserapi.SubqueryExpr:
+		if e.Plan != nil {
+			if plan, ok := e.Plan.(*SelectPlan); ok {
+				for _, line := range strings.Split(plan.String(), "\n") {
+					b.WriteString("\n    └─ ")
+					b.WriteString(line)
+				}
+			}
+		}
+	case *parserapi.BinaryExpr:
+		walkExprForExplain(e.Left, b)
+		walkExprForExplain(e.Right, b)
+	case *parserapi.UnaryExpr:
+		walkExprForExplain(e.Operand, b)
+	case *parserapi.InExpr:
+		walkExprForExplain(e.Expr, b)
+		for _, v := range e.Values {
+			walkExprForExplain(v, b)
+		}
+	case *parserapi.LikeExpr:
+		walkExprForExplain(e.Expr, b)
+	case *parserapi.BetweenExpr:
+		walkExprForExplain(e.Expr, b)
+		walkExprForExplain(e.Low, b)
+		walkExprForExplain(e.High, b)
+	case *parserapi.IsNullExpr:
+		walkExprForExplain(e.Expr, b)
+	case *parserapi.AggregateCallExpr:
+		walkExprForExplain(e.Arg, b)
+	}
+}
+
+// scanString returns a string for a ScanPlan by type-asserting to concrete type.
+func scanString(s ScanPlan) string {
+	switch s := s.(type) {
+	case *TableScanPlan:
+		return s.String()
+	case *IndexScanPlan:
+		return s.String()
+	case *IndexRangePlan:
+		return s.String()
+	default:
+		return fmt.Sprintf("%T", s)
+	}
+}
+
+// String returns a human-readable plan description for EXPLAIN.
+func (p *SelectPlan) String() string {
+	var b strings.Builder
+	b.WriteString("SELECT")
+	if len(p.Columns) == 0 {
+		b.WriteString(" *")
+	} else {
+		b.WriteString(fmt.Sprintf(" %d columns", len(p.Columns)))
+	}
+	if p.Table != nil {
+		b.WriteString(" FROM " + p.Table.Name)
+	}
+	if p.Scan != nil {
+		b.WriteString("\n└─ " + scanString(p.Scan))
+	}
+	if p.Filter != nil {
+		b.WriteString("\n└─ FILTER: " + formatExpr(p.Filter))
+		walkExprForExplain(p.Filter, &b)
+	}
+	if p.GroupByExprs != nil {
+		b.WriteString("\n└─ GROUP BY")
+	}
+	if p.Having != nil {
+		b.WriteString("\n└─ HAVING: " + formatExpr(p.Having))
+	}
+	if p.OrderBy != nil {
+		b.WriteString(fmt.Sprintf("\n└─ ORDER BY column=%d desc=%v", p.OrderBy.ColumnIndex, p.OrderBy.Desc))
+	}
+	if p.Limit > 0 {
+		b.WriteString(fmt.Sprintf("\n└─ LIMIT %d", p.Limit))
+	}
+	return b.String()
+}
+
+// String returns a human-readable scan description.
+func (p *TableScanPlan) String() string {
+	return fmt.Sprintf("TABLE SCAN table=%d", p.TableID)
+}
+
+// String returns a human-readable index scan description.
+func (p *IndexScanPlan) String() string {
+	return fmt.Sprintf("INDEX SCAN table=%d index=%d op=%v value=%v", p.TableID, p.IndexID, p.Op, p.Value)
+}
+
+// String returns a human-readable index range description.
+func (p *IndexRangePlan) String() string {
+	return fmt.Sprintf("INDEX RANGE table=%d index=%d prefix=[%s..%s]", p.TableID, p.IndexID, p.StartPrefix, p.EndPrefix)
 }

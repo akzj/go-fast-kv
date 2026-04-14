@@ -42,6 +42,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planDelete(s)
 	case *parserapi.UpdateStmt:
 		return p.planUpdate(s)
+	case *parserapi.ExplainStmt:
+		return p.Plan(s.Statement)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}

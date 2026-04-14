@@ -83,8 +83,10 @@ const (
 	TokSemicolon TokenType = 50 // ;
 
 	// Special
-	TokEOF     TokenType = 51
-	TokIllegal TokenType = 52
+	TokExplain  TokenType = 53 // EXPLAIN
+	TokAnalyze  TokenType = 54 // ANALYZE
+	TokEOF      TokenType = 51
+	TokIllegal  TokenType = 52
 )
 
 // Token represents a single lexical token.
@@ -323,6 +325,14 @@ type SubqueryExpr struct {
 }
 
 func (*SubqueryExpr) exprNode() {}
+
+// ExplainStmt wraps a statement for EXPLAIN output.
+type ExplainStmt struct {
+	Statement Statement // the inner statement to explain
+	Analyze   bool     // true for EXPLAIN ANALYZE
+}
+
+func (*ExplainStmt) stmtNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

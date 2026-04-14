@@ -23,6 +23,7 @@ package sql
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -151,6 +152,30 @@ func (db *DB) exec(sql string) (*Result, error) {
 	plan, err := db.planner.Plan(stmt)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle EXPLAIN: format plan text (optionally with stats)
+	if explainStmt, ok := stmt.(*parserapi.ExplainStmt); ok {
+		var planText string
+		if selectPlan, ok := plan.(*plannerapi.SelectPlan); ok {
+			planText = selectPlan.String()
+		} else {
+			planText = fmt.Sprintf("%T", plan)
+		}
+		if explainStmt.Analyze {
+			// Execute the plan to collect stats
+			start := time.Now()
+			result, err := db.executor.Execute(plan)
+			if err != nil {
+				return nil, err
+			}
+			elapsed := time.Since(start)
+			planText += fmt.Sprintf("\n[rows=%d, time=%v]", len(result.Rows), elapsed)
+		}
+		return &executorapi.Result{
+			Columns: []string{"QUERY PLAN"},
+			Rows:    [][]catalogapi.Value{{{Text: planText}}},
+		}, nil
 	}
 
 	// Execute plan → result

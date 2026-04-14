@@ -62,6 +62,8 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseDelete()
 	case api.TokUpdate:
 		return p.parseUpdate()
+	case api.TokExplain:
+		return p.parseExplain()
 	default:
 		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP)")
 	}
@@ -376,6 +378,23 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		p.advance()
 	}
 	return stmt, nil
+}
+
+// ─── EXPLAIN ──────────────────────────────────────────────────────
+
+func (p *parser) parseExplain() (api.Statement, error) {
+	p.advance() // consume EXPLAIN
+	analyze := false
+	// Check for ANALYZE keyword
+	if p.cur.Type == api.TokAnalyze || p.cur.Literal == "ANALYZE" {
+		analyze = true
+		p.advance()
+	}
+	inner, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	return &api.ExplainStmt{Statement: inner, Analyze: analyze}, nil
 }
 
 // ─── SELECT ───────────────────────────────────────────────────────
