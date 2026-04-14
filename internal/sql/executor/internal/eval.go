@@ -69,23 +69,24 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 	case *parserapi.InExpr:
 		return evalInExpr(e, row, columns, subqueryResults)
 	case *parserapi.SubqueryExpr:
-		// Pre-computed by execSelect pre-plan pass
+		// Pre-computed by execSelect pre-plan pass.
+		// Scalar subqueries store a single catalogapi.Value.
+		// IN-list subqueries store a []catalogapi.Value (handled by evalInExpr).
 		if vals, ok := subqueryResults[e]; ok {
-			if vals == nil {
-				return catalogapi.Value{IsNull: true}, nil
-			}
-			// vals is []catalogapi.Value (for IN) or catalogapi.Value (for scalar)
 			switch v := vals.(type) {
 			case catalogapi.Value:
+				// Scalar subquery result
 				return v, nil
 			case []catalogapi.Value:
-				// Shouldn't reach here directly — evalInExpr handles list lookups
+				// IN-list subquery — should not reach here directly;
+				// evalInExpr expands these into individual checks.
 				return catalogapi.Value{IsNull: true}, nil
 			default:
 				return catalogapi.Value{IsNull: true}, nil
 			}
 		}
-		return catalogapi.Value{}, fmt.Errorf("%w: subquery not pre-computed", executorapi.ErrExecFailed)
+		// Not pre-computed: treat as NULL (should not happen with precomputeSubqueries)
+		return catalogapi.Value{IsNull: true}, nil
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}

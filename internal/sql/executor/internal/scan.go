@@ -189,7 +189,11 @@ func buildColumnNames(table *catalogapi.TableSchema, colIndices []int) []string 
 	}
 	names := make([]string, len(colIndices))
 	for i, idx := range colIndices {
-		names[i] = table.Columns[idx].Name
+		if idx < 0 || idx >= len(table.Columns) {
+			names[i] = "?"
+		} else {
+			names[i] = table.Columns[idx].Name
+		}
 	}
 	return names
 }
@@ -206,7 +210,7 @@ func projectRows(rows []*engineapi.Row, colIndices []int) [][]catalogapi.Value {
 		} else {
 			vals := make([]catalogapi.Value, len(colIndices))
 			for j, idx := range colIndices {
-				if idx < len(row.Values) {
+				if idx >= 0 && idx < len(row.Values) {
 					vals[j] = row.Values[idx]
 				} else {
 					vals[j] = catalogapi.Value{IsNull: true}

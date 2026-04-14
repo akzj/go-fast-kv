@@ -320,8 +320,39 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
 }
 
+// isSubqueryInListContext checks if sq appears inside an InExpr's Values list.
+func isSubqueryInListContext(sq *parserapi.SubqueryExpr, root parserapi.Expr) bool {
+	found := false
+	walkExpr(root, func(expr parserapi.Expr) {
+		if expr == sq {
+			found = true
+		}
+	})
+	if !found {
+		return false
+	}
+	// Walk again, checking if we find sq inside an InExpr.Values
+	inList := false
+	walkExpr(root, func(expr parserapi.Expr) {
+		if inList {
+			return
+		}
+		if inExpr, ok := expr.(*parserapi.InExpr); ok {
+			for _, v := range inExpr.Values {
+				if v == sq {
+					inList = true
+					return
+				}
+			}
+		}
+	})
+	return inList
+}
+
 // precomputeSubqueries finds all SubqueryExpr nodes in the plan's WHERE/HAVING
 // and executes them, caching results in subqueryResults.
+// Scalar subqueries (used in comparisons) store a single catalogapi.Value.
+// List subqueries (used in IN) store a []catalogapi.Value.
 // This is called with the OUTER subqueryResults map so that nested subqueries
 // don't re-execute infinitely (they share the parent's cache).
 func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
@@ -335,8 +366,8 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 		exprs = append(exprs, plan.Having)
 	}
 
-	for _, expr := range exprs {
-		walkExpr(expr, func(expr parserapi.Expr) {
+	for _, root := range exprs {
+		walkExpr(root, func(expr parserapi.Expr) {
 			sq, ok := expr.(*parserapi.SubqueryExpr)
 			if !ok {
 				return
@@ -354,13 +385,27 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 			if err != nil {
 				return
 			}
-			var vals []catalogapi.Value
-			for _, row := range result.Rows {
-				if len(row) > 0 {
-					vals = append(vals, row[0])
+			// Determine scalar vs list context
+			inList := isSubqueryInListContext(sq, root)
+			if inList {
+				// List context: collect all first-column values
+				var vals []catalogapi.Value
+				for _, row := range result.Rows {
+					if len(row) > 0 {
+						vals = append(vals, row[0])
+					}
+				}
+				subqueryResults[sq] = vals
+			} else {
+				// Scalar context: expect 0 or 1 row/column
+				if len(result.Rows) == 0 {
+					subqueryResults[sq] = catalogapi.Value{IsNull: true}
+				} else if len(result.Rows) >= 1 && len(result.Rows[0]) > 0 {
+					subqueryResults[sq] = result.Rows[0][0]
+				} else {
+					subqueryResults[sq] = catalogapi.Value{IsNull: true}
 				}
 			}
-			subqueryResults[sq] = vals
 		})
 	}
 }
@@ -415,13 +460,17 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		for i, row := range rows {
 			projected[i] = row.Values
 		}
-		colNames = make([]string, len(plan.SelectColumns))
-		for i, sc := range plan.SelectColumns {
-			if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
-				colNames[i] = ref.Column
-			} else {
-				colNames[i] = "count(...)"
+		if plan.SelectColumns != nil {
+			colNames = make([]string, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+					colNames[i] = ref.Column
+				} else {
+					colNames[i] = "?"
+				}
 			}
+		} else {
+			colNames = []string{"?"}
 		}
 	} else {
 		colNames = buildColumnNames(plan.Table, plan.Columns)

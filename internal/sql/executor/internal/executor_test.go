@@ -618,3 +618,74 @@ func TestExec_Subquery(t *testing.T) {
 		}
 	})
 }
+
+func TestExec_ScalarSubquery(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE t1 (id INT, salary INT)")
+	env.execSQL(t, "CREATE TABLE t2 (id INT, dept TEXT, max_sal INT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (2, 200)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (3, 300)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (4, 400)")
+	env.execSQL(t, "INSERT INTO t2 VALUES (1, 'eng', 400)")
+	env.execSQL(t, "INSERT INTO t2 VALUES (2, 'sales', 200)")
+
+	t.Run("scalar_gt_subquery", func(t *testing.T) {
+		// t1 rows where salary > (SELECT MAX(salary) FROM t2 WHERE dept='eng') = 400
+		// Expected: id 3 (300), id 4 (400) — both > 400? No, 300 is NOT > 400.
+		// Actually MAX(eng) = 400, so only id 4 (400) > 400? No. Let's be precise.
+		// MAX salary for 'eng' dept: only row (1, 'eng', 400) → max = 400
+		// salary > 400 → only rows with salary > 400 → none (max in t1 is 400)
+		// salary >= 400 → id 4 (400) only
+		result := env.execSQL(t, "SELECT id, salary FROM t1 WHERE salary >= (SELECT max_sal FROM t2 WHERE dept='eng')")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (id 4 with salary 400 >= 400)", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 4 {
+			t.Errorf("row[0].id = %d, want 4", result.Rows[0][0].Int)
+		}
+	})
+
+	t.Run("scalar_eq_subquery", func(t *testing.T) {
+		// t1 rows where salary = (SELECT MAX(salary) FROM t1 ORDER BY 1 LIMIT 1) — using ORDER/LIMIT instead of aggregate
+		// Use a simpler approach: salary = (SELECT salary FROM t1 ORDER BY salary DESC LIMIT 1) = 400
+		result := env.execSQL(t, "SELECT id FROM t1 WHERE salary = (SELECT salary FROM t1 ORDER BY salary DESC LIMIT 1)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (id 4 with max salary 400)", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 4 {
+			t.Errorf("row[0].id = %d, want 4", result.Rows[0][0].Int)
+		}
+	})
+
+	t.Run("scalar_lt_subquery", func(t *testing.T) {
+		// t1 rows where salary < (SELECT salary FROM t1 WHERE id=2 ORDER BY id LIMIT 1) = 200
+		// Rows with salary < 200: id 1 (100) only
+		result := env.execSQL(t, "SELECT id FROM t1 WHERE salary < (SELECT salary FROM t1 WHERE id=2 ORDER BY id LIMIT 1)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (id 1 with salary 100 < 200)", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 1 {
+			t.Errorf("row[0].id = %d, want 1", result.Rows[0][0].Int)
+		}
+	})
+
+	t.Run("scalar_empty_subquery", func(t *testing.T) {
+		// t1 rows where salary > (SELECT max_sal FROM t2 WHERE dept='unknown') → empty subquery → NULL → 0 rows
+		result := env.execSQL(t, "SELECT id FROM t1 WHERE salary > (SELECT max_sal FROM t2 WHERE dept='unknown')")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0 (empty subquery → NULL, comparison yields false)", len(result.Rows))
+		}
+	})
+
+	t.Run("scalar_comparison_text", func(t *testing.T) {
+		// t2 rows where dept = (SELECT dept FROM t2 WHERE id=1) = 'eng'
+		result := env.execSQL(t, "SELECT id FROM t2 WHERE dept = (SELECT dept FROM t2 WHERE id=1)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 (dept='eng')", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 1 {
+			t.Errorf("row[0].id = %d, want 1", result.Rows[0][0].Int)
+		}
+	})
+}
