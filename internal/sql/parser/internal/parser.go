@@ -885,6 +885,61 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 	return &api.BinaryExpr{Left: left, Op: op, Right: right}, nil
 }
 
+// isAggregateFunc returns true for built-in aggregate function names (case-insensitive).
+func isAggregateFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	default:
+		return false
+	}
+}
+
+// parseFunctionArgs parses a comma-separated list of expressions inside parentheses.
+// For COUNT(*), the '*' is represented as a nil Expr (AggregateCallExpr.Arg == nil).
+// The opening '(' has already been consumed by the caller.
+func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
+	var args []api.Expr
+
+	// Empty args: COUNT()
+	if p.cur.Type == api.TokRParen {
+		return args, nil
+	}
+
+	for {
+		// COUNT(*) — '*' as sole argument
+		if p.cur.Type == api.TokStar && len(args) == 0 {
+			p.advance()
+			// Allow only COUNT(*), not COUNT(*, col) etc.
+			if p.cur.Type != api.TokRParen {
+				return nil, p.errorf("unexpected token after * in aggregate: %s", p.cur.Literal)
+			}
+			args = append(args, nil) // nil = star
+			break
+		}
+
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+
+		if p.cur.Type == api.TokRParen {
+			break
+		}
+		if p.cur.Type == api.TokComma {
+			p.advance()
+			continue
+		}
+		// FROM terminates function args (e.g., SELECT myfunc(id) FROM t)
+		if p.cur.Type == api.TokFrom {
+			break
+		}
+		return nil, p.errorf("expected , or ) in function args, got %s", p.cur.Literal)
+	}
+	return args, nil
+}
+
 // primary = literal | ident ["." ident] | "(" expr ")" | "-" primary | "*"
 func (p *parser) parsePrimary() (api.Expr, error) {
 	if p.depth > 1000 {
@@ -919,9 +974,52 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance()
 		return &api.Literal{Value: catalogapi.Value{IsNull: true}}, nil
 
+	case api.TokMax, api.TokMin, api.TokCount, api.TokSum, api.TokAvg:
+		// Aggregate function: MAX(expr), COUNT(*), etc.
+		funcName := p.cur.Literal
+		p.advance() // consume function name
+		// expect '('
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		var arg api.Expr
+		if len(args) == 1 {
+			arg = args[0] // nil for COUNT(*)
+		} else if len(args) > 1 {
+			return nil, p.errorf("%s requires at most one argument", funcName)
+		}
+		return &api.AggregateCallExpr{Func: strings.ToUpper(funcName), Arg: arg}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
+		// Function call: ident followed by '('
+		if p.cur.Type == api.TokLParen {
+			args, err := p.parseFunctionArgs()
+			if err != nil {
+				return nil, err
+			}
+			// Exactly one argument, or COUNT(*) with nil
+			var arg api.Expr
+			if len(args) == 1 {
+				arg = args[0]
+			} else if len(args) > 1 {
+				return nil, p.errorf("aggregate functions require at most one argument")
+			}
+			// COUNT(*) — arg is nil, already set
+			if isAggregateFunc(name) {
+				return &api.AggregateCallExpr{Func: strings.ToUpper(name), Arg: arg}, nil
+			}
+			// Unknown function — treat as column reference for backward compatibility
+			return &api.ColumnRef{Column: name}, nil
+		}
 		return &api.ColumnRef{Column: name}, nil
 
 	case api.TokStar:

@@ -1173,3 +1173,137 @@ func TestParse_Subquery(t *testing.T) {
 		}
 	})
 }
+
+
+func TestParse_Aggregates(t *testing.T) {
+	t.Run("max", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT MAX(id) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if len(sel.Columns) != 1 {
+			t.Fatalf("expected 1 column, got %d", len(sel.Columns))
+		}
+		agg, ok := sel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if agg.Func != "MAX" {
+			t.Errorf("expected MAX, got %s", agg.Func)
+		}
+		col, ok := agg.Arg.(*api.ColumnRef)
+		if !ok {
+			t.Fatalf("expected ColumnRef arg, got %T", agg.Arg)
+		}
+		if col.Column != "ID" {
+			t.Errorf("expected ID, got %s", col.Column)
+		}
+	})
+
+	t.Run("min", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT min(age) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		agg, ok := sel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if agg.Func != "MIN" {
+			t.Errorf("expected MIN, got %s", agg.Func)
+		}
+	})
+
+	t.Run("count_star", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT COUNT(*) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		agg, ok := sel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if agg.Func != "COUNT" {
+			t.Errorf("expected COUNT, got %s", agg.Func)
+		}
+		if agg.Arg != nil {
+			t.Errorf("expected nil arg for COUNT(*), got %T", agg.Arg)
+		}
+	})
+
+	t.Run("sum", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT SUM(amount) FROM orders")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		agg, ok := sel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if agg.Func != "SUM" {
+			t.Errorf("expected SUM, got %s", agg.Func)
+		}
+	})
+
+	t.Run("avg", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT AVG(score) FROM exams")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		agg, ok := sel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if agg.Func != "AVG" {
+			t.Errorf("expected AVG, got %s", agg.Func)
+		}
+	})
+
+	t.Run("aggregate_in_subquery", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM t WHERE id IN (SELECT MAX(id) FROM t2)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		in, ok := sel.Where.(*api.InExpr)
+		if !ok {
+			t.Fatalf("expected InExpr, got %T", sel.Where)
+		}
+		subq, ok := in.Values[0].(*api.SubqueryExpr)
+		if !ok {
+			t.Fatalf("expected SubqueryExpr in IN values, got %T", in.Values[0])
+		}
+		subSel := subq.Stmt.(*api.SelectStmt)
+		agg, ok := subSel.Columns[0].Expr.(*api.AggregateCallExpr)
+		if !ok {
+			t.Fatalf("expected AggregateCallExpr in subquery, got %T", subSel.Columns[0].Expr)
+		}
+		if agg.Func != "MAX" {
+			t.Errorf("expected MAX in subquery, got %s", agg.Func)
+		}
+	})
+
+	t.Run("unknown_function_treated_as_column", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT myfunc(id) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		_, ok := sel.Columns[0].Expr.(*api.ColumnRef)
+		if !ok {
+			t.Fatalf("expected ColumnRef for unknown function, got %T", sel.Columns[0].Expr)
+		}
+	})
+}
