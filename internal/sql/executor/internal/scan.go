@@ -22,6 +22,8 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 		return e.tableScan(table, s.Filter)
 	case *plannerapi.IndexScanPlan:
 		return e.indexScan(table, s)
+	case *plannerapi.IndexRangePlan:
+		return e.indexRangeScan(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported scan type %T", executorapi.ErrExecFailed, scan)
 	}
@@ -124,6 +126,48 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 		return nil, fmt.Errorf("%w: index scan iteration: %v", executorapi.ErrExecFailed, err)
 	}
 
+	return rows, nil
+}
+
+// indexRangeScan uses an index range scan for LIKE 'prefix%' optimization.
+func (e *executor) indexRangeScan(scan *plannerapi.IndexRangePlan) ([]*engineapi.Row, error) {
+	startVal := catalogapi.Value{Type: catalogapi.TypeText, Text: scan.StartPrefix}
+	endVal := catalogapi.Value{Type: catalogapi.TypeText, Text: scan.EndPrefix}
+	iter, err := e.indexEngine.ScanRange(scan.TableID, scan.IndexID, &startVal, &endVal)
+	if err != nil {
+		return nil, fmt.Errorf("%w: index range scan: %v", executorapi.ErrExecFailed, err)
+	}
+	defer iter.Close()
+
+	table, err := e.catalog.GetTable(scan.Index.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []*engineapi.Row
+	for iter.Next() {
+		rowID := iter.RowID()
+		row, err := e.tableEngine.Get(table, rowID)
+		if err != nil {
+			if err == engineapi.ErrRowNotFound {
+				continue // stale index entry
+			}
+			return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
+		}
+		if scan.ResidualFilter != nil {
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			if !pass {
+				continue
+			}
+		}
+		rows = append(rows, row)
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("%w: index range scan iteration: %v", executorapi.ErrExecFailed, err)
+	}
 	return rows, nil
 }
 
