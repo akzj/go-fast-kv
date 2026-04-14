@@ -347,6 +347,31 @@ func (p *planner) planScan(tbl *catalogapi.TableSchema, where parserapi.Expr) (p
 
 	conditions := flattenAnd(where)
 
+	// First: check for LIKE prefix candidates (highest priority — more specific than EQ)
+	for i, cond := range conditions {
+		cand := p.extractLikeIndexCandidate(tbl, cond)
+		if cand != nil {
+			var residualParts []parserapi.Expr
+			for j, c := range conditions {
+				if j != i {
+					residualParts = append(residualParts, c)
+				}
+			}
+			var residual parserapi.Expr
+			if len(residualParts) == 1 {
+				residual = residualParts[0]
+			} else if len(residualParts) > 1 {
+				residual = buildAndChain(residualParts)
+			}
+			return &plannerapi.IndexRangePlan{
+				TableID: tbl.TableID, IndexID: cand.index.IndexID,
+				Index: cand.index,
+				StartPrefix: cand.startPrefix, EndPrefix: cand.endPrefix,
+				ResidualFilter: residual,
+			}, residual, nil
+		}
+	}
+
 	var bestCandidate *indexCandidate
 	var bestIdx int = -1
 
@@ -390,6 +415,84 @@ type indexCandidate struct {
 	index *catalogapi.IndexSchema
 	op    encodingapi.CompareOp
 	value catalogapi.Value
+}
+
+type likeIndexCandidate struct {
+	index       *catalogapi.IndexSchema
+	startPrefix string
+	endPrefix   string
+}
+
+// extractLikeIndexCandidate checks if expr is a LIKE 'prefix%' on an indexed column.
+func (p *planner) extractLikeIndexCandidate(tbl *catalogapi.TableSchema, expr parserapi.Expr) *likeIndexCandidate {
+	like, ok := expr.(*parserapi.LikeExpr)
+	if !ok {
+		return nil
+	}
+	// LikeExpr.Pattern is directly a string (verified from parser/api/api.go)
+	pattern := like.Pattern
+	if !isPrefixPattern(pattern) {
+		return nil
+	}
+	// Strip trailing % to get prefix
+	prefix := pattern
+	if len(prefix) > 0 && prefix[len(prefix)-1] == '%' {
+		prefix = prefix[:len(prefix)-1]
+	}
+	endPrefix := nextLexicographic(prefix)
+
+	colRef, ok := like.Expr.(*parserapi.ColumnRef)
+	if !ok {
+		return nil
+	}
+	idx, err := p.catalog.GetIndexByColumn(tbl.Name, colRef.Column)
+	if err != nil || idx == nil {
+		return nil
+	}
+	// Index column must be TEXT type
+	idxColIdx := -1
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, colRef.Column) {
+			idxColIdx = i
+			break
+		}
+	}
+	if idxColIdx < 0 || tbl.Columns[idxColIdx].Type != catalogapi.TypeText {
+		return nil
+	}
+
+	return &likeIndexCandidate{index: idx, startPrefix: prefix, endPrefix: endPrefix}
+}
+
+// isPrefixPattern returns true if pattern is LIKE 'prefix%' (all wildcards at end).
+func isPrefixPattern(pattern string) bool {
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '%' {
+			for j := i; j < len(pattern); j++ {
+				if pattern[j] != '%' {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// nextLexicographic returns the smallest string lexicographically greater than s.
+func nextLexicographic(s string) string {
+	if s == "" {
+		return ""
+	}
+	b := []byte(s)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 255 {
+			b[i]++
+			return string(b)
+		}
+		b[i] = 0
+	}
+	return string([]byte{0}) + s + string([]byte{0})
 }
 
 func (p *planner) extractIndexCandidate(tbl *catalogapi.TableSchema, expr parserapi.Expr) *indexCandidate {

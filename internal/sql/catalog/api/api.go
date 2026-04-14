@@ -3,7 +3,11 @@
 // To understand the catalog module, read only this file.
 package api
 
-import "errors"
+import (
+	"errors"
+
+	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+)
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -92,6 +96,10 @@ type CatalogManager interface {
 	// Returns ErrIndexExists if the index already exists.
 	// Returns ErrTableNotFound if the table does not exist.
 	CreateIndex(schema IndexSchema) error
+
+	// CreateIndexBatch writes an index catalog entry into a WriteBatch.
+	// Both index data and catalog entry are committed atomically — no orphan.
+	CreateIndexBatch(schema IndexSchema, batch kvstoreapi.WriteBatch) error
 
 	// GetIndex returns an index by table and index name.
 	// Returns ErrIndexNotFound if the index does not exist.

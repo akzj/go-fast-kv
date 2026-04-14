@@ -142,6 +142,31 @@ func (c *Catalog) CreateIndex(schema api.IndexSchema) error {
 	return c.createIndexImpl(schema)
 }
 
+// CreateIndexBatch writes an index catalog entry into a WriteBatch.
+// Used by CREATE INDEX to make catalog entry atomic with index data.
+// Caller holds c.mu.
+func (c *Catalog) CreateIndexBatch(schema api.IndexSchema, batch kvstoreapi.WriteBatch) error {
+	_, err := c.getTableImpl(schema.Table)
+	if err != nil {
+		return err
+	}
+	upperTable := strings.ToUpper(schema.Table)
+	upperName := strings.ToUpper(schema.Name)
+	key := indexKey(upperTable, upperName)
+	_, err = c.kv.Get(key)
+	if err == nil {
+		return api.ErrIndexExists
+	}
+	if err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return batch.Put(key, data)
+}
+
 func (c *Catalog) createIndexImpl(schema api.IndexSchema) error {
 	// Verify table exists
 	_, err := c.getTableImpl(schema.Table)

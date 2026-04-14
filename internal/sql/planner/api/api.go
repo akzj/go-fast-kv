@@ -153,6 +153,19 @@ type IndexScanPlan struct {
 
 func (*IndexScanPlan) scanNode() {}
 
+// IndexRangePlan uses an index range scan for LIKE 'prefix%' optimization.
+// Encodes LIKE 'abc%' as start='abc' (inclusive), end='abd' (exclusive).
+type IndexRangePlan struct {
+	TableID        uint32
+	IndexID       uint32
+	Index         *catalogapi.IndexSchema
+	StartPrefix   string          // lower bound (inclusive)
+	EndPrefix     string          // upper bound (exclusive)
+	ResidualFilter parserapi.Expr // remaining non-indexed conditions
+}
+
+func (*IndexRangePlan) scanNode() {}
+
 // OrderByPlan describes an ORDER BY clause.
 type OrderByPlan struct {
 	ColumnIndex int

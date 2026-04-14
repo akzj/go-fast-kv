@@ -215,13 +215,17 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 			return nil, fmt.Errorf("%w: backfill insert index: %v", executorapi.ErrExecFailed, err)
 		}
 	}
-	if err := batch.Commit(); err != nil {
-		return nil, fmt.Errorf("%w: backfill commit: %v", executorapi.ErrExecFailed, err)
+	// M2: Add catalog entry to the SAME batch as index entries. Both are
+	// committed atomically — if batch.Commit() succeeds, both index data AND
+	// catalog entry are persisted. No orphan index data possible.
+	if err := e.catalog.CreateIndexBatch(schema, batch); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: create catalog entry: %v", executorapi.ErrExecFailed, err)
 	}
 
-	// CR-C: Catalog entry created only after successful backfill.
-	if err := e.catalog.CreateIndex(schema); err != nil {
-		return nil, fmt.Errorf("%w: create catalog entry: %v", executorapi.ErrExecFailed, err)
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: backfill commit: %v", executorapi.ErrExecFailed, err)
 	}
 
 	return &executorapi.Result{RowsAffected: 0}, nil
