@@ -44,6 +44,10 @@ func (ie *indexEngine) InsertBatch(key []byte, batch kvstoreapi.WriteBatch) erro
 	return batch.Put(key, []byte{})
 }
 
+func (ie *indexEngine) DeleteBatch(key []byte, batch kvstoreapi.WriteBatch) error {
+	return batch.Delete(key)
+}
+
 func (ie *indexEngine) EncodeIndexKey(tableID uint32, indexID uint32,
 	value catalogapi.Value, rowID uint64) []byte {
 	return ie.encoder.EncodeIndexKey(tableID, indexID, value, rowID)

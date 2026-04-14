@@ -403,7 +403,8 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				continue
 			}
 			val := row.Values[colIdx]
-			if err := e.indexEngine.Delete(idx, plan.Table.TableID, idx.IndexID, val, row.RowID); err != nil {
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, row.RowID)
+			if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 			}
@@ -455,7 +456,8 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				continue
 			}
 			oldVal := row.Values[colIdx]
-			if err := e.indexEngine.Delete(idx, plan.Table.TableID, idx.IndexID, oldVal, row.RowID); err != nil {
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
+			if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 			}
@@ -481,7 +483,8 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				continue
 			}
 			newVal := newValues[colIdx]
-			if err := e.indexEngine.Insert(idx, plan.Table.TableID, idx.IndexID, newVal, row.RowID); err != nil {
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 			}

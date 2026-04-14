@@ -164,6 +164,10 @@ type IndexEngine interface {
 	// Does NOT encode the key — caller provides the pre-encoded key and value.
 	InsertBatch(key []byte, batch kvstoreapi.WriteBatch) error
 
+	// DeleteBatch removes an index entry via a provided WriteBatch.
+	// Does NOT encode the key — caller provides the pre-encoded key.
+	DeleteBatch(key []byte, batch kvstoreapi.WriteBatch) error
+
 	// EncodeIndexKey encodes an index key. Exposed so callers can pre-encode
 	// keys for batch operations.
 	EncodeIndexKey(tableID uint32, indexID uint32, value catalogapi.Value, rowID uint64) []byte
