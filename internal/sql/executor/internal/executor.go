@@ -766,8 +766,13 @@ func (e *executor) filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Ex
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
+	// Only set outerVals per row when the filter contains correlated subqueries.
+	setOuterVals := hasCorrelatedSubquery(filter)
 	filtered := rows[:0]
 	for _, row := range rows {
+		if setOuterVals {
+			e.outerVals = row
+		}
 		engineRow := &engineapi.Row{Values: row}
 		match, err := matchFilter(filter, engineRow, columns, subqueryResults, e)
 		if err != nil {
@@ -949,8 +954,16 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 			if _, exists := subqueryResults[sq]; exists {
 				return
 			}
-			// Skip correlated subqueries — they must be evaluated per outer row.
+			// Skip correlated subqueries for pre-computation — they must be evaluated
+			// per outer row. But ensure they have a plan for execSubquery.
 			if isCorrelatedSubquery(sq) {
+				if sq.Plan == nil {
+					subplan, err := e.planner.Plan(sq.Stmt)
+					if err != nil {
+						return
+					}
+					sq.Plan = subplan
+				}
 				return
 			}
 			// Plan and execute the subquery (may trigger nested execSelect with same map)
