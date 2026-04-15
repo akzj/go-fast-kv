@@ -494,6 +494,11 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 			grouped = grouped[:plan.Limit]
 		}
 
+		// OFFSET on grouped rows (after LIMIT)
+		if plan.Offset >= 0 && plan.Offset < len(grouped) {
+			grouped = grouped[plan.Offset:]
+		}
+
 		// Extract values from grouped rows (projection done by groupByRowsForJoin)
 		rows := make([][]catalogapi.Value, len(grouped))
 		for i, row := range grouped {
@@ -523,6 +528,11 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
 		mergedRows = mergedRows[:plan.Limit]
+	}
+
+	// OFFSET on merged rows (after LIMIT)
+	if plan.Offset >= 0 && plan.Offset < len(mergedRows) {
+		mergedRows = mergedRows[plan.Offset:]
 	}
 
 	projected, projCols := projectJoinRows(mergedRows, colNames, plan)
@@ -1117,6 +1127,11 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	// LIMIT (apply before projection for efficiency)
 	if plan.Limit >= 0 && plan.Limit < len(rows) {
 		rows = rows[:plan.Limit]
+	}
+
+	// OFFSET (skip first N rows after LIMIT)
+	if plan.Offset >= 0 && plan.Offset < len(rows) {
+		rows = rows[plan.Offset:]
 	}
 
 	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.
