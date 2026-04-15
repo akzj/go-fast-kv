@@ -836,7 +836,8 @@ func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *planner
 // This is called with the OUTER subqueryResults map so that nested subqueries
 // don't re-execute infinitely (they share the parent's cache).
 func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
-	subqueryResults map[*parserapi.SubqueryExpr]interface{}) {
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) error {
+	var multiErr error
 	// Collect all expressions that might contain SubqueryExpr
 	var exprs []parserapi.Expr
 	if plan.Filter != nil {
@@ -888,13 +889,21 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 				if len(result.Rows) == 0 {
 					subqueryResults[sq] = catalogapi.Value{IsNull: true}
 				} else if len(result.Rows) >= 1 && len(result.Rows[0]) > 0 {
+					if len(result.Rows) > 1 {
+						multiErr = fmt.Errorf("scalar subquery returned more than 1 row")
+						return
+					}
 					subqueryResults[sq] = result.Rows[0][0]
 				} else {
 					subqueryResults[sq] = catalogapi.Value{IsNull: true}
 				}
 			}
 		})
+		if multiErr != nil {
+			return multiErr
+		}
 	}
+	return nil
 }
 
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
@@ -922,7 +931,9 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 
 	// Pre-compute subquery results BEFORE scanning — needed for filter during scan.
 	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
-	e.precomputeSubqueries(plan, subqueryResults)
+	if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+		return nil, err
+	}
 
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
 	rows, err := e.scanRows(plan.Table, plan.Scan, subqueryResults)
