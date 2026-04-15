@@ -855,4 +855,28 @@ func TestExec_Join(t *testing.T) {
 		}
 	})
 
+
+	t.Run("join_order_by", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.name")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		if result.Rows[0][0].Text != "alice" {
+			t.Errorf("row[0].name = %q, want alice", result.Rows[0][0].Text)
+		}
+		if result.Rows[1][0].Text != "alice" {
+			t.Errorf("row[1].name = %q, want alice", result.Rows[1][0].Text)
+		}
+		if result.Rows[2][0].Text != "carol" {
+			t.Errorf("row[2].name = %q, want carol", result.Rows[2][0].Text)
+		}
+	})
+
+	t.Run("join_limit", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id LIMIT 2")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+	})
+
 }

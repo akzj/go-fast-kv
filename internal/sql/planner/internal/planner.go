@@ -417,7 +417,48 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		}
 	}
 
-	// ORDER BY and LIMIT for JOIN — Phase 4
+	// ORDER BY for JOIN — resolve against combined schema with table qualifier support
+	var orderBy *plannerapi.OrderByPlan
+	if stmt.OrderBy != nil {
+		idx := -1
+		// Split qualified name (e.g., "users.name") into table and column
+		orderCol := stmt.OrderBy.Column
+		orderTable := ""
+		if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
+			orderTable = orderCol[:dot]
+			orderCol = orderCol[dot+1:]
+		}
+		for i, c := range combinedSchema {
+			if strings.EqualFold(c.Name, orderCol) {
+				if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
+					idx = i
+					break
+				}
+				// Unqualified: remember first match but keep looking for qualified match
+				if idx < 0 {
+					idx = i
+				}
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
+		}
+		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
+	}
+
+	// LIMIT for JOIN
+	limit := -1
+	if stmt.Limit != nil {
+		val, err := resolveExprToValue(stmt.Limit)
+		if err != nil {
+			return nil, fmt.Errorf("LIMIT: %w", err)
+		}
+		if val.IsNull || val.Type != catalogapi.TypeInt {
+			return nil, fmt.Errorf("LIMIT: %w: expected integer", plannerapi.ErrTypeMismatch)
+		}
+		limit = int(val.Int)
+	}
+
 	return &plannerapi.SelectPlan{
 		Table:            leftTbl,
 		Scan:             nil,
@@ -427,8 +468,8 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Filter:           stmt.Where, // WHERE applied on merged rows in executor
 		GroupByExprs:     nil,
 		Having:           nil,
-		OrderBy:          nil,
-		Limit:            -1,
+		OrderBy:          orderBy,
+		Limit:            limit,
 		LeftColumnCount:  len(leftSchema),
 	}, nil
 }

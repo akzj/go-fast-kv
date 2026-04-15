@@ -520,24 +520,33 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		stmt.Having = expr
 	}
 
-	// Optional ORDER BY
+	// Optional ORDER BY — parse via parseExpr so qualified names (t.col) work
 	if p.cur.Type == api.TokOrder {
 		p.advance()
 		if err := p.expect(api.TokBy); err != nil {
 			return nil, err
 		}
-		if p.cur.Type != api.TokIdent {
-			return nil, p.errorf("expected column name after ORDER BY")
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
 		}
-		ob := &api.OrderByClause{Column: p.cur.Literal}
-		p.advance()
-		if p.cur.Type == api.TokDesc {
-			ob.Desc = true
-			p.advance()
-		} else if p.cur.Type == api.TokAsc {
-			p.advance()
+		// Extract column from expression (parseExpr handles t.col via parsePrimary)
+		if ref, ok := expr.(*api.ColumnRef); ok {
+			col := ref.Column
+			if ref.Table != "" {
+				col = ref.Table + "." + ref.Column
+			}
+			ob := &api.OrderByClause{Column: col}
+			if p.cur.Type == api.TokDesc {
+				ob.Desc = true
+				p.advance()
+			} else if p.cur.Type == api.TokAsc {
+				p.advance()
+			}
+			stmt.OrderBy = ob
+		} else {
+			return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
 		}
-		stmt.OrderBy = ob
 	}
 
 	// Optional LIMIT
@@ -648,16 +657,25 @@ func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
 		if err := p.expect(api.TokBy); err != nil {
 			return nil, err
 		}
-		if p.cur.Type != api.TokIdent {
-			return nil, p.errorf("expected column name after ORDER BY")
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
 		}
-		stmt.OrderBy = &api.OrderByClause{Column: p.cur.Literal}
-		p.advance()
-		if p.cur.Type == api.TokDesc {
-			stmt.OrderBy.Desc = true
-			p.advance()
-		} else if p.cur.Type == api.TokAsc {
-			p.advance()
+		if ref, ok := expr.(*api.ColumnRef); ok {
+			col := ref.Column
+			if ref.Table != "" {
+				col = ref.Table + "." + ref.Column
+			}
+			ob := &api.OrderByClause{Column: col}
+			if p.cur.Type == api.TokDesc {
+				ob.Desc = true
+				p.advance()
+			} else if p.cur.Type == api.TokAsc {
+				p.advance()
+			}
+			stmt.OrderBy = ob
+		} else {
+			return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
 		}
 	}
 
