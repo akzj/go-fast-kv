@@ -714,6 +714,14 @@ func TestExec_ScalarSubquery(t *testing.T) {
 			t.Errorf("row[0].id = %d, want 1", result.Rows[0][0].Int)
 		}
 	})
+
+	t.Run("multi_row_scalar_subquery_error", func(t *testing.T) {
+		// Subquery returns 2 rows — should error per SQL standard
+		_, err := env.execSQLErr(t, "SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE amount > 100)")
+		if err == nil {
+			t.Error("expected error for multi-row scalar subquery")
+		}
+	})
 }
 
 func TestExec_Join(t *testing.T) {
@@ -931,6 +939,21 @@ func TestExec_Join(t *testing.T) {
 		}
 		if result.Rows[0][1].Int != 2 {
 			t.Errorf("alice count = %d, want 2", result.Rows[0][1].Int)
+		}
+	})
+
+	t.Run("join_where_scalar_subquery", func(t *testing.T) {
+		// B3-1: WHERE subquery in JOIN query should be precomputed
+		// Subquery (SELECT MIN(id) FROM users) returns 1, so id > 1 excludes alice
+		result := env.execSQL(t, "SELECT * FROM users WHERE id > (SELECT MIN(id) FROM users)")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		// Should return bob (id=2) and carol (id=3)
+		for _, row := range result.Rows {
+			if row[0].Int == 1 {
+				t.Errorf("alice (id=1) should NOT be in results")
+			}
 		}
 	})
 
