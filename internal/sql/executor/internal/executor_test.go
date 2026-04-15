@@ -1048,3 +1048,21 @@ func TestExec_ScalarAggregate(t *testing.T) {
 	})
 
 }
+
+func TestExec_SelectWithoutFrom(t *testing.T) {
+	env := newTestEnv(t)
+
+	t.Run("select_integer", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT 1")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+	})
+
+	t.Run("select_string", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT 'hello'")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+	})
+}

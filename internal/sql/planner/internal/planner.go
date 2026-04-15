@@ -246,6 +246,37 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		return p.planJoinSelect(stmt)
 	}
 
+	// Handle SELECT without FROM (constant expressions)
+	if stmt.Table == "" {
+		// SELECT 1, SELECT 1+1, SELECT 'hello'
+		// No table scan needed — evaluate expressions directly
+		// ORDER BY on constants: sort the single row (no-op but wire through)
+		var orderBy *plannerapi.OrderByPlan
+		if stmt.OrderBy != nil {
+			// For constant SELECT, ORDER BY just returns the single row
+			// We still need a column index — resolve against SELECT columns
+			orderBy = &plannerapi.OrderByPlan{ColumnIndex: 0, Desc: stmt.OrderBy.Desc}
+		}
+		limit := -1
+		if stmt.Limit != nil {
+			val, err := resolveExprToValue(stmt.Limit)
+			if err == nil && !val.IsNull && val.Type == catalogapi.TypeInt {
+				limit = int(val.Int)
+			}
+		}
+		return &plannerapi.SelectPlan{
+			Table:         nil,
+			Scan:          nil,
+			Columns:       nil,
+			SelectColumns: stmt.Columns,
+			Filter:        nil,
+			GroupByExprs:  nil,
+			Having:        nil,
+			OrderBy:       orderBy,
+			Limit:         limit,
+		}, nil
+	}
+
 	// Single-table SELECT
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {

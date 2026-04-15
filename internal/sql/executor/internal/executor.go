@@ -898,6 +898,28 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 }
 
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
+	// Handle SELECT without FROM (constant expressions: SELECT 1, SELECT 'hello')
+	if plan.Table == nil {
+		// Evaluate SelectColumns expressions against an empty row
+		emptyRow := &engineapi.Row{Values: []catalogapi.Value{}}
+		emptyCols := []catalogapi.ColumnDef{}
+		vals := make([]catalogapi.Value, len(plan.SelectColumns))
+		names := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			name := sc.Alias
+			if name == "" {
+				name = "expr"
+			}
+			names[i] = name
+			val, err := evalExpr(sc.Expr, emptyRow, emptyCols, nil)
+			if err != nil {
+				return nil, err
+			}
+			vals[i] = val
+		}
+		return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+	}
+
 	// Pre-compute subquery results BEFORE scanning — needed for filter during scan.
 	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
 	e.precomputeSubqueries(plan, subqueryResults)

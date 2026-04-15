@@ -459,15 +459,16 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		}
 	}
 
-	// FROM
-	if err := p.expect(api.TokFrom); err != nil {
-		return nil, err
+	// FROM (optional — allows SELECT 1, SELECT 'hello')
+	var leftTable string
+	if p.cur.Type == api.TokFrom {
+		p.advance()
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected table name after FROM")
+		}
+		leftTable = p.cur.Literal
+		p.advance()
 	}
-	if p.cur.Type != api.TokIdent {
-		return nil, p.errorf("expected table name after FROM")
-	}
-	leftTable := p.cur.Literal
-	p.advance()
 
 	// Check for JOIN (INNER, LEFT, RIGHT, CROSS all start with their own token)
 	if p.cur.Type == api.TokJoin || p.cur.Type == api.TokLeft ||
