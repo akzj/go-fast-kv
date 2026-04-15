@@ -444,9 +444,35 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	// Check for JOIN (INNER, LEFT, RIGHT, CROSS all start with their own token)
 	if p.cur.Type == api.TokJoin || p.cur.Type == api.TokLeft ||
 		p.cur.Type == api.TokRight || p.cur.Type == api.TokCross {
+		// Parse first join
 		join, err := p.parseJoin(leftTable)
 		if err != nil {
 			return nil, err
+		}
+		// Chain additional JOINs iteratively — build left-associative structure
+		// so outer ON can reference columns from all previous tables
+		for {
+			if p.cur.Type == api.TokJoin || p.cur.Type == api.TokLeft ||
+				p.cur.Type == api.TokRight || p.cur.Type == api.TokCross {
+				// Parse the next join
+				nextJoin, err := p.parseJoin("")  // placeholder, will set Left below
+				if err != nil {
+					return nil, err
+				}
+				// Build nested structure: (previous) JOIN (next) with previous as LEFT
+				// For t1 JOIN t2 JOIN t3:
+				// After first join: join = t1 JOIN t2
+				// Second: nested = t1 JOIN t2, then outer = nested JOIN t3
+				if join != nil {
+					// wrap previous join as left of new outer join
+					nextJoin.Left = join
+					join = nextJoin
+				} else {
+					join = nextJoin
+				}
+			} else {
+				break
+			}
 		}
 		stmt.Join = join
 	} else {
@@ -1018,8 +1044,14 @@ func (p *parser) parseJoin(left interface{}) (*api.JoinExpr, error) {
 		}
 	}
 
+	// If left is empty string (placeholder from chain), try to detect from ON
+	joinLeft := left
+	if leftStr, ok := left.(string); ok && leftStr == "" {
+		// Placeholder — let the chain set the actual left
+		joinLeft = nil
+	}
 	return &api.JoinExpr{
-		Left:  left,
+		Left:  joinLeft,
 		Right: rightTable,
 		Type:  joinType,
 		On:    on,

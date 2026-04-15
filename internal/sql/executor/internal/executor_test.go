@@ -813,4 +813,46 @@ func TestExec_Join(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("triple_join", func(t *testing.T) {
+		// Add a third table that joins on users.id
+		env.execSQL(t, "CREATE TABLE ages (user_id INT, age INT)")
+		env.execSQL(t, "INSERT INTO ages VALUES (1, 30)")
+		env.execSQL(t, "INSERT INTO ages VALUES (2, 25)")
+		env.execSQL(t, "INSERT INTO ages VALUES (3, 35)")
+
+		// users (3 rows) → orders (3 rows) → ages (3 rows)
+		// users JOIN orders ON users.id = orders.user_id → alice has 2 orders, carol has 1
+		// Then JOIN ages ON users.id = ages.user_id → each user matched with their age
+		// Expected: alice/100/30, alice/200/30, carol/50/35 (3 rows, no bob)
+		result := env.execSQL(t, "SELECT users.name, orders.amount, ages.age FROM users JOIN orders ON users.id = orders.user_id JOIN ages ON users.id = ages.user_id")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		// Verify column values: alice has 2 orders (100, 200), both with age 30
+		// carol has 1 order (50) with age 35
+		aliceCount := 0
+		carolCount := 0
+		for _, row := range result.Rows {
+			if row[0].Text == "alice" {
+				aliceCount++
+				if row[2].Int != 30 {
+					t.Errorf("alice age = %d, want 30", row[2].Int)
+				}
+			}
+			if row[0].Text == "carol" {
+				carolCount++
+				if row[2].Int != 35 {
+					t.Errorf("carol age = %d, want 35", row[2].Int)
+				}
+			}
+		}
+		if aliceCount != 2 {
+			t.Errorf("alice rows = %d, want 2", aliceCount)
+		}
+		if carolCount != 1 {
+			t.Errorf("carol rows = %d, want 1", carolCount)
+		}
+	})
+
 }

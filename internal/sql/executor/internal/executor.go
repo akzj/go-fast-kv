@@ -756,44 +756,21 @@ func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *planner
 	if len(plan.Columns) == 0 {
 		return rows, colNames
 	}
-	isJoin := plan.Join != nil
-	leftLen := 0
-	if isJoin {
-		leftLen = plan.LeftColumnCount
-	}
 	projected := make([][]catalogapi.Value, len(rows))
+	// For JOINs, plan.Columns contains indices into the merged row.
+	// The merged row format is: [left cols...][right cols...]
+	// So indices already account for the split — use them directly.
 	for i, row := range rows {
 		vals := make([]catalogapi.Value, len(plan.Columns))
 		for j, idx := range plan.Columns {
-			globalIdx := idx
-			if isJoin {
-				// For JOIN, determine which table this column comes from.
-				// plan.SelectColumns[j].Expr.(*ColumnRef).Table tells us the table.
-				// Right-table columns need offset by leftLen.
-				if j < len(plan.SelectColumns) {
-					if ref, ok := plan.SelectColumns[j].Expr.(*parserapi.ColumnRef); ok && ref.Table != "" {
-						if ref.Table == plan.Join.RightTable.Name {
-							globalIdx = leftLen + idx
-						}
-						// Left-table: globalIdx = idx (no offset needed)
-					}
-				}
-			}
-			if globalIdx < len(row) {
-				vals[j] = row[globalIdx]
+			if idx < len(row) {
+				vals[j] = row[idx]
 			}
 		}
 		projected[i] = vals
 	}
 	projNames := make([]string, len(plan.Columns))
 	for j, idx := range plan.Columns {
-		if isJoin && j < len(plan.SelectColumns) {
-			// For JOIN, use the qualified column name from SelectColumns
-			if ref, ok := plan.SelectColumns[j].Expr.(*parserapi.ColumnRef); ok {
-				projNames[j] = ref.Table + "." + ref.Column
-				continue
-			}
-		}
 		if idx < len(colNames) {
 			projNames[j] = colNames[idx]
 		}
