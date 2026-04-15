@@ -170,7 +170,7 @@ type JoinType string
 
 // JoinExpr represents a JOIN ... ON ... clause in FROM.
 type JoinExpr struct {
-	Left  string   // left table name
+	Left  interface{} // left table name (string) or nested JoinExpr for chained joins
 	Right string   // right table name
 	Type  JoinType // "INNER", "LEFT", "RIGHT", "CROSS"
 	On    Expr     // join condition (nil for CROSS)

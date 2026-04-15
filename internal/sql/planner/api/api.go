@@ -182,10 +182,12 @@ type OrderByPlan struct {
 }
 // JoinPlan represents a two-table join.
 type JoinPlan struct {
-	Left         ScanPlan                  // Scan plan for left table
-	Right        ScanPlan                  // Scan plan for right table
+	Left         Plan                       // left plan (ScanPlan or nested JoinPlan for multi-join)
+	Right        ScanPlan                   // Scan plan for right table
+	LeftSchema   []*catalogapi.ColumnDef   // columns from left side (for ON eval)
+	RightSchema  []*catalogapi.ColumnDef   // columns from right table
 	LeftTable    *catalogapi.TableSchema   // Left table schema (columns)
-	RightTable   *catalogapi.TableSchema  // Right table schema (columns)
+	RightTable   *catalogapi.TableSchema    // Right table schema (columns)
 	On           parserapi.Expr            // join condition (e.g. BinaryExpr t1.id = t2.t1_id)
 	Type         string                    // "INNER", "LEFT", "RIGHT", "CROSS"
 }
@@ -204,7 +206,17 @@ func (p *JoinPlan) String() string {
 		b.WriteString("├─ ON: " + formatExpr(p.On) + "\n")
 	}
 	if p.Left != nil {
-		b.WriteString("└─ LEFT: " + scanString(p.Left))
+		switch left := p.Left.(type) {
+		case ScanPlan:
+			b.WriteString("└─ LEFT: " + scanString(left))
+		case *JoinPlan:
+			b.WriteString("└─ LEFT:\n")
+			for _, line := range strings.Split(left.String(), "\n") {
+				b.WriteString("  " + line + "\n")
+			}
+		default:
+			b.WriteString("└─ LEFT: " + fmt.Sprintf("%T", p.Left))
+		}
 	}
 	if p.Right != nil {
 		b.WriteString("\n└─ RIGHT: " + scanString(p.Right))

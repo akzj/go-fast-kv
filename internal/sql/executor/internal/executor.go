@@ -360,21 +360,45 @@ func isSubqueryInListContext(sq *parserapi.SubqueryExpr, root parserapi.Expr) bo
 func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 	jplan := plan.Join
 
-	leftRows, err := e.collectRows(jplan.LeftTable, jplan.Left, nil)
-	if err != nil {
-		return nil, err
+	// Collect left rows — may be ScanPlan or nested *JoinPlan
+	var leftRows []*engineapi.Row
+	switch left := jplan.Left.(type) {
+	case *plannerapi.JoinPlan:
+		result, err := e.execJoin(left)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range result.Rows {
+			leftRows = append(leftRows, &engineapi.Row{Values: v})
+		}
+	case plannerapi.ScanPlan:
+		var err error
+		leftRows, err = e.scanRows(jplan.LeftTable, left, nil)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("execJoinSelect: unexpected left type %T", jplan.Left)
 	}
-	rightRows, err := e.collectRows(jplan.RightTable, jplan.Right, nil)
+
+	rightRows, err := e.scanRows(jplan.RightTable, jplan.Right, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	colNames := make([]string, 0, len(jplan.LeftTable.Columns)+len(jplan.RightTable.Columns))
-	for _, col := range jplan.LeftTable.Columns {
-		colNames = append(colNames, jplan.LeftTable.Name+"."+col.Name)
+	colNames := make([]string, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
+	combinedCols := make([]catalogapi.ColumnDef, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
+	for _, c := range jplan.LeftSchema {
+		colNames = append(colNames, c.Name)
+		col := *c
+		col.Table = jplan.LeftTable.Name
+		combinedCols = append(combinedCols, col)
 	}
-	for _, col := range jplan.RightTable.Columns {
-		colNames = append(colNames, jplan.RightTable.Name+"."+col.Name)
+	for _, c := range jplan.RightSchema {
+		colNames = append(colNames, c.Name)
+		col := *c
+		col.Table = jplan.RightTable.Name
+		combinedCols = append(combinedCols, col)
 	}
 
 	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
@@ -383,11 +407,8 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 	}
 
 	var mergedRows [][]catalogapi.Value
-	leftLen := len(jplan.LeftTable.Columns)
-	rightLen := len(jplan.RightTable.Columns)
-	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
-	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
-	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
+	leftLen := len(jplan.LeftSchema)
+	rightLen := len(jplan.RightSchema)
 
 	switch jplan.Type {
 	case "LEFT":
@@ -421,21 +442,46 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 // execJoin handles a bare JoinPlan (used for EXPLAIN or subquery JOINs).
 func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, error) {
-	leftRows, err := e.collectRows(jplan.LeftTable, jplan.Left, nil)
-	if err != nil {
-		return nil, err
+	// Collect left rows — may be ScanPlan or nested *JoinPlan
+	var leftRows []*engineapi.Row
+	switch left := jplan.Left.(type) {
+	case *plannerapi.JoinPlan:
+		result, err := e.execJoin(left)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range result.Rows {
+			leftRows = append(leftRows, &engineapi.Row{Values: v})
+		}
+	case plannerapi.ScanPlan:
+		var err error
+		leftRows, err = e.scanRows(jplan.LeftTable, left, nil)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("execJoin: unexpected left type %T", jplan.Left)
 	}
-	rightRows, err := e.collectRows(jplan.RightTable, jplan.Right, nil)
+
+	rightRows, err := e.scanRows(jplan.RightTable, jplan.Right, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	colNames := make([]string, 0, len(jplan.LeftTable.Columns)+len(jplan.RightTable.Columns))
-	for _, col := range jplan.LeftTable.Columns {
-		colNames = append(colNames, jplan.LeftTable.Name+"."+col.Name)
+	// Build colNames and combinedCols with table names tagged
+	colNames := make([]string, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
+	combinedCols := make([]catalogapi.ColumnDef, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
+	for _, c := range jplan.LeftSchema {
+		colNames = append(colNames, c.Name)
+		col := *c
+		col.Table = jplan.LeftTable.Name
+		combinedCols = append(combinedCols, col)
 	}
-	for _, col := range jplan.RightTable.Columns {
-		colNames = append(colNames, jplan.RightTable.Name+"."+col.Name)
+	for _, c := range jplan.RightSchema {
+		colNames = append(colNames, c.Name)
+		col := *c
+		col.Table = jplan.RightTable.Name
+		combinedCols = append(combinedCols, col)
 	}
 
 	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
@@ -444,11 +490,8 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 	}
 
 	var mergedRows [][]catalogapi.Value
-	leftLen := len(jplan.LeftTable.Columns)
-	rightLen := len(jplan.RightTable.Columns)
-	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
-	combinedCols = append(combinedCols, jplan.LeftTable.Columns...)
-	combinedCols = append(combinedCols, jplan.RightTable.Columns...)
+	leftLen := len(jplan.LeftSchema)
+	rightLen := len(jplan.RightSchema)
 
 	switch jplan.Type {
 	case "LEFT":

@@ -95,6 +95,22 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 // evalColumnRef looks up a column value from the row.
 func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
 	upper := strings.ToUpper(ref.Column)
+	upperTable := strings.ToUpper(ref.Table)
+
+	// If table qualifier provided, match both table AND column name
+	if ref.Table != "" {
+		for i, col := range columns {
+			if strings.ToUpper(col.Name) == upper && strings.EqualFold(col.Table, upperTable) {
+				if i < len(row.Values) {
+					return row.Values[i], nil
+				}
+				return catalogapi.Value{IsNull: true}, nil
+			}
+		}
+		return catalogapi.Value{}, fmt.Errorf("%w: column %q not found in table %q", executorapi.ErrExecFailed, ref.Column, ref.Table)
+	}
+
+	// Unqualified column name — find first match (original behavior)
 	for i, col := range columns {
 		if strings.ToUpper(col.Name) == upper {
 			if i < len(row.Values) {

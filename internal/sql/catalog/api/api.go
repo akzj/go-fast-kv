@@ -63,6 +63,7 @@ type TableSchema struct {
 
 // ColumnDef describes a single column in a table.
 type ColumnDef struct {
+	Table string // table name for qualified column lookups
 	Name string
 	Type Type
 }

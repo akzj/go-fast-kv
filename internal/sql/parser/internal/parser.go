@@ -972,7 +972,7 @@ func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
 }
 
 // primary = literal | ident ["." ident] | "(" expr ")" | "-" primary | "*"
-func (p *parser) parseJoin(leftTable string) (*api.JoinExpr, error) {
+func (p *parser) parseJoin(left interface{}) (*api.JoinExpr, error) {
 	// Check for LEFT/RIGHT/CROSS prefix
 	joinType := api.JoinType("INNER")
 	if p.cur.Type == api.TokLeft {
@@ -1019,7 +1019,7 @@ func (p *parser) parseJoin(leftTable string) (*api.JoinExpr, error) {
 	}
 
 	return &api.JoinExpr{
-		Left:  leftTable,
+		Left:  left,
 		Right: rightTable,
 		Type:  joinType,
 		On:    on,
