@@ -391,7 +391,7 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 	for _, c := range jplan.LeftSchema {
 		colNames = append(colNames, c.Name)
 		col := *c
-		col.Table = jplan.LeftTable.Name
+		if col.Table == "" { col.Table = jplan.LeftTable.Name }
 		combinedCols = append(combinedCols, col)
 	}
 	for _, c := range jplan.RightSchema {
@@ -439,7 +439,7 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
-			grouped = filterRows(grouped, plan.Having, plan.Table.Columns, nil)
+			grouped = filterRows(grouped, plan.Having, combinedCols, nil)
 		}
 
 		// ORDER BY on grouped rows
@@ -525,7 +525,7 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 	for _, c := range jplan.LeftSchema {
 		colNames = append(colNames, c.Name)
 		col := *c
-		col.Table = jplan.LeftTable.Name
+		if col.Table == "" { col.Table = jplan.LeftTable.Name }
 		combinedCols = append(combinedCols, col)
 	}
 	for _, c := range jplan.RightSchema {

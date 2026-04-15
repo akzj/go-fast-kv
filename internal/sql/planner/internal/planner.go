@@ -351,12 +351,10 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 	var leftPlan plannerapi.Plan
 	var leftTbl *catalogapi.TableSchema
 	var leftSchema []*catalogapi.ColumnDef
-	var leftTableName string
 
 	switch left := j.Left.(type) {
 	case string:
 		// Base case: left is a table name
-		leftTableName = left
 		leftTbl, err = p.catalog.GetTable(left)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, left)
@@ -367,6 +365,10 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		}
 		leftPlan = leftScan
 		leftSchema = colsToPtr(leftTbl.Columns)
+		// Set Table field on base-case left columns for executor's evalColumnRef
+		for i := range leftSchema {
+			leftSchema[i].Table = leftTbl.Name
+		}
 
 	case *parserapi.JoinExpr:
 		// Nested join: recursively plan the left side
@@ -378,21 +380,25 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		leftPlan = leftNested.Join
 		// Build combined schema from nested join's left + right
 		if lt, ok := leftNested.Join.Left.(*plannerapi.JoinPlan); ok {
+			// Nested-nested: use its schemas directly (Table already set by its executor call)
 			leftSchema = append(leftSchema, lt.LeftSchema...)
 			leftSchema = append(leftSchema, lt.RightSchema...)
 		} else {
-			// Base case left: use LeftTable columns
+			// Base case left: LeftTable columns, set Table field
 			for _, c := range leftNested.Join.LeftTable.Columns {
+				c := c
+				c.Table = leftNested.Join.LeftTable.Name
 				leftSchema = append(leftSchema, &c)
 			}
 		}
-		// Add nested join's right schema
+		// Add nested join's right schema, set Table field
 		for _, c := range leftNested.Join.RightTable.Columns {
+			c := c
+			c.Table = leftNested.Join.RightTable.Name
 			leftSchema = append(leftSchema, &c)
 		}
 		// leftTable is the leftmost table (from nested join)
 		leftTbl = leftNested.Join.LeftTable
-		leftTableName = leftTbl.Name
 
 	default:
 		return nil, fmt.Errorf("invalid left in join: %T", j.Left)
@@ -404,8 +410,9 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		return nil, fmt.Errorf("join right scan: %w", err)
 	}
 
-	// Collect all table names for validation
-	allTables := []string{leftTableName, j.Right}
+	// Collect all table names for validation (including nested joins)
+	allTables := collectJoinTableNames(j.Left)
+	allTables = append(allTables, j.Right)
 
 	// Validate ON condition
 	if err := validateJoinOn(j.On, allTables); err != nil {
@@ -507,6 +514,20 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Limit:            limit,
 		LeftColumnCount:  len(leftSchema),
 	}, nil
+}
+
+// collectJoinTableNames recursively collects all table names from a JoinExpr
+// (which may have a nested JoinExpr on its left side).
+func collectJoinTableNames(left interface{}) []string {
+	var tables []string
+	switch l := left.(type) {
+	case string:
+		tables = append(tables, l)
+	case *parserapi.JoinExpr:
+		tables = append(tables, collectJoinTableNames(l.Left)...)
+		tables = append(tables, l.Right)
+	}
+	return tables
 }
 
 // validateJoinOn checks that all column references in the ON condition
