@@ -593,6 +593,16 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		stmt.Limit = expr
 	}
 
+	// Optional OFFSET (must follow LIMIT)
+	if p.cur.Type == api.TokOffset {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Offset = expr
+	}
+
 	return stmt, nil
 }
 
@@ -721,6 +731,16 @@ func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
 			return nil, err
 		}
 		stmt.Limit = expr
+	}
+
+	// Optional OFFSET (must follow LIMIT)
+	if p.cur.Type == api.TokOffset {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Offset = expr
 	}
 
 	// NOTE: Do NOT consume the trailing TokRParen. Callers handle it.

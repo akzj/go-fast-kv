@@ -94,6 +94,7 @@ const (
 	TokRight    TokenType = 69 // RIGHT
 	TokCross    TokenType = 70 // CROSS
 	TokCoalesce TokenType = 71 // COALESCE
+	TokOffset   TokenType = 72 // OFFSET
 )
 
 // Token represents a single lexical token.
@@ -187,6 +188,7 @@ type SelectStmt struct {
 	Having  Expr        // nil if no HAVING
 	OrderBy *OrderByClause // nil if no ORDER BY
 	Limit   Expr        // nil if no LIMIT
+	Offset  Expr        // nil if no OFFSET
 	Distinct bool       // true for SELECT DISTINCT
 }
 
