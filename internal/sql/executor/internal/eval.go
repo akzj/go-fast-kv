@@ -84,88 +84,52 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 			}
 		}
 		// Not pre-computed: execute on-demand for correlated subqueries
-		// Use ex.outerCols/outerValsStack if set (outer query's columns/values).
-		// This is critical: row is from the INNER table (being scanned in subquery),
-		// but we need OUTER table's row values for correlation.
-		outerCols := columns
-		outerVals := row.Values
-		if ex != nil && ex.outerCols != nil && len(ex.outerValsStack) > 0 {
-			outerCols = ex.outerCols
-			outerVals = ex.outerValsStack[len(ex.outerValsStack)-1]
-		}
-		subqResult, err := ex.execSubquery(node.Plan, outerCols, outerVals)
-		return subqResult, err
+		return ex.execSubquery(node.Plan)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
 }
 
 // evalColumnRef looks up a column value from the row.
-// Column resolution order for qualified refs (e.g., users.id):
-// 1. outerCols (outer query's table for correlated subqueries)
-// 2. currentCols (inner table being scanned)
-// 3. columns (passed columns)
-// For unqualified refs (e.g., id): match in order 1, 2, 3
+// e provides access to outerCols/outerVals for correlated subquery resolution.
 func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catalogapi.ColumnDef, e *executor) (catalogapi.Value, error) {
 	upper := strings.ToUpper(ref.Column)
 	upperTable := strings.ToUpper(ref.Table)
 
 	// Helper to find column in given columns
-	findCol := func(cols []catalogapi.ColumnDef, vals []catalogapi.Value) (catalogapi.Value, bool) {
+	findIn := func(cols []catalogapi.ColumnDef, vals []catalogapi.Value) (catalogapi.Value, bool) {
+		if cols == nil || vals == nil {
+			return catalogapi.Value{}, false
+		}
+		if upperTable != "" {
+			for i, col := range cols {
+				if strings.ToUpper(col.Name) == upper && strings.EqualFold(col.Table, upperTable) {
+					if i < len(vals) {
+						return vals[i], true
+					}
+					return catalogapi.Value{IsNull: true}, true
+				}
+			}
+		}
 		for i, col := range cols {
-			if strings.ToUpper(col.Name) != upper {
-				continue
+			if strings.ToUpper(col.Name) == upper {
+				if i < len(vals) {
+					return vals[i], true
+				}
+				return catalogapi.Value{IsNull: true}, true
 			}
-			colTable := strings.ToUpper(col.Table)
-			// Table qualifier matching rules:
-			// - If ref has no qualifier: match any column with same name
-			// - If ref has qualifier AND column has qualifier: they must match
-			// - If ref has qualifier but column doesn't: accept if names match
-			if upperTable != "" && colTable != "" && colTable != upperTable {
-				continue // Table mismatch
-			}
-			if i < len(vals) {
-				return vals[i], true
-			}
-			return catalogapi.Value{IsNull: true}, true
 		}
 		return catalogapi.Value{}, false
 	}
 
-	// For qualified refs (e.g., users.id), check outerCols FIRST
-	// because "users" refers to the outer query's table, not the inner table
-	if upperTable != "" && e != nil && e.outerCols != nil {
-		if val, ok := findCol(e.outerCols, e.currentOuterVals()); ok {
-			return val, nil
-		}
-		// Fallback: strip table qualifier and check by name only
-		for i, col := range e.outerCols {
-			if strings.ToUpper(col.Name) == upper {
-				if i < len(e.currentOuterVals()) {
-					return e.currentOuterVals()[i], nil
-				}
-				return catalogapi.Value{IsNull: true}, nil
-			}
-		}
-	}
-
-	// Try current table columns (inner table being scanned)
-	if e != nil && e.currentCols != nil && e.currentRow != nil {
-		if val, ok := findCol(e.currentCols, e.currentRow.Values); ok {
-			return val, nil
-		}
-	}
-
-	// Try passed columns (typically current table in non-correlated context)
-	if val, ok := findCol(columns, row.Values); ok {
+	// Try current table columns first
+	if val, ok := findIn(columns, row.Values); ok {
 		return val, nil
 	}
 
-	// For unqualified refs, try outer columns last (cross-table access)
-	if upperTable == "" && e != nil && e.outerCols != nil {
-		if val, ok := findCol(e.outerCols, e.currentOuterVals()); ok {
-			return val, nil
-		}
+	// Fall back to outer columns for correlated subqueries
+	if val, ok := findIn(e.outerCols, e.outerVals); ok {
+		return val, nil
 	}
 
 	return catalogapi.Value{}, fmt.Errorf("%w: column %q not found", executorapi.ErrExecFailed, ref.Column)
