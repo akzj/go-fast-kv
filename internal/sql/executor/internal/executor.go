@@ -33,6 +33,9 @@ type executor struct {
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
 	planner     plannerapi.Planner
+	// For correlated subquery support - outer query context set before filter evaluation
+	outerCols []catalogapi.ColumnDef
+	outerVals []catalogapi.Value
 }
 
 // New creates a new Executor.
@@ -47,6 +50,26 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
 	}
+}
+
+// execSubquery executes a scalar subquery plan with outer row context.
+// outerCols/outerVals on e must be set before calling this method.
+func (e *executor) execSubquery(plan parserapi.SubqueryPlan) (catalogapi.Value, error) {
+	typedPlan, ok := plan.(plannerapi.Plan)
+	if !ok {
+		return catalogapi.Value{}, fmt.Errorf("subquery plan has wrong type: %T", plan)
+	}
+	result, err := e.Execute(typedPlan)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if len(result.Rows) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if len(result.Rows) > 1 {
+		return catalogapi.Value{}, fmt.Errorf("scalar subquery returned more than 1 row")
+	}
+	return result.Rows[0][0], nil
 }
 
 // Execute dispatches a plan to the appropriate handler.
@@ -425,7 +448,7 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
 			return nil, err
 		}
-		mergedRows = filterJoinRows(mergedRows, plan.Filter, combinedCols, subqueryResults)
+		mergedRows = e.filterJoinRows(mergedRows, plan.Filter, combinedCols, subqueryResults)
 	}
 
 	// GROUP BY on merged join rows
@@ -443,7 +466,7 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
-			grouped = filterRows(grouped, plan.Having, combinedCols, subqueryResults)
+			grouped = e.filterRows(grouped, plan.Having, combinedCols, subqueryResults)
 		}
 
 		// ORDER BY on grouped rows
@@ -662,7 +685,7 @@ func (e *executor) joinMatch(left, right *engineapi.Row, jplan *plannerapi.JoinP
 	copy(combinedVals, left.Values)
 	copy(combinedVals[leftLen:], right.Values)
 	combinedRow := &engineapi.Row{Values: combinedVals}
-	result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults)
+	result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults, e)
 	if err != nil {
 		return false
 	}
@@ -724,14 +747,14 @@ func (ex *executor) walkExprForJoinSubqueries(expr parserapi.Expr,
 }
 
 // filterJoinRows applies a WHERE filter to merged join rows.
-func filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Expr, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) [][]catalogapi.Value {
+func (e *executor) filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Expr, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) [][]catalogapi.Value {
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
 	filtered := rows[:0]
 	for _, row := range rows {
 		engineRow := &engineapi.Row{Values: row}
-		match, err := matchFilter(filter, engineRow, columns, subqueryResults)
+		match, err := matchFilter(filter, engineRow, columns, subqueryResults, e)
 		if err != nil {
 			continue
 		}
@@ -924,7 +947,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 				name = "expr"
 			}
 			names[i] = name
-			val, err := evalExpr(sc.Expr, emptyRow, emptyCols, nil)
+			val, err := evalExpr(sc.Expr, emptyRow, emptyCols, nil, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -945,9 +968,12 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return nil, err
 	}
 
+	// Set outerCols for correlated subquery resolution - used by filterRows to set outerVals per row
+	e.outerCols = plan.Table.Columns
+
 	// Apply residual filter from SelectPlan (handles index scan + residual)
 	if plan.Filter != nil {
-		rows = filterRows(rows, plan.Filter, plan.Table.Columns, subqueryResults)
+		rows = e.filterRows(rows, plan.Filter, plan.Table.Columns, subqueryResults)
 	}
 
 	// GROUP BY: group rows by encoded key, then compute aggregates per group.
@@ -960,7 +986,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
-			rows = filterRows(rows, plan.Having, plan.Table.Columns, subqueryResults)
+			rows = e.filterRows(rows, plan.Having, plan.Table.Columns, subqueryResults)
 		}
 	}
 
@@ -1280,7 +1306,7 @@ func projectGroupedRowForJoin(groupRows []*engineapi.Row, plan *plannerapi.Selec
 func (e *executor) encodeGroupKey(row *engineapi.Row, exprs []parserapi.Expr, columns []catalogapi.ColumnDef) ([]byte, error) {
 	var buf []byte
 	for _, expr := range exprs {
-		val, err := evalExpr(expr, row, columns, nil)
+		val, err := evalExpr(expr, row, columns, nil, e)
 		if err != nil {
 			return nil, err
 		}

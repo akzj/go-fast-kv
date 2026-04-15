@@ -37,14 +37,16 @@ func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi
 }
 
 // filterRows applies a residual filter to already-scanned rows (used by execSelect for SelectPlan.Filter).
-func filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []catalogapi.ColumnDef,
+func (e *executor) filterRows(rows []*engineapi.Row, filter parserapi.Expr, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}) []*engineapi.Row {
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
 	filtered := rows[:0]
 	for _, row := range rows {
-		match, err := matchFilter(filter, row, columns, subqueryResults)
+		// Set outerVals for correlated subquery evaluation
+		e.outerVals = row.Values
+		match, err := matchFilter(filter, row, columns, subqueryResults, e)
 		if err != nil {
 			continue
 		}
@@ -70,7 +72,7 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 
 		// Apply filter if present
 		if filter != nil {
-			pass, err := matchFilter(filter, row, table.Columns, subqueryResults)
+			pass, err := matchFilter(filter, row, table.Columns, subqueryResults, e)
 			if err != nil {
 				return nil, err
 			}
@@ -115,7 +117,7 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 
 		// Apply residual filter
 		if scan.ResidualFilter != nil {
-			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults)
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults, e)
 			if err != nil {
 				return nil, err
 			}
@@ -159,7 +161,7 @@ func (e *executor) indexRangeScan(scan *plannerapi.IndexRangePlan, subqueryResul
 			return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
 		}
 		if scan.ResidualFilter != nil {
-			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults)
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults, e)
 			if err != nil {
 				return nil, err
 			}
