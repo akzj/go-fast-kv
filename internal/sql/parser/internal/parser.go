@@ -1056,9 +1056,17 @@ func (p *parser) parseJoin(left interface{}) (*api.JoinExpr, error) {
 	if p.cur.Type == api.TokLeft {
 		joinType = api.JoinType("LEFT")
 		p.advance()
+		// Check for optional OUTER keyword
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "OUTER" {
+			p.advance()
+		}
 	} else if p.cur.Type == api.TokRight {
 		joinType = api.JoinType("RIGHT")
 		p.advance()
+		// Check for optional OUTER keyword
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "OUTER" {
+			p.advance()
+		}
 	} else if p.cur.Type == api.TokCross {
 		joinType = api.JoinType("CROSS")
 		p.advance()
