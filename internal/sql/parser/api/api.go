@@ -16,83 +16,83 @@ type TokenType int
 
 const (
 	// Literals
-	TokInteger TokenType = 0  // 42
-	TokFloat   TokenType = 1  // 3.14
-	TokString  TokenType = 2  // 'hello'
-	TokIdent   TokenType = 3  // users, name, age
+	TokInteger  TokenType = 0  // 42
+	TokFloat    TokenType = 1  // 3.14
+	TokString   TokenType = 2  // 'hello'
+	TokIdent    TokenType = 3  // users, name, age
 
 	// Keywords
-	TokSelect   TokenType = 4
-	TokFrom     TokenType = 5
-	TokWhere    TokenType = 6
-	TokInsert   TokenType = 7
-	TokInto     TokenType = 8
-	TokValues   TokenType = 9
-	TokDelete   TokenType = 10
-	TokUpdate   TokenType = 11
-	TokSet      TokenType = 12
-	TokCreate   TokenType = 13
-	TokDrop     TokenType = 14
-	TokTable    TokenType = 15
-	TokIndex    TokenType = 16
-	TokOn       TokenType = 17
-	TokAnd      TokenType = 18
-	TokOr       TokenType = 19
-	TokNot      TokenType = 20
-	TokNull     TokenType = 21
-	TokIs       TokenType = 22
-	TokIn       TokenType = 24
-	TokBetween  TokenType = 53 // BETWEEN
-	TokOrder    TokenType = 23
-	TokBy       TokenType = 24
-	TokAsc      TokenType = 25
-	TokDesc     TokenType = 26
-	TokLimit    TokenType = 27
-	TokIntKw    TokenType = 28 // INT type keyword
-	TokTextKw   TokenType = 29 // TEXT type keyword
-	TokFloatKw  TokenType = 30 // FLOAT type keyword
-	TokBlobKw   TokenType = 31 // BLOB type keyword
-	TokPrimary  TokenType = 32
-	TokKey      TokenType = 33
-	TokUnique   TokenType = 34
-	TokIf       TokenType = 35
-	TokGroup   TokenType = 37 // GROUP
-	TokDistinct TokenType = 36 // DISTINCT
-	TokHaving  TokenType = 38 // HAVING
-	TokCount   TokenType = 39 // COUNT
-	TokSum     TokenType = 40 // SUM
-	TokAvg     TokenType = 41 // AVG
-	TokMin     TokenType = 42 // MIN
-	TokMax     TokenType = 43 // MAX
-	TokLike    TokenType = 44 // LIKE
-	TokExists  TokenType = 44 // EXISTS (moved from 36)
-	TokInteger2 TokenType = 37 // INTEGER type keyword (alias for INT)
+	TokSelect    TokenType = 4
+	TokFrom      TokenType = 5
+	TokWhere     TokenType = 6
+	TokInsert    TokenType = 7
+	TokInto      TokenType = 8
+	TokValues    TokenType = 9
+	TokDelete    TokenType = 10
+	TokUpdate    TokenType = 11
+	TokSet       TokenType = 12
+	TokCreate    TokenType = 13
+	TokDrop      TokenType = 14
+	TokTable     TokenType = 15
+	TokIndex     TokenType = 16
+	TokOn        TokenType = 17
+	TokAnd       TokenType = 18
+	TokOr        TokenType = 19
+	TokNot       TokenType = 20
+	TokNull      TokenType = 21
+	TokIs        TokenType = 22
+	TokOrder     TokenType = 23
+	TokBy        TokenType = 24
+	TokIn        TokenType = 25
+	TokBetween   TokenType = 26 // BETWEEN
+	TokAsc       TokenType = 27
+	TokDesc      TokenType = 28
+	TokLimit     TokenType = 29
+	TokIntKw     TokenType = 30 // INT type keyword
+	TokTextKw    TokenType = 31 // TEXT type keyword
+	TokFloatKw   TokenType = 32 // FLOAT type keyword
+	TokBlobKw    TokenType = 33 // BLOB type keyword
+	TokPrimary   TokenType = 34
+	TokKey       TokenType = 35
+	TokUnique    TokenType = 36
+	TokIf        TokenType = 37
+	TokDistinct  TokenType = 38 // DISTINCT
+	TokGroup     TokenType = 39 // GROUP
+	TokInteger2  TokenType = 40 // INTEGER type keyword (alias for INT)
+	TokHaving    TokenType = 41 // HAVING
+	TokExists    TokenType = 42 // EXISTS
+	TokCount     TokenType = 43 // COUNT
+	TokSum       TokenType = 44 // SUM
+	TokAvg       TokenType = 45 // AVG
+	TokMin       TokenType = 46 // MIN
+	TokMax       TokenType = 47 // MAX
+	TokLike      TokenType = 48 // LIKE
 
 	// Operators
-	TokEQ        TokenType = 38 // =
-	TokNE        TokenType = 39 // != or <>
-	TokLT        TokenType = 40 // <
-	TokLE        TokenType = 41 // <=
-	TokGT        TokenType = 42 // >
-	TokGE        TokenType = 43 // >=
-	TokPlus      TokenType = 44 // +
-	TokMinus     TokenType = 45 // -
-	TokStar      TokenType = 46 // *
-	TokComma     TokenType = 47 // ,
-	TokLParen    TokenType = 48 // (
-	TokRParen    TokenType = 49 // )
-	TokSemicolon TokenType = 50 // ;
-	TokDot       TokenType = 60 // .
+	TokEQ        TokenType = 49 // =
+	TokNE        TokenType = 50 // != or <>
+	TokLT        TokenType = 51 // <
+	TokLE        TokenType = 52 // <=
+	TokGT        TokenType = 53 // >
+	TokGE        TokenType = 54 // >=
+	TokPlus      TokenType = 55 // +
+	TokMinus     TokenType = 56 // -
+	TokStar      TokenType = 57 // *
+	TokComma     TokenType = 58 // ,
+	TokLParen    TokenType = 59 // (
+	TokRParen    TokenType = 60 // )
+	TokSemicolon TokenType = 61 // ;
+	TokDot       TokenType = 62 // .
 
 	// Special
-	TokExplain  TokenType = 54 // EXPLAIN
-	TokAnalyze  TokenType = 55 // ANALYZE
-	TokJoin     TokenType = 56 // JOIN
-	TokLeft     TokenType = 57 // LEFT
-	TokRight    TokenType = 58 // RIGHT
-	TokCross    TokenType = 59 // CROSS
-	TokEOF      TokenType = 51
-	TokIllegal  TokenType = 52
+	TokEOF      TokenType = 63
+	TokIllegal  TokenType = 64
+	TokExplain  TokenType = 65 // EXPLAIN
+	TokAnalyze  TokenType = 66 // ANALYZE
+	TokJoin     TokenType = 67 // JOIN
+	TokLeft     TokenType = 68 // LEFT
+	TokRight    TokenType = 69 // RIGHT
+	TokCross    TokenType = 70 // CROSS
 )
 
 // Token represents a single lexical token.
