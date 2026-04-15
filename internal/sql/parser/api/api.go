@@ -93,6 +93,7 @@ const (
 	TokLeft     TokenType = 68 // LEFT
 	TokRight    TokenType = 69 // RIGHT
 	TokCross    TokenType = 70 // CROSS
+	TokCoalesce TokenType = 71 // COALESCE
 )
 
 // Token represents a single lexical token.
@@ -290,6 +291,13 @@ type IsNullExpr struct {
 }
 
 func (*IsNullExpr) exprNode() {}
+
+// CoalesceExpr: COALESCE(expr1, expr2, ...) returns first non-NULL value.
+type CoalesceExpr struct {
+	Args []Expr // at least one argument
+}
+
+func (*CoalesceExpr) exprNode() {}
 
 // StarExpr: SELECT *
 type StarExpr struct{}

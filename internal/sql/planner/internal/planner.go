@@ -494,6 +494,21 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		if idx < 0 {
 			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
 		}
+		// If GROUP BY is present, map the ORDER BY index from combinedSchema
+		// to the position in SELECT columns. After GROUP BY, the result only
+		// contains SELECT columns,not the full combined schema.
+		if stmt.GroupBy != nil {
+			mappedIdx := -1
+			for selectPos, combinedIdx := range colIndices {
+				if combinedIdx == idx {
+					mappedIdx = selectPos
+					break
+				}
+			}
+			if mappedIdx >= 0 {
+				idx = mappedIdx
+			}
+		}
 		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
 	}
 

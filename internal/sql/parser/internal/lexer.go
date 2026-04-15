@@ -58,9 +58,10 @@ var keywords = map[string]api.TokenType{
 	"PRIMARY": api.TokPrimary,
 	"KEY":     api.TokKey,
 	"UNIQUE":  api.TokUnique,
-	"IF":      api.TokIf,
-	"EXISTS":  api.TokExists,
-	"AS":      api.TokIdent, // also a keyword but handled as alias separator in SELECT
+	"IF":       api.TokIf,
+	"EXISTS":   api.TokExists,
+	"AS":       api.TokIdent, // also a keyword but handled as alias separator in SELECT
+	"COALESCE": api.TokCoalesce,
 }
 
 // lexer tokenizes SQL input.

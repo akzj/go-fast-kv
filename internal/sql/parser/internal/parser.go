@@ -1174,6 +1174,24 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		}
 		return &api.AggregateCallExpr{Func: strings.ToUpper(funcName), Arg: arg}, nil
 
+	case api.TokCoalesce:
+		// COALESCE(expr1, expr2, ...)
+		p.advance() // consume COALESCE
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after COALESCE")
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) == 0 {
+			return nil, p.errorf("COALESCE requires at least one argument")
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		return &api.CoalesceExpr{Args: args}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()

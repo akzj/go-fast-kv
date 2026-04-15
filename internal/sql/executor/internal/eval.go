@@ -42,6 +42,10 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		}
 	case *parserapi.SubqueryExpr:
 		// Subquery body not walked here (would need Statement visitor)
+	case *parserapi.CoalesceExpr:
+		for _, arg := range e.Args {
+			walkExpr(arg, fn)
+		}
 	}
 }
 
@@ -69,6 +73,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalBetweenExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.InExpr:
 		return evalInExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.CoalesceExpr:
+		return evalCoalesceExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.SubqueryExpr:
 		// Pre-computed by execSelect pre-plan pass.
 		// Scalar subqueries store a single catalogapi.Value.
@@ -584,4 +590,21 @@ func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi
 		return intVal(1), nil // NOT IN: no match -> true
 	}
 	return intVal(0), nil
+}
+
+// evalCoalesceExpr evaluates COALESCE(expr1, expr2, ...).
+// Returns the first non-NULL value. If all are NULL, returns NULL.
+func evalCoalesceExpr(expr *parserapi.CoalesceExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	for _, arg := range expr.Args {
+		val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if !val.IsNull {
+			return val, nil
+		}
+	}
+	// All values were NULL
+	return catalogapi.Value{IsNull: true}, nil
 }
