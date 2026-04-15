@@ -79,7 +79,7 @@ func (env *testEnv) execSQLErr(t *testing.T, sql string) (*executorapi.Result, e
 	}
 	plan, err := env.planner.Plan(stmt)
 	if err != nil {
-		t.Fatalf("plan %q: %v", sql, err)
+		return nil, err
 	}
 	return env.exec.Execute(plan)
 }
@@ -615,6 +615,17 @@ func TestExec_Subquery(t *testing.T) {
 		result := env.execSQL(t, "SELECT id FROM t1 WHERE name IN (SELECT val FROM t2)")
 		if len(result.Rows) != 0 {
 			t.Fatalf("rows = %d, want 0 (no text overlap)", len(result.Rows))
+		}
+	})
+
+	t.Run("having_without_groupby", func(t *testing.T) {
+		// HAVING without GROUP BY should return an error
+		env := newTestEnv(t)
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		_, err := env.execSQLErr(t, "SELECT COUNT(*) FROM orders HAVING COUNT(*) > 0")
+		if err == nil {
+			t.Error("expected error for HAVING without GROUP BY")
 		}
 	})
 }

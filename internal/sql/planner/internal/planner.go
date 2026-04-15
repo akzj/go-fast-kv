@@ -294,6 +294,10 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 	if err := p.planSubqueries(stmt.Having); err != nil {
 		return nil, fmt.Errorf("planning subquery in HAVING: %w", err)
 	}
+	// HAVING requires GROUP BY
+	if stmt.Having != nil && len(stmt.GroupBy) == 0 {
+		return nil, fmt.Errorf("HAVING requires GROUP BY")
+	}
 	return &plannerapi.SelectPlan{
 		Table: tbl, Scan: scan, Columns: colIndices,
 		SelectColumns: stmt.Columns,
