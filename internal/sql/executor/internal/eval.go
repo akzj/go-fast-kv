@@ -101,6 +101,7 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 		if cols == nil || vals == nil {
 			return catalogapi.Value{}, false
 		}
+		// First pass: table-qualified match (both table and column name)
 		if upperTable != "" {
 			for i, col := range cols {
 				if strings.ToUpper(col.Name) == upper && strings.EqualFold(col.Table, upperTable) {
@@ -108,6 +109,20 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 						return vals[i], true
 					}
 					return catalogapi.Value{IsNull: true}, true
+				}
+			}
+		}
+		// Second pass: unqualified fallback (name only).
+		// Skip this fallback when the ref has a table qualifier AND the
+		// columns have Table fields set — the qualified match above should
+		// have found it. This prevents misresolving e.g. "users.id" as
+		// "orders.id" when both tables have an "id" column.
+		if upperTable != "" {
+			// Check if any column in this set has a Table field set.
+			// If so, the qualified match was authoritative — do not fallback.
+			for _, col := range cols {
+				if col.Table != "" {
+					return catalogapi.Value{}, false
 				}
 			}
 		}
@@ -128,8 +143,10 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 	}
 
 	// Fall back to outer columns for correlated subqueries
-	if val, ok := findIn(e.outerCols, e.outerVals); ok {
-		return val, nil
+	if e != nil {
+		if val, ok := findIn(e.outerCols, e.outerVals); ok {
+			return val, nil
+		}
 	}
 
 	return catalogapi.Value{}, fmt.Errorf("%w: column %q not found", executorapi.ErrExecFailed, ref.Column)

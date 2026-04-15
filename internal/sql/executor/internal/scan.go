@@ -42,10 +42,16 @@ func (e *executor) filterRows(rows []*engineapi.Row, filter parserapi.Expr, colu
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
+	// Only set outerVals per row when the filter contains correlated subqueries.
+	// This is the mechanism by which the outer row's values are propagated to
+	// the subquery's evalColumnRef. Without correlated subqueries, setting
+	// outerVals would corrupt the outer context for nested executions.
+	setOuterVals := hasCorrelatedSubquery(filter)
 	filtered := rows[:0]
 	for _, row := range rows {
-		// Set outerVals for correlated subquery evaluation
-		e.outerVals = row.Values
+		if setOuterVals {
+			e.outerVals = row.Values
+		}
 		match, err := matchFilter(filter, row, columns, subqueryResults, e)
 		if err != nil {
 			continue
@@ -66,13 +72,23 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 	}
 	defer iter.Close()
 
+	// Build columns with Table field populated so that evalColumnRef can
+	// distinguish table-qualified references (e.g., orders.user_id vs users.id).
+	scanCols := make([]catalogapi.ColumnDef, len(table.Columns))
+	for i, col := range table.Columns {
+		scanCols[i] = col
+		if scanCols[i].Table == "" {
+			scanCols[i].Table = table.Name
+		}
+	}
+
 	var rows []*engineapi.Row
 	for iter.Next() {
 		row := iter.Row()
 
 		// Apply filter if present
 		if filter != nil {
-			pass, err := matchFilter(filter, row, table.Columns, subqueryResults, e)
+			pass, err := matchFilter(filter, row, scanCols, subqueryResults, e)
 			if err != nil {
 				return nil, err
 			}

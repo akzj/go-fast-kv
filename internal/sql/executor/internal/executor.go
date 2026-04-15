@@ -54,12 +54,20 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 
 // execSubquery executes a scalar subquery plan with outer row context.
 // outerCols/outerVals on e must be set before calling this method.
+// Saves and restores outerCols/outerVals so the inner execSelect doesn't
+// clobber the outer query's context.
 func (e *executor) execSubquery(plan parserapi.SubqueryPlan) (catalogapi.Value, error) {
 	typedPlan, ok := plan.(plannerapi.Plan)
 	if !ok {
 		return catalogapi.Value{}, fmt.Errorf("subquery plan has wrong type: %T", plan)
 	}
+	// Save outer context — inner execSelect will overwrite e.outerCols/e.outerVals.
+	savedOuterCols := e.outerCols
+	savedOuterVals := e.outerVals
 	result, err := e.Execute(typedPlan)
+	// Restore outer context after inner execution.
+	e.outerCols = savedOuterCols
+	e.outerVals = savedOuterVals
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -855,11 +863,61 @@ func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *planner
 	}
 	return projected, projNames
 }
+// hasCorrelatedSubquery checks whether an expression tree contains any correlated subquery.
+func hasCorrelatedSubquery(expr parserapi.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	found := false
+	walkExpr(expr, func(e parserapi.Expr) {
+		if found {
+			return
+		}
+		if sq, ok := e.(*parserapi.SubqueryExpr); ok {
+			if isCorrelatedSubquery(sq) {
+				found = true
+			}
+		}
+	})
+	return found
+}
+
+
+// isCorrelatedSubquery checks whether a SubqueryExpr references columns from
+// tables outside its own FROM clause (i.e., it is correlated with the outer query).
+// A correlated subquery must NOT be precomputed — it must be re-evaluated per outer row.
+func isCorrelatedSubquery(sq *parserapi.SubqueryExpr) bool {
+	sel, ok := sq.Stmt.(*parserapi.SelectStmt)
+	if !ok {
+		return false
+	}
+	subTable := strings.ToUpper(sel.Table)
+	correlated := false
+	if sel.Where != nil {
+		walkExpr(sel.Where, func(expr parserapi.Expr) {
+			if correlated {
+				return
+			}
+			ref, ok := expr.(*parserapi.ColumnRef)
+			if !ok || ref.Table == "" {
+				return
+			}
+			// If the column ref's table qualifier doesn't match the subquery's own FROM table,
+			// it must be referencing an outer table → correlated.
+			if !strings.EqualFold(ref.Table, subTable) {
+				correlated = true
+			}
+		})
+	}
+	return correlated
+}
 
 // precomputeSubqueries finds all SubqueryExpr nodes in the plan's WHERE/HAVING
 // and executes them, caching results in subqueryResults.
 // Scalar subqueries (used in comparisons) store a single catalogapi.Value.
 // List subqueries (used in IN) store a []catalogapi.Value.
+// Correlated subqueries (referencing outer table columns) are SKIPPED here
+// and evaluated on-demand per outer row via execSubquery during filterRows.
 // This is called with the OUTER subqueryResults map so that nested subqueries
 // don't re-execute infinitely (they share the parent's cache).
 func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
@@ -882,6 +940,10 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 			}
 			// Already computed by an ancestor execSelect call?
 			if _, exists := subqueryResults[sq]; exists {
+				return
+			}
+			// Skip correlated subqueries — they must be evaluated per outer row.
+			if isCorrelatedSubquery(sq) {
 				return
 			}
 			// Plan and execute the subquery (may trigger nested execSelect with same map)
@@ -934,6 +996,16 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 }
 
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
+	// Save outer context — a correlated subquery's inner execSelect must not
+	// clobber the outer query's outerCols/outerVals that evalColumnRef needs
+	// to resolve outer table references (e.g., users.id inside an orders subquery).
+	savedOuterCols := e.outerCols
+	savedOuterVals := e.outerVals
+	defer func() {
+		e.outerCols = savedOuterCols
+		e.outerVals = savedOuterVals
+	}()
+
 	// Handle SELECT without FROM (constant expressions: SELECT 1, SELECT 'hello')
 	if plan.Table == nil {
 		// Evaluate SelectColumns expressions against an empty row
@@ -962,18 +1034,45 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return nil, err
 	}
 
+	// If the scan filter contains a correlated subquery, we must NOT evaluate it
+	// during the scan (outer context isn't available yet). Strip the scan filter
+	// and rely on plan.Filter in filterRows instead.
+	scanPlan := plan.Scan
+	if hasCorrelatedSubquery(plan.Filter) {
+		switch s := scanPlan.(type) {
+		case *plannerapi.TableScanPlan:
+			stripped := *s
+			stripped.Filter = nil
+			scanPlan = &stripped
+		}
+	}
+
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
-	rows, err := e.scanRows(plan.Table, plan.Scan, subqueryResults)
+	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults)
 	if err != nil {
 		return nil, err
 	}
 
-	// Set outerCols for correlated subquery resolution - used by filterRows to set outerVals per row
-	e.outerCols = plan.Table.Columns
+	// Build columns with Table field populated so that evalColumnRef can
+	// distinguish table-qualified references (e.g., orders.user_id vs users.id).
+	tableCols := make([]catalogapi.ColumnDef, len(plan.Table.Columns))
+	for i, col := range plan.Table.Columns {
+		tableCols[i] = col
+		if tableCols[i].Table == "" {
+			tableCols[i].Table = plan.Table.Name
+		}
+	}
+
+	// Set outerCols for correlated subquery resolution - used by filterRows to set outerVals per row.
+	// Only set for the outermost query — if outerCols is already set (by a parent execSelect),
+	// preserve it so the inner query can resolve outer table references (e.g., users.id).
+	if e.outerCols == nil {
+		e.outerCols = tableCols
+	}
 
 	// Apply residual filter from SelectPlan (handles index scan + residual)
 	if plan.Filter != nil {
-		rows = e.filterRows(rows, plan.Filter, plan.Table.Columns, subqueryResults)
+		rows = e.filterRows(rows, plan.Filter, tableCols, subqueryResults)
 	}
 
 	// GROUP BY: group rows by encoded key, then compute aggregates per group.
