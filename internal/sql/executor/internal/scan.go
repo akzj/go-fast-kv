@@ -55,10 +55,13 @@ func (e *executor) filterRows(rows []*engineapi.Row, filter parserapi.Expr, colu
 
 	filtered := rows[:0]
 	for _, row := range rows {
-		// Push outer context for this row (copy to avoid reference issues)
-		// Also set outerVals for fallback when stack is empty (JOIN evaluation)
+		// Push inner row onto stack for correlation resolution
 		e.outerValsStack = append(e.outerValsStack, append([]catalogapi.Value(nil), row.Values...))
-		e.outerVals = row.Values
+		// Only set outerVals for top-level queries (stack had 0 entries before push)
+		// For subqueries, outerVals should remain the outer row (set by execSubquery)
+		if len(e.outerValsStack) == 1 {
+			e.outerVals = row.Values
+		}
 		e.currentRow = row
 
 		match, err := matchFilter(filter, row, columns, subqueryResults, e)

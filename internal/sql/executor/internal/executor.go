@@ -75,6 +75,9 @@ func (e *executor) execSubquery(plan parserapi.SubqueryPlan, outerCols []catalog
 	// Push outer context onto stack (MUST copy values - outerVals is a reference!)
 	e.outerValsStack = append(e.outerValsStack, append([]catalogapi.Value(nil), outerVals...))
 
+	// Set outerVals so filterRows doesn't overwrite it with inner table's row
+	e.outerVals = outerVals
+
 	result, err := e.Execute(typedPlan)
 
 	// Pop outer row from stack
@@ -989,9 +992,9 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return nil, err
 	}
 
-	// Set outerCols for correlated subquery column resolution during scan.
-	// Only set for the outermost query (outerValsStack == nil means no outer context yet).
-	// For subqueries, we don't overwrite outerCols - we need to keep the outermost query's columns.
+	// Set outerCols for correlated subquery column resolution.
+	// Only set for top-level queries (outerValsStack == 0).
+	// For subqueries, outerCols is set by execSubquery and should NOT be overwritten.
 	if len(e.outerValsStack) == 0 {
 		e.outerCols = plan.Table.Columns
 	}
