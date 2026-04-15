@@ -431,6 +431,12 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	p.advance() // consume SELECT
 	stmt := &api.SelectStmt{}
 
+	// DISTINCT keyword
+	if p.cur.Type == api.TokDistinct || strings.ToUpper(p.cur.Literal) == "DISTINCT" {
+		stmt.Distinct = true
+		p.advance()
+	}
+
 	// Columns
 	if p.cur.Type == api.TokStar {
 		stmt.Columns = []api.SelectColumn{{Expr: &api.StarExpr{}}}

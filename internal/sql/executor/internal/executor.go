@@ -1158,6 +1158,28 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		projected = projectRows(rows, plan.Columns)
 	}
 
+	// DISTINCT: deduplicate projected rows by concatenating all column values into a key
+	if plan.Distinct {
+		seen := make(map[string]bool)
+		var deduped [][]catalogapi.Value
+		for _, row := range projected {
+			var key strings.Builder
+			for _, v := range row {
+				if v.IsNull {
+					key.WriteString("NULL")
+				} else {
+					key.WriteString(fmt.Sprintf("%v", v))
+				}
+				key.WriteByte(0) // separator between columns
+			}
+			if !seen[key.String()] {
+				seen[key.String()] = true
+				deduped = append(deduped, row)
+			}
+		}
+		projected = deduped
+	}
+
 	return &executorapi.Result{
 		Columns: colNames,
 		Rows:    projected,

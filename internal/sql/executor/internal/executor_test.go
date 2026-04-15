@@ -1102,3 +1102,94 @@ func TestExec_SelectWithoutFrom(t *testing.T) {
 		}
 	})
 }
+
+func TestExec_Distinct(t *testing.T) {
+	env := newTestEnv(t)
+
+	t.Run("distinct_removes_duplicates", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE users (id INT, name TEXT, age INT)")
+		// Insert duplicate names
+		env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+		env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+		env.execSQL(t, "INSERT INTO users VALUES (3, 'Alice', 35)")
+		env.execSQL(t, "INSERT INTO users VALUES (4, 'Bob', 40)")
+		env.execSQL(t, "INSERT INTO users VALUES (5, 'Charlie', 28)")
+
+		// DISTINCT on name should return 3 unique names
+		result := env.execSQL(t, "SELECT DISTINCT name FROM users")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 distinct names", len(result.Rows))
+		}
+		// Verify the names are unique
+		names := make(map[string]bool)
+		for _, row := range result.Rows {
+			if names[row[0].Text] {
+				t.Errorf("duplicate name found: %s", row[0].Text)
+			}
+			names[row[0].Text] = true
+		}
+	})
+
+	t.Run("distinct_with_where", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.execSQL(t, "CREATE TABLE products (id INT, category TEXT, name TEXT)")
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'fruit', 'apple')")
+		env.execSQL(t, "INSERT INTO products VALUES (2, 'fruit', 'banana')")
+		env.execSQL(t, "INSERT INTO products VALUES (3, 'vegetable', 'carrot')")
+		env.execSQL(t, "INSERT INTO products VALUES (4, 'fruit', 'apple')")
+		env.execSQL(t, "INSERT INTO products VALUES (5, 'vegetable', 'carrot')")
+
+		// DISTINCT with WHERE: only fruits
+		result := env.execSQL(t, "SELECT DISTINCT category FROM products WHERE category = 'fruit'")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1 distinct category", len(result.Rows))
+		}
+		if result.Rows[0][0].Text != "fruit" {
+			t.Errorf("category = %q, want fruit", result.Rows[0][0].Text)
+		}
+	})
+
+	t.Run("distinct_no_duplicates", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.execSQL(t, "CREATE TABLE t (a INT, b TEXT)")
+		env.execSQL(t, "INSERT INTO t VALUES (1, 'x')")
+		env.execSQL(t, "INSERT INTO t VALUES (2, 'y')")
+		env.execSQL(t, "INSERT INTO t VALUES (3, 'z')")
+
+		// No duplicates — should return all rows
+		result := env.execSQL(t, "SELECT DISTINCT a FROM t")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+	})
+
+	t.Run("distinct_multiple_columns", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.execSQL(t, "CREATE TABLE orders (id INT, product TEXT, color TEXT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 'widget', 'red')")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 'widget', 'red')")
+		env.execSQL(t, "INSERT INTO orders VALUES (3, 'widget', 'blue')")
+		env.execSQL(t, "INSERT INTO orders VALUES (4, 'gadget', 'red')")
+
+		// DISTINCT on (product, color) — should return 3 unique pairs
+		result := env.execSQL(t, "SELECT DISTINCT product, color FROM orders")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 distinct (product,color) pairs", len(result.Rows))
+		}
+	})
+
+	t.Run("distinct_all_columns", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.execSQL(t, "CREATE TABLE t (a INT, b TEXT, c INT)")
+		env.execSQL(t, "INSERT INTO t VALUES (1, 'x', 10)")
+		env.execSQL(t, "INSERT INTO t VALUES (1, 'x', 10)")
+		env.execSQL(t, "INSERT INTO t VALUES (1, 'x', 20)")
+		env.execSQL(t, "INSERT INTO t VALUES (1, 'y', 10)")
+
+		// SELECT DISTINCT * — all columns
+		result := env.execSQL(t, "SELECT DISTINCT * FROM t")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 distinct rows", len(result.Rows))
+		}
+	})
+}

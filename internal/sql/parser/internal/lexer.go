@@ -44,6 +44,7 @@ var keywords = map[string]api.TokenType{
 	"ASC":     api.TokAsc,
 	"DESC":    api.TokDesc,
 	"LIMIT":   api.TokLimit,
+	"DISTINCT": api.TokDistinct,
 	"COUNT":   api.TokCount,
 	"SUM":     api.TokSum,
 	"AVG":     api.TokAvg,

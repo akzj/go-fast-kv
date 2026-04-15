@@ -57,6 +57,7 @@ const (
 	TokUnique   TokenType = 34
 	TokIf       TokenType = 35
 	TokGroup   TokenType = 37 // GROUP
+	TokDistinct TokenType = 36 // DISTINCT
 	TokHaving  TokenType = 38 // HAVING
 	TokCount   TokenType = 39 // COUNT
 	TokSum     TokenType = 40 // SUM
@@ -185,6 +186,7 @@ type SelectStmt struct {
 	Having  Expr        // nil if no HAVING
 	OrderBy *OrderByClause // nil if no ORDER BY
 	Limit   Expr        // nil if no LIMIT
+	Distinct bool       // true for SELECT DISTINCT
 }
 
 func (*SelectStmt) stmtNode() {}

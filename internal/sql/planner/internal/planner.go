@@ -274,6 +274,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 			Having:        nil,
 			OrderBy:       orderBy,
 			Limit:         limit,
+			Distinct:      stmt.Distinct,
 		}, nil
 	}
 
@@ -334,6 +335,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		SelectColumns: stmt.Columns,
 		Filter: residualFilter, GroupByExprs: stmt.GroupBy,
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit,
+		Distinct: stmt.Distinct,
 	}, nil
 }
 
@@ -520,6 +522,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		OrderBy:          orderBy,
 		Limit:            limit,
 		LeftColumnCount:  len(leftSchema),
+		Distinct:         stmt.Distinct,
 	}, nil
 }
 
