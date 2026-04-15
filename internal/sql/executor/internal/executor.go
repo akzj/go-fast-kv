@@ -424,6 +424,57 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		mergedRows = filterJoinRows(mergedRows, plan.Filter, combinedCols)
 	}
 
+	// GROUP BY on merged join rows
+	if plan.GroupByExprs != nil {
+		// Convert [][]catalogapi.Value to []*engineapi.Row for groupByRowsForJoin
+		engineRows := make([]*engineapi.Row, len(mergedRows))
+		for i, row := range mergedRows {
+			engineRows[i] = &engineapi.Row{Values: row}
+		}
+
+		grouped, err := e.groupByRowsForJoin(engineRows, plan, combinedCols)
+		if err != nil {
+			return nil, err
+		}
+
+		// HAVING: filter grouped rows
+		if plan.Having != nil {
+			grouped = filterRows(grouped, plan.Having, plan.Table.Columns, nil)
+		}
+
+		// ORDER BY on grouped rows
+		if plan.OrderBy != nil {
+			sortRawRows(grouped, plan.OrderBy)
+		}
+
+		// LIMIT on grouped rows
+		if plan.Limit >= 0 && plan.Limit < len(grouped) {
+			grouped = grouped[:plan.Limit]
+		}
+
+		// Extract values from grouped rows (projection done by groupByRowsForJoin)
+		rows := make([][]catalogapi.Value, len(grouped))
+		for i, row := range grouped {
+			rows[i] = row.Values
+		}
+
+		// Build column names from SelectColumns
+		projCols := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				if ref.Table != "" {
+					projCols[i] = ref.Table + "." + ref.Column
+				} else {
+					projCols[i] = ref.Column
+				}
+			} else {
+				projCols[i] = sc.Alias
+			}
+		}
+
+		return &executorapi.Result{Columns: projCols, Rows: rows}, nil
+	}
+
 	if plan.OrderBy != nil {
 		sortJoinRows(mergedRows, plan.OrderBy, combinedCols)
 	}
@@ -1085,6 +1136,76 @@ func (e *executor) groupByRows(rows []*engineapi.Row, plan *plannerapi.SelectPla
 	return result, nil
 }
 
+
+// groupByRowsForJoin is like groupByRows but uses combinedCols for column resolution.
+// This is needed for JOIN queries where plan.Table.Columns only has left-table columns.
+func (e *executor) groupByRowsForJoin(rows []*engineapi.Row, plan *plannerapi.SelectPlan, combinedCols []catalogapi.ColumnDef) ([]*engineapi.Row, error) {
+	type group struct {
+		key  []byte
+		rows []*engineapi.Row
+	}
+	groups := make([]group, 0)
+	groupMap := make(map[string]int)
+
+	for _, row := range rows {
+		key, err := e.encodeGroupKey(row, plan.GroupByExprs, combinedCols)
+		if err != nil {
+			return nil, fmt.Errorf("%w: group key: %v", executorapi.ErrExecFailed, err)
+		}
+		keyStr := string(key)
+		if idx, ok := groupMap[keyStr]; ok {
+			groups[idx].rows = append(groups[idx].rows, row)
+		} else {
+			groupMap[keyStr] = len(groups)
+			groups = append(groups, group{key: key, rows: []*engineapi.Row{row}})
+		}
+	}
+
+	result := make([]*engineapi.Row, 0, len(groups))
+	for _, g := range groups {
+		vals, err := projectGroupedRowForJoin(g.rows, plan, combinedCols)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, &engineapi.Row{Values: vals})
+	}
+
+	sort.SliceStable(result, func(i, j int) bool {
+		return string(groups[i].key) < string(groups[j].key)
+	})
+	return result, nil
+}
+
+// projectGroupedRowForJoin is like projectGroupedRow but uses combinedCols for column resolution.
+func projectGroupedRowForJoin(groupRows []*engineapi.Row, plan *plannerapi.SelectPlan, combinedCols []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+	groupCols := groupKeyColIndices(plan)
+	result := make([]catalogapi.Value, len(plan.SelectColumns))
+
+	for i, sc := range plan.SelectColumns {
+		switch expr := sc.Expr.(type) {
+		case *parserapi.ColumnRef:
+			if groupCols[plan.Columns[i]] {
+				idx := plan.Columns[i]
+				if idx >= 0 && idx < len(groupRows[0].Values) {
+					result[i] = groupRows[0].Values[idx]
+				} else {
+					result[i] = catalogapi.Value{IsNull: true}
+				}
+			} else {
+				result[i] = catalogapi.Value{IsNull: true}
+			}
+		case *parserapi.AggregateCallExpr:
+			val, err := computeAggregate(expr, groupRows, combinedCols)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		default:
+			return nil, fmt.Errorf("%w: GROUP BY SELECT expression must be column or aggregate", executorapi.ErrExecFailed)
+		}
+	}
+	return result, nil
+}
 
 // encodeGroupKey computes a unique encoded key from GROUP BY expression values.
 func (e *executor) encodeGroupKey(row *engineapi.Row, exprs []parserapi.Expr, columns []catalogapi.ColumnDef) ([]byte, error) {

@@ -466,8 +466,8 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Columns:          colIndices,
 		SelectColumns:    stmt.Columns,
 		Filter:           stmt.Where, // WHERE applied on merged rows in executor
-		GroupByExprs:     nil,
-		Having:           nil,
+		GroupByExprs:     stmt.GroupBy,
+		Having:           stmt.Having,
 		OrderBy:          orderBy,
 		Limit:            limit,
 		LeftColumnCount:  len(leftSchema),
