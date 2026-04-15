@@ -1155,12 +1155,18 @@ func TestExec_SelectWithoutFrom(t *testing.T) {
 		if len(result.Rows) != 1 {
 			t.Fatalf("rows = %d, want 1", len(result.Rows))
 		}
+		if result.Rows[0][0].Int != 2 {
+			t.Errorf("SELECT 1+1 = %d, want 2", result.Rows[0][0].Int)
+		}
 	})
 
 	t.Run("select_arithmetic_sub", func(t *testing.T) {
 		result := env.execSQL(t, "SELECT 5-3")
 		if len(result.Rows) != 1 {
 			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 2 {
+			t.Errorf("SELECT 5-3 = %d, want 2", result.Rows[0][0].Int)
 		}
 	})
 
@@ -1170,6 +1176,14 @@ func TestExec_SelectWithoutFrom(t *testing.T) {
 		result := env.execSQL(t, "SELECT 1+1, name FROM users")
 		if len(result.Rows) != 1 {
 			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		// First column: 1+1 = 2
+		if result.Rows[0][0].Int != 2 {
+			t.Errorf("SELECT 1+1, name = %d, want 2", result.Rows[0][0].Int)
+		}
+		// Second column: name = 'Alice'
+		if result.Rows[0][1].Text != "Alice" {
+			t.Errorf("name = %q, want 'Alice'", result.Rows[0][1].Text)
 		}
 	})
 }
