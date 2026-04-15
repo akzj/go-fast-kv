@@ -18,7 +18,7 @@ var _ api.CatalogManager = (*Catalog)(nil)
 // All exported methods are protected by a mutex to prevent TOCTOU races.
 type Catalog struct {
 	kv  kvstoreapi.Store
-	mu  sync.Mutex
+	mu sync.RWMutex
 }
 
 // New creates a new Catalog that persists to kv.
@@ -77,8 +77,8 @@ func (c *Catalog) createTableImpl(schema api.TableSchema) error {
 }
 
 func (c *Catalog) GetTable(name string) (*api.TableSchema, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.getTableImpl(name)
 }
 
@@ -196,8 +196,8 @@ func (c *Catalog) createIndexImpl(schema api.IndexSchema) error {
 }
 
 func (c *Catalog) GetIndex(tableName, indexName string) (*api.IndexSchema, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.getIndexImpl(tableName, indexName)
 }
 
@@ -219,8 +219,8 @@ func (c *Catalog) getIndexImpl(tableName, indexName string) (*api.IndexSchema, e
 }
 
 func (c *Catalog) GetIndexByColumn(tableName, columnName string) (*api.IndexSchema, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.getIndexByColumnImpl(tableName, columnName)
 }
 
@@ -263,8 +263,8 @@ func (c *Catalog) dropIndexImpl(tableName, indexName string) error {
 }
 
 func (c *Catalog) ListTables() ([]string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.listTablesImpl()
 }
 
@@ -285,8 +285,8 @@ func (c *Catalog) listTablesImpl() ([]string, error) {
 }
 
 func (c *Catalog) ListIndexes(tableName string) ([]*api.IndexSchema, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.listIndexesImpl(tableName)
 }
 
