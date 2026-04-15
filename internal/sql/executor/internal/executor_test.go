@@ -880,3 +880,102 @@ func TestExec_Join(t *testing.T) {
 	})
 
 }
+
+// ─── GROUP BY Tests ──────────────────────────────────────────────────
+
+
+// ─── GROUP BY Tests ──────────────────────────────────────────────────
+
+func TestExec_GroupBy(t *testing.T) {
+	t.Run("basic_group_by", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 50)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 75)")
+		result := env.execSQL(t, "SELECT user_id, COUNT(*), SUM(amount) FROM orders GROUP BY user_id")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		for _, row := range result.Rows {
+			if row[0].Int == 1 {
+				if row[1].Int != 2 {
+					t.Errorf("COUNT(*) for user 1 = %d, want 2", row[1].Int)
+				}
+				if row[2].Int != 300 {
+					t.Errorf("SUM(amount) for user 1 = %d, want 300", row[2].Int)
+				}
+			}
+		}
+	})
+
+	t.Run("group_by_with_where", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 50)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 75)")
+		result := env.execSQL(t, "SELECT user_id, COUNT(*) FROM orders WHERE amount > 50 GROUP BY user_id")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		for _, row := range result.Rows {
+			if row[0].Int == 1 && row[1].Int != 2 {
+				t.Errorf("COUNT(*) for user 1 = %d, want 2", row[1].Int)
+			}
+			if row[0].Int == 2 && row[1].Int != 1 {
+				t.Errorf("COUNT(*) for user 2 = %d, want 1", row[1].Int)
+			}
+		}
+	})
+
+	t.Run("group_by_single_group", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 50)")
+		result := env.execSQL(t, "SELECT COUNT(*), SUM(amount) FROM orders GROUP BY user_id")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 3 {
+			t.Errorf("COUNT(*) = %d, want 3", result.Rows[0][0].Int)
+		}
+		if result.Rows[0][1].Int != 350 {
+			t.Errorf("SUM(amount) = %d, want 350", result.Rows[0][1].Int)
+		}
+	})
+
+	t.Run("avg_min_max", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 50)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, 75)")
+		result := env.execSQL(t, "SELECT user_id, AVG(amount), MIN(amount), MAX(amount) FROM orders GROUP BY user_id")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		for _, row := range result.Rows {
+			if row[0].Int == 1 {
+				if row[1].Float != 150.0 {
+					t.Errorf("AVG(amount) for user 1 = %v, want 150.0", row[1].Float)
+				}
+				if row[2].Int != 100 {
+					t.Errorf("MIN(amount) for user 1 = %d, want 100", row[2].Int)
+				}
+				if row[3].Int != 200 {
+					t.Errorf("MAX(amount) for user 1 = %d, want 200", row[3].Int)
+				}
+			}
+		}
+	})
+}
