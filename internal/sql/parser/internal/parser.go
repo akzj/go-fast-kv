@@ -984,6 +984,24 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 	case api.TokGE:
 		op = api.BinGE
 	default:
+		// No comparison operator — check for arithmetic operators (+, -)
+		// This allows expressions like SELECT 1+1 to work
+		for p.cur.Type == api.TokPlus || p.cur.Type == api.TokMinus {
+			arithOp := p.cur.Type
+			p.advance()
+			right, err := p.parsePrimary()
+			if err != nil {
+				return nil, err
+			}
+			// Wrap left in a BinaryExpr
+			var binOp api.BinaryOp
+			if arithOp == api.TokPlus {
+				binOp = api.BinAdd
+			} else {
+				binOp = api.BinSub
+			}
+			left = &api.BinaryExpr{Left: left, Op: binOp, Right: right}
+		}
 		return left, nil // no comparison operator
 	}
 	p.advance()

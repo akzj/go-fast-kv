@@ -257,15 +257,17 @@ func (*BinaryExpr) exprNode() {}
 type BinaryOp int
 
 const (
-	BinEQ  BinaryOp = 0 // =
-	BinNE  BinaryOp = 1 // !=
-	BinLT  BinaryOp = 2 // <
-	BinLE  BinaryOp = 3 // <=
-	BinGT  BinaryOp = 4 // >
-	BinGE  BinaryOp = 5 // >=
-	BinAnd BinaryOp = 6 // AND
-	BinOr      BinaryOp = 7  // OR
-	BinBetween BinaryOp = 8  // BETWEEN
+	BinEQ      BinaryOp = 0 // =
+	BinNE      BinaryOp = 1 // !=
+	BinLT      BinaryOp = 2 // <
+	BinLE      BinaryOp = 3 // <=
+	BinGT      BinaryOp = 4 // >
+	BinGE      BinaryOp = 5 // >=
+	BinAnd     BinaryOp = 6 // AND
+	BinOr      BinaryOp = 7 // OR
+	BinBetween BinaryOp = 8 // BETWEEN
+	BinAdd     BinaryOp = 9 // +
+	BinSub     BinaryOp = 10 // -
 )
 
 // UnaryExpr: op operand (e.g. NOT x, -42)

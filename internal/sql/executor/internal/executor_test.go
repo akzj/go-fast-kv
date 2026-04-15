@@ -1056,6 +1056,54 @@ func TestExec_GroupBy(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("coalesce_in_group_by", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, NULL)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, NULL)")
+		env.execSQL(t, "INSERT INTO orders VALUES (3, 50)")
+
+		// Test: SELECT COALESCE(amount, 0) FROM orders GROUP BY amount
+		// Groups: {100}, {200}, {NULL (coalesced to 0)}, {50} = 4 groups
+		result := env.execSQL(t, "SELECT COALESCE(amount, 0) FROM orders GROUP BY amount")
+
+		if len(result.Rows) != 4 {
+			t.Fatalf("rows = %d, want 4", len(result.Rows))
+		}
+
+		// Find the coalesced NULL row (should be 0)
+		foundZero := false
+		for _, row := range result.Rows {
+			if row[0].Int == 0 {
+				foundZero = true
+				break
+			}
+		}
+		if !foundZero {
+			t.Error("expected a row with COALESCE(amount, 0) = 0 for NULL amounts")
+		}
+	})
+
+	t.Run("coalesce_in_group_by_with_aggregate", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.store.Close()
+		env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+		env.execSQL(t, "INSERT INTO orders VALUES (1, NULL)")
+		env.execSQL(t, "INSERT INTO orders VALUES (2, NULL)")
+
+		// Test: SELECT user_id, COALESCE(amount, 0), COUNT(*) FROM orders GROUP BY user_id, amount
+		result := env.execSQL(t, "SELECT user_id, COALESCE(amount, 0), COUNT(*) FROM orders GROUP BY user_id, amount")
+
+		// Should have 3 groups: (1, 100, 1), (1, 0, 1), (2, 0, 1)
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+	})
 }
 
 func TestExec_ScalarAggregate(t *testing.T) {
@@ -1097,6 +1145,29 @@ func TestExec_SelectWithoutFrom(t *testing.T) {
 
 	t.Run("select_string", func(t *testing.T) {
 		result := env.execSQL(t, "SELECT 'hello'")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+	})
+
+	t.Run("select_arithmetic_add", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT 1+1")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+	})
+
+	t.Run("select_arithmetic_sub", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT 5-3")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+	})
+
+	t.Run("select_arithmetic_from_table", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE users (id INT, name TEXT, age INT)")
+		env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+		result := env.execSQL(t, "SELECT 1+1, name FROM users")
 		if len(result.Rows) != 1 {
 			t.Fatalf("rows = %d, want 1", len(result.Rows))
 		}

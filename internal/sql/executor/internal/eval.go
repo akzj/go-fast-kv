@@ -252,6 +252,50 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		result = cmp > 0
 	case parserapi.BinGE:
 		result = cmp >= 0
+	case parserapi.BinAdd, parserapi.BinSub:
+		// Arithmetic operators: evaluate left and right as numbers
+		left, err := evalExpr(expr.Left, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		right, err := evalExpr(expr.Right, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// Handle NULL arithmetic
+		if left.IsNull || right.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// Perform arithmetic
+		switch left.Type {
+		case catalogapi.TypeInt:
+			switch right.Type {
+			case catalogapi.TypeInt:
+				if expr.Op == parserapi.BinAdd {
+					return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int + right.Int}, nil
+				}
+				return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int - right.Int}, nil
+			case catalogapi.TypeFloat:
+				if expr.Op == parserapi.BinAdd {
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) + right.Float}, nil
+				}
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) - right.Float}, nil
+			}
+		case catalogapi.TypeFloat:
+			switch right.Type {
+			case catalogapi.TypeInt:
+				if expr.Op == parserapi.BinAdd {
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float + float64(right.Int)}, nil
+				}
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - float64(right.Int)}, nil
+			case catalogapi.TypeFloat:
+				if expr.Op == parserapi.BinAdd {
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float + right.Float}, nil
+				}
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - right.Float}, nil
+			}
+		}
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot perform arithmetic on non-numeric types", executorapi.ErrExecFailed)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported binary op %d", executorapi.ErrExecFailed, expr.Op)
 	}
