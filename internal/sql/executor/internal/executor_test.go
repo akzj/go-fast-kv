@@ -184,6 +184,21 @@ func TestExec_SelectStar(t *testing.T) {
 	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
 	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
 
+	t.Run("insert_set_syntax", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t (a INT, b TEXT)")
+		env.execSQL(t, "INSERT INTO t SET a = 1, b = 'hello'")
+		sel := env.execSQL(t, "SELECT * FROM t")
+		if len(sel.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(sel.Rows))
+		}
+		if sel.Rows[0][0].Int != 1 {
+			t.Errorf("a = %d, want 1", sel.Rows[0][0].Int)
+		}
+		if sel.Rows[0][1].Text != "hello" {
+			t.Errorf("b = %q, want hello", sel.Rows[0][1].Text)
+		}
+	})
+
 	result := env.execSQL(t, "SELECT * FROM users")
 	if len(result.Columns) != 3 {
 		t.Errorf("columns = %d, want 3", len(result.Columns))

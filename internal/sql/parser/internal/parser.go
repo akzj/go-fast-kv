@@ -345,7 +345,35 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		}
 	}
 
-	// VALUES
+	// VALUES or SET
+	var cols []string
+	var row []api.Expr // single row for SET syntax
+	if p.cur.Type == api.TokSet {
+		// INSERT INTO t SET col = val, col = val, ...
+		p.advance()
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name after SET")
+			}
+			cols = append(cols, p.cur.Literal)
+			p.advance()
+			if err := p.expect(api.TokEQ); err != nil {
+				return nil, err
+			}
+			val, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			row = append(row, val)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+		stmt.Columns = cols
+		stmt.Values = [][]api.Expr{row}
+		return stmt, nil
+	}
 	if err := p.expect(api.TokValues); err != nil {
 		return nil, err
 	}
