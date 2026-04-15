@@ -937,6 +937,38 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		rows = rows[:plan.Limit]
 	}
 
+	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.
+	if plan.SelectColumns != nil && plan.GroupByExprs == nil {
+		hasScalarAgg := false
+		for _, sc := range plan.SelectColumns {
+			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+				hasScalarAgg = true
+				break
+			}
+		}
+		if hasScalarAgg {
+			// rows is []*engineapi.Row at this point
+			vals := make([]catalogapi.Value, len(plan.SelectColumns))
+			names := make([]string, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				names[i] = sc.Alias
+				if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+					val, err := computeAggregate(agg, rows, plan.Table.Columns)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+					idx := findColumnIndexByName(plan.Table.Columns, ref.Column)
+					if len(rows) > 0 && idx >= 0 && idx < len(rows[0].Values) {
+						vals[i] = rows[0].Values[idx]
+					}
+				}
+			}
+			return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+		}
+	}
+
 	// Project columns
 	var projected [][]catalogapi.Value
 	var colNames []string

@@ -1021,3 +1021,30 @@ func TestExec_GroupBy(t *testing.T) {
 		}
 	})
 }
+
+func TestExec_ScalarAggregate(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT, salary INT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 200)")
+
+	t.Run("count_in_scalar_subquery", func(t *testing.T) {
+		// COUNT(*) = 2, so id > 2 returns no rows
+		result := env.execSQL(t, "SELECT * FROM users WHERE id > (SELECT COUNT(*) FROM users)")
+		if len(result.Rows) != 0 {
+			t.Fatalf("rows = %d, want 0", len(result.Rows))
+		}
+	})
+
+	t.Run("max_in_scalar_subquery", func(t *testing.T) {
+		// MAX(salary) = 200, so salary < 200 returns user with salary 100
+		result := env.execSQL(t, "SELECT * FROM users WHERE salary < (SELECT MAX(salary) FROM users)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][1].Int != 100 {
+			t.Errorf("salary = %d, want 100", result.Rows[0][1].Int)
+		}
+	})
+
+}
