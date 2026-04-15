@@ -489,14 +489,14 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 			sortRawRows(grouped, plan.OrderBy)
 		}
 
-		// LIMIT on grouped rows
-		if plan.Limit >= 0 && plan.Limit < len(grouped) {
-			grouped = grouped[:plan.Limit]
-		}
-
-		// OFFSET on grouped rows (after LIMIT)
+		// OFFSET on grouped rows (skip first N)
 		if plan.Offset >= 0 && plan.Offset < len(grouped) {
 			grouped = grouped[plan.Offset:]
+		}
+
+		// LIMIT on grouped rows (take from remaining)
+		if plan.Limit >= 0 && plan.Limit < len(grouped) {
+			grouped = grouped[:plan.Limit]
 		}
 
 		// Extract values from grouped rows (projection done by groupByRowsForJoin)
@@ -526,13 +526,14 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		sortJoinRows(mergedRows, plan.OrderBy, combinedCols)
 	}
 
-	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
-		mergedRows = mergedRows[:plan.Limit]
-	}
-
-	// OFFSET on merged rows (after LIMIT)
+	// OFFSET on merged rows (skip first N)
 	if plan.Offset >= 0 && plan.Offset < len(mergedRows) {
 		mergedRows = mergedRows[plan.Offset:]
+	}
+
+	// LIMIT on merged rows (take from remaining)
+	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
+		mergedRows = mergedRows[:plan.Limit]
 	}
 
 	projected, projCols := projectJoinRows(mergedRows, colNames, plan)
@@ -1124,14 +1125,14 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		sortRawRows(rows, plan.OrderBy)
 	}
 
-	// LIMIT (apply before projection for efficiency)
-	if plan.Limit >= 0 && plan.Limit < len(rows) {
-		rows = rows[:plan.Limit]
-	}
-
-	// OFFSET (skip first N rows after LIMIT)
+	// OFFSET (skip first N rows first)
 	if plan.Offset >= 0 && plan.Offset < len(rows) {
 		rows = rows[plan.Offset:]
+	}
+
+	// LIMIT (take N from remaining)
+	if plan.Limit >= 0 && plan.Limit < len(rows) {
+		rows = rows[:plan.Limit]
 	}
 
 	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.
