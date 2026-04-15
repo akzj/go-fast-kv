@@ -1468,6 +1468,12 @@ func projectGroupedRowForJoin(groupRows []*engineapi.Row, plan *plannerapi.Selec
 				return nil, err
 			}
 			result[i] = val
+		case *parserapi.CoalesceExpr:
+			val, err := evalExpr(expr, groupRows[0], combinedCols, nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
 		default:
 			return nil, fmt.Errorf("%w: GROUP BY SELECT expression must be column or aggregate", executorapi.ErrExecFailed)
 		}
@@ -1733,6 +1739,12 @@ func projectGroupedRow(groupRows []*engineapi.Row, plan *plannerapi.SelectPlan) 
 			}
 		case *parserapi.AggregateCallExpr:
 			val, err := computeAggregate(expr, groupRows, plan.Table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		case *parserapi.CoalesceExpr:
+			val, err := evalExpr(expr, groupRows[0], plan.Table.Columns, nil, nil)
 			if err != nil {
 				return nil, err
 			}
