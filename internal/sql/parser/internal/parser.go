@@ -497,11 +497,10 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		}
 		// Parse GROUP BY column [, column ...]
 		for {
-			if p.cur.Type != api.TokIdent {
-				return nil, p.errorf("expected column name in GROUP BY")
+			colExpr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
 			}
-			colExpr := &api.ColumnRef{Column: p.cur.Literal}
-			p.advance()
 			stmt.GroupBy = append(stmt.GroupBy, colExpr)
 			if p.cur.Type != api.TokComma {
 				break
@@ -629,11 +628,11 @@ func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
 			return nil, err
 		}
 		for {
-			if p.cur.Type != api.TokIdent {
-				return nil, p.errorf("expected column name in GROUP BY")
+			colExpr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
 			}
-			stmt.GroupBy = append(stmt.GroupBy, &api.ColumnRef{Column: p.cur.Literal})
-			p.advance()
+			stmt.GroupBy = append(stmt.GroupBy, colExpr)
 			if p.cur.Type != api.TokComma {
 				break
 			}

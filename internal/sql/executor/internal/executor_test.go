@@ -879,6 +879,22 @@ func TestExec_Join(t *testing.T) {
 		}
 	})
 
+	t.Run("join_group_by", func(t *testing.T) {
+		// GROUP BY on JOIN: users.name grouped by, COUNT(*) per group
+		// alice has 2 orders, carol has 1, bob has 0 (excluded from inner join)
+		result := env.execSQL(t, "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		// Results should be sorted by name: alice first
+		if result.Rows[0][0].Text != "alice" {
+			t.Errorf("row[0].name = %q, want alice", result.Rows[0][0].Text)
+		}
+		if result.Rows[0][1].Int != 2 {
+			t.Errorf("alice count = %d, want 2", result.Rows[0][1].Int)
+		}
+	})
+
 }
 
 // ─── GROUP BY Tests ──────────────────────────────────────────────────
