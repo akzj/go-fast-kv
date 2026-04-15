@@ -435,21 +435,28 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Type:        string(j.Type),
 	}
 
-	// Build combined schema for column resolution
+	// Build combined schema for column resolution (with Table field set)
 	combinedSchema := make([]*catalogapi.ColumnDef, 0, len(leftSchema)+len(rightTbl.Columns))
 	combinedSchema = append(combinedSchema, leftSchema...)
-	combinedSchema = append(combinedSchema, colsToPtr(rightTbl.Columns)...)
+	// Right columns need Table field set
+	for _, c := range rightTbl.Columns {
+		col := c
+		col.Table = rightTbl.Name
+		combinedSchema = append(combinedSchema, &col)
+	}
 
 	// Resolve select columns using combined schema
 	colIndices := []int{}
 	for _, col := range stmt.Columns {
 		if colExpr, ok := col.Expr.(*parserapi.ColumnRef); ok {
 			idx := -1
-			// Search in combined schema by column name
+			// Search in combined schema by column name AND table qualifier
 			for i, c := range combinedSchema {
 				if strings.EqualFold(c.Name, colExpr.Column) {
-					idx = i
-					break
+					if colExpr.Table == "" || strings.EqualFold(c.Table, colExpr.Table) {
+						idx = i
+						break
+					}
 				}
 			}
 			if idx < 0 {
