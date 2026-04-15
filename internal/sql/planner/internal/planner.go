@@ -264,6 +264,13 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 				limit = int(val.Int)
 			}
 		}
+		offset := -1
+		if stmt.Offset != nil {
+			val, err := resolveExprToValue(stmt.Offset)
+			if err == nil && !val.IsNull && val.Type == catalogapi.TypeInt {
+				offset = int(val.Int)
+			}
+		}
 		return &plannerapi.SelectPlan{
 			Table:         nil,
 			Scan:          nil,
@@ -274,6 +281,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 			Having:        nil,
 			OrderBy:       orderBy,
 			Limit:         limit,
+			Offset:        offset,
 			Distinct:      stmt.Distinct,
 		}, nil
 	}
@@ -317,7 +325,17 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		}
 		limit = int(val.Int)
 	}
-
+	offset := -1
+	if stmt.Offset != nil {
+		val, err := resolveExprToValue(stmt.Offset)
+		if err != nil {
+			return nil, fmt.Errorf("OFFSET: %w", err)
+		}
+		if val.IsNull || val.Type != catalogapi.TypeInt {
+			return nil, fmt.Errorf("OFFSET: %w: expected integer", plannerapi.ErrTypeMismatch)
+		}
+		offset = int(val.Int)
+	}
 
 	// NEW: plan subqueries in WHERE and HAVING
 	if err := p.planSubqueries(residualFilter); err != nil {
@@ -334,7 +352,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		Table: tbl, Scan: scan, Columns: colIndices,
 		SelectColumns: stmt.Columns,
 		Filter: residualFilter, GroupByExprs: stmt.GroupBy,
-		Having: stmt.Having, OrderBy: orderBy, Limit: limit,
+		Having: stmt.Having, OrderBy: orderBy, Limit: limit, Offset: offset,
 		Distinct: stmt.Distinct,
 	}, nil
 }
@@ -525,6 +543,19 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		limit = int(val.Int)
 	}
 
+	// OFFSET for JOIN
+	offset := -1
+	if stmt.Offset != nil {
+		val, err := resolveExprToValue(stmt.Offset)
+		if err != nil {
+			return nil, fmt.Errorf("OFFSET: %w", err)
+		}
+		if val.IsNull || val.Type != catalogapi.TypeInt {
+			return nil, fmt.Errorf("OFFSET: %w: expected integer", plannerapi.ErrTypeMismatch)
+		}
+		offset = int(val.Int)
+	}
+
 	return &plannerapi.SelectPlan{
 		Table:            leftTbl,
 		Scan:             nil,
@@ -536,6 +567,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Having:           stmt.Having,
 		OrderBy:          orderBy,
 		Limit:            limit,
+		Offset:           offset,
 		LeftColumnCount:  len(leftSchema),
 		Distinct:         stmt.Distinct,
 	}, nil

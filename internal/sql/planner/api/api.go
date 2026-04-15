@@ -113,6 +113,7 @@ type SelectPlan struct {
 	Having        parserapi.Expr             // nil if no HAVING
 	OrderBy       *OrderByPlan               // nil if no ORDER BY
 	Limit         int                        // -1 if no LIMIT
+	Offset        int                        // -1 if no OFFSET
 	Distinct      bool                       // true for SELECT DISTINCT
 
 	Join            *JoinPlan               // nil for non-join; non-nil for JOIN
@@ -357,6 +358,9 @@ func (p *SelectPlan) String() string {
 	}
 	if p.Limit > 0 {
 		b.WriteString(fmt.Sprintf("\n└─ LIMIT %d", p.Limit))
+	}
+	if p.Offset > 0 {
+		b.WriteString(fmt.Sprintf("\n└─ OFFSET %d", p.Offset))
 	}
 	return b.String()
 }
