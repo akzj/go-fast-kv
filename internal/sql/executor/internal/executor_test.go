@@ -882,7 +882,20 @@ func TestExec_Join(t *testing.T) {
 	})
 
 
-	t.Run("join_order_by", func(t *testing.T) {
+	t.Run("triple_join_middle_table_on", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE IF NOT EXISTS ages (user_id INT, age INT)")
+		env.execSQL(t, "DELETE FROM ages")
+		env.execSQL(t, "INSERT INTO ages VALUES (1, 30)")
+		env.execSQL(t, "INSERT INTO ages VALUES (2, 25)")
+		env.execSQL(t, "INSERT INTO ages VALUES (3, 35)")
+		// B1: second ON references middle table (orders), not leftmost (users)
+		result := env.execSQL(t, "SELECT users.name, orders.amount, ages.age FROM users JOIN orders ON users.id = orders.user_id JOIN ages ON orders.user_id = ages.user_id")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+	})
+
+		t.Run("join_order_by", func(t *testing.T) {
 		result := env.execSQL(t, "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.name")
 		if len(result.Rows) != 3 {
 			t.Fatalf("rows = %d, want 3", len(result.Rows))
