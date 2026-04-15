@@ -887,6 +887,9 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 		case *parserapi.AggregateCallExpr:
 			// Aggregates are not column indices; set -1 as sentinel (executor handles them via SelectColumns).
 			indices[i] = -1
+		case *parserapi.CoalesceExpr:
+			// CoalesceExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		default:
 			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
 		}

@@ -1228,3 +1228,88 @@ func TestGroupByJoinOrderBy(t *testing.T) {
 		t.Errorf("alice count = %d, want 2", result.Rows[1][1].Int)
 	}
 }
+
+func TestExec_Coalesce(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT, discount INT)")
+
+	t.Run("coalesce_with_null", func(t *testing.T) {
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'Apple', NULL, 10)")
+		env.execSQL(t, "INSERT INTO products VALUES (2, 'Banana', 30, 5)")
+
+		// COALESCE(col, 'default') returns 'default' for NULL values
+		result := env.execSQL(t, "SELECT name, COALESCE(price, 0) FROM products ORDER BY id")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		// Apple has NULL price, should get 0
+		if result.Rows[0][1].Int != 0 {
+			t.Errorf("Apple price = %d, want 0", result.Rows[0][1].Int)
+		}
+		// Banana has price 30, should get 30
+		if result.Rows[1][1].Int != 30 {
+			t.Errorf("Banana price = %d, want 30", result.Rows[1][1].Int)
+		}
+	})
+
+	t.Run("coalesce_multiple_nulls", func(t *testing.T) {
+		// SELECT COALESCE(NULL, NULL, 'third') returns 'third'
+		result := env.execSQL(t, "SELECT COALESCE(NULL, NULL, 'third')")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Text != "third" {
+			t.Errorf("result = %q, want 'third'", result.Rows[0][0].Text)
+		}
+	})
+
+	t.Run("coalesce_with_column", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM products")
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'Apple', NULL, 10)")
+		env.execSQL(t, "INSERT INTO products VALUES (2, 'Banana', 30, 5)")
+
+		// SELECT COALESCE(price, discount) uses discount when price is NULL
+		result := env.execSQL(t, "SELECT COALESCE(price, discount) FROM products ORDER BY id")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+		// Apple has NULL price, should get discount 10
+		if result.Rows[0][0].Int != 10 {
+			t.Errorf("Apple coalesce = %d, want 10", result.Rows[0][0].Int)
+		}
+		// Banana has price 30, should get 30 (not discount 5)
+		if result.Rows[1][0].Int != 30 {
+			t.Errorf("Banana coalesce = %d, want 30", result.Rows[1][0].Int)
+		}
+	})
+
+	t.Run("coalesce_all_null", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM products")
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'Apple', NULL, NULL)")
+
+		// COALESCE(NULL, NULL) returns NULL
+		result := env.execSQL(t, "SELECT COALESCE(price, discount) FROM products")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if !result.Rows[0][0].IsNull {
+			t.Errorf("result.IsNull = false, want true")
+		}
+	})
+
+	t.Run("coalesce_first_non_null", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM products")
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'First', 100, 200)")
+
+		// First non-NULL value
+		result := env.execSQL(t, "SELECT COALESCE(NULL, 100, 200, 300)")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 100 {
+			t.Errorf("result = %d, want 100", result.Rows[0][0].Int)
+		}
+	})
+}

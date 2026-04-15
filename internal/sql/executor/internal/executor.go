@@ -1140,6 +1140,15 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 						return nil, err
 					}
 					vals[i] = val
+				} else if coalesce, ok := sc.Expr.(*parserapi.CoalesceExpr); ok {
+					// Evaluate COALESCE against the first row
+					if len(rows) > 0 {
+						val, err := evalExpr(coalesce, rows[0], plan.Table.Columns, nil, nil)
+						if err != nil {
+							return nil, err
+						}
+						vals[i] = val
+					}
 				} else if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
 					idx := findColumnIndexByName(plan.Table.Columns, ref.Column)
 					if len(rows) > 0 && idx >= 0 && idx < len(rows[0].Values) {
@@ -1176,6 +1185,29 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	} else {
 		colNames = buildColumnNames(plan.Table, plan.Columns)
 		projected = projectRows(rows, plan.Columns)
+
+		// If SelectColumns has expressions (like CoalesceExpr), evaluate them
+		if plan.SelectColumns != nil && hasExpressions(plan.SelectColumns) {
+			projected = make([][]catalogapi.Value, len(rows))
+			colNames = make([]string, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				if sc.Alias != "" {
+					colNames[i] = sc.Alias
+				} else {
+					colNames[i] = "?"
+				}
+			}
+			for rowIdx, row := range rows {
+				projected[rowIdx] = make([]catalogapi.Value, len(plan.SelectColumns))
+				for i, sc := range plan.SelectColumns {
+					val, err := evalExpr(sc.Expr, row, plan.Table.Columns, nil, nil)
+					if err != nil {
+						return nil, err
+					}
+					projected[rowIdx][i] = val
+				}
+			}
+		}
 	}
 
 	// DISTINCT: deduplicate projected rows by concatenating all column values into a key
@@ -1710,4 +1742,17 @@ func projectGroupedRow(groupRows []*engineapi.Row, plan *plannerapi.SelectPlan) 
 		}
 	}
 	return result, nil
+}
+
+// hasExpressions returns true if any SelectColumn contains a non-column, non-star expression.
+func hasExpressions(cols []parserapi.SelectColumn) bool {
+	for _, sc := range cols {
+		switch sc.Expr.(type) {
+		case *parserapi.ColumnRef, *parserapi.StarExpr:
+			// These are handled by projectRows
+		default:
+			return true
+		}
+	}
+	return false
 }
