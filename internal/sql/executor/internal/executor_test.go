@@ -1193,3 +1193,38 @@ func TestExec_Distinct(t *testing.T) {
 		}
 	})
 }
+
+func TestGroupByJoinOrderBy(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+	
+	env.execSQL(t, "CREATE TABLE users (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'carol')")
+	
+	env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+	env.execSQL(t, "INSERT INTO orders VALUES (3, 50)")
+	
+	// Test GROUP BY + ORDER BY name DESC
+	// Should be: carol (c > a), alice (a < c) - DESC by name
+	result := env.execSQL(t, "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name ORDER BY users.name DESC")
+	
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "carol" {
+		t.Errorf("row[0] = %q, want carol", result.Rows[0][0].Text)
+	}
+	if result.Rows[0][1].Int != 1 {
+		t.Errorf("carol count = %d, want 1", result.Rows[0][1].Int)
+	}
+	if result.Rows[1][0].Text != "alice" {
+		t.Errorf("row[1] = %q, want alice", result.Rows[1][0].Text)
+	}
+	if result.Rows[1][1].Int != 2 {
+		t.Errorf("alice count = %d, want 2", result.Rows[1][1].Int)
+	}
+}
