@@ -421,7 +421,11 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 	// Apply WHERE filter on merged rows
 	if plan.Filter != nil {
-		mergedRows = filterJoinRows(mergedRows, plan.Filter, combinedCols)
+		// Precompute subqueries in WHERE (non-correlated only at this stage)
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		mergedRows = filterJoinRows(mergedRows, plan.Filter, combinedCols, subqueryResults)
 	}
 
 	// GROUP BY on merged join rows
@@ -439,7 +443,7 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
-			grouped = filterRows(grouped, plan.Having, combinedCols, nil)
+			grouped = filterRows(grouped, plan.Having, combinedCols, subqueryResults)
 		}
 
 		// ORDER BY on grouped rows
@@ -720,14 +724,14 @@ func (ex *executor) walkExprForJoinSubqueries(expr parserapi.Expr,
 }
 
 // filterJoinRows applies a WHERE filter to merged join rows.
-func filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Expr, columns []catalogapi.ColumnDef) [][]catalogapi.Value {
+func filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Expr, columns []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) [][]catalogapi.Value {
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
 	filtered := rows[:0]
 	for _, row := range rows {
 		engineRow := &engineapi.Row{Values: row}
-		match, err := matchFilter(filter, engineRow, columns, nil)
+		match, err := matchFilter(filter, engineRow, columns, subqueryResults)
 		if err != nil {
 			continue
 		}
