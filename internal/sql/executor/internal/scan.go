@@ -42,18 +42,40 @@ func (e *executor) filterRows(rows []*engineapi.Row, filter parserapi.Expr, colu
 	if filter == nil || len(rows) == 0 {
 		return rows
 	}
+	// Save current context (may be modified by subqueries during evaluation)
+	savedCurrentCols := e.currentCols
+	savedOuterCols := e.outerCols
+	defer func() {
+		e.currentCols = savedCurrentCols
+		e.outerCols = savedOuterCols
+	}()
+
+	// Set current table columns for this filter evaluation
+	e.currentCols = columns
+
 	filtered := rows[:0]
 	for _, row := range rows {
-		// Set outerVals for correlated subquery evaluation
+		// Push outer context for this row (copy to avoid reference issues)
+		// Also set outerVals for fallback when stack is empty (JOIN evaluation)
+		e.outerValsStack = append(e.outerValsStack, append([]catalogapi.Value(nil), row.Values...))
 		e.outerVals = row.Values
+		e.currentRow = row
+
 		match, err := matchFilter(filter, row, columns, subqueryResults, e)
 		if err != nil {
+			// Pop before continue
+			e.outerValsStack = e.outerValsStack[:len(e.outerValsStack)-1]
 			continue
 		}
 		if match {
 			filtered = append(filtered, row)
 		}
+
+		// Pop this row's context
+		e.outerValsStack = e.outerValsStack[:len(e.outerValsStack)-1]
 	}
+	// Clear current row after filtering
+	e.currentRow = nil
 	return filtered
 }
 
@@ -66,11 +88,17 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 	}
 	defer iter.Close()
 
+	// Set current table context for column resolution
+	e.currentCols = table.Columns
+
 	var rows []*engineapi.Row
 	for iter.Next() {
 		row := iter.Row()
+		e.currentRow = row
 
 		// Apply filter if present
+		// NOTE: Do NOT push to outerValsStack here! The outer context is already
+		// set by execSubquery for correlated subqueries. Pushing would overwrite it.
 		if filter != nil {
 			pass, err := matchFilter(filter, row, table.Columns, subqueryResults, e)
 			if err != nil {
@@ -93,6 +121,10 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 		return nil, fmt.Errorf("%w: scan iteration: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Clear current context after scan
+	e.currentCols = nil
+	e.currentRow = nil
+
 	return rows, nil
 }
 
@@ -104,6 +136,9 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 	}
 	defer rowIDIter.Close()
 
+	// Set current table context for column resolution
+	e.currentCols = table.Columns
+
 	var rows []*engineapi.Row
 	for rowIDIter.Next() {
 		rowID := rowIDIter.RowID()
@@ -114,8 +149,11 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 			}
 			return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
 		}
+		e.currentRow = row
 
 		// Apply residual filter
+		// NOTE: Do NOT push to outerValsStack here! The outer context is already
+		// set by execSubquery for correlated subqueries.
 		if scan.ResidualFilter != nil {
 			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults, e)
 			if err != nil {
@@ -131,6 +169,10 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 	if err := rowIDIter.Err(); err != nil {
 		return nil, fmt.Errorf("%w: index scan iteration: %v", executorapi.ErrExecFailed, err)
 	}
+
+	// Clear current context after scan
+	e.currentCols = nil
+	e.currentRow = nil
 
 	return rows, nil
 }

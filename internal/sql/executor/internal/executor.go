@@ -33,9 +33,22 @@ type executor struct {
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
 	planner     plannerapi.Planner
-	// For correlated subquery support - outer query context set before filter evaluation
-	outerCols []catalogapi.ColumnDef
-	outerVals []catalogapi.Value
+	// For correlated subquery support
+	outerCols      []catalogapi.ColumnDef  // outer table columns (for qualified column resolution)
+	outerValsStack [][]catalogapi.Value   // stack of outer row values (for nested subqueries)
+	outerVals      []catalogapi.Value      // direct reference (fallback for JOINs without stack)
+	// For column resolution during evaluation (inner table context)
+	currentCols    []catalogapi.ColumnDef  // current table columns (set during scan)
+	currentRow     *engineapi.Row          // current row being processed
+}
+
+// currentOuterVals returns the current outer row values.
+// Priority: 1) top of stack (for nested subqueries), 2) outerVals (for JOINs, top-level queries)
+func (e *executor) currentOuterVals() []catalogapi.Value {
+	if len(e.outerValsStack) > 0 {
+		return e.outerValsStack[len(e.outerValsStack)-1]
+	}
+	return e.outerVals
 }
 
 // New creates a new Executor.
@@ -53,13 +66,22 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 }
 
 // execSubquery executes a scalar subquery plan with outer row context.
-// outerCols/outerVals on e must be set before calling this method.
-func (e *executor) execSubquery(plan parserapi.SubqueryPlan) (catalogapi.Value, error) {
+func (e *executor) execSubquery(plan parserapi.SubqueryPlan, outerCols []catalogapi.ColumnDef, outerVals []catalogapi.Value) (catalogapi.Value, error) {
 	typedPlan, ok := plan.(plannerapi.Plan)
 	if !ok {
 		return catalogapi.Value{}, fmt.Errorf("subquery plan has wrong type: %T", plan)
 	}
+
+	// Push outer context onto stack (MUST copy values - outerVals is a reference!)
+	e.outerValsStack = append(e.outerValsStack, append([]catalogapi.Value(nil), outerVals...))
+
 	result, err := e.Execute(typedPlan)
+
+	// Pop outer row from stack
+	if len(e.outerValsStack) > 0 {
+		e.outerValsStack = e.outerValsStack[:len(e.outerValsStack)-1]
+	}
+
 	if err != nil {
 		return catalogapi.Value{}, err
 	}
@@ -884,6 +906,11 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 			if _, exists := subqueryResults[sq]; exists {
 				return
 			}
+			// Skip scalar subqueries - they need lazy evaluation with outer row context.
+			// Only precompute IN-list subqueries where outer context is not needed.
+			if !isSubqueryInListContext(sq, root) {
+				return
+			}
 			// Plan and execute the subquery (may trigger nested execSelect with same map)
 			// Planner already set sq.Plan — use it. Otherwise fallback to executor planning.
 			var subplan plannerapi.Plan
@@ -962,14 +989,18 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return nil, err
 	}
 
+	// Set outerCols for correlated subquery column resolution during scan.
+	// Only set for the outermost query (outerValsStack == nil means no outer context yet).
+	// For subqueries, we don't overwrite outerCols - we need to keep the outermost query's columns.
+	if len(e.outerValsStack) == 0 {
+		e.outerCols = plan.Table.Columns
+	}
+
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
 	rows, err := e.scanRows(plan.Table, plan.Scan, subqueryResults)
 	if err != nil {
 		return nil, err
 	}
-
-	// Set outerCols for correlated subquery resolution - used by filterRows to set outerVals per row
-	e.outerCols = plan.Table.Columns
 
 	// Apply residual filter from SelectPlan (handles index scan + residual)
 	if plan.Filter != nil {
@@ -1003,33 +1034,33 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.
 	if plan.SelectColumns != nil && plan.GroupByExprs == nil {
 		hasScalarAgg := false
-		for _, sc := range plan.SelectColumns {
-			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
-				hasScalarAgg = true
-				break
-			}
+	for _, sc := range plan.SelectColumns {
+		if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+			hasScalarAgg = true
+			break
 		}
-		if hasScalarAgg {
-			// rows is []*engineapi.Row at this point
-			vals := make([]catalogapi.Value, len(plan.SelectColumns))
-			names := make([]string, len(plan.SelectColumns))
-			for i, sc := range plan.SelectColumns {
-				names[i] = sc.Alias
-				if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
-					val, err := computeAggregate(agg, rows, plan.Table.Columns)
-					if err != nil {
-						return nil, err
-					}
-					vals[i] = val
-				} else if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
-					idx := findColumnIndexByName(plan.Table.Columns, ref.Column)
-					if len(rows) > 0 && idx >= 0 && idx < len(rows[0].Values) {
-						vals[i] = rows[0].Values[idx]
-					}
+	}
+	if hasScalarAgg {
+		// rows is []*engineapi.Row at this point
+		vals := make([]catalogapi.Value, len(plan.SelectColumns))
+		names := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			names[i] = sc.Alias
+			if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+				val, err := computeAggregate(agg, rows, plan.Table.Columns)
+				if err != nil {
+					return nil, err
+				}
+				vals[i] = val
+			} else if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				idx := findColumnIndexByName(plan.Table.Columns, ref.Column)
+				if len(rows) > 0 && idx >= 0 && idx < len(rows[0].Values) {
+					vals[i] = rows[0].Values[idx]
 				}
 			}
-			return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
 		}
+		return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+	}
 	}
 
 	// Project columns

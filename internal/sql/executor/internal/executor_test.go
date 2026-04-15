@@ -724,6 +724,188 @@ func TestExec_ScalarSubquery(t *testing.T) {
 	})
 }
 
+func TestExec_CorrelatedSubquery(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Setup users and orders tables
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)")
+
+	// Insert users: id=1 (alice), id=2 (bob), id=3 (carol), id=4 (dave)
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'carol')")
+	env.execSQL(t, "INSERT INTO users VALUES (4, 'dave')")
+
+	// Insert orders:
+	// alice (user_id=1): 2 orders (amount 100, 200)
+	// bob (user_id=2): 1 order (amount 150)
+	// carol (user_id=3): 0 orders
+	// dave (user_id=4): 3 orders (amount 50, 75, 125)
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 1, 100)")
+	env.execSQL(t, "INSERT INTO orders VALUES (2, 1, 200)")
+	env.execSQL(t, "INSERT INTO orders VALUES (3, 2, 150)")
+	env.execSQL(t, "INSERT INTO orders VALUES (4, 4, 50)")
+	env.execSQL(t, "INSERT INTO orders VALUES (5, 4, 75)")
+	env.execSQL(t, "INSERT INTO orders VALUES (6, 4, 125)")
+
+	t.Run("correlated_basic", func(t *testing.T) {
+		// Simple test: find users whose id appears in orders.user_id
+		// alice (user_id=1): 2 orders, bob (user_id=2): 1 order, carol (user_id=3): 0, dave (user_id=4): 3
+		// Expected: alice (id=1), bob (id=2), dave (id=4)
+		result := env.execSQL(t, "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)")
+
+		t.Logf("IN subquery got %d rows:", len(result.Rows))
+		for i, row := range result.Rows {
+			t.Logf("  row[%d]: id=%d", i, row[0].Int)
+		}
+
+		// Should have 3 rows: alice (1), bob (2), dave (4)
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 (alice, bob, dave have orders)", len(result.Rows))
+		}
+		// Verify the specific users returned
+		gotIDs := make(map[int64]bool)
+		for _, row := range result.Rows {
+			gotIDs[row[0].Int] = true
+		}
+		wantIDs := map[int64]bool{1: true, 2: true, 4: true}
+		for id := range wantIDs {
+			if !gotIDs[id] {
+				t.Errorf("expected user with id=%d in results", id)
+			}
+		}
+		if gotIDs[3] {
+			t.Error("carol (id=3) should NOT be in results (has 0 orders)")
+		}
+	})
+
+	t.Run("correlated_simple_scalar", func(t *testing.T) {
+		// Simple scalar subquery: get first order's user_id, compare to users.id
+		// Query: SELECT * FROM users WHERE id > (SELECT user_id FROM orders LIMIT 1)
+		// First order has user_id = 1
+		// Users with id > 1: bob (2), carol (3), dave (4)
+		result := env.execSQL(t, "SELECT id, name FROM users WHERE id > (SELECT user_id FROM orders LIMIT 1)")
+
+		t.Logf("simple scalar got %d rows:", len(result.Rows))
+		for i, row := range result.Rows {
+			t.Logf("  row[%d]: id=%d, name=%s", i, row[0].Int, row[1].Text)
+		}
+
+		// Should have 3 rows: bob, carol, dave
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 (users with id > 1)", len(result.Rows))
+		}
+	})
+
+	t.Run("non_correlated_count", func(t *testing.T) {
+		// Non-correlated COUNT: should work
+		// Query: SELECT * FROM users WHERE id > (SELECT COUNT(*) FROM orders)
+		// Total orders = 6, so users with id > 6: none
+		result := env.execSQL(t, "SELECT COUNT(*) FROM orders")
+		t.Logf("total orders: %d", result.Rows[0][0].Int)
+		if result.Rows[0][0].Int != 6 {
+			t.Errorf("total orders = %d, want 6", result.Rows[0][0].Int)
+		}
+	})
+
+	t.Run("correlated_count_where", func(t *testing.T) {
+		// Test if WHERE clause in subquery sees outer context
+		// For bob (id=2): WHERE orders.user_id = 2 should return 1 row
+		// For alice (id=1): WHERE orders.user_id = 1 should return 2 rows
+		result := env.execSQL(t, "SELECT id, name, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) as cnt FROM users ORDER BY id")
+
+		t.Logf("correlated count results:")
+		for i, row := range result.Rows {
+			t.Logf("  row[%d]: id=%d, name=%s, cnt=%d", i, row[0].Int, row[1].Text, row[2].Int)
+		}
+
+		// Check alice (id=1) should have cnt=2
+		if result.Rows[0][2].Int != 2 {
+			t.Errorf("alice cnt = %d, want 2", result.Rows[0][2].Int)
+		}
+		// Check bob (id=2) should have cnt=1
+		if result.Rows[1][2].Int != 1 {
+			t.Errorf("bob cnt = %d, want 1", result.Rows[1][2].Int)
+		}
+		// Check carol (id=3) should have cnt=0
+		if result.Rows[2][2].Int != 0 {
+			t.Errorf("carol cnt = %d, want 0", result.Rows[2][2].Int)
+		}
+	})
+
+	t.Run("correlated_with_count", func(t *testing.T) {
+		// Query: SELECT * FROM users WHERE id > (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id)
+		// alice: id=1, order_count=2, 1 > 2 = false
+		// bob: id=2, order_count=1, 2 > 1 = true
+		// carol: id=3, order_count=0, 3 > 0 = true
+		// dave: id=4, order_count=3, 4 > 3 = true
+		// Expected: bob (id=2), carol (id=3), dave (id=4)
+		result := env.execSQL(t, "SELECT id, name FROM users WHERE id > (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id)")
+
+		// Debug: print what we got
+		t.Logf("got %d rows:", len(result.Rows))
+		for i, row := range result.Rows {
+			idVal := row[0]
+			nameVal := row[1]
+			t.Logf("  row[%d]: id=%d, name=%s", i, idVal.Int, nameVal.Text)
+		}
+
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3 (bob, carol, dave have id > order_count)", len(result.Rows))
+		}
+
+		// Verify the specific users returned
+		gotIDs := make(map[int64]bool)
+		for _, row := range result.Rows {
+			gotIDs[row[0].Int] = true
+		}
+
+		wantIDs := map[int64]bool{2: true, 3: true, 4: true}
+		for id := range wantIDs {
+			if !gotIDs[id] {
+				t.Errorf("expected user with id=%d in results", id)
+			}
+		}
+		if gotIDs[1] {
+			t.Error("alice (id=1) should NOT be in results (1 > 2 is false)")
+		}
+	})
+
+	t.Run("correlated_with_count_greater_than_1", func(t *testing.T) {
+		// Query: SELECT name FROM users WHERE (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) > 1
+		// alice: order_count=2, 2 > 1 = true
+		// bob: order_count=1, 1 > 1 = false
+		// carol: order_count=0, 0 > 1 = false
+		// dave: order_count=3, 3 > 1 = true
+		// Expected: alice, dave
+		result := env.execSQL(t, "SELECT name FROM users WHERE (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) > 1")
+
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (alice and dave have order_count > 1)", len(result.Rows))
+		}
+
+		// Verify names
+		gotNames := make(map[string]bool)
+		for _, row := range result.Rows {
+			gotNames[row[0].Text] = true
+		}
+
+		if !gotNames["alice"] {
+			t.Error("alice should be in results (has 2 orders)")
+		}
+		if !gotNames["dave"] {
+			t.Error("dave should be in results (has 3 orders)")
+		}
+		if gotNames["bob"] {
+			t.Error("bob should NOT be in results (has only 1 order)")
+		}
+		if gotNames["carol"] {
+			t.Error("carol should NOT be in results (has 0 orders)")
+		}
+	})
+}
+
 func TestExec_Join(t *testing.T) {
 	env := newTestEnv(t)
 
