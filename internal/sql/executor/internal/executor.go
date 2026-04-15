@@ -456,6 +456,10 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
 			return nil, err
 		}
+		// Set outerCols for correlated subquery resolution in WHERE.
+		// filterRows sets outerVals per-row; evalColumnRef uses both to resolve
+		// outer table references in correlated subqueries.
+		e.outerCols = combinedCols
 		mergedRows = e.filterJoinRows(mergedRows, plan.Filter, combinedCols, subqueryResults)
 	}
 
@@ -474,6 +478,9 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 
 		// HAVING: filter grouped rows
 		if plan.Having != nil {
+			// Set outerCols for correlated subquery resolution in HAVING.
+			// This is the combined schema of the join result.
+			e.outerCols = combinedCols
 			grouped = e.filterRows(grouped, plan.Having, combinedCols, subqueryResults)
 		}
 
