@@ -1398,3 +1398,63 @@ func TestExec_Coalesce(t *testing.T) {
 		}
 	})
 }
+
+func TestExec_CoalesceGroupByJoin(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE users (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'carol')")
+
+	env.execSQL(t, "CREATE TABLE orders (user_id INT, amount INT)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, NULL)")
+	env.execSQL(t, "INSERT INTO orders VALUES (3, 50)")
+	env.execSQL(t, "INSERT INTO orders VALUES (3, NULL)")
+
+	// Test COALESCE in GROUP BY with JOIN
+	// alice has orders: 100, 200, NULL -> GROUP BY picks one value
+	// carol has orders: 50, NULL -> GROUP BY picks 50
+	// bob has no orders -> won't appear in JOIN result
+	result := env.execSQL(t, "SELECT users.name, COALESCE(orders.amount, 0) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name")
+
+	if len(result.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (alice and carol)", len(result.Rows))
+	}
+
+	// Find alice and carol rows
+	var aliceIdx, carolIdx int = -1, -1
+	for i, row := range result.Rows {
+		if row[0].Text == "alice" {
+			aliceIdx = i
+		} else if row[0].Text == "carol" {
+			carolIdx = i
+		}
+	}
+
+	if aliceIdx == -1 {
+		t.Fatal("alice row not found")
+	}
+	if carolIdx == -1 {
+		t.Fatal("carol row not found")
+	}
+
+	aliceRow := result.Rows[aliceIdx]
+	carolRow := result.Rows[carolIdx]
+
+	// Verify coalesced values are not NULL
+	if aliceRow[1].IsNull {
+		t.Error("alice COALESCE(amount, 0) is NULL, expected non-NULL")
+	}
+	if carolRow[1].IsNull {
+		t.Error("carol COALESCE(amount, 0) is NULL, expected non-NULL")
+	}
+
+	// Verify carol's coalesced amount is 50 (her non-NULL order)
+	if carolRow[1].Int != 50 {
+		t.Errorf("carol amount = %d, want 50", carolRow[1].Int)
+	}
+}
