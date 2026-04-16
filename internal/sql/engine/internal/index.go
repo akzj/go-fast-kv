@@ -179,9 +179,10 @@ func (ri *rowIDIterator) Next() bool {
 	return true
 }
 
-func (ri *rowIDIterator) RowID() uint64 { return ri.current }
-func (ri *rowIDIterator) Err() error    { return ri.err }
-func (ri *rowIDIterator) Close()        { ri.kvIter.Close() }
+func (ri *rowIDIterator) RowID() uint64  { return ri.current }
+func (ri *rowIDIterator) Err() error     { return ri.err }
+func (ri *rowIDIterator) Close()          { ri.kvIter.Close() }
+func (ri *rowIDIterator) Key() []byte     { return ri.kvIter.Key() }
 
 // ─── Empty iterator ─────────────────────────────────────────────────
 

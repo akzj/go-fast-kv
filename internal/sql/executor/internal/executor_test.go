@@ -353,6 +353,28 @@ func TestExec_IndexScan(t *testing.T) {
 	}
 }
 
+func TestExec_IndexOnlyScan(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_age ON users (age)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Charlie', 35)")
+
+	// SELECT age FROM users WHERE age = 30
+	// Should use index-only scan (covering index) — no table access needed.
+	// The index contains the age column value, so we can satisfy the query
+	// entirely from the index without reading table pages.
+	result := env.execSQL(t, "SELECT age FROM users WHERE age = 30")
+
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Int != 30 {
+		t.Errorf("age = %v, want 30", result.Rows[0][0].Int)
+	}
+}
+
 func TestExec_NullHandling(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE data (id INT PRIMARY KEY, val INT)")

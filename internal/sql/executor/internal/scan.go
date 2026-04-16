@@ -173,6 +173,17 @@ func (e *executor) indexOnlyScan(table *catalogapi.TableSchema, scan *plannerapi
 		return nil, fmt.Errorf("%w: iterator does not support key access", executorapi.ErrExecFailed)
 	}
 
+	// Find the table column index for the indexed column.
+	// scan.IndexedColumnIdx is the position in SELECT list (e.g., 0 for "SELECT age").
+	// We need to find where "age" is in the table schema (e.g., index 2 in users table).
+	indexedColIdx := -1
+	for i, col := range table.Columns {
+		if strings.EqualFold(col.Name, scan.Index.Column) {
+			indexedColIdx = i
+			break
+		}
+	}
+
 	var rows []*engineapi.Row
 	for rowIDIter.Next() {
 		// Decode index key to extract the indexed column value
@@ -181,10 +192,18 @@ func (e *executor) indexOnlyScan(table *catalogapi.TableSchema, scan *plannerapi
 			return nil, fmt.Errorf("%w: decode index key: %v", executorapi.ErrExecFailed, err)
 		}
 
-		// Build row with just the indexed column value
+		// Build row with all columns initialized to zero/default.
+		// Place the indexed column value at its table column position.
+		// This ensures projectRows(colIndices) works correctly:
+		// - plan.Columns = [2] (age's position in table)
+		// - row.Values[2] = colValue (the decoded index value)
+		values := make([]catalogapi.Value, len(table.Columns))
+		if indexedColIdx >= 0 {
+			values[indexedColIdx] = colValue
+		}
 		row := &engineapi.Row{
 			RowID:  rowIDIter.RowID(),
-			Values: []catalogapi.Value{colValue},
+			Values: values,
 		}
 
 		// Apply residual filter if any
