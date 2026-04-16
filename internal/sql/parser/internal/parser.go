@@ -973,9 +973,9 @@ func (p *parser) parseNotExpr() (api.Expr, error) {
 	return p.parseCompareExpr()
 }
 
-// compare_expr = primary [cmp_op primary | "IS" ["NOT"] "NULL"]
+// compare_expr = term [cmp_op term]
 func (p *parser) parseCompareExpr() (api.Expr, error) {
-	left, err := p.parsePrimary()
+	left, err := p.parseTermExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -1097,32 +1097,62 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 	case api.TokGE:
 		op = api.BinGE
 	default:
-		// No comparison operator — check for arithmetic operators (+, -)
-		// This allows expressions like SELECT 1+1 to work
-		for p.cur.Type == api.TokPlus || p.cur.Type == api.TokMinus {
-			arithOp := p.cur.Type
-			p.advance()
-			right, err := p.parsePrimary()
-			if err != nil {
-				return nil, err
-			}
-			// Wrap left in a BinaryExpr
-			var binOp api.BinaryOp
-			if arithOp == api.TokPlus {
-				binOp = api.BinAdd
-			} else {
-				binOp = api.BinSub
-			}
-			left = &api.BinaryExpr{Left: left, Op: binOp, Right: right}
-		}
 		return left, nil // no comparison operator
 	}
 	p.advance()
-	right, err := p.parsePrimary()
+	right, err := p.parseTermExpr()
 	if err != nil {
 		return nil, err
 	}
 	return &api.BinaryExpr{Left: left, Op: op, Right: right}, nil
+}
+
+// term_expr = factor {("+" | "-") factor}
+// Handles + and - with higher precedence than comparison operators.
+func (p *parser) parseTermExpr() (api.Expr, error) {
+	left, err := p.parseFactorExpr()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.Type == api.TokPlus || p.cur.Type == api.TokMinus {
+		arithOp := p.cur.Type
+		p.advance()
+		right, err := p.parseFactorExpr()
+		if err != nil {
+			return nil, err
+		}
+		var binOp api.BinaryOp
+		if arithOp == api.TokPlus {
+			binOp = api.BinAdd
+		} else {
+			binOp = api.BinSub
+		}
+		left = &api.BinaryExpr{Left: left, Op: binOp, Right: right}
+	}
+	return left, nil
+}
+
+// factor_expr = primary {("*" | "/") primary}
+// Handles * and / with higher precedence than + and -.
+func (p *parser) parseFactorExpr() (api.Expr, error) {
+	left, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.Type == api.TokStar || p.cur.Type == api.TokSlash {
+		op := p.cur.Type
+		p.advance()
+		right, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		if op == api.TokStar {
+			left = &api.BinaryExpr{Left: left, Op: api.BinMul, Right: right}
+		} else {
+			left = &api.BinaryExpr{Left: left, Op: api.BinDiv, Right: right}
+		}
+	}
+	return left, nil
 }
 
 // isAggregateFunc returns true for built-in aggregate function names (case-insensitive).

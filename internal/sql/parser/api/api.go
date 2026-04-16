@@ -78,14 +78,15 @@ const (
 	TokPlus      TokenType = 55 // +
 	TokMinus     TokenType = 56 // -
 	TokStar      TokenType = 57 // *
-	TokComma     TokenType = 58 // ,
-	TokLParen    TokenType = 59 // (
-	TokRParen    TokenType = 60 // )
-	TokSemicolon TokenType = 61 // ;
-	TokDot       TokenType = 62 // .
+	TokSlash     TokenType = 58 // /
+	TokComma     TokenType = 59 // ,
+	TokLParen    TokenType = 60 // (
+	TokRParen    TokenType = 61 // )
+	TokSemicolon TokenType = 62 // ;
+	TokDot       TokenType = 63 // .
 
 	// Special
-	TokEOF      TokenType = 63
+	TokEOF      TokenType = 64
 	TokIllegal  TokenType = 64
 	TokExplain  TokenType = 65 // EXPLAIN
 	TokAnalyze  TokenType = 66 // ANALYZE
@@ -312,6 +313,8 @@ const (
 	BinBetween BinaryOp = 8 // BETWEEN
 	BinAdd     BinaryOp = 9 // +
 	BinSub     BinaryOp = 10 // -
+	BinMul     BinaryOp = 11 // *
+	BinDiv     BinaryOp = 12 // /
 )
 
 // UnaryExpr: op operand (e.g. NOT x, -42)

@@ -125,6 +125,9 @@ func (l *lexer) nextToken() api.Token {
 	case '*':
 		l.pos++
 		return api.Token{Type: api.TokStar, Literal: "*", Pos: startPos}
+	case '/':
+		l.pos++
+		return api.Token{Type: api.TokSlash, Literal: "/", Pos: startPos}
 	case '<':
 		l.pos++
 		if l.pos < len(l.input) {

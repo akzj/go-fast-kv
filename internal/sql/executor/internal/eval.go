@@ -267,7 +267,7 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		result = cmp > 0
 	case parserapi.BinGE:
 		result = cmp >= 0
-	case parserapi.BinAdd, parserapi.BinSub:
+	case parserapi.BinAdd, parserapi.BinSub, parserapi.BinMul, parserapi.BinDiv:
 		// Arithmetic operators: evaluate left and right as numbers
 		left, err := evalExpr(expr.Left, row, columns, subqueryResults, ex)
 		if err != nil {
@@ -286,28 +286,55 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		case catalogapi.TypeInt:
 			switch right.Type {
 			case catalogapi.TypeInt:
-				if expr.Op == parserapi.BinAdd {
+				switch expr.Op {
+				case parserapi.BinAdd:
 					return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int + right.Int}, nil
+				case parserapi.BinSub:
+					return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int - right.Int}, nil
+				case parserapi.BinMul:
+					return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int * right.Int}, nil
+				case parserapi.BinDiv:
+					if right.Int == 0 {
+						return catalogapi.Value{}, fmt.Errorf("%w: division by zero", executorapi.ErrExecFailed)
+					}
+					return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int / right.Int}, nil
 				}
-				return catalogapi.Value{Type: catalogapi.TypeInt, Int: left.Int - right.Int}, nil
 			case catalogapi.TypeFloat:
-				if expr.Op == parserapi.BinAdd {
+				switch expr.Op {
+				case parserapi.BinAdd:
 					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) + right.Float}, nil
+				case parserapi.BinSub:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) - right.Float}, nil
+				case parserapi.BinMul:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) * right.Float}, nil
+				case parserapi.BinDiv:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) / right.Float}, nil
 				}
-				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(left.Int) - right.Float}, nil
 			}
 		case catalogapi.TypeFloat:
 			switch right.Type {
 			case catalogapi.TypeInt:
-				if expr.Op == parserapi.BinAdd {
+				switch expr.Op {
+				case parserapi.BinAdd:
 					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float + float64(right.Int)}, nil
+				case parserapi.BinSub:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - float64(right.Int)}, nil
+				case parserapi.BinMul:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float * float64(right.Int)}, nil
+				case parserapi.BinDiv:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float / float64(right.Int)}, nil
 				}
-				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - float64(right.Int)}, nil
 			case catalogapi.TypeFloat:
-				if expr.Op == parserapi.BinAdd {
+				switch expr.Op {
+				case parserapi.BinAdd:
 					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float + right.Float}, nil
+				case parserapi.BinSub:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - right.Float}, nil
+				case parserapi.BinMul:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float * right.Float}, nil
+				case parserapi.BinDiv:
+					return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float / right.Float}, nil
 				}
-				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: left.Float - right.Float}, nil
 			}
 		}
 		return catalogapi.Value{}, fmt.Errorf("%w: cannot perform arithmetic on non-numeric types", executorapi.ErrExecFailed)
