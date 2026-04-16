@@ -1540,3 +1540,81 @@ func TestIntersectExcept_NullHandling(t *testing.T) {
 		t.Errorf("SELECT NULL INTERSECT SELECT NULL: expected 1 row (NULLs equal), got %d", len(result.Rows))
 	}
 }
+
+func TestExec_InsertSelect(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "CREATE TABLE t2 (id INT PRIMARY KEY, name TEXT)")
+
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO t1 VALUES (2, 'Bob')")
+	env.execSQL(t, "INSERT INTO t1 VALUES (3, 'Charlie')")
+
+	result := env.execSQL(t, "INSERT INTO t2 SELECT * FROM t1")
+	if result.RowsAffected != 3 {
+		t.Errorf("RowsAffected = %d, want 3", result.RowsAffected)
+	}
+
+	sel := env.execSQL(t, "SELECT * FROM t2 ORDER BY id")
+	if len(sel.Rows) != 3 {
+		t.Fatalf("t2 rows = %d, want 3", len(sel.Rows))
+	}
+	if sel.Rows[0][0].Int != 1 || sel.Rows[0][1].Text != "Alice" {
+		t.Errorf("row[0] = (%v, %v), want (1, Alice)", sel.Rows[0][0], sel.Rows[0][1])
+	}
+	if sel.Rows[1][0].Int != 2 || sel.Rows[1][1].Text != "Bob" {
+		t.Errorf("row[1] = (%v, %v), want (2, Bob)", sel.Rows[1][0], sel.Rows[1][1])
+	}
+	if sel.Rows[2][0].Int != 3 || sel.Rows[2][1].Text != "Charlie" {
+		t.Errorf("row[2] = (%v, %v), want (3, Charlie)", sel.Rows[2][0], sel.Rows[2][1])
+	}
+}
+
+func TestExec_InsertSelectWithColumns(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE src (a INT, b TEXT, c INT)")
+	env.execSQL(t, "CREATE TABLE dst (id INT, label TEXT)")
+
+	env.execSQL(t, "INSERT INTO src VALUES (10, 'x', 100)")
+	env.execSQL(t, "INSERT INTO src VALUES (20, 'y', 200)")
+
+	result := env.execSQL(t, "INSERT INTO dst (id, label) SELECT a, b FROM src")
+	if result.RowsAffected != 2 {
+		t.Errorf("RowsAffected = %d, want 2", result.RowsAffected)
+	}
+
+	sel := env.execSQL(t, "SELECT * FROM dst ORDER BY id")
+	if len(sel.Rows) != 2 {
+		t.Fatalf("dst rows = %d, want 2", len(sel.Rows))
+	}
+	if sel.Rows[0][0].Int != 10 || sel.Rows[0][1].Text != "x" {
+		t.Errorf("row[0] = (%v, %v), want (10, x)", sel.Rows[0][0], sel.Rows[0][1])
+	}
+	if sel.Rows[1][0].Int != 20 || sel.Rows[1][1].Text != "y" {
+		t.Errorf("row[1] = (%v, %v), want (20, y)", sel.Rows[1][0], sel.Rows[1][1])
+	}
+}
+
+func TestExec_InsertSelectWithIndex(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE src (id INT, val INT)")
+	env.execSQL(t, "CREATE TABLE dst (id INT PRIMARY KEY, val INT)")
+
+	env.execSQL(t, "INSERT INTO src VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO src VALUES (2, 200)")
+
+	result := env.execSQL(t, "INSERT INTO dst SELECT * FROM src")
+	if result.RowsAffected != 2 {
+		t.Errorf("RowsAffected = %d, want 2", result.RowsAffected)
+	}
+
+	sel := env.execSQL(t, "SELECT * FROM dst ORDER BY id")
+	if len(sel.Rows) != 2 {
+		t.Fatalf("dst rows = %d, want 2", len(sel.Rows))
+	}
+
+	idx := env.execSQL(t, "SELECT * FROM dst WHERE id = 1")
+	if len(idx.Rows) != 1 || idx.Rows[0][1].Int != 100 {
+		t.Errorf("index lookup: got %v, want (1, 100)", idx.Rows[0])
+	}
+}

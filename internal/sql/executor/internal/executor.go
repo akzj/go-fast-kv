@@ -370,6 +370,9 @@ func (e *executor) execInsertSelect(plan *plannerapi.InsertSelectPlan) (*executo
 		return nil, fmt.Errorf("%w: execute select: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Use destination table's column count as the expected count.
+	// When explicit columns are given (INSERT INTO t (a, b) SELECT ...), plan.Columns
+	// has the list. Otherwise, the table schema determines the count.
 	expectedCols := len(plan.Columns)
 	if expectedCols == 0 {
 		expectedCols = len(plan.Table.Columns)

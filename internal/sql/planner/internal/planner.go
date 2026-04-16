@@ -191,12 +191,16 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 		if err != nil {
 			return nil, err
 		}
-		selectColCount := len(subPlan.SelectColumns)
-		if len(stmt.Columns) > 0 && selectColCount != len(stmt.Columns) {
-			return nil, plannerapi.ErrColumnCountMismatch
-		}
-		if len(stmt.Columns) == 0 && selectColCount != len(tbl.Columns) {
-			return nil, plannerapi.ErrColumnCountMismatch
+		// If SELECT has explicit columns (not *), validate count against target columns.
+		// Skip validation for SELECT * — executor's projectRows expands * to all table columns.
+		// For SELECT *, INSERT INTO dst SELECT * FROM src: dst table columns govern expected count.
+		if !hasStarExpr(subPlan.SelectColumns) {
+			if len(stmt.Columns) > 0 && len(subPlan.SelectColumns) != len(stmt.Columns) {
+				return nil, plannerapi.ErrColumnCountMismatch
+			}
+			if len(stmt.Columns) == 0 && len(subPlan.SelectColumns) != len(tbl.Columns) {
+				return nil, plannerapi.ErrColumnCountMismatch
+			}
 		}
 		return &plannerapi.InsertSelectPlan{
 			Table:      tbl,
@@ -1161,4 +1165,14 @@ func detectEquiJoin(on parserapi.Expr, leftTable, rightTable string, leftTableSc
 	}
 
 	return -1, -1, false
+}
+
+// hasStarExpr returns true if any column expression is a StarExpr (SELECT *).
+func hasStarExpr(cols []parserapi.SelectColumn) bool {
+	for _, c := range cols {
+		if _, ok := c.Expr.(*parserapi.StarExpr); ok {
+			return true
+		}
+	}
+	return false
 }

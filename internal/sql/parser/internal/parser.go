@@ -375,8 +375,8 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		return stmt, nil
 	}
 	if p.cur.Type == api.TokSelect {
-		// INSERT INTO t SELECT ...
-		p.advance() // consume SELECT
+		// Note: do NOT advance here — parseSelect consumes SELECT itself.
+		// (parseInsert's SET branch also does NOT advance before returning.)
 		sel, err := p.parseSelect()
 		if err != nil {
 			return nil, err
