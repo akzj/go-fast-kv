@@ -789,6 +789,14 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		key := hashKey(probe.Values[probeKeyIdx])
 		buildMatches := hashTable[key]
 
+		// Pre-allocate combinedVals once per probe row for ON condition evaluation.
+		// This buffer is reused across all build matches for this probe row,
+		// reducing allocations from O(matches) to O(probe rows).
+		var combinedVals []catalogapi.Value
+		if hplan.On != nil {
+			combinedVals = make([]catalogapi.Value, leftLen+rightLen)
+		}
+
 		if len(buildMatches) == 0 {
 			if joinType == "LEFT" {
 				// LEFT JOIN: unmatched probe (left) → NULL right
@@ -804,15 +812,13 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		for _, build := range buildMatches {
 			if hplan.On != nil {
 				// Evaluate ON condition with combined row
-				var combinedVals []catalogapi.Value
+				// Reuse pre-allocated combinedVals buffer
 				if buildIsLeft {
 					// build=left, probe=right
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, build.Values)
 					copy(combinedVals[leftLen:], probe.Values)
 				} else {
 					// build=right, probe=left
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, probe.Values)
 					copy(combinedVals[leftLen:], build.Values)
 				}
