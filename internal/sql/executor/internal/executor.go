@@ -789,14 +789,6 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		key := hashKey(probe.Values[probeKeyIdx])
 		buildMatches := hashTable[key]
 
-		// Pre-allocate combinedVals once per probe row for ON condition evaluation.
-		// This buffer is reused across all build matches for this probe row,
-		// reducing allocations from O(matches) to O(probe rows).
-		var combinedVals []catalogapi.Value
-		if hplan.On != nil {
-			combinedVals = make([]catalogapi.Value, leftLen+rightLen)
-		}
-
 		if len(buildMatches) == 0 {
 			if joinType == "LEFT" {
 				// LEFT JOIN: unmatched probe (left) → NULL right
@@ -812,13 +804,15 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		for _, build := range buildMatches {
 			if hplan.On != nil {
 				// Evaluate ON condition with combined row
-				// Reuse pre-allocated combinedVals buffer
+				var combinedVals []catalogapi.Value
 				if buildIsLeft {
 					// build=left, probe=right
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, build.Values)
 					copy(combinedVals[leftLen:], probe.Values)
 				} else {
 					// build=right, probe=left
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, probe.Values)
 					copy(combinedVals[leftLen:], build.Values)
 				}
@@ -1002,28 +996,9 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 func (e *executor) execInnerJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
 	var merged [][]catalogapi.Value
-	// Pre-allocate mergedRows buffer to estimated max size (worst case: all rows match).
-	// This reduces slice growth allocations.
-	merged = make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
-
-	// Pre-allocate combinedVals buffer once per outer row iteration.
-	// This buffer is reused across all right row match checks for the same left row,
-	// reducing allocations from O(matches) to O(outer rows).
-	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
-
 	for _, left := range leftRows {
-		// Reset combinedVals for each left row, keeping capacity.
-		// Copy left values into the combined buffer.
-		copy(combinedVals, left.Values)
-
 		for _, right := range rightRows {
-			// Copy right values into the remaining portion of combinedVals.
-			copy(combinedVals[leftLen:], right.Values)
-			combinedRow := &engineapi.Row{Values: combinedVals}
-
-			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults, e) {
-				// Use mergeRows which allocates the result - this is unavoidable
-				// since each matched row needs its own storage in the result.
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
 		}
@@ -1031,29 +1006,26 @@ func (e *executor) execInnerJoin(leftRows, rightRows []*engineapi.Row, jplan *pl
 	return merged
 }
 
-// joinMatchNoAlloc evaluates the ON condition for a combined row.
-// This version does NOT allocate combinedVals - it expects the caller
-// to have already set up the combinedRow.
-func (e *executor) joinMatchNoAlloc(combinedRow *engineapi.Row, on parserapi.Expr,
-	combinedCols []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) bool {
-	if on == nil {
-		return true
-	}
-	result, err := evalExpr(on, combinedRow, combinedCols, subqueryResults, ex)
-	if err != nil {
-		return false
-	}
-	return isTruthy(result)
-}
-
 // execLeftJoin emits all left rows; unmatched left rows get NULL for right columns.
 func (e *executor) execLeftJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
-	var merged [][]catalogapi.Value
+	// Pre-allocate mergedRows buffer to estimated max size.
+	merged := make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
+
+	// Pre-allocate combinedVals buffer once per outer row iteration.
+	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+
 	for _, left := range leftRows {
 		matched := false
+		// Copy left values once per row.
+		copy(combinedVals, left.Values)
+
 		for _, right := range rightRows {
-			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+			// Copy right values into combined buffer.
+			copy(combinedVals[leftLen:], right.Values)
+			combinedRow := &engineapi.Row{Values: combinedVals}
+
+			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults) {
 				matched = true
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
@@ -1068,12 +1040,23 @@ func (e *executor) execLeftJoin(leftRows, rightRows []*engineapi.Row, jplan *pla
 // execRightJoin emits all right rows; unmatched right rows get NULL for left columns.
 func (e *executor) execRightJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
-	var merged [][]catalogapi.Value
+	// Pre-allocate mergedRows buffer to estimated max size.
+	merged := make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
 	matchedRight := make([]bool, len(rightRows))
 
+	// Pre-allocate combinedVals buffer once per outer row iteration.
+	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+
 	for _, left := range leftRows {
+		// Copy left values once per row.
+		copy(combinedVals, left.Values)
+
 		for j, right := range rightRows {
-			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+			// Copy right values into combined buffer.
+			copy(combinedVals[leftLen:], right.Values)
+			combinedRow := &engineapi.Row{Values: combinedVals}
+
+			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults) {
 				matchedRight[j] = true
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
@@ -1132,6 +1115,20 @@ func (e *executor) joinMatch(left, right *engineapi.Row, jplan *plannerapi.JoinP
 	copy(combinedVals[leftLen:], right.Values)
 	combinedRow := &engineapi.Row{Values: combinedVals}
 	result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults, e)
+	if err != nil {
+		return false
+	}
+	return isTruthy(result)
+}
+
+// joinMatchNoAlloc evaluates the ON condition for a combined row without allocating.
+// The combinedVals buffer must be set up by the caller before calling this function.
+func (e *executor) joinMatchNoAlloc(combinedRow *engineapi.Row, on parserapi.Expr,
+	combinedCols []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) bool {
+	if on == nil {
+		return true
+	}
+	result, err := evalExpr(on, combinedRow, combinedCols, subqueryResults, e)
 	if err != nil {
 		return false
 	}
