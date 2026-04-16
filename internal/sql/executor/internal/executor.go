@@ -93,6 +93,8 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 		return e.execDropIndex(p)
 	case *plannerapi.InsertPlan:
 		return e.execInsert(p)
+	case *plannerapi.InsertSelectPlan:
+		return e.execInsertSelect(p)
 	case *plannerapi.SelectPlan:
 		if p.Join != nil {
 			return e.execJoinSelect(p)
@@ -360,6 +362,65 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	}
 
 	return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
+}
+
+func (e *executor) execInsertSelect(plan *plannerapi.InsertSelectPlan) (*executorapi.Result, error) {
+	subResult, err := e.execSelect(plan.SelectPlan)
+	if err != nil {
+		return nil, fmt.Errorf("%w: execute select: %v", executorapi.ErrExecFailed, err)
+	}
+
+	expectedCols := len(plan.Columns)
+	if expectedCols == 0 {
+		expectedCols = len(plan.Table.Columns)
+	}
+
+	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	batch := e.store.NewWriteBatch()
+	rowsAffected := int64(0)
+
+	for i, row := range subResult.Rows {
+		if len(row) != expectedCols {
+			return nil, fmt.Errorf("row %d: column count mismatch: got %d, expected %d", i+1, len(row), expectedCols)
+		}
+
+		rowID, err := e.tableEngine.InsertInto(plan.Table, batch, row)
+		if err != nil {
+			batch.Discard()
+			return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Insert index entries into the same batch (same pattern as execInsert).
+		for _, idx := range indexes {
+			colIdx := findColumnIndex(plan.Table, idx.Column)
+			if colIdx < 0 {
+				continue
+			}
+			val := row[colIdx]
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+		rowsAffected++
+	}
+
+	if err := e.tableEngine.PersistCounter(batch, plan.Table.TableID); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: rowsAffected}, nil
 }
 
 // isSubqueryInListContext checks if sq appears inside an InExpr's Values list.

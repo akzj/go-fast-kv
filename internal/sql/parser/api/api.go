@@ -169,9 +169,10 @@ func (*DropIndexStmt) stmtNode() {}
 
 // InsertStmt: INSERT INTO table [(col1, col2)] VALUES (v1, v2), ...
 type InsertStmt struct {
-	Table   string
-	Columns []string   // optional column list
-	Values  [][]Expr   // multiple rows
+	Table      string
+	Columns    []string   // optional column list
+	Values     [][]Expr   // multiple rows
+	SelectStmt *SelectStmt // SELECT subquery for INSERT ... SELECT
 }
 
 func (*InsertStmt) stmtNode() {}

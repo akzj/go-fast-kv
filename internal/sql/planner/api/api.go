@@ -116,6 +116,15 @@ type InsertPlan struct {
 
 func (*InsertPlan) planNode() {}
 
+// InsertSelectPlan inserts rows from a SELECT query into a table.
+type InsertSelectPlan struct {
+	Table      *catalogapi.TableSchema
+	SelectPlan *SelectPlan
+	Columns    []string // target column list; empty = use table schema
+}
+
+func (*InsertSelectPlan) planNode() {}
+
 // SelectPlan selects rows from a table.
 type SelectPlan struct {
 	Table         *catalogapi.TableSchema

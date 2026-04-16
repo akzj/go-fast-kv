@@ -374,6 +374,16 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		stmt.Values = [][]api.Expr{row}
 		return stmt, nil
 	}
+	if p.cur.Type == api.TokSelect {
+		// INSERT INTO t SELECT ...
+		p.advance() // consume SELECT
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		stmt.SelectStmt = sel.(*api.SelectStmt)
+		return stmt, nil
+	}
 	if err := p.expect(api.TokValues); err != nil {
 		return nil, err
 	}

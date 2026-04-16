@@ -176,13 +176,33 @@ func (p *planner) planDropIndex(stmt *parserapi.DropIndexStmt) (*plannerapi.Drop
 
 // ─── DML Planning ───────────────────────────────────────────────────
 
-func (p *planner) planInsert(stmt *parserapi.InsertStmt) (*plannerapi.InsertPlan, error) {
+func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error) {
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {
 		if err == catalogapi.ErrTableNotFound {
 			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
 		}
 		return nil, err
+	}
+
+	// INSERT ... SELECT
+	if stmt.SelectStmt != nil {
+		subPlan, err := p.planSelect(stmt.SelectStmt)
+		if err != nil {
+			return nil, err
+		}
+		selectColCount := len(subPlan.SelectColumns)
+		if len(stmt.Columns) > 0 && selectColCount != len(stmt.Columns) {
+			return nil, plannerapi.ErrColumnCountMismatch
+		}
+		if len(stmt.Columns) == 0 && selectColCount != len(tbl.Columns) {
+			return nil, plannerapi.ErrColumnCountMismatch
+		}
+		return &plannerapi.InsertSelectPlan{
+			Table:      tbl,
+			SelectPlan: subPlan,
+			Columns:    stmt.Columns,
+		}, nil
 	}
 
 	rows := make([][]catalogapi.Value, len(stmt.Values))
