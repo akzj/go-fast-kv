@@ -3,10 +3,12 @@ package gosql
 import (
 	"context"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"strings"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 	gosql "github.com/akzj/go-fast-kv/internal/sql"
 )
 
@@ -20,12 +22,16 @@ var _ driver.Connector = (*driverConnector)(nil)
 
 // db wraps the internal SQL DB with a method to create driver.Conn.
 type db struct {
-	store kvstoreapi.Store
+	store  kvstoreapi.Store
+	txnMgr txnapi.TxnContextFactory // for creating transaction contexts
 }
 
 // newDB creates a new SQL DB wrapper.
 func newDB(store kvstoreapi.Store) *db {
-	return &db{store: store}
+	return &db{
+		store:  store,
+		txnMgr: store.TxnManager(),
+	}
 }
 
 // conn returns a driver.Conn for this database.
@@ -58,24 +64,29 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 }
 
 // Begin implements driver.Conn.Begin.
-// Starts a new transaction.
+// Starts a new transaction with a real TxnContext.
 func (c *Conn) Begin() (driver.Tx, error) {
 	if c.closed {
 		return nil, driver.ErrBadConn
 	}
+	if c.tx != nil {
+		return nil, fmt.Errorf("gosql: transaction already active")
+	}
 
-	// Create a new SQL DB for transaction isolation.
-	txDB := gosql.Open(c.db.store)
+	// Create a real transaction context using the txnMgr.
+	txnCtx := c.db.txnMgr.BeginTxnContext()
+	if txnCtx == nil {
+		return nil, fmt.Errorf("gosql: failed to begin transaction")
+	}
 
-	txWrapper := &Tx{
-		conn:    c,
-		txDB:    txDB,
-		committed: false,
+	c.tx = &Tx{
+		conn:       c,
+		txnCtx:     txnCtx,
+		committed:  false,
 		rollbacked: false,
 	}
-	c.tx = txWrapper
 
-	return txWrapper, nil
+	return c.tx, nil
 }
 
 // Close implements driver.Conn.Close.
@@ -193,40 +204,46 @@ func (s *Stmt) CheckNamedValue(nv *driver.NamedValue) error {
 }
 
 // Tx implements driver.Tx.
-// Uses a separate gosql.DB instance for transaction isolation.
+// Uses a real TxnContext for transaction lifecycle management.
 type Tx struct {
 	conn       *Conn
-	txDB       *gosql.DB // Dedicated SQL DB for this transaction
+	txnCtx     txnapi.TxnContext // the active transaction context
 	committed  bool
 	rollbacked bool
 }
 
 // Commit implements driver.Tx.Commit.
-// Commits the transaction by closing the transaction DB.
+// Commits the transaction via txnCtx.Commit().
 func (t *Tx) Commit() error {
-	if t.committed || t.rollbacked {
-		return nil
+	if t.committed {
+		return fmt.Errorf("gosql: transaction already committed")
+	}
+	if t.rollbacked {
+		return fmt.Errorf("gosql: transaction already rolled back")
+	}
+	if !t.txnCtx.IsActive() {
+		return fmt.Errorf("gosql: transaction not active")
 	}
 	t.committed = true
-	// The txDB is closed which finalizes the transaction.
-	// KNOWN TRAP: Clean up resources.
-	t.txDB.Close()
-	t.txDB = nil
-	return nil
+	err := t.txnCtx.Commit()
+	t.conn.tx = nil // clear the transaction
+	return err
 }
 
 // Rollback implements driver.Tx.Rollback.
 func (t *Tx) Rollback() error {
-	if t.committed || t.rollbacked {
-		return nil
+	if t.committed {
+		return nil // already committed: no-op (per MySQL/Postgres)
+	}
+	if t.rollbacked {
+		return nil // already rolled back: no-op
+	}
+	if !t.txnCtx.IsActive() {
+		return nil // not active: no-op
 	}
 	t.rollbacked = true
-	// For proper rollback, we need to discard changes.
-	// Since gosql.DB doesn't support true rollback, we implement
-	// rollback by tracking and undoing operations.
-	// This is a limitation - full rollback requires engine support.
-	t.txDB.Close()
-	t.txDB = nil
+	t.txnCtx.Rollback()
+	t.conn.tx = nil // clear the transaction
 	return nil
 }
 
@@ -253,7 +270,7 @@ func (s *TxStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.tx.txDB.Exec(query)
+	result, err := s.tx.conn.txnDB.Exec(query)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +282,7 @@ func (s *TxStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.tx.txDB.Query(query)
+	result, err := s.tx.conn.txnDB.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +290,7 @@ func (s *TxStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RowsWithDB{rows: rows, db: s.tx.txDB, idx: 0}, nil
+	return &RowsWithDB{rows: rows, db: s.tx.conn.txnDB, idx: 0}, nil
 }
 
 func (s *TxStmt) LastInsertId() (int64, bool) { return 0, false }
