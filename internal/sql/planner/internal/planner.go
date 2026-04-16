@@ -55,6 +55,14 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planIntersect(s)
 	case *parserapi.ExceptStmt:
 		return p.planExcept(s)
+	// Transaction control statements — nil plan signals "transaction control"
+	// to sql.DB.Exec(), which manages the transaction lifecycle.
+	case *parserapi.BeginStmt:
+		return nil, nil
+	case *parserapi.CommitStmt:
+		return nil, nil
+	case *parserapi.RollbackStmt:
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}

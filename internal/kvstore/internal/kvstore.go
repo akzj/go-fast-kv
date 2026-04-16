@@ -647,6 +647,13 @@ func (s *store) SetTTL(key []byte, ttl time.Duration) error {
 func (s *store) TTL(key []byte) (time.Duration, error) {
 	return 0, kvstoreapi.ErrNotImplemented
 }
+
+// TxnManager returns the underlying transaction manager.
+// Used by the SQL layer to create TxnContext for BEGIN...COMMIT transactions.
+func (s *store) TxnManager() txnapi.TxnContextFactory {
+	return s.txnMgr
+}
+
 // ─── Close ──────────────────────────────────────────────────────────
 
 func (s *store) Close() error {

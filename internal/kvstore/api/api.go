@@ -12,6 +12,7 @@ import (
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
+	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -202,6 +203,10 @@ type Store interface {
 	// TTL returns the remaining time until key expires.
 	// Returns 0 if key has no expiration, negative if expired.
 	TTL(key []byte) (time.Duration, error)
+
+	// TxnManager returns the underlying transaction manager.
+	// Used by the SQL layer to create TxnContext for BEGIN...COMMIT transactions.
+	TxnManager() txnapi.TxnContextFactory
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────
