@@ -226,6 +226,38 @@ func (p *JoinPlan) String() string {
 	return b.String()
 }
 
+// HashJoinPlan represents an equi-join optimized with hash table.
+// Uses O(n+m) hash join instead of O(n*m) nested loop for equi-joins.
+type HashJoinPlan struct {
+	Left        Plan                     // left plan (ScanPlan or nested JoinPlan for multi-join)
+	Right       ScanPlan                 // Scan plan for right table
+	LeftSchema  []*catalogapi.ColumnDef // columns from left side (for ON eval)
+	RightSchema []*catalogapi.ColumnDef // columns from right table
+	LeftTable   string                  // table name for left (for key resolution)
+	RightTable  string                  // table name for right (for key resolution)
+	LeftKeyIdx  int                     // column index in left schema for hash key
+	RightKeyIdx int                     // column index in right schema for hash key
+	On          parserapi.Expr          // join condition (may include non-equi parts)
+	Type        string                  // "INNER", "LEFT", "RIGHT"
+}
+
+func (*HashJoinPlan) planNode() {}
+
+// String returns a human-readable description of the hash join.
+func (p *HashJoinPlan) String() string {
+	var b strings.Builder
+	b.WriteString(p.Type + " HASH JOIN (optimized)")
+	if p.LeftTable != "" && p.RightTable != "" {
+		b.WriteString(" " + p.LeftTable + " × " + p.RightTable)
+	}
+	b.WriteString("\n")
+	if p.On != nil {
+		b.WriteString("├─ ON: " + formatExpr(p.On) + "\n")
+	}
+	b.WriteString("└─ hash keys: " + p.LeftTable + "[col" + fmt.Sprintf("%d", p.LeftKeyIdx) + "] = " + p.RightTable + "[col" + fmt.Sprintf("%d", p.RightKeyIdx) + "]")
+	return b.String()
+}
+
 
 
 // ─── Planner Interface ──────────────────────────────────────────────
