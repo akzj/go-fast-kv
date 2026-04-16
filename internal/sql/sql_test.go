@@ -299,3 +299,65 @@ func TestEndToEnd_NotNot(t *testing.T) {
 		t.Errorf("expected [1,3], got [%d,%d]", res.Rows[0][0].Int, res.Rows[1][0].Int)
 	}
 }
+
+func TestEndToEnd_Union(t *testing.T) {
+	db, _ := openTestDB(t)
+
+	// Test 1: SELECT 1 UNION SELECT 2 → 2 rows (basic dedup)
+	res, err := db.Query("SELECT 1 UNION SELECT 2")
+	if err != nil {
+		t.Fatalf("UNION: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("UNION: expected 2 rows, got %d", len(res.Rows))
+	}
+
+	// Test 2: SELECT 1 UNION ALL SELECT 1 → 2 rows (no dedup)
+	res, err = db.Query("SELECT 1 UNION ALL SELECT 1")
+	if err != nil {
+		t.Fatalf("UNION ALL: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("UNION ALL: expected 2 rows, got %d", len(res.Rows))
+	}
+
+	// Test 3: SELECT 1 UNION SELECT 2 UNION SELECT 3 → 3 rows (all unique, standard SQL dedup)
+	res, err = db.Query("SELECT 1 UNION SELECT 2 UNION SELECT 3")
+	if err != nil {
+		t.Fatalf("chained UNION: %v", err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("chained UNION: expected 3 rows (all values unique), got %d", len(res.Rows))
+	}
+
+	// Test 3b: SELECT 1 UNION SELECT 1 UNION SELECT 1 → 1 row (dedup removes all duplicates)
+	res, err = db.Query("SELECT 1 UNION SELECT 1 UNION SELECT 1")
+	if err != nil {
+		t.Fatalf("chained UNION with dupes: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("chained UNION with dupes: expected 1 row, got %d", len(res.Rows))
+	}
+
+	// Test 4: Table with UNION
+	db.Exec("CREATE TABLE t (id INTEGER)")
+	db.Exec("INSERT INTO t VALUES (1)")
+	db.Exec("INSERT INTO t VALUES (2)")
+	db.Exec("INSERT INTO t VALUES (3)")
+
+	res, err = db.Query("SELECT id FROM t UNION SELECT id FROM t")
+	if err != nil {
+		t.Fatalf("table UNION: %v", err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("table UNION: expected 3 rows (dedup), got %d", len(res.Rows))
+	}
+
+	res, err = db.Query("SELECT id FROM t UNION ALL SELECT id FROM t")
+	if err != nil {
+		t.Fatalf("table UNION ALL: %v", err)
+	}
+	if len(res.Rows) != 6 {
+		t.Fatalf("table UNION ALL: expected 6 rows, got %d", len(res.Rows))
+	}
+}

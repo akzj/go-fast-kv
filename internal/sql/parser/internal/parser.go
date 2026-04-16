@@ -605,6 +605,7 @@ func (p *parser) parseSelect() (api.Statement, error) {
 
 	// Check for UNION [ALL]
 	// Right-associative: A UNION B UNION C parses as A UNION (B UNION C)
+	// by recursively parsing the right side as another SELECT
 	if p.cur.Type == api.TokUnion || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "UNION") {
 		p.advance() // consume UNION
 		unionAll := false
@@ -613,7 +614,7 @@ func (p *parser) parseSelect() (api.Statement, error) {
 			unionAll = true
 			p.advance() // consume ALL
 		}
-		// Parse right side as a statement (may be another UNION)
+		// Parse right side as a statement (may be another UNION → right-assoc)
 		rightStmt, err := p.parseSelect()
 		if err != nil {
 			return nil, err
