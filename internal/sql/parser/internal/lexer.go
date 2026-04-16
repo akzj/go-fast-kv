@@ -68,6 +68,8 @@ var keywords = map[string]api.TokenType{
 	"THEN":     api.TokThen,
 	"ELSE":     api.TokElse,
 	"END":      api.TokEnd,
+	"UNION":    api.TokUnion,
+	"ALL":      api.TokAll,
 }
 
 // lexer tokenizes SQL input.

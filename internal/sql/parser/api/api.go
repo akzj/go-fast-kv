@@ -100,6 +100,8 @@ const (
 	TokThen     TokenType = 75 // THEN
 	TokElse     TokenType = 76 // ELSE
 	TokEnd      TokenType = 77 // END
+	TokUnion    TokenType = 78 // UNION
+	TokAll      TokenType = 79 // ALL
 )
 
 // Token represents a single lexical token.
@@ -198,6 +200,15 @@ type SelectStmt struct {
 }
 
 func (*SelectStmt) stmtNode() {}
+
+// UnionStmt: SELECT ... UNION [ALL] SELECT ...
+type UnionStmt struct {
+	Left     Statement
+	Right    Statement
+	UnionAll bool
+}
+
+func (*UnionStmt) stmtNode() {}
 
 // SelectColumn represents a single column in a SELECT list.
 type SelectColumn struct {
