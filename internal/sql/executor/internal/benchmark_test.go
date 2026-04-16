@@ -208,6 +208,43 @@ func BenchmarkNestedLoopJoin(b *testing.B) {
 	}
 }
 
+// BenchmarkHashJoinWithExtraON measures hash join when there's an extra ON condition
+// beyond the equi-join key. This exercises the combinedVals allocation in execHashJoin.
+func BenchmarkHashJoinWithExtraON(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	// Create tables for hash join with extra column
+	env.execSQL("CREATE TABLE customers (id INT, name TEXT, score INT)")
+	env.execSQL("CREATE TABLE orders (customer_id INT, amount INT)")
+
+	// Insert 100 customers, 500 orders
+	for i := 1; i <= 100; i++ {
+		env.execSQL("INSERT INTO customers VALUES (" + itoa(i) + ", 'customer', " + itoa(i*10) + ")")
+	}
+	for i := 1; i <= 500; i++ {
+		customerID := (i % 100) + 1
+		env.execSQL("INSERT INTO orders VALUES (" + itoa(customerID) + ", " + itoa(i*10) + ")")
+	}
+
+	// Query with extra ON condition: JOIN ON customers.id = orders.customer_id AND customers.score > 50
+	// This forces combinedVals allocation in execHashJoin for ON evaluation
+	plan, err := env.prepare("SELECT customers.name, orders.amount FROM customers JOIN orders ON customers.id = orders.customer_id AND customers.score > 50")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
 // itoa converts int to string without importing strconv.
 func itoa(i int) string {
 	if i == 0 {
