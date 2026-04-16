@@ -1087,6 +1087,49 @@ func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
 	return args, nil
 }
 
+// parseCaseExpr parses CASE WHEN cond THEN val [WHEN ...] [ELSE val] END
+func (p *parser) parseCaseExpr() (api.Expr, error) {
+	p.advance() // consume CASE
+	var whens []api.WhenClause
+	for {
+		if p.cur.Type != api.TokWhen {
+			return nil, p.errorf("expected WHEN after CASE")
+		}
+		p.advance() // consume WHEN
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokThen {
+			return nil, p.errorf("expected THEN after WHEN condition")
+		}
+		p.advance() // consume THEN
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		whens = append(whens, api.WhenClause{Cond: cond, Val: val})
+		if p.cur.Type != api.TokWhen {
+			break
+		}
+	}
+	// Optional ELSE
+	var elseVal api.Expr
+	if p.cur.Type == api.TokElse {
+		p.advance() // consume ELSE
+		var err error
+		elseVal, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if p.cur.Type != api.TokEnd {
+		return nil, p.errorf("expected END after CASE")
+	}
+	p.advance() // consume END
+	return &api.CaseExpr{Whens: whens, Else: elseVal}, nil
+}
+
 // primary = literal | ident ["." ident] | "(" expr ")" | "-" primary | "*"
 func (p *parser) parseJoin(left interface{}) (*api.JoinExpr, error) {
 	// Check for LEFT/RIGHT/CROSS prefix
@@ -1370,6 +1413,9 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			}
 		}
 		return &api.UnaryExpr{Op: api.UnaryMinus, Operand: operand}, nil
+
+	case api.TokCase:
+		return p.parseCaseExpr()
 
 	default:
 		return nil, p.errorf("expected expression")

@@ -63,6 +63,11 @@ var keywords = map[string]api.TokenType{
 	"AS":       api.TokIdent, // also a keyword but handled as alias separator in SELECT
 	"OFFSET":   api.TokOffset,
 	"COALESCE": api.TokCoalesce,
+	"CASE":     api.TokCase,
+	"WHEN":     api.TokWhen,
+	"THEN":     api.TokThen,
+	"ELSE":     api.TokElse,
+	"END":      api.TokEnd,
 }
 
 // lexer tokenizes SQL input.

@@ -47,6 +47,14 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		for _, arg := range e.Args {
 			walkExpr(arg, fn)
 		}
+	case *parserapi.CaseExpr:
+		for _, w := range e.Whens {
+			walkExpr(w.Cond, fn)
+			walkExpr(w.Val, fn)
+		}
+		if e.Else != nil {
+			walkExpr(e.Else, fn)
+		}
 	case *parserapi.ExistsExpr:
 		// Subquery body not walked here (would need Statement visitor)
 	}
@@ -78,6 +86,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalInExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CoalesceExpr:
 		return evalCoalesceExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.CaseExpr:
+		return evalCaseExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.ExistsExpr:
 		return evalExistsExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.SubqueryExpr:
@@ -659,6 +669,30 @@ func evalCoalesceExpr(expr *parserapi.CoalesceExpr, row *engineapi.Row, columns 
 		}
 	}
 	// All values were NULL
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalCaseExpr evaluates a CASE expression.
+// SQL three-valued logic: WHEN condition must evaluate to TRUE (not NULL, not FALSE).
+// If condition is NULL → falls through to next WHEN/ELSE.
+// If condition is FALSE → falls through to next WHEN/ELSE.
+func evalCaseExpr(expr *parserapi.CaseExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	for _, w := range expr.Whens {
+		condVal, err := evalExpr(w.Cond, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// SQL: WHEN condition must be TRUE (not NULL, not FALSE)
+		if !condVal.IsNull && isTruthy(condVal) {
+			return evalExpr(w.Val, row, columns, subqueryResults, ex)
+		}
+		// NULL or FALSE → fall through
+	}
+	// No WHEN matched — return ELSE or NULL
+	if expr.Else != nil {
+		return evalExpr(expr.Else, row, columns, subqueryResults, ex)
+	}
 	return catalogapi.Value{IsNull: true}, nil
 }
 

@@ -95,6 +95,11 @@ const (
 	TokCross    TokenType = 70 // CROSS
 	TokCoalesce TokenType = 71 // COALESCE
 	TokOffset   TokenType = 72 // OFFSET
+	TokCase     TokenType = 73 // CASE
+	TokWhen     TokenType = 74 // WHEN
+	TokThen     TokenType = 75 // THEN
+	TokElse     TokenType = 76 // ELSE
+	TokEnd      TokenType = 77 // END
 )
 
 // Token represents a single lexical token.
@@ -343,6 +348,19 @@ type BetweenExpr struct {
 }
 
 func (*BetweenExpr) exprNode() {}
+
+// CaseExpr represents a CASE expression: CASE WHEN cond THEN val [WHEN ...] [ELSE val] END
+type CaseExpr struct {
+	Whens []WhenClause // each WHEN cond THEN val
+	Else  Expr         // nil if no ELSE (result is NULL)
+}
+
+type WhenClause struct {
+	Cond Expr // condition expression
+	Val  Expr // result when condition is true
+}
+
+func (*CaseExpr) exprNode() {}
 
 // SubqueryExpr represents a subquery in an expression context, e.g. (SELECT ...).
 type SubqueryExpr struct {

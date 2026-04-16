@@ -953,6 +953,9 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 		case *parserapi.CoalesceExpr:
 			// CoalesceExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
+		case *parserapi.CaseExpr:
+			// CaseExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		case *parserapi.BinaryExpr:
 			// Binary expressions (e.g., 1+1, a+b) are evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
@@ -1034,6 +1037,20 @@ func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
 		return walkExprForSubqueries(e.High, p)
 	case *parserapi.IsNullExpr:
 		return walkExprForSubqueries(e.Expr, p)
+	case *parserapi.CaseExpr:
+		for _, w := range e.Whens {
+			if err := walkExprForSubqueries(w.Cond, p); err != nil {
+				return err
+			}
+			if err := walkExprForSubqueries(w.Val, p); err != nil {
+				return err
+			}
+		}
+		if e.Else != nil {
+			if err := walkExprForSubqueries(e.Else, p); err != nil {
+				return err
+			}
+		}
 	case *parserapi.AggregateCallExpr:
 		// No subquery inside aggregates
 	case *parserapi.Literal, *parserapi.ColumnRef, *parserapi.StarExpr:
