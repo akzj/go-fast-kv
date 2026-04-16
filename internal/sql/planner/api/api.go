@@ -277,6 +277,21 @@ type IndexScanPlan struct {
 func (*IndexScanPlan) scanNode()  {}
 func (*IndexScanPlan) planNode() {}
 
+// IndexOnlyScanPlan uses an index to satisfy a query without touching table pages.
+// All required columns (SELECT, WHERE, ORDER BY) are available in the index itself.
+type IndexOnlyScanPlan struct {
+	TableID           uint32
+	IndexID          uint32
+	Index            *catalogapi.IndexSchema
+	Op               encodingapi.CompareOp
+	Value            catalogapi.Value
+	ResidualFilter   parserapi.Expr // remaining filter conditions; nil = none
+	IndexedColumnIdx int            // column index for the indexed column in SELECT
+}
+
+func (*IndexOnlyScanPlan) scanNode() {}
+func (*IndexOnlyScanPlan) planNode() {}
+
 // IndexRangePlan uses an index range scan for LIKE 'prefix%' optimization.
 // Encodes LIKE 'abc%' as start='abc' (inclusive), end='abd' (exclusive).
 type IndexRangePlan struct {
@@ -535,6 +550,8 @@ func scanString(s ScanPlan) string {
 		return s.String()
 	case *IndexScanPlan:
 		return s.String()
+	case *IndexOnlyScanPlan:
+		return s.String()
 	case *IndexRangePlan:
 		return s.String()
 	default:
@@ -589,6 +606,11 @@ func (p *TableScanPlan) String() string {
 // String returns a human-readable index scan description.
 func (p *IndexScanPlan) String() string {
 	return fmt.Sprintf("INDEX SCAN table=%d index=%d op=%v value=%v", p.TableID, p.IndexID, p.Op, p.Value)
+}
+
+// String returns a human-readable index-only scan description.
+func (p *IndexOnlyScanPlan) String() string {
+	return fmt.Sprintf("INDEX ONLY SCAN table=%d index=%d op=%v value=%v", p.TableID, p.IndexID, p.Op, p.Value)
 }
 
 // String returns a human-readable index range description.
