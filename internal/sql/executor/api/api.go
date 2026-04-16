@@ -12,6 +12,7 @@ import (
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
+	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -43,4 +44,9 @@ type Executor interface {
 	// Execute runs a plan and returns the result.
 	// Plans are produced by the planner module.
 	Execute(plan plannerapi.Plan) (*Result, error)
+
+	// ExecuteWithTxn runs a plan with transaction context for row locking.
+	// If txnCtx is nil, behaves identically to Execute.
+	// Use for executing statements inside BEGIN...COMMIT blocks.
+	ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*Result, error)
 }

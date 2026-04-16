@@ -30,6 +30,7 @@ import (
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
+	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 
 	"github.com/akzj/go-fast-kv/internal/sql/catalog"
 	"github.com/akzj/go-fast-kv/internal/sql/encoding"
@@ -61,6 +62,10 @@ type DB struct {
 	parser   parserapi.Parser
 	planner  plannerapi.Planner
 	executor executorapi.Executor
+	// Transaction state: txnMgr creates transactions, txnCtx is the active transaction.
+	// txnCtx is protected by db.mu (serializes all DB operations).
+	txnMgr txnapi.TxnContextFactory
+	txnCtx txnapi.TxnContext
 }
 
 // Open creates a new SQL database using the given KV store.
@@ -96,6 +101,8 @@ func Open(store kvstoreapi.Store) *DB {
 		parser:   p,
 		planner:  pl,
 		executor: ex,
+		txnMgr:   store.TxnManager(),
+		txnCtx:   nil,
 	}
 }
 
@@ -178,6 +185,44 @@ func (db *DB) exec(sql string) (*Result, error) {
 		}, nil
 	}
 
-	// Execute plan → result
+	// Handle transaction-control statements.
+	// Planner returns nil plan for BeginStmt/CommitStmt/RollbackStmt.
+	// nil plan + non-nil stmt means "transaction control" (not a parse error).
+	if plan == nil && stmt != nil {
+		switch stmt.(type) {
+		case *parserapi.BeginStmt:
+			if db.txnCtx != nil {
+				return nil, fmt.Errorf("sql: transaction already active")
+			}
+			db.txnCtx = db.txnMgr.BeginTxnContext()
+			if db.txnCtx == nil {
+				return nil, fmt.Errorf("sql: failed to begin transaction")
+			}
+			return &executorapi.Result{}, nil
+
+		case *parserapi.CommitStmt:
+			if db.txnCtx == nil {
+				return nil, fmt.Errorf("sql: no active transaction to commit")
+			}
+			err := db.txnCtx.Commit()
+			db.txnCtx = nil
+			return &executorapi.Result{}, err
+
+		case *parserapi.RollbackStmt:
+			if db.txnCtx == nil {
+				// Rollback with no transaction: no-op (per MySQL/Postgres compatibility)
+				return &executorapi.Result{}, nil
+			}
+			db.txnCtx.Rollback()
+			db.txnCtx = nil
+			return &executorapi.Result{}, nil
+		}
+	}
+
+	// Normal plan execution
+	if db.txnCtx != nil {
+		// Inside a transaction: use ExecuteWithTxn for row locking
+		return db.executor.ExecuteWithTxn(plan, db.txnCtx)
+	}
 	return db.executor.Execute(plan)
 }
