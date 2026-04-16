@@ -1274,7 +1274,8 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			return nil, p.errorf("expression too deeply nested (max 1000 levels)")
 		}
 		// EXISTS (SELECT ...) or NOT EXISTS (SELECT ...) — check peek since cur is TokLParen.
-		if p.peek.Type == api.TokExists {
+		// TokNot must be checked too: NOT EXISTS has peek=NOT, not EXISTS.
+		if p.peek.Type == api.TokExists || p.peek.Type == api.TokNot {
 			p.advance() // consume '('
 			not := false
 			if p.cur.Type == api.TokNot {
