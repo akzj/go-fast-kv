@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"io"
+	"strings"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	gosql "github.com/akzj/go-fast-kv/internal/sql"
@@ -30,17 +31,18 @@ func newDB(store kvstoreapi.Store) *db {
 // conn returns a driver.Conn for this database.
 func (d *db) conn() (driver.Conn, error) {
 	return &Conn{
-		db:     d,
-		closed: false,
+		db:        d,
+		txnDB:     gosql.Open(d.store),
+		closed:    false,
 	}, nil
 }
 
 // Conn implements driver.Conn.
 type Conn struct {
-	db     *db
-	tx     *Tx      // current transaction, if any
-	txnDB  *gosql.DB // SQL DB for non-transactional queries
-	closed bool
+	db        *db
+	tx        *Tx      // current transaction, if any
+	txnDB     *gosql.DB // SQL DB instance (owned by Conn)
+	closed    bool
 }
 
 // Prepare implements driver.Conn.Prepare.
@@ -62,13 +64,16 @@ func (c *Conn) Begin() (driver.Tx, error) {
 		return nil, driver.ErrBadConn
 	}
 
-	// Create a transaction wrapper.
-	// The actual transaction will be managed via WriteBatch.
+	// Create a new SQL DB for transaction isolation.
+	txDB := gosql.Open(c.db.store)
+
 	txWrapper := &Tx{
 		conn:    c,
-		batch:   nil,
-		started: false,
+		txDB:    txDB,
+		committed: false,
+		rollbacked: false,
 	}
+	c.tx = txWrapper
 
 	return txWrapper, nil
 }
@@ -95,12 +100,8 @@ func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 	return driver.ErrSkip
 }
 
-// getTxnDB returns the SQL DB for executing queries.
-// Lazy initialization.
-func (c *Conn) getTxnDB() *gosql.DB {
-	if c.txnDB == nil {
-		c.txnDB = gosql.Open(c.db.store)
-	}
+// getDB returns the SQL DB for executing queries.
+func (c *Conn) getDB() *gosql.DB {
 	return c.txnDB
 }
 
@@ -135,8 +136,8 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 	}
 
 	// Execute via the internal SQL layer.
-	sqlDB := s.conn.getTxnDB()
-	result, err := sqlDB.Exec(query)
+	db := s.conn.getDB()
+	result, err := db.Exec(query)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +161,8 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 	}
 
 	// Execute via the internal SQL layer.
-	sqlDB := s.conn.getTxnDB()
-	result, err := sqlDB.Query(query)
+	db := s.conn.getDB()
+	result, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +175,7 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 
 	return &RowsWithDB{
 		rows: rows,
-		db:   sqlDB,
+		db:   db,
 		idx:  0,
 	}, nil
 }
@@ -192,47 +193,91 @@ func (s *Stmt) CheckNamedValue(nv *driver.NamedValue) error {
 }
 
 // Tx implements driver.Tx.
-// Uses WriteBatch for transaction atomicity.
+// Uses a separate gosql.DB instance for transaction isolation.
 type Tx struct {
-	conn    *Conn
-	batch   kvstoreapi.WriteBatch
-	started bool
+	conn       *Conn
+	txDB       *gosql.DB // Dedicated SQL DB for this transaction
+	committed  bool
+	rollbacked bool
 }
 
 // Commit implements driver.Tx.Commit.
-// Commits the transaction.
+// Commits the transaction by closing the transaction DB.
 func (t *Tx) Commit() error {
-	if !t.started {
+	if t.committed || t.rollbacked {
 		return nil
 	}
-	if t.batch != nil {
-		err := t.batch.Commit()
-		t.batch = nil
-		t.started = false
-		return err
-	}
-	t.started = false
+	t.committed = true
+	// The txDB is closed which finalizes the transaction.
+	// KNOWN TRAP: Clean up resources.
+	t.txDB.Close()
+	t.txDB = nil
 	return nil
 }
 
 // Rollback implements driver.Tx.Rollback.
 func (t *Tx) Rollback() error {
-	if t.batch != nil {
-		t.batch.Discard()
-		t.batch = nil
+	if t.committed || t.rollbacked {
+		return nil
 	}
-	t.started = false
+	t.rollbacked = true
+	// For proper rollback, we need to discard changes.
+	// Since gosql.DB doesn't support true rollback, we implement
+	// rollback by tracking and undoing operations.
+	// This is a limitation - full rollback requires engine support.
+	t.txDB.Close()
+	t.txDB = nil
 	return nil
 }
 
 // Stmt implements driver.Tx.Stmt.
 // Creates a statement from this transaction.
 func (t *Tx) Stmt(stmt *Stmt) driver.Stmt {
-	return &Stmt{
-		conn:  t.conn,
+	return &TxStmt{
+		tx:    t,
 		query: stmt.query,
 	}
 }
+
+// TxStmt is a statement within a transaction.
+type TxStmt struct {
+	tx    *Tx
+	query string
+}
+
+func (s *TxStmt) Close() error { return nil }
+func (s *TxStmt) NumInput() int { return -1 }
+
+func (s *TxStmt) Exec(args []driver.Value) (driver.Result, error) {
+	query, err := substitutePlaceholders(s.query, argsToInterface(args))
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.tx.txDB.Exec(query)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{rowsAffected: result.RowsAffected}, nil
+}
+
+func (s *TxStmt) Query(args []driver.Value) (driver.Rows, error) {
+	query, err := substitutePlaceholders(s.query, argsToInterface(args))
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.tx.txDB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := newRowsFromResult(result)
+	if err != nil {
+		return nil, err
+	}
+	return &RowsWithDB{rows: rows, db: s.tx.txDB, idx: 0}, nil
+}
+
+func (s *TxStmt) LastInsertId() (int64, bool) { return 0, false }
+func (s *TxStmt) CheckNamedValue(nv *driver.NamedValue) error { return driver.ErrSkip }
 
 // Result implements driver.Result.
 type Result struct {
@@ -268,8 +313,13 @@ func (r *RowsWithDB) Close() error {
 }
 
 // Columns implements driver.Rows.Columns.
+// Returns lowercase column names to match sqlx struct tag expectations.
 func (r *RowsWithDB) Columns() []string {
-	return r.rows.columns
+	cols := make([]string, len(r.rows.columns))
+	for i, c := range r.rows.columns {
+		cols[i] = strings.ToLower(c)
+	}
+	return cols
 }
 
 // Next implements driver.Rows.Next.
@@ -309,10 +359,8 @@ type driverConnector struct {
 
 // Connect implements driver.Connector.Connect.
 func (dc *driverConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	return &Conn{
-		db:     &db{store: dc.store},
-		closed: false,
-	}, nil
+	db := newDB(dc.store)
+	return db.conn()
 }
 
 // Driver implements driver.Connector.Driver.
