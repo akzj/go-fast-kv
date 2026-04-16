@@ -193,6 +193,66 @@ type ExceptPlan struct {
 
 func (*ExceptPlan) planNode() {}
 
+// ─── EXPLAIN Plan ──────────────────────────────────────────────────
+
+// ExplainPlan wraps an inner plan for EXPLAIN output.
+// For EXPLAIN: returns the plan description without execution.
+// For EXPLAIN ANALYZE: executes the inner plan and returns stats.
+type ExplainPlan struct {
+	Inner   Plan // the plan to explain
+	Analyze bool // true for EXPLAIN ANALYZE (execute and return stats)
+}
+
+func (*ExplainPlan) planNode() {}
+
+// String returns a human-readable description of the EXPLAIN plan.
+func (p *ExplainPlan) String() string {
+	if p.Inner == nil {
+		return "EXPLAIN (nil plan)"
+	}
+	innerStr := planDescription(p.Inner)
+	if p.Analyze {
+		return "EXPLAIN ANALYZE\n└─ " + innerStr
+	}
+	return "EXPLAIN\n└─ " + innerStr
+}
+
+// planDescription returns a string description of any plan.
+func planDescription(plan Plan) string {
+	switch p := plan.(type) {
+	case *SelectPlan:
+		return p.String()
+	case *InsertPlan:
+		return fmt.Sprintf("INSERT INTO %s", p.Table.Name)
+	case *DeletePlan:
+		return fmt.Sprintf("DELETE FROM %s", p.Table.Name)
+	case *UpdatePlan:
+		return fmt.Sprintf("UPDATE %s", p.Table.Name)
+	case *CreateTablePlan:
+		return fmt.Sprintf("CREATE TABLE %s", p.Schema.Name)
+	case *DropTablePlan:
+		return fmt.Sprintf("DROP TABLE %s", p.TableName)
+	case *CreateIndexPlan:
+		return fmt.Sprintf("CREATE INDEX ON %s(%s)", p.Schema.Table, p.Schema.Column)
+	case *DropIndexPlan:
+		return fmt.Sprintf("DROP INDEX %s.%s", p.TableName, p.IndexName)
+	case *JoinPlan:
+		return p.String()
+	case *HashJoinPlan:
+		return p.String()
+	case *UnionPlan:
+		return "UNION"
+	case *IntersectPlan:
+		return "INTERSECT"
+	case *ExceptPlan:
+		return "EXCEPT"
+	case *InsertSelectPlan:
+		return fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
+	default:
+		return fmt.Sprintf("%T", plan)
+	}
+}
+
 // ─── Scan Plans ─────────────────────────────────────────────────────
 
 // TableScanPlan performs a full table scan.

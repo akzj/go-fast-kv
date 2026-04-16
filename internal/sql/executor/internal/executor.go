@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"time"
 	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -112,6 +113,8 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 		return e.execIntersect(p)
 	case *plannerapi.ExceptPlan:
 		return e.execExcept(p)
+	case *plannerapi.ExplainPlan:
+		return e.execExplain(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -2605,4 +2608,136 @@ func hasExpressions(cols []parserapi.SelectColumn) bool {
 		}
 	}
 	return false
+}
+
+// execExplain handles EXPLAIN and EXPLAIN ANALYZE.
+// For EXPLAIN: returns the plan description without execution.
+// For EXPLAIN ANALYZE: executes the inner plan and returns timing/row stats.
+func (e *executor) execExplain(plan *plannerapi.ExplainPlan) (*executorapi.Result, error) {
+	planDesc := explainPlanDescription(plan.Inner, plan.Analyze)
+	planLines := strings.Split(planDesc, "\n")
+
+	if !plan.Analyze {
+		// EXPLAIN: just return the plan description as a single row.
+		values := make([]catalogapi.Value, 1)
+		values[0] = catalogapi.Value{Type: catalogapi.TypeText, Text: planDesc}
+		return &executorapi.Result{
+			Columns: []string{"QUERY PLAN"},
+			Rows:    [][]catalogapi.Value{values},
+		}, nil
+	}
+
+	// EXPLAIN ANALYZE: execute the inner plan and return stats.
+	start := time.Now()
+	innerResult, err := e.Execute(plan.Inner)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: EXPLAIN ANALYZE: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Build a detailed plan output with timing and execution stats.
+	var sb strings.Builder
+	sb.WriteString("┌")
+	for i := 0; i < 70; i++ {
+		sb.WriteString("─")
+	}
+	sb.WriteString("┐\n")
+
+	// Header
+	mode := "EXPLAIN ANALYZE"
+	sb.WriteString(fmt.Sprintf("│ %-70s │\n", mode))
+
+	// Separator
+	sb.WriteString("├")
+	for i := 0; i < 70; i++ {
+		sb.WriteString("─")
+	}
+	sb.WriteString("┤\n")
+
+	// Plan description
+	for _, line := range planLines {
+		if line == "" {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("│ %-70s │\n", line))
+	}
+
+	// Separator
+	sb.WriteString("├")
+	for i := 0; i < 70; i++ {
+		sb.WriteString("─")
+	}
+	sb.WriteString("┤\n")
+
+	// Execution stats
+	if innerResult != nil {
+		sb.WriteString(fmt.Sprintf("│ %-70s │\n",
+			fmt.Sprintf("actual rows=%d", len(innerResult.Rows))))
+		if innerResult.RowsAffected > 0 {
+			sb.WriteString(fmt.Sprintf("│ %-70s │\n",
+				fmt.Sprintf("rows affected=%d", innerResult.RowsAffected)))
+		}
+	}
+
+	// Timing
+	sb.WriteString(fmt.Sprintf("│ %-70s │\n",
+		fmt.Sprintf("actual time=%.3fms", float64(elapsed.Nanoseconds())/1e6)))
+
+	// Bottom border
+	sb.WriteString("└")
+	for i := 0; i < 70; i++ {
+		sb.WriteString("─")
+	}
+	sb.WriteString("┘")
+
+	values := make([]catalogapi.Value, 1)
+	values[0] = catalogapi.Value{Type: catalogapi.TypeText, Text: sb.String()}
+	return &executorapi.Result{
+		Columns: []string{"QUERY PLAN"},
+		Rows:    [][]catalogapi.Value{values},
+	}, nil
+}
+
+// explainPlanDescription returns a human-readable description of any plan.
+func explainPlanDescription(plan plannerapi.Plan, analyze bool) string {
+	prefix := "EXPLAIN"
+	if analyze {
+		prefix = "EXPLAIN ANALYZE"
+	}
+	
+	var inner string
+	switch p := plan.(type) {
+	case *plannerapi.SelectPlan:
+		inner = p.String()
+	case *plannerapi.InsertPlan:
+		inner = fmt.Sprintf("INSERT INTO %s", p.Table.Name)
+	case *plannerapi.DeletePlan:
+		inner = fmt.Sprintf("DELETE FROM %s", p.Table.Name)
+	case *plannerapi.UpdatePlan:
+		inner = fmt.Sprintf("UPDATE %s", p.Table.Name)
+	case *plannerapi.CreateTablePlan:
+		inner = fmt.Sprintf("CREATE TABLE %s", p.Schema.Name)
+	case *plannerapi.DropTablePlan:
+		inner = fmt.Sprintf("DROP TABLE %s", p.TableName)
+	case *plannerapi.CreateIndexPlan:
+		inner = fmt.Sprintf("CREATE INDEX ON %s(%s)", p.Schema.Table, p.Schema.Column)
+	case *plannerapi.DropIndexPlan:
+		inner = fmt.Sprintf("DROP INDEX %s.%s", p.TableName, p.IndexName)
+	case *plannerapi.JoinPlan:
+		inner = p.String()
+	case *plannerapi.HashJoinPlan:
+		inner = p.String()
+	case *plannerapi.UnionPlan:
+		inner = "UNION"
+	case *plannerapi.IntersectPlan:
+		inner = "INTERSECT"
+	case *plannerapi.ExceptPlan:
+		inner = "EXCEPT"
+	case *plannerapi.InsertSelectPlan:
+		inner = fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
+	default:
+		inner = fmt.Sprintf("%T", plan)
+	}
+	return prefix + "\n└─ " + inner
 }

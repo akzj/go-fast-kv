@@ -43,7 +43,12 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 	case *parserapi.UpdateStmt:
 		return p.planUpdate(s)
 	case *parserapi.ExplainStmt:
-		return p.Plan(s.Statement)
+		// Wrap the inner plan in ExplainPlan instead of unwrapping it.
+		innerPlan, err := p.Plan(s.Statement)
+		if err != nil {
+			return nil, err
+		}
+		return &plannerapi.ExplainPlan{Inner: innerPlan, Analyze: s.Analyze}, nil
 	case *parserapi.UnionStmt:
 		return p.planUnion(s)
 	case *parserapi.IntersectStmt:
