@@ -399,26 +399,16 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		// leftPlan is the nested JoinPlan
 		leftPlan = leftNested.Join
 		// Build combined schema from nested join's left + right
-		if lt, ok := leftNested.Join.Left.(*plannerapi.JoinPlan); ok {
-			// Nested-nested: use its schemas directly (Table already set by its executor call)
-			leftSchema = append(leftSchema, lt.LeftSchema...)
-			leftSchema = append(leftSchema, lt.RightSchema...)
-		} else {
-			// Base case left: LeftTable columns, set Table field
-			for _, c := range leftNested.Join.LeftTable.Columns {
-				c := c
-				c.Table = leftNested.Join.LeftTable.Name
-				leftSchema = append(leftSchema, &c)
-			}
-		}
-		// Add nested join's right schema, set Table field
-		for _, c := range leftNested.Join.RightTable.Columns {
-			c := c
-			c.Table = leftNested.Join.RightTable.Name
-			leftSchema = append(leftSchema, &c)
-		}
+		leftSchema = append(leftSchema, leftNested.Join.GetLeftSchema()...)
+		leftSchema = append(leftSchema, leftNested.Join.GetRightSchema()...)
 		// leftTable is the leftmost table (from nested join)
-		leftTbl = leftNested.Join.LeftTable
+		// Type-assert to get LeftTable since nested joins use *JoinPlan
+		if jp, ok := leftNested.Join.(*plannerapi.JoinPlan); ok {
+			leftTbl = jp.LeftTable
+		} else {
+			// For HashJoinPlan nested (shouldn't happen), use table name
+			leftTbl = &catalogapi.TableSchema{Name: leftNested.Join.GetLeftTableName()}
+		}
 
 	default:
 		return nil, fmt.Errorf("invalid left in join: %T", j.Left)
@@ -448,7 +438,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Left:        leftPlan,
 		Right:       rightScan,
 		LeftSchema:  leftSchema,
-		RightSchema: colsToPtr(rightTbl.Columns),
+		RightSchema: colsToPtrWithTable(rightTbl.Columns, rightTbl.Name),
 		LeftTable:   leftTbl,
 		RightTable:  rightTbl,
 		On:          j.On,
@@ -556,6 +546,36 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		offset = int(val.Int)
 	}
 
+	// Check for equi-join and convert to HashJoinPlan if applicable
+	if hashLeftIdx, hashRightIdx, isEqui := detectEquiJoin(j.On, leftTbl.Name, rightTbl.Name, leftTbl, rightTbl); isEqui {
+		return &plannerapi.SelectPlan{
+			Table:            leftTbl,
+			Scan:             nil,
+			Join: &plannerapi.HashJoinPlan{
+				Left:        leftPlan,
+				Right:       rightScan,
+				LeftSchema:  leftSchema,
+				RightSchema: colsToPtrWithTable(rightTbl.Columns, rightTbl.Name),
+				LeftTable:   leftTbl.Name,
+				RightTable:  rightTbl.Name,
+				LeftKeyIdx:  hashLeftIdx,
+				RightKeyIdx: hashRightIdx,
+				On:          j.On,
+				Type:        string(j.Type),
+			},
+			Columns:          colIndices,
+			SelectColumns:    stmt.Columns,
+			Filter:           stmt.Where,
+			GroupByExprs:     stmt.GroupBy,
+			Having:           stmt.Having,
+			OrderBy:          orderBy,
+			Limit:            limit,
+			Offset:           offset,
+			LeftColumnCount:  len(leftSchema),
+			Distinct:         stmt.Distinct,
+		}, nil
+	}
+
 	return &plannerapi.SelectPlan{
 		Table:            leftTbl,
 		Scan:             nil,
@@ -649,6 +669,17 @@ func colsToPtr(cols []catalogapi.ColumnDef) []*catalogapi.ColumnDef {
 	result := make([]*catalogapi.ColumnDef, len(cols))
 	for i := range cols {
 		result[i] = &cols[i]
+	}
+	return result
+}
+
+// colsToPtrWithTable converts []ColumnDef to []*ColumnDef and sets the Table field.
+func colsToPtrWithTable(cols []catalogapi.ColumnDef, tableName string) []*catalogapi.ColumnDef {
+	result := make([]*catalogapi.ColumnDef, len(cols))
+	for i := range cols {
+		col := cols[i] // copy
+		col.Table = tableName
+		result[i] = &col
 	}
 	return result
 }
@@ -1003,4 +1034,46 @@ func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
 		// Leaf nodes
 	}
 	return nil
+}
+
+// detectEquiJoin checks if the ON clause is an equi-join (t1.col = t2.col).
+// Returns left and right key column indices if it's an equi-join, or -1/-1 if not.
+// Handles both orderings: t1.col = t2.col AND t2.col = t1.col.
+func detectEquiJoin(on parserapi.Expr, leftTable, rightTable string, leftTableSchema, rightTableSchema *catalogapi.TableSchema) (leftIdx, rightIdx int, isEqui bool) {
+	if on == nil {
+		return -1, -1, false
+	}
+
+	bin, ok := on.(*parserapi.BinaryExpr)
+	if !ok || bin.Op != parserapi.BinEQ {
+		return -1, -1, false
+	}
+
+	leftRef, leftOK := bin.Left.(*parserapi.ColumnRef)
+	rightRef, rightOK := bin.Right.(*parserapi.ColumnRef)
+
+	if !leftOK || !rightOK {
+		return -1, -1, false
+	}
+
+	// Case 1: leftTable.col = rightTable.col (normal ordering)
+	if strings.EqualFold(leftRef.Table, leftTable) && strings.EqualFold(rightRef.Table, rightTable) {
+		leftIdx = findColumnIndex(leftTableSchema, leftRef.Column)
+		rightIdx = findColumnIndex(rightTableSchema, rightRef.Column)
+		if leftIdx >= 0 && rightIdx >= 0 {
+			return leftIdx, rightIdx, true
+		}
+	}
+
+	// Case 2: rightTable.col = leftTable.col (reversed ordering)
+	if strings.EqualFold(leftRef.Table, rightTable) && strings.EqualFold(rightRef.Table, leftTable) {
+		// For reversed ordering, we swap: build on right, probe on left
+		rightIdx = findColumnIndex(rightTableSchema, leftRef.Column)  // key in right table
+		leftIdx = findColumnIndex(leftTableSchema, rightRef.Column)   // key in left table
+		if leftIdx >= 0 && rightIdx >= 0 {
+			return leftIdx, rightIdx, true
+		}
+	}
+
+	return -1, -1, false
 }

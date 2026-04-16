@@ -56,6 +56,20 @@ type ScanPlan interface {
 	planNode() // also implement Plan for executor compatibility
 }
 
+// JoinPlanNode is the common interface for join plan types (JoinPlan, HashJoinPlan).
+type JoinPlanNode interface {
+	planNode()
+	GetOn() parserapi.Expr
+	GetType() string
+	String() string
+	GetLeft() Plan
+	GetRight() ScanPlan
+	GetLeftSchema() []*catalogapi.ColumnDef
+	GetRightSchema() []*catalogapi.ColumnDef
+	GetLeftTableName() string
+	GetRightTableName() string
+}
+
 // ─── DDL Plans ──────────────────────────────────────────────────────
 
 // CreateTablePlan creates a new table.
@@ -116,7 +130,7 @@ type SelectPlan struct {
 	Offset        int                        // -1 if no OFFSET
 	Distinct      bool                       // true for SELECT DISTINCT
 
-	Join            *JoinPlan               // nil for non-join; non-nil for JOIN
+	Join            JoinPlanNode           // nil for non-join; non-nil for JOIN
 	LeftColumnCount int                    // number of columns in left table (for JOIN projection)
 }
 
@@ -196,6 +210,40 @@ type JoinPlan struct {
 
 func (*JoinPlan) planNode() {}
 
+// GetOn returns the join condition.
+func (p *JoinPlan) GetOn() parserapi.Expr { return p.On }
+
+// GetType returns the join type.
+func (p *JoinPlan) GetType() string { return p.Type }
+
+// GetLeft returns the left plan.
+func (p *JoinPlan) GetLeft() Plan { return p.Left }
+
+// GetRight returns the right scan plan.
+func (p *JoinPlan) GetRight() ScanPlan { return p.Right }
+
+// GetLeftSchema returns the left schema.
+func (p *JoinPlan) GetLeftSchema() []*catalogapi.ColumnDef { return p.LeftSchema }
+
+// GetRightSchema returns the right schema.
+func (p *JoinPlan) GetRightSchema() []*catalogapi.ColumnDef { return p.RightSchema }
+
+// GetLeftTableName returns the left table name.
+func (p *JoinPlan) GetLeftTableName() string {
+	if p.LeftTable != nil {
+		return p.LeftTable.Name
+	}
+	return ""
+}
+
+// GetRightTableName returns the right table name.
+func (p *JoinPlan) GetRightTableName() string {
+	if p.RightTable != nil {
+		return p.RightTable.Name
+	}
+	return ""
+}
+
 // String returns a human-readable description of the join.
 func (p *JoinPlan) String() string {
 	var b strings.Builder
@@ -242,6 +290,30 @@ type HashJoinPlan struct {
 }
 
 func (*HashJoinPlan) planNode() {}
+
+// GetOn returns the join condition.
+func (p *HashJoinPlan) GetOn() parserapi.Expr { return p.On }
+
+// GetType returns the join type.
+func (p *HashJoinPlan) GetType() string { return p.Type }
+
+// GetLeft returns the left plan.
+func (p *HashJoinPlan) GetLeft() Plan { return p.Left }
+
+// GetRight returns the right scan plan.
+func (p *HashJoinPlan) GetRight() ScanPlan { return p.Right }
+
+// GetLeftSchema returns the left schema.
+func (p *HashJoinPlan) GetLeftSchema() []*catalogapi.ColumnDef { return p.LeftSchema }
+
+// GetRightSchema returns the right schema.
+func (p *HashJoinPlan) GetRightSchema() []*catalogapi.ColumnDef { return p.RightSchema }
+
+// GetLeftTableName returns the left table name.
+func (p *HashJoinPlan) GetLeftTableName() string { return p.LeftTable }
+
+// GetRightTableName returns the right table name.
+func (p *HashJoinPlan) GetRightTableName() string { return p.RightTable }
 
 // String returns a human-readable description of the hash join.
 func (p *HashJoinPlan) String() string {

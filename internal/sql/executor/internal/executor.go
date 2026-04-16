@@ -391,9 +391,17 @@ func isSubqueryInListContext(sq *parserapi.SubqueryExpr, root parserapi.Expr) bo
 func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 	jplan := plan.Join
 
-	// Collect left rows — may be ScanPlan or nested *JoinPlan
+	// Dispatch to hash join if equi-join detected
+	if hplan, ok := jplan.(*plannerapi.HashJoinPlan); ok {
+		return e.execHashJoinSelect(plan, hplan)
+	}
+
+	// Regular nested loop join
+	jp := jplan.(*plannerapi.JoinPlan)
+
+	// Collect left rows — may be ScanPlan, nested *JoinPlan, or nested *HashJoinPlan
 	var leftRows []*engineapi.Row
-	switch left := jplan.Left.(type) {
+	switch left := jp.Left.(type) {
 	case *plannerapi.JoinPlan:
 		result, err := e.execJoin(left)
 		if err != nil {
@@ -402,52 +410,73 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		for _, v := range result.Rows {
 			leftRows = append(leftRows, &engineapi.Row{Values: v})
 		}
+	case *plannerapi.HashJoinPlan:
+		// Nested hash join - create a SelectPlan wrapper and execute
+		innerPlan := &plannerapi.SelectPlan{
+			Join:            left,
+			Columns:         nil,
+			SelectColumns:   nil,
+			Filter:          nil,
+			GroupByExprs:    nil,
+			Having:          nil,
+			OrderBy:         nil,
+			Limit:           -1,
+			Offset:          -1,
+			LeftColumnCount: len(left.LeftSchema),
+		}
+		result, err := e.execHashJoinSelect(innerPlan, left)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range result.Rows {
+			leftRows = append(leftRows, &engineapi.Row{Values: v})
+		}
 	case plannerapi.ScanPlan:
 		var err error
-		leftRows, err = e.scanRows(jplan.LeftTable, left, nil)
+		leftRows, err = e.scanRows(jp.LeftTable, left, nil)
 		if err != nil {
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("execJoinSelect: unexpected left type %T", jplan.Left)
+		return nil, fmt.Errorf("execJoinSelect: unexpected left type %T", jp.Left)
 	}
 
-	rightRows, err := e.scanRows(jplan.RightTable, jplan.Right, nil)
+	rightRows, err := e.scanRows(jp.RightTable, jp.Right, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	colNames := make([]string, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
-	combinedCols := make([]catalogapi.ColumnDef, 0, len(jplan.LeftSchema)+len(jplan.RightSchema))
-	for _, c := range jplan.LeftSchema {
+	colNames := make([]string, 0, len(jp.LeftSchema)+len(jp.RightSchema))
+	combinedCols := make([]catalogapi.ColumnDef, 0, len(jp.LeftSchema)+len(jp.RightSchema))
+	for _, c := range jp.LeftSchema {
 		colNames = append(colNames, c.Name)
 		col := *c
-		if col.Table == "" { col.Table = jplan.LeftTable.Name }
+		if col.Table == "" { col.Table = jp.LeftTable.Name }
 		combinedCols = append(combinedCols, col)
 	}
-	for _, c := range jplan.RightSchema {
+	for _, c := range jp.RightSchema {
 		colNames = append(colNames, c.Name)
 		col := *c
-		col.Table = jplan.RightTable.Name
+		col.Table = jp.RightTable.Name
 		combinedCols = append(combinedCols, col)
 	}
 
 	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
-	if jplan.On != nil {
-		e.walkExprForJoinSubqueries(jplan.On, subqueryResults)
+	if jp.On != nil {
+		e.walkExprForJoinSubqueries(jp.On, subqueryResults)
 	}
 
 	var mergedRows [][]catalogapi.Value
-	leftLen := len(jplan.LeftSchema)
-	rightLen := len(jplan.RightSchema)
+	leftLen := len(jp.LeftSchema)
+	rightLen := len(jp.RightSchema)
 
-	switch jplan.Type {
+	switch jp.Type {
 	case "LEFT":
-		mergedRows = e.execLeftJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+		mergedRows = e.execLeftJoin(leftRows, rightRows, jp, subqueryResults, leftLen, rightLen, combinedCols)
 	case "RIGHT":
-		mergedRows = e.execRightJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+		mergedRows = e.execRightJoin(leftRows, rightRows, jp, subqueryResults, leftLen, rightLen, combinedCols)
 	default:
-		mergedRows = e.execInnerJoin(leftRows, rightRows, jplan, subqueryResults, leftLen, rightLen, combinedCols)
+		mergedRows = e.execInnerJoin(leftRows, rightRows, jp, subqueryResults, leftLen, rightLen, combinedCols)
 	}
 
 	// Apply WHERE filter on merged rows
@@ -542,6 +571,357 @@ func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Res
 		Columns: projCols,
 		Rows:    projected,
 	}, nil
+}
+
+// execHashJoinSelect handles SELECT with HashJoinPlan (optimized equi-join).
+func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *plannerapi.HashJoinPlan) (*executorapi.Result, error) {
+	// Execute left side
+	var leftRows []*engineapi.Row
+	switch left := hplan.Left.(type) {
+	case plannerapi.ScanPlan:
+		// Get table schema for scanning
+		leftTbl, err := e.catalog.GetTable(hplan.LeftTable)
+		if err != nil {
+			return nil, fmt.Errorf("execHashJoin: get left table: %w", err)
+		}
+		var scan plannerapi.ScanPlan
+		switch sp := left.(type) {
+		case *plannerapi.TableScanPlan:
+			scan = sp
+		default:
+			return nil, fmt.Errorf("execHashJoin: unsupported left scan type %T", left)
+		}
+		rows, err := e.scanRows(leftTbl, scan, nil)
+		if err != nil {
+			return nil, fmt.Errorf("execHashJoin: scan left: %w", err)
+		}
+		leftRows = rows
+	case *plannerapi.HashJoinPlan:
+		// Nested hash join - should not reach here for simple nested case
+		// For nested hash joins, we need to execute the inner join first
+		// and then continue with the outer join
+		// This case is handled in execJoinSelect
+		return nil, fmt.Errorf("nested hash join should be handled in execJoinSelect")
+	default:
+		return nil, fmt.Errorf("execHashJoin: unsupported left type %T", hplan.Left)
+	}
+
+	// Execute right side
+	rightTbl, err := e.catalog.GetTable(hplan.RightTable)
+	if err != nil {
+		return nil, fmt.Errorf("execHashJoin: get right table: %w", err)
+	}
+	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil)
+	if err != nil {
+		return nil, fmt.Errorf("execHashJoin: scan right: %w", err)
+	}
+
+	leftSchema := hplan.LeftSchema
+	rightSchema := hplan.RightSchema
+	leftLen := len(leftSchema)
+	rightLen := len(rightSchema)
+
+	// Build combined column definitions for ON evaluation
+	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
+	for _, c := range leftSchema {
+		col := *c
+		if col.Table == "" {
+			col.Table = hplan.LeftTable
+		}
+		combinedCols = append(combinedCols, col)
+	}
+	for _, c := range rightSchema {
+		col := *c
+		col.Table = hplan.RightTable
+		combinedCols = append(combinedCols, col)
+	}
+
+	// Execute hash join
+	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+	if hplan.On != nil {
+		e.walkExprForJoinSubqueries(hplan.On, subqueryResults)
+	}
+
+	mergedRows := e.execHashJoin(leftRows, rightRows, hplan, subqueryResults, leftLen, rightLen, combinedCols)
+
+	// Build column names
+	colNames := make([]string, 0, len(leftSchema)+len(rightSchema))
+	for _, c := range leftSchema {
+		colNames = append(colNames, c.Name)
+	}
+	for _, c := range rightSchema {
+		colNames = append(colNames, c.Name)
+	}
+
+	// Apply WHERE filter on merged rows
+	if plan.Filter != nil {
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		e.outerCols = combinedCols
+		mergedRows = e.filterJoinRows(mergedRows, plan.Filter, combinedCols, subqueryResults)
+	}
+
+	// GROUP BY on merged join rows
+	if plan.GroupByExprs != nil {
+		engineRows := make([]*engineapi.Row, len(mergedRows))
+		for i, row := range mergedRows {
+			engineRows[i] = &engineapi.Row{Values: row}
+		}
+
+		grouped, err := e.groupByRowsForJoin(engineRows, plan, combinedCols)
+		if err != nil {
+			return nil, err
+		}
+
+		if plan.Having != nil {
+			e.outerCols = combinedCols
+			grouped = e.filterRows(grouped, plan.Having, combinedCols, subqueryResults)
+		}
+
+		if plan.OrderBy != nil {
+			sortRawRows(grouped, plan.OrderBy)
+		}
+
+		if plan.Offset >= 0 && plan.Offset < len(grouped) {
+			grouped = grouped[plan.Offset:]
+		}
+
+		if plan.Limit >= 0 && plan.Limit < len(grouped) {
+			grouped = grouped[:plan.Limit]
+		}
+
+		rows := make([][]catalogapi.Value, len(grouped))
+		for i, row := range grouped {
+			rows[i] = row.Values
+		}
+
+		projCols := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				if ref.Table != "" {
+					projCols[i] = ref.Table + "." + ref.Column
+				} else {
+					projCols[i] = ref.Column
+				}
+			} else {
+				projCols[i] = sc.Alias
+			}
+		}
+
+		return &executorapi.Result{Columns: projCols, Rows: rows}, nil
+	}
+
+	if plan.OrderBy != nil {
+		sortJoinRows(mergedRows, plan.OrderBy, combinedCols)
+	}
+
+	if plan.Offset >= 0 && plan.Offset < len(mergedRows) {
+		mergedRows = mergedRows[plan.Offset:]
+	}
+
+	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
+		mergedRows = mergedRows[:plan.Limit]
+	}
+
+	projected, projCols := projectJoinRows(mergedRows, colNames, plan)
+
+	return &executorapi.Result{
+		Columns: projCols,
+		Rows:    projected,
+	}, nil
+}
+
+// execHashJoin performs the hash join algorithm.
+// Build hash table on smaller table, probe with larger table.
+// For outer joins, build on the "preserved" side to track unmatched rows correctly.
+func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *plannerapi.HashJoinPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
+
+	// Determine build/probe tables based on join type and size
+	var buildRows, probeRows []*engineapi.Row
+	var buildKeyIdx, probeKeyIdx int
+	var buildIsLeft bool // true if build side is the left table
+
+	joinType := hplan.Type
+
+	switch joinType {
+	case "LEFT":
+		// For LEFT JOIN: build on RIGHT so we can track unmatched LEFT rows
+		buildRows, probeRows = rightRows, leftRows
+		buildKeyIdx, probeKeyIdx = hplan.RightKeyIdx, hplan.LeftKeyIdx
+		buildIsLeft = false
+	case "RIGHT":
+		// For RIGHT JOIN: build on LEFT so we can track unmatched RIGHT rows
+		buildRows, probeRows = leftRows, rightRows
+		buildKeyIdx, probeKeyIdx = hplan.LeftKeyIdx, hplan.RightKeyIdx
+		buildIsLeft = true
+	default:
+		// INNER JOIN: build on smaller table for memory efficiency
+		if len(leftRows) <= len(rightRows) {
+			buildRows, probeRows = leftRows, rightRows
+			buildKeyIdx, probeKeyIdx = hplan.LeftKeyIdx, hplan.RightKeyIdx
+			buildIsLeft = true
+		} else {
+			buildRows, probeRows = rightRows, leftRows
+			buildKeyIdx, probeKeyIdx = hplan.RightKeyIdx, hplan.LeftKeyIdx
+			buildIsLeft = false
+		}
+	}
+
+	// Build phase: create hash table
+	hashTable := make(map[string][]*engineapi.Row)
+	for _, row := range buildRows {
+		key := hashKey(row.Values[buildKeyIdx])
+		hashTable[key] = append(hashTable[key], row)
+	}
+
+	var merged [][]catalogapi.Value
+
+	// Track unmatched rows for outer joins
+	var matchedBuild map[*engineapi.Row]bool
+	if joinType == "LEFT" || joinType == "RIGHT" {
+		matchedBuild = make(map[*engineapi.Row]bool, len(buildRows))
+	}
+
+	// Probe phase
+	for _, probe := range probeRows {
+		key := hashKey(probe.Values[probeKeyIdx])
+		buildMatches := hashTable[key]
+
+		if len(buildMatches) == 0 {
+			if joinType == "LEFT" {
+				// LEFT JOIN: unmatched probe (left) → NULL right
+				merged = append(merged, e.mergeLeftWithNull(probe, leftLen))
+			} else if joinType == "RIGHT" {
+				// RIGHT JOIN: unmatched probe (right) → NULL left
+				merged = append(merged, e.mergeNullWithRight(probe, leftLen))
+			}
+			continue
+		}
+
+		// For each build match, check if there's an ON condition match
+		for _, build := range buildMatches {
+			if hplan.On != nil {
+				// Evaluate ON condition with combined row
+				var combinedVals []catalogapi.Value
+				if buildIsLeft {
+					// build=left, probe=right
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
+					copy(combinedVals, build.Values)
+					copy(combinedVals[leftLen:], probe.Values)
+				} else {
+					// build=right, probe=left
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
+					copy(combinedVals, probe.Values)
+					copy(combinedVals[leftLen:], build.Values)
+				}
+				combinedRow := &engineapi.Row{Values: combinedVals}
+				result, err := evalExpr(hplan.On, combinedRow, combinedCols, subqueryResults, e)
+				if err != nil || !isTruthy(result) {
+					continue
+				}
+			}
+
+			// Match found
+			if matchedBuild != nil {
+				matchedBuild[build] = true
+			}
+
+			var row []catalogapi.Value
+			if buildIsLeft {
+				row = e.mergeRows(build, probe, leftLen, rightLen)
+			} else {
+				row = e.mergeRows(probe, build, leftLen, rightLen)
+			}
+			merged = append(merged, row)
+		}
+	}
+
+	// Emit unmatched build rows for outer joins
+	// For LEFT JOIN: build=right, emit unmatched RIGHT with NULL left
+	// For RIGHT JOIN: no unmatched build rows - unmatched RIGHT already handled in probe loop
+	if joinType == "LEFT" {
+		for _, build := range buildRows {
+			if !matchedBuild[build] {
+				merged = append(merged, e.mergeNullWithRight(build, leftLen))
+			}
+		}
+	}
+	// RIGHT JOIN: unmatched probe (RIGHT) rows are already handled in probe loop above
+
+	return merged
+}
+
+// hashKey generates a string key for a value (for hash table lookup).
+func hashKey(v catalogapi.Value) string {
+	if v.IsNull {
+		return "NULL"
+	}
+	switch v.Type {
+	case catalogapi.TypeInt:
+		return fmt.Sprintf("i:%d", v.Int)
+	case catalogapi.TypeFloat:
+		return fmt.Sprintf("f:%f", v.Float)
+	case catalogapi.TypeText:
+		return fmt.Sprintf("t:%s", v.Text)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// executeHashJoinPlan executes a HashJoinPlan and returns the merged rows.
+func (e *executor) executeHashJoinPlan(hplan *plannerapi.HashJoinPlan, subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([][]catalogapi.Value, error) {
+	// Execute left side
+	var leftRows []*engineapi.Row
+	switch left := hplan.Left.(type) {
+	case plannerapi.ScanPlan:
+		leftTbl, err := e.catalog.GetTable(hplan.LeftTable)
+		if err != nil {
+			return nil, fmt.Errorf("executeHashJoinPlan: get left table: %w", err)
+		}
+		rows, err := e.scanRows(leftTbl, left, nil)
+		if err != nil {
+			return nil, fmt.Errorf("executeHashJoinPlan: scan left: %w", err)
+		}
+		leftRows = rows
+	default:
+		return nil, fmt.Errorf("executeHashJoinPlan: unsupported left type %T", hplan.Left)
+	}
+
+	// Execute right side
+	rightTbl, err := e.catalog.GetTable(hplan.RightTable)
+	if err != nil {
+		return nil, fmt.Errorf("executeHashJoinPlan: get right table: %w", err)
+	}
+	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil)
+	if err != nil {
+		return nil, fmt.Errorf("executeHashJoinPlan: scan right: %w", err)
+	}
+
+	leftSchema := hplan.LeftSchema
+	rightSchema := hplan.RightSchema
+	leftLen := len(leftSchema)
+	rightLen := len(rightSchema)
+
+	// Build combined column definitions
+	combinedCols := make([]catalogapi.ColumnDef, 0, leftLen+rightLen)
+	for _, c := range leftSchema {
+		combinedCols = append(combinedCols, *c)
+	}
+	for _, c := range rightSchema {
+		combinedCols = append(combinedCols, *c)
+	}
+
+	// Execute hash join
+	if subqueryResults == nil {
+		subqueryResults = make(map[*parserapi.SubqueryExpr]interface{})
+	}
+	if hplan.On != nil {
+		e.walkExprForJoinSubqueries(hplan.On, subqueryResults)
+	}
+
+	return e.execHashJoin(leftRows, rightRows, hplan, subqueryResults, leftLen, rightLen, combinedCols), nil
 }
 
 // execJoin handles a bare JoinPlan (used for EXPLAIN or subquery JOINs).
