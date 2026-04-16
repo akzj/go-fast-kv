@@ -344,11 +344,6 @@ type BetweenExpr struct {
 
 func (*BetweenExpr) exprNode() {}
 
-// SubqueryPlan holds the planner's pre-computed subquery plan.
-// Runtime type is *plannerapi.SelectPlan (type-assert at use site).
-// This is an interface{} with a type alias for documentation clarity.
-type SubqueryPlan = interface{}
-
 // SubqueryExpr represents a subquery in an expression context, e.g. (SELECT ...).
 type SubqueryExpr struct {
 	Stmt Statement   // the subquery (always SelectStmt at parse time)
@@ -356,6 +351,16 @@ type SubqueryExpr struct {
 }
 
 func (*SubqueryExpr) exprNode() {}
+
+// ExistsExpr represents EXISTS (SELECT ...) or NOT EXISTS (SELECT ...).
+type ExistsExpr struct {
+	Subquery *SubqueryExpr
+	Not      bool // true for NOT EXISTS
+}
+
+func (*ExistsExpr) exprNode() {}
+
+type SubqueryPlan = interface{}
 
 // ExplainStmt wraps a statement for EXPLAIN output.
 type ExplainStmt struct {

@@ -1273,6 +1273,33 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		if p.depth > 1000 {
 			return nil, p.errorf("expression too deeply nested (max 1000 levels)")
 		}
+		// EXISTS (SELECT ...) or NOT EXISTS (SELECT ...) — check peek since cur is TokLParen.
+		if p.peek.Type == api.TokExists {
+			p.advance() // consume '('
+			not := false
+			if p.cur.Type == api.TokNot {
+				not = true
+				p.advance() // consume NOT
+				if p.cur.Type != api.TokExists {
+					return nil, p.errorf("expected EXISTS after NOT")
+				}
+				p.advance() // consume EXISTS
+			} else {
+				p.advance() // consume EXISTS
+			}
+			if p.cur.Type != api.TokLParen {
+				return nil, p.errorf("expected ( after EXISTS")
+			}
+			p.advance() // consume '(' — now at SELECT
+			subq, err := p.parseSubquerySelect()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(api.TokRParen); err != nil {
+				return nil, err
+			}
+			return &api.ExistsExpr{Subquery: &api.SubqueryExpr{Stmt: subq}, Not: not}, nil
+		}
 		// Subquery: ( SELECT ... ) — check peek since cur is TokLParen.
 		// parseSubquerySelect stops at ')', so consume it here.
 		if p.peek.Type == api.TokSelect {

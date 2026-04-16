@@ -965,6 +965,9 @@ func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
 			return err
 		}
 		e.Plan = subplan
+	case *parserapi.ExistsExpr:
+		// Recurse into the subquery to plan it
+		return walkExprForSubqueries(&parserapi.SubqueryExpr{Stmt: e.Subquery.Stmt, Plan: e.Subquery.Plan}, p)
 	case *parserapi.BinaryExpr:
 		if err := walkExprForSubqueries(e.Left, p); err != nil {
 			return err

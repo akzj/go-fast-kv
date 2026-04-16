@@ -769,6 +769,15 @@ func (ex *executor) walkExprForJoinSubqueries(expr parserapi.Expr,
 		ex.walkExprForJoinSubqueries(node.High, subqueryResults)
 	case *parserapi.IsNullExpr:
 		ex.walkExprForJoinSubqueries(node.Expr, subqueryResults)
+	case *parserapi.ExistsExpr:
+		// EXISTS subqueries are not precomputed — they need outer row context.
+		// Just recurse into the inner SubqueryExpr to plan it if needed.
+		if node.Subquery != nil && node.Subquery.Plan == nil {
+			subplan, err := ex.planner.Plan(node.Subquery.Stmt)
+			if err == nil {
+				node.Subquery.Plan = subplan
+			}
+		}
 	}
 }
 
@@ -956,6 +965,17 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 	}
 
 	for _, root := range exprs {
+		// Check for ExistsExpr at the root level — skip precomputation since
+		// EXISTS needs outer row context for correlated subqueries.
+		if exists, ok := root.(*parserapi.ExistsExpr); ok {
+			if exists.Subquery != nil && exists.Subquery.Plan == nil {
+				subplan, err := e.planner.Plan(exists.Subquery.Stmt)
+				if err == nil {
+					exists.Subquery.Plan = subplan
+				}
+			}
+			continue
+		}
 		walkExpr(root, func(expr parserapi.Expr) {
 			sq, ok := expr.(*parserapi.SubqueryExpr)
 			if !ok {

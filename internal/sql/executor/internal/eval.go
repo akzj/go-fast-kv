@@ -10,6 +10,7 @@ import (
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
+	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
 )
 
 // ─── Expression Evaluation ──────────────────────────────────────────
@@ -46,6 +47,8 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		for _, arg := range e.Args {
 			walkExpr(arg, fn)
 		}
+	case *parserapi.ExistsExpr:
+		// Subquery body not walked here (would need Statement visitor)
 	}
 }
 
@@ -75,6 +78,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalInExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CoalesceExpr:
 		return evalCoalesceExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.ExistsExpr:
+		return evalExistsExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.SubqueryExpr:
 		// Pre-computed by execSelect pre-plan pass.
 		// Scalar subqueries store a single catalogapi.Value.
@@ -651,4 +656,42 @@ func evalCoalesceExpr(expr *parserapi.CoalesceExpr, row *engineapi.Row, columns 
 	}
 	// All values were NULL
 	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalExistsExpr evaluates EXISTS (SELECT ...) or NOT EXISTS (SELECT ...).
+// EXISTS returns TRUE if subquery returns at least 1 row, FALSE otherwise.
+// The subquery is executed with outer row context for correlated subqueries.
+func evalExistsExpr(expr *parserapi.ExistsExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Set outer context for correlated subquery resolution
+	if ex != nil {
+		if row != nil {
+			ex.outerVals = row.Values
+		}
+		if columns != nil {
+			ex.outerCols = columns
+		}
+	}
+	typedPlan, ok := expr.Subquery.Plan.(plannerapi.Plan)
+	if !ok {
+		return catalogapi.Value{}, fmt.Errorf("exists subquery plan has wrong type: %T", expr.Subquery.Plan)
+	}
+	// Save outer context — inner Execute will overwrite e.outerCols/e.outerVals.
+	savedOuterCols := ex.outerCols
+	savedOuterVals := ex.outerVals
+	result, err := ex.Execute(typedPlan)
+	// Restore outer context after inner execution.
+	ex.outerCols = savedOuterCols
+	ex.outerVals = savedOuterVals
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	hasRows := len(result.Rows) >= 1
+	if expr.Not {
+		hasRows = !hasRows
+	}
+	if hasRows {
+		return intVal(1), nil
+	}
+	return intVal(0), nil
 }
