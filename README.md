@@ -23,6 +23,34 @@ A high-performance embedded key-value store written in Go.
 - **Metrics** — Prometheus-compatible metrics for WAL, compaction, transactions, and operations
 - **GC / Vacuum** — reclaim space from deleted and overwritten entries
 
+## SQL Layer
+
+go-fast-kv includes a full SQL query engine for relational queries over your key-value data.
+
+### Supported Features
+
+| Category | Features |
+|----------|----------|
+| **DDL** | `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX` |
+| **DML** | `INSERT`, `UPDATE`, `DELETE` |
+| **Queries** | `SELECT` with `WHERE`, `JOIN` (INNER), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET` |
+| **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
+| **Set Operations** | `UNION`, `INTERSECT`, `EXCEPT` |
+| **Expressions** | Subqueries, scalar expressions, `IN`, `BETWEEN`, `LIKE`, `DISTINCT` |
+
+### Quick Example
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT)
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')
+SELECT name FROM users WHERE id > 1
+-- Returns: Bob
+
+SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1
+```
+
+See [docs/sql.md](docs/sql.md) for complete SQL language documentation.
+
 ## Quick Start
 
 ```go
