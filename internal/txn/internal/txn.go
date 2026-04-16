@@ -152,32 +152,27 @@ func (txn *ssiTransaction) Commit() error {
 		return nil
 	}
 
-	// SSI commit validation: check RWSet and WWSet for conflicts
+	// SSI commit validation: check RWSet for conflicts
 	xid := txn.xid
 
 	// For each key in RWSet (read), check for RW-conflict:
-	// If another committed transaction wrote this key AFTER our snapshot,
-	// we have a read-write conflict.
+	// If another committed transaction wrote this key while we were running
+	// (i.e., CommitTS >= Xmin), we have a read-write conflict.
 	for key := range txn.ssiState.RWSet {
 		info := tm.ssiIndex.GetWriteInfo(ssiapi.Key(key))
 		if info != nil {
 			// A committed transaction wrote this key.
-			// Check if that commit happened after our snapshot started.
-			if info.CommitTS > txn.snap.Xmin {
+			// Check if that commit happened while we were running:
+			// - Xmin is the oldest active transaction at snapshot time
+			// - If CommitTS >= Xmin, the commit occurred at or after our snapshot start
+			// - This means we read stale data that was modified by a concurrent txn
+			if info.CommitTS >= txn.snap.Xmin {
 				// RW-conflict detected: we read a stale value
 				tm.Abort(xid)
 				return api.ErrSerializationFailure
 			}
 		}
 	}
-
-	// Note: WW-conflict detection via TIndex is intentionally omitted here.
-	// The RW-conflict check above correctly detects all serialization anomalies.
-	// A WW-conflict (write-write anomaly) requires: T1 wrote K, T2 read K, T1 committed.
-	// This is already caught as RW-conflict when T2 tries to commit (since T2
-	// read K, and T1's write to K committed after T2's snapshot began).
-	// Attempting to detect WW-conflict via TIndex's last-reader tracking produces
-	// false positives when a transaction writes a key it never read.
 
 	// No conflicts detected — commit and update SSI index
 	tm.mu.Lock()
@@ -192,7 +187,12 @@ func (txn *ssiTransaction) Commit() error {
 				TxnID:    xid,
 				CommitTS: xid, // Use XID as commit timestamp
 			})
-			// Update TIndex: we are now the last writer
+		}
+		// Only update TIndex for keys that were ACTUALLY READ (in RWSet),
+		// not for all written keys. This prevents WW-conflict false positives.
+		// A transaction that writes a key it never read should not be flagged
+		// as a "reader" when other transactions write that key.
+		for key := range txn.ssiState.RWSet {
 			tm.ssiIndex.SetReader(ssiapi.Key(key), xid)
 		}
 	}

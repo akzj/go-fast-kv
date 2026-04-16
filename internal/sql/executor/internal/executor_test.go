@@ -1761,3 +1761,99 @@ func TestDerivedTableColumnNamesLowercase(t *testing.T) {
 		t.Errorf("expected 2 rows, got %d", len(result.Rows))
 	}
 }
+
+func TestExec_IndexNestedLoopJoin(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Setup tables
+	env.execSQL(t, "CREATE TABLE customers (id INT, name TEXT)")
+	env.execSQL(t, "CREATE TABLE orders (customer_id INT, amount INT)")
+	env.execSQL(t, "CREATE INDEX idx_orders_customer ON orders (customer_id)")
+
+	// Insert data
+	env.execSQL(t, "INSERT INTO customers VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO customers VALUES (2, 'Bob')")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 200)")
+	env.execSQL(t, "INSERT INTO orders VALUES (2, 50)")
+
+	t.Run("basic_index_nested_loop_join", func(t *testing.T) {
+		// Query: SELECT customers.name, orders.amount FROM customers JOIN orders ON customers.id = orders.customer_id
+		result := env.execSQL(t, "SELECT customers.name, orders.amount FROM customers JOIN orders ON customers.id = orders.customer_id")
+
+		// Expected: Alice 100, Alice 200, Bob 50 (3 rows)
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+
+		// Verify results
+		results := make(map[string][]int64)
+		for _, row := range result.Rows {
+			name := row[0].Text
+			amount := row[1].Int
+			results[name] = append(results[name], amount)
+		}
+
+		aliceAmounts := results["Alice"]
+		if len(aliceAmounts) != 2 {
+			t.Errorf("Alice should have 2 orders, got %d", len(aliceAmounts))
+		}
+		// Check Alice's amounts (order may vary)
+		hasAlice100 := false
+		hasAlice200 := false
+		for _, amt := range aliceAmounts {
+			if amt == 100 {
+				hasAlice100 = true
+			}
+			if amt == 200 {
+				hasAlice200 = true
+			}
+		}
+		if !hasAlice100 || !hasAlice200 {
+			t.Errorf("Alice's amounts = %v, want [100, 200]", aliceAmounts)
+		}
+
+		bobAmounts := results["Bob"]
+		if len(bobAmounts) != 1 {
+			t.Errorf("Bob should have 1 order, got %d", len(bobAmounts))
+		}
+		if bobAmounts[0] != 50 {
+			t.Errorf("Bob's amount = %d, want 50", bobAmounts[0])
+		}
+	})
+
+	t.Run("index_nested_loop_join_with_where", func(t *testing.T) {
+		// Filter on outer table first - should still use index on inner
+		result := env.execSQL(t, "SELECT customers.name, orders.amount FROM customers JOIN orders ON customers.id = orders.customer_id WHERE customers.id = 1")
+
+		// Only Alice (id=1) should appear with her 2 orders
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+
+		for _, row := range result.Rows {
+			if row[0].Text != "Alice" {
+				t.Errorf("expected Alice, got %s", row[0].Text)
+			}
+		}
+	})
+
+	t.Run("index_nested_loop_left_join", func(t *testing.T) {
+		// Add a customer with no orders
+		env.execSQL(t, "INSERT INTO customers VALUES (3, 'Carol')")
+
+		// LEFT JOIN: Carol should appear with NULL for amount
+		result := env.execSQL(t, "SELECT customers.name, orders.amount FROM customers LEFT JOIN orders ON customers.id = orders.customer_id WHERE customers.id = 3")
+
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+
+		if result.Rows[0][0].Text != "Carol" {
+			t.Errorf("expected Carol, got %s", result.Rows[0][0].Text)
+		}
+		if !result.Rows[0][1].IsNull {
+			t.Errorf("Carol's amount should be NULL, got %v", result.Rows[0][1])
+		}
+	})
+}

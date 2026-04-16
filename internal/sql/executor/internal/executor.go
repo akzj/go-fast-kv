@@ -464,13 +464,22 @@ func isSubqueryInListContext(sq *parserapi.SubqueryExpr, root parserapi.Expr) bo
 func (e *executor) execJoinSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 	jplan := plan.Join
 
-	// Dispatch to hash join if equi-join detected
-	if hplan, ok := jplan.(*plannerapi.HashJoinPlan); ok {
-		return e.execHashJoinSelect(plan, hplan)
+	// Dispatch based on join plan type
+	switch jp := jplan.(type) {
+	case *plannerapi.IndexNestedLoopJoinPlan:
+		return e.execIndexNestedLoopJoinSelect(plan, jp)
+	case *plannerapi.HashJoinPlan:
+		return e.execHashJoinSelect(plan, jp)
+	case *plannerapi.JoinPlan:
+		// Regular nested loop join - use execRegularJoin
+		return e.execRegularJoin(jp, plan)
+	default:
+		return nil, fmt.Errorf("execJoinSelect: unsupported join plan type %T", jplan)
 	}
+}
 
-	// Regular nested loop join
-	jp := jplan.(*plannerapi.JoinPlan)
+// execRegularJoin handles regular nested loop join (used for non-optimized joins).
+func (e *executor) execRegularJoin(jp *plannerapi.JoinPlan, plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 
 	// Collect left rows — may be ScanPlan, nested *JoinPlan, or nested *HashJoinPlan
 	var leftRows []*engineapi.Row

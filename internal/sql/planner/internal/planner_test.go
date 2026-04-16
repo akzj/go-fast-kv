@@ -825,3 +825,165 @@ func TestPlan_InsertNull(t *testing.T) {
 		t.Error("expected NULL for column 1")
 	}
 }
+
+// setupPlannerWithJoinTables creates a planner with two tables for join testing.
+func setupPlannerWithJoinTables(t *testing.T) *planner {
+	t.Helper()
+	store, err := kvstore.Open(kvstoreapi.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	cat := catalog.New(store)
+
+	// Create t1 table
+	err = cat.CreateTable(catalogapi.TableSchema{
+		Name: "t1",
+		Columns: []catalogapi.ColumnDef{
+			{Name: "id", Type: catalogapi.TypeInt},
+			{Name: "x", Type: catalogapi.TypeInt},
+		},
+		PrimaryKey: "id",
+		TableID:    1,
+	})
+	if err != nil {
+		t.Fatalf("create t1 table: %v", err)
+	}
+
+	// Create t2 table
+	err = cat.CreateTable(catalogapi.TableSchema{
+		Name: "t2",
+		Columns: []catalogapi.ColumnDef{
+			{Name: "id", Type: catalogapi.TypeInt},
+			{Name: "y", Type: catalogapi.TypeInt},
+		},
+		PrimaryKey: "id",
+		TableID:    2,
+	})
+	if err != nil {
+		t.Fatalf("create t2 table: %v", err)
+	}
+
+	return New(cat)
+}
+
+func TestPlan_IndexNestedLoopJoin(t *testing.T) {
+	p := setupPlannerWithJoinTables(t)
+
+	// Create index on t1.id
+	err := p.catalog.CreateIndex(catalogapi.IndexSchema{
+		Name:   "idx_t1_id",
+		Table:  "t1",
+		Column: "id",
+		IndexID: 10,
+	})
+	if err != nil {
+		t.Fatalf("create index on t1.id: %v", err)
+	}
+
+	// Query: SELECT * FROM t1 JOIN t2 ON t1.id = t2.id
+	stmt := &parserapi.SelectStmt{
+		Join: &parserapi.JoinExpr{
+			Type: parserapi.JoinType("INNER"),
+			Left: "t1",
+			Right: "t2",
+			On: &parserapi.BinaryExpr{
+				Left:  &parserapi.ColumnRef{Table: "t1", Column: "id"},
+				Op:    parserapi.BinEQ,
+				Right: &parserapi.ColumnRef{Table: "t2", Column: "id"},
+			},
+		},
+	}
+
+	plan, err := p.Plan(stmt)
+	if err != nil {
+		t.Fatalf("Plan failed: %v", err)
+	}
+
+	sp := plan.(*plannerapi.SelectPlan)
+	if sp.Join == nil {
+		t.Fatal("expected Join plan")
+	}
+
+	// Should use IndexNestedLoopJoinPlan since t1.id has an index
+	inlPlan, ok := sp.Join.(*plannerapi.IndexNestedLoopJoinPlan)
+	if !ok {
+		t.Fatalf("expected IndexNestedLoopJoinPlan, got %T", sp.Join)
+	}
+
+	// Verify the plan structure
+	if inlPlan.OuterTable != "t2" {
+		t.Errorf("OuterTable = %q, want t2", inlPlan.OuterTable)
+	}
+	if inlPlan.InnerTable != "t1" {
+		t.Errorf("InnerTable = %q, want t1", inlPlan.InnerTable)
+	}
+	if inlPlan.InnerIndex == nil {
+		t.Error("InnerIndex should not be nil")
+	}
+	if inlPlan.Type != "INNER" {
+		t.Errorf("Type = %q, want INNER", inlPlan.Type)
+	}
+
+	// Verify EXPLAIN output shows "INDEX NESTED LOOP JOIN"
+	explain := sp.String()
+	if !strings.Contains(explain, "INDEX NESTED LOOP JOIN") {
+		t.Errorf("expected EXPLAIN to contain 'INDEX NESTED LOOP JOIN', got:\n%s", explain)
+	}
+}
+
+func TestPlan_IndexNestedLoopJoin_FallbackToHashJoin(t *testing.T) {
+	p := setupPlannerWithJoinTables(t)
+
+	// NO index on either join column - should fall back to HashJoin
+
+	stmt := &parserapi.SelectStmt{
+		Join: &parserapi.JoinExpr{
+			Type: parserapi.JoinType("INNER"),
+			Left: "t1",
+			Right: "t2",
+			On: &parserapi.BinaryExpr{
+				Left:  &parserapi.ColumnRef{Table: "t1", Column: "id"},
+				Op:    parserapi.BinEQ,
+				Right: &parserapi.ColumnRef{Table: "t2", Column: "id"},
+			},
+		},
+	}
+
+	plan, err := p.Plan(stmt)
+	if err != nil {
+		t.Fatalf("Plan failed: %v", err)
+	}
+
+	sp := plan.(*plannerapi.SelectPlan)
+	if sp.Join == nil {
+		t.Fatal("expected Join plan")
+	}
+
+	// Should fall back to HashJoinPlan since no index exists
+	hashPlan, ok := sp.Join.(*plannerapi.HashJoinPlan)
+	if !ok {
+		t.Fatalf("expected HashJoinPlan when no index, got %T", sp.Join)
+	}
+
+	// Verify the plan structure
+	if hashPlan.LeftTable != "t1" {
+		t.Errorf("LeftTable = %q, want t1", hashPlan.LeftTable)
+	}
+	if hashPlan.RightTable != "t2" {
+		t.Errorf("RightTable = %q, want t2", hashPlan.RightTable)
+	}
+	if hashPlan.Type != "INNER" {
+		t.Errorf("Type = %q, want INNER", hashPlan.Type)
+	}
+
+	// Verify EXPLAIN output shows "HASH JOIN" (not "INDEX NESTED LOOP JOIN")
+	explain := sp.String()
+	if strings.Contains(explain, "INDEX NESTED LOOP JOIN") {
+		t.Errorf("expected EXPLAIN NOT to contain 'INDEX NESTED LOOP JOIN', got:\n%s", explain)
+	}
+	if !strings.Contains(explain, "HASH JOIN") {
+		t.Errorf("expected EXPLAIN to contain 'HASH JOIN', got:\n%s", explain)
+	}
+}
