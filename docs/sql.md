@@ -807,6 +807,14 @@ EXPLAIN <statement>
 EXPLAIN SELECT * FROM users WHERE id = 1
 ```
 
+**Actual Output:**
+```
+EXPLAIN
+└─ SELECT * FROM users
+└─ TABLE SCAN table=1
+└─ FILTER: (ID 0 {1 1 0  [] false})
+```
+
 ### EXPLAIN ANALYZE
 
 Executes the statement and returns both the execution plan and actual runtime statistics.
@@ -819,6 +827,114 @@ EXPLAIN ANALYZE <statement>
 ```sql
 EXPLAIN ANALYZE SELECT name FROM users WHERE age > 18
 ```
+
+**Actual Output (SELECT with WHERE):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ SELECT * FROM users                                                 │
+│ └─ TABLE SCAN table=1                                                  │
+│ └─ FILTER: (ID 0 {1 1 0  [] false})                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=1                                                          │
+│ actual time=0.032ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Actual Output (INNER HASH JOIN):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ SELECT * FROM INNER HASH JOIN (optimized) users × orders            │
+│ ├─ ON: (ID 0 USER_ID)                                                  │
+│ └─ hash keys: users[col0] = orders[col1]                               │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=3                                                           │
+│ actual time=0.094ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Actual Output (GROUP BY with aggregate):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ SELECT 2 columns FROM employees                                     │
+│ └─ TABLE SCAN table=3                                                  │
+│ └─ GROUP BY                                                            │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=2                                                           │
+│ actual time=0.023ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Actual Output (INSERT):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ INSERT INTO users                                                   │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=0                                                          │
+│ rows affected=1                                                        │
+│ actual time=2.872ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Actual Output (UPDATE):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ UPDATE users                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=0                                                          │
+│ rows affected=1                                                        │
+│ actual time=2.807ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Actual Output (DELETE):**
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ EXPLAIN ANALYZE                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ EXPLAIN ANALYZE                                                        │
+│ └─ DELETE FROM users                                                   │
+├──────────────────────────────────────────────────────────────────────┤
+│ actual rows=0                                                          │
+│ rows affected=1                                                        │
+│ actual time=2.870ms                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Plan Node Types
+
+| Node Type | Description |
+|-----------|-------------|
+| `SELECT` | Query selection node |
+| `TABLE SCAN` | Full table scan operation |
+| `FILTER` | Row filtering condition |
+| `INNER HASH JOIN` | Hash-based inner join with optimization |
+| `GROUP BY` | Aggregation grouping |
+| `INSERT` | Row insertion |
+| `UPDATE` | Row modification |
+| `DELETE` | Row removal |
+
+### EXPLAIN ANALYZE Statistics
+
+| Field | Description |
+|-------|-------------|
+| `actual rows` | Number of rows produced by the operation |
+| `actual time` | Time taken to execute (in milliseconds) |
+| `rows affected` | Number of rows modified (INSERT/UPDATE/DELETE)
 
 ---
 
