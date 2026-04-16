@@ -1618,3 +1618,99 @@ func TestExec_InsertSelectWithIndex(t *testing.T) {
 		t.Errorf("index lookup: got %v, want (1, 100)", idx.Rows[0])
 	}
 }
+
+func TestExec_DerivedTable(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Charlie')")
+
+	t.Run("basic_derived_table", func(t *testing.T) {
+		// SELECT * FROM (SELECT id, name FROM users) AS u
+		result := env.execSQL(t, "SELECT * FROM (SELECT id, name FROM users) AS u")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		if len(result.Columns) != 2 {
+			t.Errorf("columns count = %d, want 2", len(result.Columns))
+		}
+	})
+
+	t.Run("derived_table_with_where", func(t *testing.T) {
+		// The acceptance test case: SELECT * FROM (SELECT id, name FROM users) AS u WHERE u.id = 1
+		result := env.execSQL(t, "SELECT * FROM (SELECT id, name FROM users) AS u WHERE u.id = 1")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 1 {
+			t.Errorf("id = %d, want 1", result.Rows[0][0].Int)
+		}
+		if result.Rows[0][1].Text != "Alice" {
+			t.Errorf("name = %q, want Alice", result.Rows[0][1].Text)
+		}
+	})
+
+	t.Run("derived_table_with_alias_columns", func(t *testing.T) {
+		// SELECT alias.column FROM (SELECT col AS alias FROM ...) AS t
+		result := env.execSQL(t, "SELECT u.id, u.uname FROM (SELECT id, name AS uname FROM users) AS u WHERE u.id = 2")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 2 {
+			t.Errorf("id = %d, want 2", result.Rows[0][0].Int)
+		}
+		if result.Rows[0][1].Text != "Bob" {
+			t.Errorf("uname = %q, want Bob", result.Rows[0][1].Text)
+		}
+	})
+
+	t.Run("derived_table_projection", func(t *testing.T) {
+		// Only select specific columns from derived table
+		result := env.execSQL(t, "SELECT u.name FROM (SELECT id, name FROM users) AS u")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		if len(result.Columns) != 1 {
+			t.Errorf("columns = %d, want 1", len(result.Columns))
+		}
+	})
+
+	t.Run("derived_table_limit", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT * FROM (SELECT id, name FROM users) AS u LIMIT 2")
+		if len(result.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(result.Rows))
+		}
+	})
+
+	t.Run("derived_table_order_by", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT * FROM (SELECT id, name FROM users) AS u ORDER BY name DESC")
+		if len(result.Rows) != 3 {
+			t.Fatalf("rows = %d, want 3", len(result.Rows))
+		}
+		if result.Rows[0][1].Text != "Charlie" {
+			t.Errorf("first row name = %q, want Charlie (descending)", result.Rows[0][1].Text)
+		}
+	})
+
+	t.Run("derived_table_with_aggregate", func(t *testing.T) {
+		result := env.execSQL(t, "SELECT COUNT(*) FROM (SELECT id, name FROM users) AS u")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 3 {
+			t.Errorf("COUNT(*) = %d, want 3", result.Rows[0][0].Int)
+		}
+	})
+
+	t.Run("nested_subquery_in_derived", func(t *testing.T) {
+		// Derived table containing a subquery
+		result := env.execSQL(t, "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT id FROM users)) AS u WHERE u.id = 1")
+		if len(result.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(result.Rows))
+		}
+		if result.Rows[0][0].Int != 1 {
+			t.Errorf("id = %d, want 1", result.Rows[0][0].Int)
+		}
+	})
+}

@@ -189,9 +189,16 @@ type JoinExpr struct {
 	On    Expr     // join condition (nil for CROSS)
 }
 
+// DerivedTable represents a subquery in the FROM clause: (SELECT ...) AS alias
+type DerivedTable struct {
+	Subquery *SubqueryExpr
+	Alias    string // required: the alias after AS
+}
+
 type SelectStmt struct {
 	Columns []SelectColumn
-	Table   string      // single table name (used when Join is nil)
+	Table   string      // single table name (used when DerivedTable is nil and Join is nil)
+	DerivedTable *DerivedTable // subquery AS alias (used when Table is empty)
 	Join    *JoinExpr   // non-nil means this is a JOIN query
 	Where   Expr        // nil if no WHERE
 	GroupBy []Expr      // nil if no GROUP BY

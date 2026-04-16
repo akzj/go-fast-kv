@@ -25,6 +25,10 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 		return e.indexScan(table, s, subqueryResults)
 	case *plannerapi.IndexRangePlan:
 		return e.indexRangeScan(s, subqueryResults)
+	case *plannerapi.DerivedTableScanPlan:
+		// DerivedTableScanPlan is handled in execSelect before scanRows is called.
+		// This case should not be reached, but return empty rows to be safe.
+		return []*engineapi.Row{}, nil
 	default:
 		return nil, fmt.Errorf("%w: unsupported scan type %T", executorapi.ErrExecFailed, scan)
 	}

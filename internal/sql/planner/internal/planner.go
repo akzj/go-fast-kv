@@ -307,6 +307,11 @@ func (p *planner) planExcept(s *parserapi.ExceptStmt) (plannerapi.Plan, error) {
 }
 
 func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
+	// Handle derived table (subquery in FROM clause)
+	if stmt.DerivedTable != nil {
+		return p.planDerivedTableSelect(stmt)
+	}
+
 	// Handle JOIN queries
 	if stmt.Join != nil {
 		return p.planJoinSelect(stmt)
@@ -421,6 +426,251 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit, Offset: offset,
 		Distinct: stmt.Distinct,
 	}, nil
+}
+
+
+// planDerivedTableSelect handles SELECT ... FROM (SELECT ...) AS alias [WHERE ...]
+// The derived table produces a virtual table with its SELECT list as the schema.
+func (p *planner) planDerivedTableSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
+	dt := stmt.DerivedTable
+
+	// Plan the subquery first
+	subStmt, ok := dt.Subquery.Stmt.(*parserapi.SelectStmt)
+	if !ok {
+		return nil, fmt.Errorf("%w: derived table subquery must be SELECT", plannerapi.ErrInvalidPlan)
+	}
+	subPlan, err := p.planSelect(subStmt)
+	if err != nil {
+		return nil, fmt.Errorf("plan derived table subquery: %w", err)
+	}
+
+	// Build the derived table schema from the subquery's SELECT list.
+	// This schema has NO catalog backing — executor materializes it as a temp table.
+	derivedSchema := buildDerivedSchema(dt.Alias, subPlan.SelectColumns)
+
+	// Resolve select columns against the derived table's schema.
+	colIndices, err := p.resolveSelectColumnsFromDerived(stmt.Columns, derivedSchema, stmt.GroupBy)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve WHERE filter — may reference columns from the derived table via alias.
+	scan, residualFilter, err := p.planScanForDerived(derivedSchema, stmt.Where)
+	if err != nil {
+		return nil, err
+	}
+
+	// Plan subqueries in WHERE and HAVING
+	if err := p.planSubqueries(residualFilter); err != nil {
+		return nil, fmt.Errorf("planning subquery in WHERE: %w", err)
+	}
+	if err := p.planSubqueries(stmt.Having); err != nil {
+		return nil, fmt.Errorf("planning subquery in HAVING: %w", err)
+	}
+
+	// HAVING requires GROUP BY
+	if stmt.Having != nil && len(stmt.GroupBy) == 0 {
+		return nil, fmt.Errorf("HAVING requires GROUP BY")
+	}
+
+	// Resolve ORDER BY against derived schema
+	var orderBy *plannerapi.OrderByPlan
+	if stmt.OrderBy != nil {
+		orderCol := stmt.OrderBy.Column
+		orderTable := ""
+		if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
+			orderTable = orderCol[:dot]
+			orderCol = orderCol[dot+1:]
+		}
+		idx := -1
+		for i, c := range derivedSchema.Columns {
+			if strings.EqualFold(c.Name, orderCol) {
+				if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
+					idx = i
+					break
+				}
+				if idx < 0 {
+					idx = i
+				}
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
+		}
+		// Map ORDER BY index from derivedSchema to projected output
+		if len(colIndices) > 0 {
+			mappedIdx := -1
+			for selectPos, derivedIdx := range colIndices {
+				if derivedIdx == idx {
+					mappedIdx = selectPos
+					break
+				}
+			}
+			if mappedIdx >= 0 {
+				idx = mappedIdx
+			}
+		}
+		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
+	}
+
+	// Resolve LIMIT
+	limit := -1
+	if stmt.Limit != nil {
+		val, err := resolveExprToValue(stmt.Limit)
+		if err != nil {
+			return nil, fmt.Errorf("LIMIT: %w", err)
+		}
+		if val.IsNull || val.Type != catalogapi.TypeInt {
+			return nil, fmt.Errorf("LIMIT: %w: expected integer", plannerapi.ErrTypeMismatch)
+		}
+		limit = int(val.Int)
+	}
+
+	// Resolve OFFSET
+	offset := -1
+	if stmt.Offset != nil {
+		val, err := resolveExprToValue(stmt.Offset)
+		if err != nil {
+			return nil, fmt.Errorf("OFFSET: %w", err)
+		}
+		if val.IsNull || val.Type != catalogapi.TypeInt {
+			return nil, fmt.Errorf("OFFSET: %w: expected integer", plannerapi.ErrTypeMismatch)
+		}
+		offset = int(val.Int)
+	}
+
+	return &plannerapi.SelectPlan{
+		Table:               derivedSchema,
+		Scan:                scan,
+		Columns:             colIndices,
+		SelectColumns:       stmt.Columns,
+		Filter:              residualFilter,
+		GroupByExprs:        stmt.GroupBy,
+		Having:              stmt.Having,
+		OrderBy:             orderBy,
+		Limit:               limit,
+		Offset:              offset,
+		Distinct:            stmt.Distinct,
+		DerivedTableSubplan: subPlan,
+		DerivedTableAlias:   dt.Alias,
+	}, nil
+}
+
+// buildDerivedSchema builds a catalogapi.TableSchema for the derived table.
+func buildDerivedSchema(alias string, selectCols []parserapi.SelectColumn) *catalogapi.TableSchema {
+	columns := make([]catalogapi.ColumnDef, len(selectCols))
+	for i, sc := range selectCols {
+		col := catalogapi.ColumnDef{
+			Name:  deriveColumnName(sc),
+			Table: alias,
+		}
+		col.Type = inferTypeFromExpr(sc.Expr)
+		columns[i] = col
+	}
+	return &catalogapi.TableSchema{
+		Name:    alias,
+		Columns: columns,
+	}
+}
+
+// deriveColumnName returns the column name for a SELECT column.
+func deriveColumnName(sc parserapi.SelectColumn) string {
+	if sc.Alias != "" {
+		return sc.Alias
+	}
+	switch expr := sc.Expr.(type) {
+	case *parserapi.ColumnRef:
+		if expr.Column != "" {
+			return expr.Column
+		}
+	case *parserapi.AggregateCallExpr:
+		return strings.ToUpper(expr.Func)
+	case *parserapi.Literal:
+		return "literal"
+	case *parserapi.StarExpr:
+		return "*"
+	}
+	return "col"
+}
+
+// inferTypeFromExpr attempts to infer the catalog type from an expression.
+func inferTypeFromExpr(expr parserapi.Expr) catalogapi.Type {
+	switch e := expr.(type) {
+	case *parserapi.Literal:
+		return e.Value.Type
+	case *parserapi.ColumnRef:
+		return catalogapi.TypeText
+	case *parserapi.AggregateCallExpr:
+		switch strings.ToUpper(e.Func) {
+		case "COUNT":
+			return catalogapi.TypeInt
+		case "SUM", "AVG":
+			return catalogapi.TypeFloat
+		case "MIN", "MAX":
+			return catalogapi.TypeText
+		}
+	case *parserapi.BinaryExpr:
+		if inferTypeFromExpr(e.Left) == catalogapi.TypeInt &&
+			inferTypeFromExpr(e.Right) == catalogapi.TypeInt {
+			return catalogapi.TypeInt
+		}
+		return catalogapi.TypeFloat
+	case *parserapi.CaseExpr:
+		if len(e.Whens) > 0 {
+			return inferTypeFromExpr(e.Whens[0].Val)
+		}
+		if e.Else != nil {
+			return inferTypeFromExpr(e.Else)
+		}
+	case *parserapi.CoalesceExpr:
+		if len(e.Args) > 0 {
+			return inferTypeFromExpr(e.Args[0])
+		}
+	}
+	return catalogapi.TypeText
+}
+
+// resolveSelectColumnsFromDerived resolves SELECT columns against a derived table schema.
+func (p *planner) resolveSelectColumnsFromDerived(cols []parserapi.SelectColumn, tbl *catalogapi.TableSchema, groupByExprs []parserapi.Expr) ([]int, error) {
+	if len(cols) == 1 {
+		if _, ok := cols[0].Expr.(*parserapi.StarExpr); ok {
+			return nil, nil
+		}
+	}
+
+	indices := make([]int, len(cols))
+	for i, sc := range cols {
+		switch expr := sc.Expr.(type) {
+		case *parserapi.ColumnRef:
+			if len(groupByExprs) > 0 && !isInGroupBy(expr.Column, expr.Table, groupByExprs) {
+				return nil, fmt.Errorf("%w: column %q must appear in the GROUP BY clause or be used in an aggregate function", plannerapi.ErrUnsupportedExpr, expr.Column)
+			}
+			idx := findColumnIndex(tbl, expr.Column)
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, expr.Column)
+			}
+			indices[i] = idx
+		case *parserapi.AggregateCallExpr:
+			indices[i] = -1
+		case *parserapi.CoalesceExpr:
+			indices[i] = -1
+		case *parserapi.CaseExpr:
+			indices[i] = -1
+		case *parserapi.BinaryExpr:
+			indices[i] = -1
+		default:
+			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
+		}
+	}
+	return indices, nil
+}
+
+// planScanForDerived creates a scan plan for a derived table.
+func (p *planner) planScanForDerived(tbl *catalogapi.TableSchema, where parserapi.Expr) (plannerapi.ScanPlan, parserapi.Expr, error) {
+	if where == nil {
+		return &plannerapi.DerivedTableScanPlan{Schema: tbl, Filter: nil}, nil, nil
+	}
+	return &plannerapi.DerivedTableScanPlan{Schema: tbl, Filter: where}, where, nil
 }
 
 // planJoinSelect handles SELECT ... FROM t1 JOIN t2 ON ...

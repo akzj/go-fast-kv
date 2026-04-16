@@ -141,6 +141,12 @@ type SelectPlan struct {
 
 	Join            JoinPlanNode           // nil for non-join; non-nil for JOIN
 	LeftColumnCount int                    // number of columns in left table (for JOIN projection)
+
+	// DerivedTableSubplan is the execution plan for the subquery in a FROM clause.
+	// nil for regular table queries.
+	DerivedTableSubplan *SelectPlan
+	// DerivedTableAlias is the alias for the derived table (e.g., "u" in "FROM (SELECT ...) AS u").
+	DerivedTableAlias string
 }
 
 func (*SelectPlan) planNode() {}
@@ -224,6 +230,18 @@ type IndexRangePlan struct {
 
 func (*IndexRangePlan) scanNode()  {}
 func (*IndexRangePlan) planNode() {}
+
+// DerivedTableScanPlan is a scan plan for a derived table (subquery in FROM clause).
+// The Schema is a virtual table built from the subquery's SELECT list.
+// There is no real catalog backing (TableID=0); the executor materializes the
+// subquery results as an in-memory table before scanning.
+type DerivedTableScanPlan struct {
+	Schema  *catalogapi.TableSchema // virtual table schema (alias + derived columns)
+	Filter  parserapi.Expr           // WHERE filter on the derived table
+}
+
+func (*DerivedTableScanPlan) scanNode()  {}
+func (*DerivedTableScanPlan) planNode() {}
 
 // OrderByPlan describes an ORDER BY clause.
 type OrderByPlan struct {
@@ -516,4 +534,12 @@ func (p *IndexScanPlan) String() string {
 // String returns a human-readable index range description.
 func (p *IndexRangePlan) String() string {
 	return fmt.Sprintf("INDEX RANGE table=%d index=%d prefix=[%s..%s]", p.TableID, p.IndexID, p.StartPrefix, p.EndPrefix)
+}
+
+// String returns a human-readable description for a derived table scan.
+func (p *DerivedTableScanPlan) String() string {
+	if p.Schema == nil {
+		return "DERIVED TABLE SCAN (nil schema)"
+	}
+	return fmt.Sprintf("DERIVED TABLE SCAN alias=%s cols=%d", p.Schema.Name, len(p.Schema.Columns))
 }

@@ -479,11 +479,41 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	var leftTable string
 	if p.cur.Type == api.TokFrom {
 		p.advance()
-		if p.cur.Type != api.TokIdent {
-			return nil, p.errorf("expected table name after FROM")
+		// Check for subquery: FROM (SELECT ...)
+		if p.cur.Type == api.TokLParen {
+			// Parse subquery
+			p.advance() // consume '(' — now at SELECT
+			subq, err := p.parseSubquerySelect()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur.Type != api.TokRParen {
+				return nil, p.errorf("expected ) after subquery")
+			}
+			p.advance() // consume ')'
+
+			// Parse alias: [AS] alias
+			alias := ""
+			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+				p.advance()
+			}
+			if p.cur.Type == api.TokIdent {
+				alias = p.cur.Literal
+				p.advance()
+			} else {
+				return nil, p.errorf("expected alias for subquery")
+			}
+
+			stmt.DerivedTable = &api.DerivedTable{
+				Subquery: &api.SubqueryExpr{Stmt: subq},
+				Alias:    alias,
+			}
+		} else if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected table name or subquery after FROM")
+		} else {
+			leftTable = p.cur.Literal
+			p.advance()
 		}
-		leftTable = p.cur.Literal
-		p.advance()
 	}
 
 	// Check for JOIN (INNER, LEFT, RIGHT, CROSS all start with their own token)

@@ -1518,6 +1518,185 @@ func columnNameFromExpr(expr parserapi.Expr) string {
 	return ""
 }
 
+// execSelectFromDerived handles SELECT ... FROM (SELECT ...) AS alias [WHERE ...].
+// It materializes the subquery result, then treats it as a regular table scan.
+func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *plannerapi.DerivedTableScanPlan) (*executorapi.Result, error) {
+	// Step 1: Execute the subquery to get materialized rows.
+	if plan.DerivedTableSubplan == nil {
+		return nil, fmt.Errorf("%w: derived table subplan is missing", executorapi.ErrExecFailed)
+	}
+	subResult, err := e.Execute(plan.DerivedTableSubplan)
+	if err != nil {
+		return nil, fmt.Errorf("%w: execute derived table subquery: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Step 2: Convert subquery result rows to engineapi.Row (with RowID=0, no storage).
+	rows := make([]*engineapi.Row, len(subResult.Rows))
+	for i, rowVals := range subResult.Rows {
+		rows[i] = &engineapi.Row{
+			RowID:  0,
+			Values: rowVals,
+		}
+	}
+
+	// Step 3: Build column definitions with Table field set to alias.
+	// The derived table schema already has the alias as Table name.
+	tableCols := make([]catalogapi.ColumnDef, len(dtScan.Schema.Columns))
+	for i, col := range dtScan.Schema.Columns {
+		tableCols[i] = col
+		if tableCols[i].Table == "" {
+			tableCols[i].Table = dtScan.Schema.Name
+		}
+	}
+
+	// Set outerCols for correlated subquery resolution.
+	e.outerCols = tableCols
+
+	// Step 4: Apply WHERE filter on materialized rows.
+	if dtScan.Filter != nil {
+		// Precompute subqueries in the WHERE filter.
+		subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		rows = e.filterRows(rows, dtScan.Filter, tableCols, subqueryResults)
+	}
+
+	// Step 5: GROUP BY
+	if plan.GroupByExprs != nil {
+		// Convert [][]catalogapi.Value back to []*engineapi.Row for groupByRows.
+		// But groupByRows expects the rows to have len(plan.Table.Columns) values,
+		// which matches the materialized subquery output.
+		engineRows := make([]*engineapi.Row, len(rows))
+		copy(engineRows, rows)
+
+		grouped, err := e.groupByRows(engineRows, plan)
+		if err != nil {
+			return nil, err
+		}
+		rows2 := make([]*engineapi.Row, len(grouped))
+		copy(rows2, grouped)
+
+		// HAVING
+		if plan.Having != nil {
+			subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+			if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+				return nil, err
+			}
+			rows2 = e.filterRows(rows2, plan.Having, plan.Table.Columns, subqueryResults)
+		}
+
+		// ORDER BY
+		if plan.OrderBy != nil {
+			sortRawRows(rows2, plan.OrderBy)
+		}
+
+		// OFFSET
+		if plan.Offset >= 0 && plan.Offset < len(rows2) {
+			rows2 = rows2[plan.Offset:]
+		}
+
+		// LIMIT
+		if plan.Limit >= 0 && plan.Limit < len(rows2) {
+			rows2 = rows2[:plan.Limit]
+		}
+
+		// Extract projected rows
+		projected := make([][]catalogapi.Value, len(rows2))
+		for i, row := range rows2 {
+			projected[i] = row.Values
+		}
+
+		colNames := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if name := columnNameFromExpr(sc.Expr); name != "" {
+				colNames[i] = name
+			} else {
+				colNames[i] = "expr"
+			}
+		}
+
+		return &executorapi.Result{Columns: colNames, Rows: projected}, nil
+	}
+
+	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.
+	if plan.SelectColumns != nil && plan.GroupByExprs == nil {
+		hasScalarAgg := false
+		for _, sc := range plan.SelectColumns {
+			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+				hasScalarAgg = true
+				break
+			}
+		}
+		if hasScalarAgg {
+			vals := make([]catalogapi.Value, len(plan.SelectColumns))
+			names := make([]string, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				names[i] = sc.Alias
+				if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
+					val, err := computeAggregate(agg, rows, tableCols)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+					idx := findColumnIndexByName(tableCols, ref.Column)
+					if len(rows) > 0 && idx >= 0 && idx < len(rows[0].Values) {
+						vals[i] = rows[0].Values[idx]
+					}
+				}
+			}
+			return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+		}
+	}
+
+	// Step 6: ORDER BY
+	if plan.OrderBy != nil {
+		sortRawRows(rows, plan.OrderBy)
+	}
+
+	// Step 7: OFFSET
+	if plan.Offset >= 0 && plan.Offset < len(rows) {
+		rows = rows[plan.Offset:]
+	}
+
+	// Step 8: LIMIT
+	if plan.Limit >= 0 && plan.Limit < len(rows) {
+		rows = rows[:plan.Limit]
+	}
+
+	// Step 9: Project columns.
+	projected := projectRows(rows, plan.Columns)
+	colNames := buildColumnNames(plan.Table, plan.Columns)
+
+	// Step 10: DISTINCT
+	if plan.Distinct {
+		seen := make(map[string]bool)
+		var deduped [][]catalogapi.Value
+		for _, row := range projected {
+			var key strings.Builder
+			for _, v := range row {
+				if v.IsNull {
+					key.WriteString("NULL")
+				} else {
+					key.WriteString(fmt.Sprintf("%v", v))
+				}
+				key.WriteByte(0)
+			}
+			if !seen[key.String()] {
+				seen[key.String()] = true
+				deduped = append(deduped, row)
+			}
+		}
+		projected = deduped
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    projected,
+	}, nil
+}
+
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 	// Save outer context — a correlated subquery's inner execSelect must not
 	// clobber the outer query's outerCols/outerVals that evalColumnRef needs
@@ -1549,6 +1728,14 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			vals[i] = val
 		}
 		return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+	}
+
+	// Handle derived table (subquery in FROM clause): materialize the subquery first.
+	// plan.Table is the derived table's schema (alias + columns from SELECT list).
+	// plan.Scan is *DerivedTableScanPlan.
+	// plan.DerivedTableSubplan contains the subquery's execution plan.
+	if dtScan, ok := plan.Scan.(*plannerapi.DerivedTableScanPlan); ok {
+		return e.execSelectFromDerived(plan, dtScan)
 	}
 
 	// Pre-compute subquery results BEFORE scanning — needed for filter during scan.
