@@ -1002,14 +1002,48 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 func (e *executor) execInnerJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
 	var merged [][]catalogapi.Value
+	// Pre-allocate mergedRows buffer to estimated max size (worst case: all rows match).
+	// This reduces slice growth allocations.
+	merged = make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
+
+	// Pre-allocate combinedVals buffer once per outer row iteration.
+	// This buffer is reused across all right row match checks for the same left row,
+	// reducing allocations from O(matches) to O(outer rows).
+	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+
 	for _, left := range leftRows {
+		// Reset combinedVals for each left row, keeping capacity.
+		// Copy left values into the combined buffer.
+		copy(combinedVals, left.Values)
+
 		for _, right := range rightRows {
-			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
+			// Copy right values into the remaining portion of combinedVals.
+			copy(combinedVals[leftLen:], right.Values)
+			combinedRow := &engineapi.Row{Values: combinedVals}
+
+			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults, e) {
+				// Use mergeRows which allocates the result - this is unavoidable
+				// since each matched row needs its own storage in the result.
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
 		}
 	}
 	return merged
+}
+
+// joinMatchNoAlloc evaluates the ON condition for a combined row.
+// This version does NOT allocate combinedVals - it expects the caller
+// to have already set up the combinedRow.
+func (e *executor) joinMatchNoAlloc(combinedRow *engineapi.Row, on parserapi.Expr,
+	combinedCols []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) bool {
+	if on == nil {
+		return true
+	}
+	result, err := evalExpr(on, combinedRow, combinedCols, subqueryResults, ex)
+	if err != nil {
+		return false
+	}
+	return isTruthy(result)
 }
 
 // execLeftJoin emits all left rows; unmatched left rows get NULL for right columns.
