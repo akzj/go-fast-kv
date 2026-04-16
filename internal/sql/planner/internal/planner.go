@@ -381,6 +381,36 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		return nil, err
 	}
 
+	// Try to optimize IndexScanPlan to IndexOnlyScanPlan (covering index).
+	// If all required columns (SELECT, ORDER BY) are available in the index itself,
+	// we can skip reading table pages entirely.
+	if indexScan, ok := scan.(*plannerapi.IndexScanPlan); ok {
+		if isCoveringIndex(tbl, stmt.Columns, stmt.OrderBy, indexScan.Index) {
+			// Find which column index in SELECT refers to the indexed column.
+			// For SELECT col FROM t WHERE col = 1, IndexedColumnIdx = 0.
+			idxColIdx := -1
+			for i, sc := range stmt.Columns {
+				if colRef, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+					if colRef.Column == indexScan.Index.Column {
+						idxColIdx = i
+						break
+					}
+				}
+			}
+			scan = &plannerapi.IndexOnlyScanPlan{
+				TableID:           indexScan.TableID,
+				IndexID:          indexScan.IndexID,
+				Index:            indexScan.Index,
+				Op:               indexScan.Op,
+				Value:            indexScan.Value,
+				ResidualFilter:   residualFilter,
+				IndexedColumnIdx: idxColIdx,
+			}
+			// ResidualFilter was already extracted from planScan
+			residualFilter = nil
+		}
+	}
+
 	var orderBy *plannerapi.OrderByPlan
 	if stmt.OrderBy != nil {
 		idx := findColumnIndex(tbl, stmt.OrderBy.Column)
@@ -1129,6 +1159,37 @@ func (p *planner) planScan(tbl *catalogapi.TableSchema, where parserapi.Expr) (p
 	}
 
 	return &plannerapi.TableScanPlan{TableID: tbl.TableID, Filter: where}, where, nil
+}
+
+// isCoveringIndex checks if the given index can satisfy the query without reading table pages.
+// For a covering index, all required columns (SELECT, WHERE, ORDER BY) must be the indexed column.
+func isCoveringIndex(tbl *catalogapi.TableSchema, selectCols []parserapi.SelectColumn, orderBy *parserapi.OrderByClause, index *catalogapi.IndexSchema) bool {
+	indexedColumn := index.Column
+
+	// Check ORDER BY column (if present)
+	if orderBy != nil {
+		if orderBy.Column != indexedColumn {
+			return false
+		}
+	}
+
+	// Check SELECT columns
+	for _, sc := range selectCols {
+		switch expr := sc.Expr.(type) {
+		case *parserapi.ColumnRef:
+			if expr.Column != indexedColumn {
+				return false
+			}
+		case *parserapi.StarExpr:
+			// SELECT * requires all columns — not covering
+			return false
+		default:
+			// Aggregates, expressions, etc. — not covering (may need other columns)
+			return false
+		}
+	}
+
+	return true
 }
 
 type indexCandidate struct {
