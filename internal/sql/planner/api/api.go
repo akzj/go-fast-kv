@@ -240,6 +240,8 @@ func planDescription(plan Plan) string {
 		return p.String()
 	case *HashJoinPlan:
 		return p.String()
+	case *IndexNestedLoopJoinPlan:
+		return p.String()
 	case *UnionPlan:
 		return "UNION"
 	case *IntersectPlan:
@@ -454,6 +456,69 @@ func (p *HashJoinPlan) String() string {
 		b.WriteString("├─ ON: " + formatExpr(p.On) + "\n")
 	}
 	b.WriteString("└─ hash keys: " + p.LeftTable + "[col" + fmt.Sprintf("%d", p.LeftKeyIdx) + "] = " + p.RightTable + "[col" + fmt.Sprintf("%d", p.RightKeyIdx) + "]")
+	return b.String()
+}
+
+// IndexNestedLoopJoinPlan represents an equi-join optimized with index nested loop.
+// Uses O(n) outer scan + O(log m) index lookup per row instead of O(n*m) nested loop.
+// The INNER side must have an index on the join column.
+type IndexNestedLoopJoinPlan struct {
+	Outer        Plan                     // Scanned side (outer loop)
+	Inner        Plan                     // Index-probed side (inner loop)
+	OuterSchema  []*catalogapi.ColumnDef  // columns from outer side (for ON eval)
+	InnerSchema  []*catalogapi.ColumnDef // columns from inner side (for ON eval)
+	OuterTable   string                  // table name for outer (for key resolution)
+	InnerTable   string                  // table name for inner (for key resolution)
+	InnerIndex   *catalogapi.IndexSchema // Index on Inner table's join column
+	OuterKeyIdx  int                     // column index in outer schema for join key
+	InnerKeyIdx  int                     // column index in inner schema for join key
+	On           parserapi.Expr          // join condition (may include non-equi parts)
+	Type         string                  // "INNER", "LEFT"
+}
+
+func (*IndexNestedLoopJoinPlan) planNode() {}
+
+// GetOn returns the join condition.
+func (p *IndexNestedLoopJoinPlan) GetOn() parserapi.Expr { return p.On }
+
+// GetType returns the join type.
+func (p *IndexNestedLoopJoinPlan) GetType() string { return p.Type }
+
+// GetLeft returns the outer (scanned) plan.
+func (p *IndexNestedLoopJoinPlan) GetLeft() Plan { return p.Outer }
+
+// GetRight returns the inner (index-probed) plan.
+func (p *IndexNestedLoopJoinPlan) GetRight() ScanPlan {
+	if scan, ok := p.Inner.(ScanPlan); ok {
+		return scan
+	}
+	return nil
+}
+
+// GetLeftSchema returns the outer schema.
+func (p *IndexNestedLoopJoinPlan) GetLeftSchema() []*catalogapi.ColumnDef { return p.OuterSchema }
+
+// GetRightSchema returns the inner schema.
+func (p *IndexNestedLoopJoinPlan) GetRightSchema() []*catalogapi.ColumnDef { return p.InnerSchema }
+
+// GetLeftTableName returns the outer table name.
+func (p *IndexNestedLoopJoinPlan) GetLeftTableName() string { return p.OuterTable }
+
+// GetRightTableName returns the inner table name.
+func (p *IndexNestedLoopJoinPlan) GetRightTableName() string { return p.InnerTable }
+
+// String returns a human-readable description of the index nested loop join.
+func (p *IndexNestedLoopJoinPlan) String() string {
+	var b strings.Builder
+	b.WriteString(p.Type + " INDEX NESTED LOOP JOIN")
+	if p.OuterTable != "" && p.InnerTable != "" {
+		b.WriteString(" " + p.OuterTable + " × " + p.InnerTable)
+	}
+	b.WriteString("\n")
+	if p.On != nil {
+		b.WriteString("├─ ON: " + formatExpr(p.On) + "\n")
+	}
+	b.WriteString("└─ index lookup: " + p.InnerTable + "[col" + fmt.Sprintf("%d", p.InnerKeyIdx) + "] using " + p.InnerIndex.Name)
 	return b.String()
 }
 

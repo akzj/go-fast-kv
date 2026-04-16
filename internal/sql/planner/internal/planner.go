@@ -898,8 +898,75 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		offset = int(val.Int)
 	}
 
-	// Check for equi-join and convert to HashJoinPlan if applicable
+	// Check for equi-join and convert to optimized plan if applicable
 	if hashLeftIdx, hashRightIdx, isEqui := detectEquiJoin(j.On, leftTbl.Name, rightTbl.Name, leftTbl, rightTbl); isEqui {
+		// Check for index availability on both join columns
+		leftIdx, _ := p.catalog.GetIndexByColumn(leftTbl.Name, leftTbl.Columns[hashLeftIdx].Name)
+		rightIdx, _ := p.catalog.GetIndexByColumn(rightTbl.Name, rightTbl.Columns[hashRightIdx].Name)
+
+		if leftIdx != nil {
+			// LEFT table has index on join column → scan RIGHT (outer), lookup LEFT (inner)
+			return &plannerapi.SelectPlan{
+				Table:            leftTbl,
+				Scan:             nil,
+				Join: &plannerapi.IndexNestedLoopJoinPlan{
+					Outer:       rightScan,
+					Inner:       leftPlan,
+					OuterSchema: colsToPtrWithTable(rightTbl.Columns, rightTbl.Name),
+					InnerSchema: leftSchema,
+					OuterTable:  rightTbl.Name,
+					InnerTable:  leftTbl.Name,
+					InnerIndex:  leftIdx,
+					OuterKeyIdx: hashRightIdx,
+					InnerKeyIdx: hashLeftIdx,
+					On:          j.On,
+					Type:        string(j.Type),
+				},
+				Columns:          colIndices,
+				SelectColumns:    stmt.Columns,
+				Filter:           stmt.Where,
+				GroupByExprs:     stmt.GroupBy,
+				Having:           stmt.Having,
+				OrderBy:          orderBy,
+				Limit:            limit,
+				Offset:           offset,
+				LeftColumnCount:  len(leftSchema),
+				Distinct:         stmt.Distinct,
+			}, nil
+		}
+
+		if rightIdx != nil {
+			// RIGHT table has index on join column → scan LEFT, lookup RIGHT
+			return &plannerapi.SelectPlan{
+				Table:            leftTbl,
+				Scan:             nil,
+				Join: &plannerapi.IndexNestedLoopJoinPlan{
+					Outer:       leftPlan,
+					Inner:       rightScan,
+					OuterSchema: leftSchema,
+					InnerSchema: colsToPtrWithTable(rightTbl.Columns, rightTbl.Name),
+					OuterTable:  leftTbl.Name,
+					InnerTable:  rightTbl.Name,
+					InnerIndex:  rightIdx,
+					OuterKeyIdx: hashLeftIdx,
+					InnerKeyIdx: hashRightIdx,
+					On:          j.On,
+					Type:        string(j.Type),
+				},
+				Columns:          colIndices,
+				SelectColumns:    stmt.Columns,
+				Filter:           stmt.Where,
+				GroupByExprs:     stmt.GroupBy,
+				Having:           stmt.Having,
+				OrderBy:          orderBy,
+				Limit:            limit,
+				Offset:           offset,
+				LeftColumnCount:  len(leftSchema),
+				Distinct:         stmt.Distinct,
+			}, nil
+		}
+
+		// No index on either side → fall back to HashJoin
 		return &plannerapi.SelectPlan{
 			Table:            leftTbl,
 			Scan:             nil,

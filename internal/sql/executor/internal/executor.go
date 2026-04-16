@@ -805,6 +805,204 @@ func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *planne
 	}, nil
 }
 
+// execIndexNestedLoopJoinSelect handles SELECT with IndexNestedLoopJoinPlan.
+func (e *executor) execIndexNestedLoopJoinSelect(plan *plannerapi.SelectPlan, nlplan *plannerapi.IndexNestedLoopJoinPlan) (*executorapi.Result, error) {
+	// Get table schemas
+	outerTbl, err := e.catalog.GetTable(nlplan.OuterTable)
+	if err != nil {
+		return nil, fmt.Errorf("%w: get outer table: %v", executorapi.ErrExecFailed, err)
+	}
+	innerTbl, err := e.catalog.GetTable(nlplan.InnerTable)
+	if err != nil {
+		return nil, fmt.Errorf("%w: get inner table: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Execute outer scan (scan all outer rows)
+	var outerScan plannerapi.ScanPlan
+	switch s := nlplan.Outer.(type) {
+	case plannerapi.ScanPlan:
+		outerScan = s
+	default:
+		return nil, fmt.Errorf("execIndexNestedLoopJoinSelect: outer must be ScanPlan, got %T", nlplan.Outer)
+	}
+	outerRows, err := e.scanRows(outerTbl, outerScan, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: scan outer: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Build combined schema for ON evaluation
+	outerLen := len(nlplan.OuterSchema)
+	innerLen := len(nlplan.InnerSchema)
+	combinedCols := make([]catalogapi.ColumnDef, 0, outerLen+innerLen)
+	for _, c := range nlplan.OuterSchema {
+		col := *c
+		if col.Table == "" {
+			col.Table = nlplan.OuterTable
+		}
+		combinedCols = append(combinedCols, col)
+	}
+	for _, c := range nlplan.InnerSchema {
+		col := *c
+		if col.Table == "" {
+			col.Table = nlplan.InnerTable
+		}
+		combinedCols = append(combinedCols, col)
+	}
+
+	// Prepare subquery results
+	subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+	if nlplan.On != nil {
+		e.walkExprForJoinSubqueries(nlplan.On, subqueryResults)
+	}
+
+	var result [][]catalogapi.Value
+	isLeftJoin := nlplan.Type == "LEFT"
+
+	for _, outerRow := range outerRows {
+		// Extract join key from outer row
+		joinKey := outerRow.Values[nlplan.OuterKeyIdx]
+
+		// Index lookup on inner table
+		rowIDIter, err := e.indexEngine.Scan(innerTbl.TableID, nlplan.InnerIndex.IndexID, encodingapi.OpEQ, joinKey)
+		if err != nil {
+			return nil, fmt.Errorf("%w: index lookup: %v", executorapi.ErrExecFailed, err)
+		}
+
+		found := false
+		for rowIDIter.Next() {
+			// Get full row from inner table
+			innerRow, err := e.tableEngine.Get(innerTbl, rowIDIter.RowID())
+			if err != nil {
+				if err == engineapi.ErrRowNotFound {
+					continue // stale index entry
+				}
+				return nil, fmt.Errorf("%w: get inner row: %v", executorapi.ErrExecFailed, err)
+			}
+
+			// Evaluate ON condition (if non-equi parts exist)
+			if nlplan.On != nil {
+				combinedVals := make([]catalogapi.Value, outerLen+innerLen)
+				copy(combinedVals[:outerLen], outerRow.Values)
+				copy(combinedVals[outerLen:], innerRow.Values)
+				combinedRow := &engineapi.Row{Values: combinedVals}
+				matchResult, err := evalExpr(nlplan.On, combinedRow, combinedCols, subqueryResults, e)
+				if err != nil {
+					rowIDIter.Close()
+					return nil, err
+				}
+				if !isTruthy(matchResult) {
+					continue
+				}
+			}
+
+			// Merge rows
+			merged := make([]catalogapi.Value, outerLen+innerLen)
+			copy(merged[:outerLen], outerRow.Values)
+			copy(merged[outerLen:], innerRow.Values)
+			result = append(result, merged)
+			found = true
+		}
+		rowIDIter.Close()
+
+		// LEFT JOIN: emit with NULLs if no match
+		if isLeftJoin && !found {
+			merged := make([]catalogapi.Value, outerLen+innerLen)
+			copy(merged[:outerLen], outerRow.Values)
+			for i := outerLen; i < outerLen+innerLen; i++ {
+				merged[i] = catalogapi.Value{IsNull: true}
+			}
+			result = append(result, merged)
+		}
+	}
+
+	// Apply WHERE filter on merged rows
+	if plan.Filter != nil {
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		e.outerCols = combinedCols
+		result = e.filterJoinRows(result, plan.Filter, combinedCols, subqueryResults)
+	}
+
+	// Build column names
+	colNames := make([]string, 0, outerLen+innerLen)
+	for _, c := range nlplan.OuterSchema {
+		colNames = append(colNames, c.Name)
+	}
+	for _, c := range nlplan.InnerSchema {
+		colNames = append(colNames, c.Name)
+	}
+
+	// GROUP BY on merged join rows
+	if plan.GroupByExprs != nil {
+		engineRows := make([]*engineapi.Row, len(result))
+		for i, row := range result {
+			engineRows[i] = &engineapi.Row{Values: row}
+		}
+
+		grouped, err := e.groupByRowsForJoin(engineRows, plan, combinedCols)
+		if err != nil {
+			return nil, err
+		}
+
+		if plan.Having != nil {
+			e.outerCols = combinedCols
+			grouped = e.filterRows(grouped, plan.Having, combinedCols, subqueryResults)
+		}
+
+		if plan.OrderBy != nil {
+			sortRawRows(grouped, plan.OrderBy)
+		}
+
+		if plan.Offset >= 0 && plan.Offset < len(grouped) {
+			grouped = grouped[plan.Offset:]
+		}
+
+		if plan.Limit >= 0 && plan.Limit < len(grouped) {
+			grouped = grouped[:plan.Limit]
+		}
+
+		rows := make([][]catalogapi.Value, len(grouped))
+		for i, row := range grouped {
+			rows[i] = row.Values
+		}
+
+		projCols := make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				if ref.Table != "" {
+					projCols[i] = ref.Table + "." + ref.Column
+				} else {
+					projCols[i] = ref.Column
+				}
+			} else {
+				projCols[i] = sc.Alias
+			}
+		}
+
+		return &executorapi.Result{Columns: projCols, Rows: rows}, nil
+	}
+
+	if plan.OrderBy != nil {
+		sortJoinRows(result, plan.OrderBy, combinedCols)
+	}
+
+	if plan.Offset >= 0 && plan.Offset < len(result) {
+		result = result[plan.Offset:]
+	}
+
+	if plan.Limit >= 0 && plan.Limit < len(result) {
+		result = result[:plan.Limit]
+	}
+
+	projected, projCols := projectJoinRows(result, colNames, plan)
+
+	return &executorapi.Result{
+		Columns: projCols,
+		Rows:    projected,
+	}, nil
+}
+
 // execHashJoin performs the hash join algorithm.
 // Build hash table on smaller table, probe with larger table.
 // For outer joins, build on the "preserved" side to track unmatched rows correctly.
