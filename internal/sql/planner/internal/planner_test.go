@@ -2,6 +2,7 @@ package internal
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/akzj/go-fast-kv/internal/kvstore"
@@ -334,6 +335,107 @@ func TestPlan_SelectIndexScan(t *testing.T) {
 	}
 	if is.ResidualFilter != nil {
 		t.Error("expected no residual filter for single equality scan")
+	}
+}
+
+func TestPlan_SelectIndexOnlyScan(t *testing.T) {
+	p := setupPlannerWithIndex(t)
+
+	// SELECT AGE FROM USERS WHERE AGE = 25
+	// Index on AGE → should produce IndexOnlyScanPlan because:
+	// - SELECT only references AGE (indexed column)
+	// - WHERE only references AGE (indexed column)
+	// - No ORDER BY
+	// All columns are in the index → covering index → no table access needed.
+	stmt := &parserapi.SelectStmt{
+		Table: "USERS",
+		Columns: []parserapi.SelectColumn{
+			{Expr: &parserapi.ColumnRef{Column: "AGE"}},
+		},
+		Where: &parserapi.BinaryExpr{
+			Left:  &parserapi.ColumnRef{Column: "AGE"},
+			Op:    parserapi.BinEQ,
+			Right: &parserapi.Literal{Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: 25}},
+		},
+	}
+
+	plan, err := p.Plan(stmt)
+	if err != nil {
+		t.Fatalf("Plan failed: %v", err)
+	}
+
+	sp := plan.(*plannerapi.SelectPlan)
+	// SELECT AGE → column index 2 (AGE is the 3rd column: ID=0, NAME=1, AGE=2)
+	if len(sp.Columns) != 1 || sp.Columns[0] != 2 {
+		t.Errorf("expected Columns=[2], got %v", sp.Columns)
+	}
+
+	is, ok := sp.Scan.(*plannerapi.IndexOnlyScanPlan)
+	if !ok {
+		t.Fatalf("expected IndexOnlyScanPlan, got %T", sp.Scan)
+	}
+	if is.IndexID != 10 {
+		t.Errorf("expected IndexID=10, got %d", is.IndexID)
+	}
+	if is.Op != encodingapi.OpEQ {
+		t.Errorf("expected OpEQ, got %v", is.Op)
+	}
+	if is.Value.Int != 25 {
+		t.Errorf("expected scan value 25, got %d", is.Value.Int)
+	}
+	if is.IndexedColumnIdx != 0 {
+		t.Errorf("expected IndexedColumnIdx=0 (first column in SELECT), got %d", is.IndexedColumnIdx)
+	}
+	if is.ResidualFilter != nil {
+		t.Error("expected no residual filter for single equality scan")
+	}
+	// Verify EXPLAIN output shows "INDEX ONLY SCAN"
+	explain := sp.String()
+	if !strings.Contains(explain, "INDEX ONLY SCAN") {
+		t.Errorf("expected EXPLAIN to contain 'INDEX ONLY SCAN', got:\n%s", explain)
+	}
+}
+
+func TestPlan_SelectIndexOnlyScan_FallbackToIndexScan(t *testing.T) {
+	p := setupPlannerWithIndex(t)
+
+	// SELECT NAME FROM USERS WHERE AGE = 25
+	// Index on AGE, but SELECT references NAME (not indexed) → NOT covering.
+	// Should fall back to IndexScanPlan (not IndexOnlyScanPlan).
+	stmt := &parserapi.SelectStmt{
+		Table: "USERS",
+		Columns: []parserapi.SelectColumn{
+			{Expr: &parserapi.ColumnRef{Column: "NAME"}},
+		},
+		Where: &parserapi.BinaryExpr{
+			Left:  &parserapi.ColumnRef{Column: "AGE"},
+			Op:    parserapi.BinEQ,
+			Right: &parserapi.Literal{Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: 25}},
+		},
+	}
+
+	plan, err := p.Plan(stmt)
+	if err != nil {
+		t.Fatalf("Plan failed: %v", err)
+	}
+
+	sp := plan.(*plannerapi.SelectPlan)
+	// Should be IndexScanPlan (uses index, but still needs table for NAME)
+	_, ok := sp.Scan.(*plannerapi.IndexScanPlan)
+	if !ok {
+		t.Fatalf("expected IndexScanPlan (not covering), got %T", sp.Scan)
+	}
+	// Should NOT be IndexOnlyScanPlan
+	if _, bad := sp.Scan.(*plannerapi.IndexOnlyScanPlan); bad {
+		t.Error("expected IndexScanPlan, not IndexOnlyScanPlan (NAME not in index)")
+	}
+	// Verify EXPLAIN output shows "INDEX SCAN" (not "INDEX ONLY SCAN")
+	explain := sp.String()
+	if !strings.Contains(explain, "INDEX SCAN") {
+		t.Errorf("expected EXPLAIN to contain 'INDEX SCAN', got:\n%s", explain)
+	}
+	if strings.Contains(explain, "INDEX ONLY SCAN") {
+		t.Errorf("expected EXPLAIN NOT to contain 'INDEX ONLY SCAN', got:\n%s", explain)
 	}
 }
 
