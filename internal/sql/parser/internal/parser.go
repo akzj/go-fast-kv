@@ -603,6 +603,28 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		stmt.Offset = expr
 	}
 
+	// Check for UNION [ALL]
+	// Right-associative: A UNION B UNION C parses as A UNION (B UNION C)
+	if p.cur.Type == api.TokUnion || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "UNION") {
+		p.advance() // consume UNION
+		unionAll := false
+		// Check for ALL keyword
+		if p.cur.Type == api.TokAll || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "ALL") {
+			unionAll = true
+			p.advance() // consume ALL
+		}
+		// Parse right side as a statement (may be another UNION)
+		rightStmt, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &api.UnionStmt{
+			Left:     stmt,
+			Right:    rightStmt,
+			UnionAll: unionAll,
+		}, nil
+	}
+
 	return stmt, nil
 }
 
