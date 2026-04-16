@@ -645,6 +645,10 @@ func evalInExpr(expr *parserapi.InExpr, row *engineapi.Row, columns []catalogapi
 // Returns the first non-NULL value. If all are NULL, returns NULL.
 func evalCoalesceExpr(expr *parserapi.CoalesceExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Defensive check: COALESCE requires at least one argument
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: COALESCE requires at least one argument", executorapi.ErrExecFailed)
+	}
 	for _, arg := range expr.Args {
 		val, err := evalExpr(arg, row, columns, subqueryResults, ex)
 		if err != nil {

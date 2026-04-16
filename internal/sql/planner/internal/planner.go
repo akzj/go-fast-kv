@@ -939,7 +939,7 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 		switch expr := sc.Expr.(type) {
 		case *parserapi.ColumnRef:
 			// CR-E: if GROUP BY present, validate column is in GROUP BY or is an aggregate
-			if len(groupByExprs) > 0 && !isInGroupBy(expr.Column, groupByExprs) {
+			if len(groupByExprs) > 0 && !isInGroupBy(expr.Column, expr.Table, groupByExprs) {
 				return nil, fmt.Errorf("%w: column %q must appear in the GROUP BY clause or be used in an aggregate function", plannerapi.ErrUnsupportedExpr, expr.Column)
 			}
 			idx := findColumnIndex(tbl, expr.Column)
@@ -963,13 +963,19 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 	return indices, nil
 }
 
-// isInGroupBy checks if a column name appears in the GROUP BY expression list.
-func isInGroupBy(colName string, groupByExprs []parserapi.Expr) bool {
+// isInGroupBy checks if a column reference appears in the GROUP BY expression list.
+// If table qualifier is non-empty, it must also match.
+func isInGroupBy(colName, table string, groupByExprs []parserapi.Expr) bool {
 	for _, gb := range groupByExprs {
 		if gbRef, ok := gb.(*parserapi.ColumnRef); ok {
-			if strings.EqualFold(colName, gbRef.Column) {
-				return true
+			if !strings.EqualFold(colName, gbRef.Column) {
+				continue
 			}
+			// If SELECT column has table qualifier, GROUP BY must match it
+			if table != "" && gbRef.Table != "" && !strings.EqualFold(table, gbRef.Table) {
+				continue
+			}
+			return true
 		}
 	}
 	return false

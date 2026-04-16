@@ -789,14 +789,6 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		key := hashKey(probe.Values[probeKeyIdx])
 		buildMatches := hashTable[key]
 
-		// Pre-allocate combinedVals once per probe row for ON condition evaluation.
-		// This buffer is reused across all build matches for this probe row,
-		// reducing allocations from O(matches) to O(probe rows).
-		var combinedVals []catalogapi.Value
-		if hplan.On != nil {
-			combinedVals = make([]catalogapi.Value, leftLen+rightLen)
-		}
-
 		if len(buildMatches) == 0 {
 			if joinType == "LEFT" {
 				// LEFT JOIN: unmatched probe (left) → NULL right
@@ -812,13 +804,15 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		for _, build := range buildMatches {
 			if hplan.On != nil {
 				// Evaluate ON condition with combined row
-				// Reuse pre-allocated combinedVals buffer
+				var combinedVals []catalogapi.Value
 				if buildIsLeft {
 					// build=left, probe=right
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, build.Values)
 					copy(combinedVals[leftLen:], probe.Values)
 				} else {
 					// build=right, probe=left
+					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, probe.Values)
 					copy(combinedVals[leftLen:], build.Values)
 				}
@@ -1015,23 +1009,11 @@ func (e *executor) execInnerJoin(leftRows, rightRows []*engineapi.Row, jplan *pl
 // execLeftJoin emits all left rows; unmatched left rows get NULL for right columns.
 func (e *executor) execLeftJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
-	// Pre-allocate mergedRows buffer to estimated max size.
-	merged := make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
-
-	// Pre-allocate combinedVals buffer once per outer row iteration.
-	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
-
+	var merged [][]catalogapi.Value
 	for _, left := range leftRows {
 		matched := false
-		// Copy left values once per row.
-		copy(combinedVals, left.Values)
-
 		for _, right := range rightRows {
-			// Copy right values into combined buffer.
-			copy(combinedVals[leftLen:], right.Values)
-			combinedRow := &engineapi.Row{Values: combinedVals}
-
-			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults) {
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
 				matched = true
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
@@ -1046,23 +1028,12 @@ func (e *executor) execLeftJoin(leftRows, rightRows []*engineapi.Row, jplan *pla
 // execRightJoin emits all right rows; unmatched right rows get NULL for left columns.
 func (e *executor) execRightJoin(leftRows, rightRows []*engineapi.Row, jplan *plannerapi.JoinPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, leftLen, rightLen int, combinedCols []catalogapi.ColumnDef) [][]catalogapi.Value {
-	// Pre-allocate mergedRows buffer to estimated max size.
-	merged := make([][]catalogapi.Value, 0, len(leftRows)*len(rightRows))
+	var merged [][]catalogapi.Value
 	matchedRight := make([]bool, len(rightRows))
 
-	// Pre-allocate combinedVals buffer once per outer row iteration.
-	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
-
 	for _, left := range leftRows {
-		// Copy left values once per row.
-		copy(combinedVals, left.Values)
-
 		for j, right := range rightRows {
-			// Copy right values into combined buffer.
-			copy(combinedVals[leftLen:], right.Values)
-			combinedRow := &engineapi.Row{Values: combinedVals}
-
-			if e.joinMatchNoAlloc(combinedRow, jplan.On, combinedCols, subqueryResults) {
+			if e.joinMatch(left, right, jplan, subqueryResults, leftLen, combinedCols) {
 				matchedRight[j] = true
 				merged = append(merged, e.mergeRows(left, right, leftLen, rightLen))
 			}
@@ -1121,20 +1092,6 @@ func (e *executor) joinMatch(left, right *engineapi.Row, jplan *plannerapi.JoinP
 	copy(combinedVals[leftLen:], right.Values)
 	combinedRow := &engineapi.Row{Values: combinedVals}
 	result, err := evalExpr(jplan.On, combinedRow, combinedCols, subqueryResults, e)
-	if err != nil {
-		return false
-	}
-	return isTruthy(result)
-}
-
-// joinMatchNoAlloc evaluates the ON condition for a combined row without allocating.
-// The combinedVals buffer must be set up by the caller before calling this function.
-func (e *executor) joinMatchNoAlloc(combinedRow *engineapi.Row, on parserapi.Expr,
-	combinedCols []catalogapi.ColumnDef, subqueryResults map[*parserapi.SubqueryExpr]interface{}) bool {
-	if on == nil {
-		return true
-	}
-	result, err := evalExpr(on, combinedRow, combinedCols, subqueryResults, e)
 	if err != nil {
 		return false
 	}
@@ -1469,6 +1426,28 @@ func (e *executor) precomputeSubqueries(plan *plannerapi.SelectPlan,
 	return nil
 }
 
+// columnNameFromExpr generates a meaningful column name from an expression.
+// Returns the column name if it's a ColumnRef, the function name for aggregates,
+// or "" for other expressions (caller should use "expr" or other default).
+func columnNameFromExpr(expr parserapi.Expr) string {
+	switch e := expr.(type) {
+	case *parserapi.ColumnRef:
+		return e.Column
+	case *parserapi.AggregateCallExpr:
+		if e.Arg != nil {
+			if colRef, ok := e.Arg.(*parserapi.ColumnRef); ok {
+				return e.Func + "_" + colRef.Column
+			}
+		}
+		return e.Func + "()"
+	case *parserapi.CoalesceExpr:
+		return "COALESCE"
+	case *parserapi.Literal:
+		return "literal"
+	}
+	return ""
+}
+
 func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result, error) {
 	// Save outer context — a correlated subquery's inner execSelect must not
 	// clobber the outer query's outerCols/outerVals that evalColumnRef needs
@@ -1632,14 +1611,14 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		if plan.SelectColumns != nil {
 			colNames = make([]string, len(plan.SelectColumns))
 			for i, sc := range plan.SelectColumns {
-				if ref, ok := sc.Expr.(*parserapi.ColumnRef); ok {
-					colNames[i] = ref.Column
+				if name := columnNameFromExpr(sc.Expr); name != "" {
+					colNames[i] = name
 				} else {
-					colNames[i] = "?"
+					colNames[i] = "expr"
 				}
 			}
 		} else {
-			colNames = []string{"?"}
+			colNames = []string{"*"}
 		}
 	} else {
 		colNames = buildColumnNames(plan.Table, plan.Columns)
@@ -1652,8 +1631,10 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			for i, sc := range plan.SelectColumns {
 				if sc.Alias != "" {
 					colNames[i] = sc.Alias
+				} else if name := columnNameFromExpr(sc.Expr); name != "" {
+					colNames[i] = name
 				} else {
-					colNames[i] = "?"
+					colNames[i] = "expr"
 				}
 			}
 			for rowIdx, row := range rows {
