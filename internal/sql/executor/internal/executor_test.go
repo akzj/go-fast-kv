@@ -1714,3 +1714,28 @@ func TestExec_DerivedTable(t *testing.T) {
 		}
 	})
 }
+
+func TestDerivedTableColumnNamesLowercase(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob')")
+	
+	// Bug fix verification: column names must be lowercase
+	result := env.execSQL(t, "SELECT * FROM (SELECT id, name FROM users) AS u")
+	
+	if len(result.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(result.Columns))
+	}
+	
+	if result.Columns[0] != "id" {
+		t.Errorf("Column 0: got %q, want 'id'", result.Columns[0])
+	}
+	if result.Columns[1] != "name" {
+		t.Errorf("Column 1: got %q, want 'name'", result.Columns[1])
+	}
+	
+	if len(result.Rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(result.Rows))
+	}
+}

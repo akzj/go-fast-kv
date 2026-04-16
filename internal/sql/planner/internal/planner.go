@@ -581,7 +581,8 @@ func deriveColumnName(sc parserapi.SelectColumn) string {
 	switch expr := sc.Expr.(type) {
 	case *parserapi.ColumnRef:
 		if expr.Column != "" {
-			return expr.Column
+			// Return lowercase for column references (SQL standard)
+			return strings.ToLower(expr.Column)
 		}
 	case *parserapi.AggregateCallExpr:
 		return strings.ToUpper(expr.Func)
