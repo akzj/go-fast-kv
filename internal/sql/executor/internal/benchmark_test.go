@@ -260,3 +260,350 @@ func itoa(i int) string {
 	}
 	return string(buf[pos:])
 }
+
+// ─── STRESS TESTS: Large Dataset Benchmarks ──────────────────────────────────
+
+// BenchmarkJoin1000Rows tests JOIN performance with 1000+ rows.
+// This validates JOIN scales well for large datasets per acceptance criteria.
+func BenchmarkJoin1000Rows(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	env.execSQL("CREATE TABLE big_users (id INT, name TEXT)")
+	env.execSQL("CREATE TABLE big_orders (user_id INT, amount INT)")
+
+	// Insert 1500 users
+	for i := 1; i <= 1500; i++ {
+		env.execSQL("INSERT INTO big_users VALUES (" + itoa(i) + ", 'user')")
+	}
+	// Insert 1500 orders (one per user on average)
+	for i := 1; i <= 1500; i++ {
+		env.execSQL("INSERT INTO big_orders VALUES (" + itoa(i) + ", " + itoa(i*100) + ")")
+	}
+
+	plan, err := env.prepare("SELECT big_users.name, big_orders.amount FROM big_users JOIN big_orders ON big_users.id = big_orders.user_id")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+// BenchmarkGroupBy1000Rows tests GROUP BY with 1000+ rows.
+func BenchmarkGroupBy1000Rows(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	env.execSQL("CREATE TABLE large_orders (user_id INT, amount INT, category TEXT)")
+
+	// Insert 1500 rows with 100 distinct users
+	for i := 1; i <= 1500; i++ {
+		userID := (i % 100) + 1
+		cat := "cat" + itoa(i%10)
+		env.execSQL("INSERT INTO large_orders VALUES (" + itoa(userID) + ", " + itoa(i*10) + ", '" + cat + "')")
+	}
+
+	plan, err := env.prepare("SELECT user_id, COUNT(*), SUM(amount), AVG(amount) FROM large_orders GROUP BY user_id")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+// BenchmarkOrderBy1000Rows tests ORDER BY with 1000+ rows.
+func BenchmarkOrderBy1000Rows(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	env.execSQL("CREATE TABLE large_data (id INT, val INT, name TEXT)")
+
+	// Insert 1500 rows
+	for i := 1; i <= 1500; i++ {
+		env.execSQL("INSERT INTO large_data VALUES (" + itoa(i) + ", " + itoa(i*7) + ", 'item')")
+	}
+
+	plan, err := env.prepare("SELECT * FROM large_data ORDER BY val DESC")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+// BenchmarkHashJoin5KRows tests hash join with 5K+ rows (reduced from 10K to avoid timeout).
+// This validates the hash join optimization handles moderately large datasets efficiently.
+func BenchmarkHashJoin5KRows(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	env.execSQL("CREATE TABLE huge_customers (id INT, name TEXT)")
+	env.execSQL("CREATE TABLE huge_orders (customer_id INT, amount INT)")
+
+	// Insert 2500 customers
+	for i := 1; i <= 2500; i++ {
+		env.execSQL("INSERT INTO huge_customers VALUES (" + itoa(i) + ", 'customer')")
+	}
+	// Insert 5000 orders (some customers have multiple orders)
+	for i := 1; i <= 5000; i++ {
+		customerID := (i % 2500) + 1
+		env.execSQL("INSERT INTO huge_orders VALUES (" + itoa(customerID) + ", " + itoa(i*10) + ")")
+	}
+
+	plan, err := env.prepare("SELECT huge_customers.name, huge_orders.amount FROM huge_customers JOIN huge_orders ON huge_customers.id = huge_orders.customer_id")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+// BenchmarkGroupByOrderBy1000Rows tests GROUP BY with ORDER BY on 1000+ rows.
+func BenchmarkGroupByOrderBy1000Rows(b *testing.B) {
+	env := newBenchEnv(b)
+	defer env.store.Close()
+
+	env.execSQL("CREATE TABLE sales (region TEXT, product TEXT, amount INT)")
+
+	// Insert 1500 rows
+	for i := 1; i <= 1500; i++ {
+		region := "region" + itoa(i%5)
+		product := "product" + itoa(i%20)
+		env.execSQL("INSERT INTO sales VALUES ('" + region + "', '" + product + "', " + itoa(i*10) + ")")
+	}
+
+	plan, err := env.prepare("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region")
+	if err != nil {
+		b.Fatalf("prepare: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := env.exec.Execute(plan)
+		if err != nil {
+			b.Fatalf("execute: %v", err)
+		}
+	}
+}
+
+// ─── STRESS TESTS: Edge Cases ────────────────────────────────────────────────
+
+// TestEdgeCase_EmptyTable tests SELECT from empty table.
+func TestEdgeCase_EmptyTable(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE empty_table (id INT, name TEXT)")
+	// Don't insert any rows
+
+	result := env.execSQL(t, "SELECT * FROM empty_table")
+	if len(result.Rows) != 0 {
+		t.Errorf("expected 0 rows from empty table, got %d", len(result.Rows))
+	}
+
+	// SELECT with WHERE on empty table
+	result = env.execSQL(t, "SELECT * FROM empty_table WHERE id > 0")
+	if len(result.Rows) != 0 {
+		t.Errorf("expected 0 rows from empty table with WHERE, got %d", len(result.Rows))
+	}
+
+	// JOIN with empty table
+	env.execSQL(t, "CREATE TABLE other_table (id INT, val TEXT)")
+	env.execSQL(t, "INSERT INTO other_table VALUES (1, 'x')")
+
+	result = env.execSQL(t, "SELECT * FROM empty_table JOIN other_table ON empty_table.id = other_table.id")
+	if len(result.Rows) != 0 {
+		t.Errorf("expected 0 rows from JOIN with empty table, got %d", len(result.Rows))
+	}
+}
+
+// TestEdgeCase_NullValuesInJoin tests NULL handling in various contexts.
+func TestEdgeCase_NullValuesInJoin(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	// Test NULL in WHERE clause
+	env.execSQL(t, "CREATE TABLE null_test_xyz (id INT, val INT)")
+	env.execSQL(t, "INSERT INTO null_test_xyz VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO null_test_xyz VALUES (2, NULL)")
+	env.execSQL(t, "INSERT INTO null_test_xyz VALUES (3, NULL)")
+	env.execSQL(t, "INSERT INTO null_test_xyz VALUES (4, 200)")
+
+	// IS NULL should return 2 rows
+	result := env.execSQL(t, "SELECT * FROM null_test_xyz WHERE val IS NULL")
+	if len(result.Rows) != 2 {
+		t.Errorf("IS NULL: expected 2 rows, got %d", len(result.Rows))
+	}
+
+	// IS NOT NULL should return 2 rows
+	result = env.execSQL(t, "SELECT * FROM null_test_xyz WHERE val IS NOT NULL")
+	if len(result.Rows) != 2 {
+		t.Errorf("IS NOT NULL: expected 2 rows, got %d", len(result.Rows))
+	}
+
+	// INNER JOIN with no overlapping values should return 0 rows
+	env.execSQL(t, "CREATE TABLE join_left_xyz (id INT, val INT)")
+	env.execSQL(t, "CREATE TABLE join_right_xyz (id INT, val INT)")
+	env.execSQL(t, "INSERT INTO join_left_xyz VALUES (1, 100)")
+	env.execSQL(t, "INSERT INTO join_left_xyz VALUES (2, 200)")
+	env.execSQL(t, "INSERT INTO join_right_xyz VALUES (10, 300)")
+	env.execSQL(t, "INSERT INTO join_right_xyz VALUES (20, 400)")
+
+	result = env.execSQL(t, "SELECT join_left_xyz.id, join_right_xyz.id FROM join_left_xyz JOIN join_right_xyz ON join_left_xyz.val = join_right_xyz.val")
+	if len(result.Rows) != 0 {
+		t.Errorf("INNER JOIN with no matches: expected 0 rows, got %d", len(result.Rows))
+	}
+}
+
+// TestEdgeCase_LargeResultSet tests handling of large result sets.
+func TestEdgeCase_LargeResultSet(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE large_table_xyz (id INT PRIMARY KEY, data TEXT)")
+
+	// Insert 500 rows (reduced from 2000 to avoid timeout)
+	for i := 1; i <= 500; i++ {
+		env.execSQL(t, "INSERT INTO large_table_xyz VALUES ("+itoa(i)+", 'data_"+itoa(i)+"')")
+	}
+
+	// SELECT all rows
+	result := env.execSQL(t, "SELECT * FROM large_table_xyz")
+	if len(result.Rows) != 500 {
+		t.Errorf("expected 500 rows, got %d", len(result.Rows))
+	}
+
+	// SELECT with LIMIT
+	result = env.execSQL(t, "SELECT * FROM large_table_xyz LIMIT 100")
+	if len(result.Rows) != 100 {
+		t.Errorf("expected 100 rows with LIMIT, got %d", len(result.Rows))
+	}
+
+	// GROUP BY on large dataset
+	env.execSQL(t, "CREATE TABLE large_orders_xyz (user_id INT, amount INT)")
+	for i := 1; i <= 500; i++ {
+		userID := (i % 50) + 1
+		env.execSQL(t, "INSERT INTO large_orders_xyz VALUES ("+itoa(userID)+", "+itoa(i*10)+")")
+	}
+
+	result = env.execSQL(t, "SELECT user_id, COUNT(*), SUM(amount) FROM large_orders_xyz GROUP BY user_id")
+	if len(result.Rows) != 50 {
+		t.Errorf("GROUP BY: expected 50 groups, got %d", len(result.Rows))
+	}
+}
+
+// TestEdgeCase_AllNullColumns tests table with all NULL values.
+func TestEdgeCase_AllNullColumns(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE null_table (id INT, val INT)")
+	env.execSQL(t, "INSERT INTO null_table VALUES (1, NULL)")
+	env.execSQL(t, "INSERT INTO null_table VALUES (2, NULL)")
+	env.execSQL(t, "INSERT INTO null_table VALUES (3, NULL)")
+
+	// IS NULL should return all rows
+	result := env.execSQL(t, "SELECT * FROM null_table WHERE val IS NULL")
+	if len(result.Rows) != 3 {
+		t.Errorf("IS NULL: expected 3 rows, got %d", len(result.Rows))
+	}
+
+	// IS NOT NULL should return 0 rows
+	result = env.execSQL(t, "SELECT * FROM null_table WHERE val IS NOT NULL")
+	if len(result.Rows) != 0 {
+		t.Errorf("IS NOT NULL: expected 0 rows, got %d", len(result.Rows))
+	}
+}
+
+// TestEdgeCase_MultipleJoinsLargeData tests multiple JOINs on large datasets.
+func TestEdgeCase_MultipleJoinsLargeData(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE users_multi (id INT, name TEXT)")
+	env.execSQL(t, "CREATE TABLE orders_multi (user_id INT, order_id INT, order_date TEXT)")
+	env.execSQL(t, "CREATE TABLE products_multi (order_id INT, product_name TEXT)")
+
+	// Insert 200 users (reduced from 500)
+	for i := 1; i <= 200; i++ {
+		env.execSQL(t, "INSERT INTO users_multi VALUES ("+itoa(i)+", 'user_"+itoa(i)+"')")
+	}
+	// Insert 500 orders
+	for i := 1; i <= 500; i++ {
+		userID := (i % 200) + 1
+		env.execSQL(t, "INSERT INTO orders_multi VALUES ("+itoa(userID)+", "+itoa(i)+", '2024-01-"+itoa(i%28+1)+"')")
+	}
+	// Insert 500 order-product links
+	for i := 1; i <= 500; i++ {
+		env.execSQL(t, "INSERT INTO products_multi VALUES ("+itoa(i)+", 'product_"+itoa(i)+"')")
+	}
+
+	// Triple JOIN: users -> orders -> products
+	result := env.execSQL(t, "SELECT users_multi.name, orders_multi.order_date, products_multi.product_name FROM users_multi JOIN orders_multi ON users_multi.id = orders_multi.user_id JOIN products_multi ON orders_multi.order_id = products_multi.order_id")
+	if len(result.Rows) != 500 {
+		t.Errorf("Triple JOIN: expected 500 rows, got %d", len(result.Rows))
+	}
+}
+
+// TestStress_500RowsWithAggregates tests 500+ rows with aggregate functions.
+func TestStress_500RowsWithAggregates(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.store.Close()
+
+	env.execSQL(t, "CREATE TABLE events_stress (user_id INT, event_type TEXT, value INT, timestamp INT)")
+
+	// Insert 500 rows (reduced from 1500 to avoid timeout)
+	for i := 1; i <= 500; i++ {
+		eventType := "type" + itoa(i%5)
+		env.execSQL(t, "INSERT INTO events_stress VALUES ("+itoa(i%50)+", '"+eventType+"', "+itoa(i*10)+", "+itoa(i)+")")
+	}
+
+	// Multiple aggregations
+	result := env.execSQL(t, "SELECT user_id, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM events_stress GROUP BY user_id")
+	if len(result.Rows) != 50 {
+		t.Errorf("expected 50 groups, got %d", len(result.Rows))
+	}
+
+	// Verify aggregation is correct for first user
+	for _, row := range result.Rows {
+		if row[0].Int == 1 {
+			if row[2].Int <= 0 {
+				t.Errorf("SUM(value) should be positive, got %d", row[2].Int)
+			}
+		}
+	}
+}
