@@ -105,6 +105,11 @@ const (
 	TokAll      TokenType = 79 // ALL
 	TokIntersect TokenType = 80 // INTERSECT
 	TokExcept   TokenType = 81 // EXCEPT
+	TokSkip     TokenType = 82 // SKIP
+	TokLocked   TokenType = 83 // LOCKED
+	TokBegin    TokenType = 84 // BEGIN
+	TokCommit   TokenType = 85 // COMMIT
+	TokRollback TokenType = 86 // ROLLBACK
 )
 
 // Token represents a single lexical token.
@@ -208,9 +213,29 @@ type SelectStmt struct {
 	Limit   Expr        // nil if no LIMIT
 	Offset  Expr        // nil if no OFFSET
 	Distinct bool       // true for SELECT DISTINCT
+	LockMode LockMode   // lock mode for FOR UPDATE
+	LockWait LockWait   // lock wait behavior
 }
 
 func (*SelectStmt) stmtNode() {}
+
+// LockMode represents the lock mode for SELECT ... FOR UPDATE.
+type LockMode int
+
+const (
+	NoUpdate        LockMode = 0 // no FOR UPDATE
+	UpdateShared    LockMode = 1 // FOR UPDATE SHARE (future)
+	UpdateExclusive LockMode = 2 // FOR UPDATE
+)
+
+// LockWait represents the lock wait behavior for SELECT ... FOR UPDATE.
+type LockWait int
+
+const (
+	LockWaitDefault    LockWait = 0 // wait for lock (default)
+	LockWaitNowait     LockWait = 1 // NOWAIT - fail immediately
+	LockWaitSkipLocked LockWait = 2 // SKIP LOCKED - skip locked rows
+)
 
 // UnionStmt: SELECT ... UNION [ALL] SELECT ...
 type UnionStmt struct {
@@ -236,6 +261,21 @@ type ExceptStmt struct {
 }
 
 func (*ExceptStmt) stmtNode() {}
+
+// BeginStmt: BEGIN transaction
+type BeginStmt struct{}
+
+func (*BeginStmt) stmtNode() {}
+
+// CommitStmt: COMMIT transaction
+type CommitStmt struct{}
+
+func (*CommitStmt) stmtNode() {}
+
+// RollbackStmt: ROLLBACK transaction
+type RollbackStmt struct{}
+
+func (*RollbackStmt) stmtNode() {}
 
 // SelectColumn represents a single column in a SELECT list.
 type SelectColumn struct {

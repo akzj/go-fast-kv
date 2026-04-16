@@ -64,9 +64,30 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseUpdate()
 	case api.TokExplain:
 		return p.parseExplain()
+	case api.TokBegin:
+		return p.parseBegin()
+	case api.TokCommit:
+		return p.parseCommit()
+	case api.TokRollback:
+		return p.parseRollback()
 	default:
-		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP)")
+		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, ROLLBACK)")
 	}
+}
+
+func (p *parser) parseBegin() (api.Statement, error) {
+	p.advance() // consume BEGIN
+	return &api.BeginStmt{}, nil
+}
+
+func (p *parser) parseCommit() (api.Statement, error) {
+	p.advance() // consume COMMIT
+	return &api.CommitStmt{}, nil
+}
+
+func (p *parser) parseRollback() (api.Statement, error) {
+	p.advance() // consume ROLLBACK
+	return &api.RollbackStmt{}, nil
 }
 
 // ─── CREATE ───────────────────────────────────────────────────────
@@ -641,6 +662,53 @@ func (p *parser) parseSelect() (api.Statement, error) {
 			return nil, err
 		}
 		stmt.Offset = expr
+	}
+
+	// Optional FOR UPDATE
+	if p.cur.Type == api.TokUpdate || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
+		// Check if it's FOR UPDATE (either as TokUpdate or FOR keyword)
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR" {
+			p.advance() // consume FOR
+			if p.cur.Type != api.TokUpdate {
+				return nil, p.errorf("expected UPDATE after FOR")
+			}
+		}
+		p.advance() // consume UPDATE
+
+		// Default: FOR UPDATE with LockWaitDefault
+		stmt.LockMode = api.UpdateExclusive
+		stmt.LockWait = api.LockWaitDefault
+
+		// Check for NOWAIT or SKIP LOCKED
+		if p.cur.Type == api.TokIdent {
+			upper := strings.ToUpper(p.cur.Literal)
+			if upper == "NOWAIT" {
+				p.advance()
+				stmt.LockWait = api.LockWaitNowait
+			} else if upper == "SKIP" {
+				p.advance()
+				if p.cur.Type != api.TokLocked && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "LOCKED") {
+					return nil, p.errorf("expected LOCKED after SKIP")
+				}
+				if p.cur.Type == api.TokLocked {
+					p.advance()
+				} else {
+					p.advance() // consume LOCKED identifier
+				}
+				stmt.LockWait = api.LockWaitSkipLocked
+			}
+		} else if p.cur.Type == api.TokSkip {
+			p.advance()
+			if p.cur.Type != api.TokLocked && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "LOCKED") {
+				return nil, p.errorf("expected LOCKED after SKIP")
+			}
+			if p.cur.Type == api.TokLocked {
+				p.advance()
+			} else {
+				p.advance() // consume LOCKED identifier
+			}
+			stmt.LockWait = api.LockWaitSkipLocked
+		}
 	}
 
 	// Check for UNION [ALL]

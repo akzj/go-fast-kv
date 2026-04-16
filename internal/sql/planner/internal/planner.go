@@ -359,6 +359,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 			Limit:         limit,
 			Offset:        offset,
 			Distinct:      stmt.Distinct,
+			LockMode:      stmt.LockMode,
 		}, nil
 	}
 
@@ -460,6 +461,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		Filter: residualFilter, GroupByExprs: stmt.GroupBy,
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit, Offset: offset,
 		Distinct: stmt.Distinct,
+		LockMode: stmt.LockMode,
 	}, nil
 }
 
@@ -586,6 +588,7 @@ func (p *planner) planDerivedTableSelect(stmt *parserapi.SelectStmt) (*plannerap
 		Limit:               limit,
 		Offset:              offset,
 		Distinct:            stmt.Distinct,
+		LockMode:            stmt.LockMode,
 		DerivedTableSubplan: subPlan,
 		DerivedTableAlias:   dt.Alias,
 	}, nil
@@ -932,6 +935,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 				Offset:           offset,
 				LeftColumnCount:  len(leftSchema),
 				Distinct:         stmt.Distinct,
+				LockMode:         stmt.LockMode,
 			}, nil
 		}
 
@@ -963,6 +967,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 				Offset:           offset,
 				LeftColumnCount:  len(leftSchema),
 				Distinct:         stmt.Distinct,
+				LockMode:         stmt.LockMode,
 			}, nil
 		}
 
@@ -992,6 +997,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 			Offset:           offset,
 			LeftColumnCount:  len(leftSchema),
 			Distinct:         stmt.Distinct,
+			LockMode:         stmt.LockMode,
 		}, nil
 	}
 
@@ -1009,6 +1015,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		Offset:           offset,
 		LeftColumnCount:  len(leftSchema),
 		Distinct:         stmt.Distinct,
+		LockMode:         stmt.LockMode,
 	}, nil
 }
 

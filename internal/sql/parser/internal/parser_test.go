@@ -1479,3 +1479,115 @@ func TestParse_Join(t *testing.T) {
 		}
 	})
 }
+
+// ─── Parser Tests: FOR UPDATE ──────────────────────────────────────
+
+func TestParse_ForUpdate(t *testing.T) {
+	t.Run("for_update_basic", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users FOR UPDATE")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.UpdateExclusive {
+			t.Errorf("expected LockMode=UpdateExclusive(%d), got %d", api.UpdateExclusive, sel.LockMode)
+		}
+		if sel.LockWait != api.LockWaitDefault {
+			t.Errorf("expected LockWait=LockWaitDefault(%d), got %d", api.LockWaitDefault, sel.LockWait)
+		}
+	})
+
+	t.Run("for_update_nowait", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users FOR UPDATE NOWAIT")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.UpdateExclusive {
+			t.Errorf("expected LockMode=UpdateExclusive(%d), got %d", api.UpdateExclusive, sel.LockMode)
+		}
+		if sel.LockWait != api.LockWaitNowait {
+			t.Errorf("expected LockWait=LockWaitNowait(%d), got %d", api.LockWaitNowait, sel.LockWait)
+		}
+	})
+
+	t.Run("for_update_skip_locked", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users FOR UPDATE SKIP LOCKED")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.UpdateExclusive {
+			t.Errorf("expected LockMode=UpdateExclusive(%d), got %d", api.UpdateExclusive, sel.LockMode)
+		}
+		if sel.LockWait != api.LockWaitSkipLocked {
+			t.Errorf("expected LockWait=LockWaitSkipLocked(%d), got %d", api.LockWaitSkipLocked, sel.LockWait)
+		}
+	})
+
+	t.Run("for_update_with_where", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users WHERE id = 1 FOR UPDATE")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.UpdateExclusive {
+			t.Errorf("expected LockMode=UpdateExclusive(%d), got %d", api.UpdateExclusive, sel.LockMode)
+		}
+		if sel.Where == nil {
+			t.Error("expected WHERE to be parsed")
+		}
+	})
+
+	t.Run("for_update_with_order_by", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users ORDER BY id FOR UPDATE")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.UpdateExclusive {
+			t.Errorf("expected LockMode=UpdateExclusive(%d), got %d", api.UpdateExclusive, sel.LockMode)
+		}
+		if sel.OrderBy == nil {
+			t.Error("expected ORDER BY to be parsed")
+		}
+	})
+
+	t.Run("no_for_update", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("SELECT * FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel, ok := stmt.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt, got %T", stmt)
+		}
+		if sel.LockMode != api.NoUpdate {
+			t.Errorf("expected LockMode=NoUpdate(%d), got %d", api.NoUpdate, sel.LockMode)
+		}
+		if sel.LockWait != api.LockWaitDefault {
+			t.Errorf("expected LockWait=LockWaitDefault(%d), got %d", api.LockWaitDefault, sel.LockWait)
+		}
+	})
+}
