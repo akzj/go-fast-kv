@@ -23,6 +23,8 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 		return e.tableScan(table, s.Filter, subqueryResults)
 	case *plannerapi.IndexScanPlan:
 		return e.indexScan(table, s, subqueryResults)
+	case *plannerapi.IndexOnlyScanPlan:
+		return e.indexOnlyScan(table, s, subqueryResults)
 	case *plannerapi.IndexRangePlan:
 		return e.indexRangeScan(s, subqueryResults)
 	case *plannerapi.DerivedTableScanPlan:
@@ -153,6 +155,52 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 	}
 
 	return rows, nil
+}
+
+// indexOnlyScan uses an index to satisfy a query without touching table pages.
+// All required columns are available in the index itself.
+func (e *executor) indexOnlyScan(table *catalogapi.TableSchema, scan *plannerapi.IndexOnlyScanPlan,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
+	rowIDIter, err := e.indexEngine.Scan(scan.TableID, scan.IndexID, scan.Op, scan.Value)
+	if err != nil {
+		return nil, fmt.Errorf("%w: index only scan: %v", executorapi.ErrExecFailed, err)
+	}
+	defer rowIDIter.Close()
+
+	// Get raw key for decoding - the iterator has Key() method
+	kvIter, ok := rowIDIter.(interface{ Key() []byte })
+	if !ok {
+		return nil, fmt.Errorf("%w: iterator does not support key access", executorapi.ErrExecFailed)
+	}
+
+	var rows []*engineapi.Row
+	for rowIDIter.Next() {
+		// Decode index key to extract the indexed column value
+		_, _, colValue, _, err := e.keyEncoder.DecodeIndexKey(kvIter.Key())
+		if err != nil {
+			return nil, fmt.Errorf("%w: decode index key: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Build row with just the indexed column value
+		row := &engineapi.Row{
+			RowID:  rowIDIter.RowID(),
+			Values: []catalogapi.Value{colValue},
+		}
+
+		// Apply residual filter if any
+		if scan.ResidualFilter != nil {
+			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults, e)
+			if err != nil {
+				return nil, err
+			}
+			if !pass {
+				continue
+			}
+		}
+
+		rows = append(rows, row)
+	}
+	return rows, rowIDIter.Err()
 }
 
 // indexRangeScan uses an index range scan for LIKE 'prefix%' optimization.
