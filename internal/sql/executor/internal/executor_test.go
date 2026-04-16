@@ -1458,3 +1458,85 @@ func TestExec_CoalesceGroupByJoin(t *testing.T) {
 		t.Errorf("carol amount = %d, want 50", carolRow[1].Int)
 	}
 }
+
+// ─── INTERSECT / EXCEPT Tests ──────────────────────────────────────
+
+func TestIntersect_Basic(t *testing.T) {
+	env := newTestEnv(t)
+	result := env.execSQL(t, "SELECT 1 INTERSECT SELECT 1")
+	if len(result.Rows) != 1 {
+		t.Errorf("SELECT 1 INTERSECT SELECT 1: expected 1 row, got %d", len(result.Rows))
+	}
+}
+
+func TestIntersect_NoMatch(t *testing.T) {
+	env := newTestEnv(t)
+	result := env.execSQL(t, "SELECT 1 INTERSECT SELECT 2")
+	if len(result.Rows) != 0 {
+		t.Errorf("SELECT 1 INTERSECT SELECT 2: expected 0 rows, got %d", len(result.Rows))
+	}
+}
+
+func TestIntersect_Dedup(t *testing.T) {
+	env := newTestEnv(t)
+	// INTERSECT with duplicates should dedup
+	result := env.execSQL(t, "SELECT 1 INTERSECT SELECT 1 INTERSECT SELECT 1")
+	if len(result.Rows) != 1 {
+		t.Errorf("INTERSECT dedup: expected 1 row, got %d", len(result.Rows))
+	}
+}
+
+func TestExcept_Basic(t *testing.T) {
+	env := newTestEnv(t)
+	result := env.execSQL(t, "SELECT 1 EXCEPT SELECT 2")
+	if len(result.Rows) != 1 {
+		t.Errorf("SELECT 1 EXCEPT SELECT 2: expected 1 row, got %d", len(result.Rows))
+	}
+}
+
+func TestExcept_ReturnsEmpty(t *testing.T) {
+	env := newTestEnv(t)
+	result := env.execSQL(t, "SELECT 1 EXCEPT SELECT 1")
+	if len(result.Rows) != 0 {
+		t.Errorf("SELECT 1 EXCEPT SELECT 1: expected 0 rows, got %d", len(result.Rows))
+	}
+}
+
+func TestExcept_Dedup(t *testing.T) {
+	env := newTestEnv(t)
+	result := env.execSQL(t, "SELECT 1 EXCEPT SELECT 999")
+	if len(result.Rows) != 1 {
+		t.Errorf("SELECT 1 EXCEPT SELECT 999: expected 1 row, got %d", len(result.Rows))
+	}
+}
+
+func TestUnionIntersectCombination(t *testing.T) {
+	env := newTestEnv(t)
+	// SELECT 1 UNION SELECT 2 INTERSECT SELECT 2
+	// With right-associativity: SELECT 1 UNION (SELECT 2 INTERSECT SELECT 2)
+	// = {1} UNION {2} = {1, 2} with dedup = 2 rows
+	result := env.execSQL(t, "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2")
+	if len(result.Rows) != 2 {
+		t.Errorf("SELECT 1 UNION SELECT 2 INTERSECT SELECT 2: got %d rows (right-assoc), expected 2", len(result.Rows))
+	}
+}
+
+func TestUnionExceptCombination(t *testing.T) {
+	env := newTestEnv(t)
+	// SELECT 1 UNION SELECT 2 EXCEPT SELECT 1
+	// With right-associativity: SELECT 1 UNION (SELECT 2 EXCEPT SELECT 1)
+	// = {1} UNION {2} = {1, 2} with dedup = 2 rows
+	result := env.execSQL(t, "SELECT 1 UNION SELECT 2 EXCEPT SELECT 1")
+	if len(result.Rows) != 2 {
+		t.Errorf("SELECT 1 UNION SELECT 2 EXCEPT SELECT 1: got %d rows (right-assoc), expected 2", len(result.Rows))
+	}
+}
+
+func TestIntersectExcept_NullHandling(t *testing.T) {
+	env := newTestEnv(t)
+	// Two NULLs should be equal in SQL set operations
+	result := env.execSQL(t, "SELECT NULL INTERSECT SELECT NULL")
+	if len(result.Rows) != 1 {
+		t.Errorf("SELECT NULL INTERSECT SELECT NULL: expected 1 row (NULLs equal), got %d", len(result.Rows))
+	}
+}
