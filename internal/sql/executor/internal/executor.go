@@ -99,6 +99,17 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 	// Ensure cleanup on any exit path
 	defer func() { e.txnCtx = nil }()
 
+	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
+	// within this transaction use the same snapshot. This provides true snapshot
+	// isolation: two SELECTs within the same BEGIN...COMMIT see the same state.
+	if txnCtx != nil {
+		snap := txnCtx.Snapshot()
+		if snap != nil {
+			e.store.RegisterSnapshot(txnCtx.XID(), snap)
+			defer e.store.UnregisterSnapshot(txnCtx.XID())
+		}
+	}
+
 	switch p := plan.(type) {
 	case *plannerapi.CreateTablePlan:
 		return e.execCreateTable(p)

@@ -207,6 +207,16 @@ type Store interface {
 	// TxnManager returns the underlying transaction manager.
 	// Used by the SQL layer to create TxnContext for BEGIN...COMMIT transactions.
 	TxnManager() txnapi.TxnContextFactory
+
+	// RegisterSnapshot registers a transaction's read snapshot for the duration
+	// of the transaction. All Get/Scan calls with txnXID as readTxnID will use
+	// this snapshot for visibility checks.
+	// Caller is responsible for calling UnregisterSnapshot when the transaction ends.
+	RegisterSnapshot(txnXID uint64, snap *txnapi.Snapshot)
+
+	// UnregisterSnapshot removes a transaction's snapshot from readSnaps.
+	// Called when the transaction commits or rolls back.
+	UnregisterSnapshot(txnXID uint64)
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────

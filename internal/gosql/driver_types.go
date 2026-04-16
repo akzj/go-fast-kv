@@ -320,12 +320,9 @@ type RowsWithDB struct {
 }
 
 // Close implements driver.Rows.Close.
-// KNOWN TRAP: Must close the sql.DB to prevent goroutine leaks.
+// The sql.DB is NOT closed here — it is shared across the connection lifetime
+// and cleaned up when Conn.Close() is called.
 func (r *RowsWithDB) Close() error {
-	if r.db != nil {
-		r.db.Close()
-		r.db = nil
-	}
 	return nil
 }
 

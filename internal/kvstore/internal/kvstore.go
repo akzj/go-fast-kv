@@ -654,6 +654,17 @@ func (s *store) TxnManager() txnapi.TxnContextFactory {
 	return s.txnMgr
 }
 
+// RegisterSnapshot registers a transaction's read snapshot.
+// Used by SQL layer to provide snapshot isolation within transactions.
+func (s *store) RegisterSnapshot(txnXID uint64, snap *txnapi.Snapshot) {
+	s.readSnaps.Store(txnXID, snap)
+}
+
+// UnregisterSnapshot removes a transaction's snapshot from readSnaps.
+func (s *store) UnregisterSnapshot(txnXID uint64) {
+	s.readSnaps.Delete(txnXID)
+}
+
 // ─── Close ──────────────────────────────────────────────────────────
 
 func (s *store) Close() error {
