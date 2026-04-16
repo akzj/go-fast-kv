@@ -106,6 +106,10 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 		return e.execUpdate(p)
 	case *plannerapi.UnionPlan:
 		return e.execUnion(p)
+	case *plannerapi.IntersectPlan:
+		return e.execIntersect(p)
+	case *plannerapi.ExceptPlan:
+		return e.execExcept(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -1715,6 +1719,108 @@ func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, e
 
 	return &executorapi.Result{
 		Rows:    rows,
+		Columns: leftResult.Columns,
+	}, nil
+}
+
+func (e *executor) execIntersect(plan *plannerapi.IntersectPlan) (*executorapi.Result, error) {
+	leftResult, err := e.Execute(plan.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightResult, err := e.Execute(plan.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a hash set of right rows for O(1) lookup
+	rightSet := make(map[string]bool)
+	for _, row := range rightResult.Rows {
+		var key strings.Builder
+		for _, v := range row {
+			if v.IsNull {
+				key.WriteString("NULL")
+			} else {
+				key.WriteString(fmt.Sprintf("%v", v))
+			}
+			key.WriteByte(0)
+		}
+		rightSet[key.String()] = true
+	}
+
+	// Keep rows that appear in both left and right (with dedup)
+	seen := make(map[string]bool)
+	var result [][]catalogapi.Value
+	for _, row := range leftResult.Rows {
+		var key strings.Builder
+		for _, v := range row {
+			if v.IsNull {
+				key.WriteString("NULL")
+			} else {
+				key.WriteString(fmt.Sprintf("%v", v))
+			}
+			key.WriteByte(0)
+		}
+		keyStr := key.String()
+		if rightSet[keyStr] && !seen[keyStr] {
+			seen[keyStr] = true
+			result = append(result, row)
+		}
+	}
+
+	return &executorapi.Result{
+		Rows:    result,
+		Columns: leftResult.Columns,
+	}, nil
+}
+
+func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result, error) {
+	leftResult, err := e.Execute(plan.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightResult, err := e.Execute(plan.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a hash set of right rows for O(1) lookup
+	rightSet := make(map[string]bool)
+	for _, row := range rightResult.Rows {
+		var key strings.Builder
+		for _, v := range row {
+			if v.IsNull {
+				key.WriteString("NULL")
+			} else {
+				key.WriteString(fmt.Sprintf("%v", v))
+			}
+			key.WriteByte(0)
+		}
+		rightSet[key.String()] = true
+	}
+
+	// Keep rows that appear in left but NOT in right (with dedup)
+	seen := make(map[string]bool)
+	var result [][]catalogapi.Value
+	for _, row := range leftResult.Rows {
+		var key strings.Builder
+		for _, v := range row {
+			if v.IsNull {
+				key.WriteString("NULL")
+			} else {
+				key.WriteString(fmt.Sprintf("%v", v))
+			}
+			key.WriteByte(0)
+		}
+		keyStr := key.String()
+		if !rightSet[keyStr] && !seen[keyStr] {
+			seen[keyStr] = true
+			result = append(result, row)
+		}
+	}
+
+	return &executorapi.Result{
+		Rows:    result,
 		Columns: leftResult.Columns,
 	}, nil
 }

@@ -626,6 +626,36 @@ func (p *parser) parseSelect() (api.Statement, error) {
 		}, nil
 	}
 
+	// Check for INTERSECT
+	// Right-associative: A INTERSECT B INTERSECT C parses as A INTERSECT (B INTERSECT C)
+	if p.cur.Type == api.TokIntersect || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "INTERSECT") {
+		p.advance() // consume INTERSECT
+		// Parse right side as a statement (may be another INTERSECT → right-assoc)
+		rightStmt, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &api.IntersectStmt{
+			Left:  stmt,
+			Right: rightStmt,
+		}, nil
+	}
+
+	// Check for EXCEPT
+	// Right-associative: A EXCEPT B EXCEPT C parses as A EXCEPT (B EXCEPT C)
+	if p.cur.Type == api.TokExcept || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "EXCEPT") {
+		p.advance() // consume EXCEPT
+		// Parse right side as a statement (may be another EXCEPT → right-assoc)
+		rightStmt, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &api.ExceptStmt{
+			Left:  stmt,
+			Right: rightStmt,
+		}, nil
+	}
+
 	return stmt, nil
 }
 

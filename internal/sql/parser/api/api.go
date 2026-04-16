@@ -102,6 +102,8 @@ const (
 	TokEnd      TokenType = 77 // END
 	TokUnion    TokenType = 78 // UNION
 	TokAll      TokenType = 79 // ALL
+	TokIntersect TokenType = 80 // INTERSECT
+	TokExcept   TokenType = 81 // EXCEPT
 )
 
 // Token represents a single lexical token.
@@ -209,6 +211,22 @@ type UnionStmt struct {
 }
 
 func (*UnionStmt) stmtNode() {}
+
+// IntersectStmt: SELECT ... INTERSECT SELECT ...
+type IntersectStmt struct {
+	Left  Statement
+	Right Statement
+}
+
+func (*IntersectStmt) stmtNode() {}
+
+// ExceptStmt: SELECT ... EXCEPT SELECT ...
+type ExceptStmt struct {
+	Left  Statement
+	Right Statement
+}
+
+func (*ExceptStmt) stmtNode() {}
 
 // SelectColumn represents a single column in a SELECT list.
 type SelectColumn struct {

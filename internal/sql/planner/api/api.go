@@ -162,6 +162,22 @@ type UnionPlan struct {
 
 func (*UnionPlan) planNode() {}
 
+// IntersectPlan: SELECT ... INTERSECT SELECT ...
+type IntersectPlan struct {
+	Left  Plan
+	Right Plan
+}
+
+func (*IntersectPlan) planNode() {}
+
+// ExceptPlan: SELECT ... EXCEPT SELECT ...
+type ExceptPlan struct {
+	Left  Plan
+	Right Plan
+}
+
+func (*ExceptPlan) planNode() {}
+
 // ─── Scan Plans ─────────────────────────────────────────────────────
 
 // TableScanPlan performs a full table scan.

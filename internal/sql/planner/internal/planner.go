@@ -46,6 +46,10 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.Plan(s.Statement)
 	case *parserapi.UnionStmt:
 		return p.planUnion(s)
+	case *parserapi.IntersectStmt:
+		return p.planIntersect(s)
+	case *parserapi.ExceptStmt:
+		return p.planExcept(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -252,6 +256,30 @@ func (p *planner) planUnion(s *parserapi.UnionStmt) (plannerapi.Plan, error) {
 		return nil, err
 	}
 	return &plannerapi.UnionPlan{Left: leftPlan, Right: rightPlan, UnionAll: s.UnionAll}, nil
+}
+
+func (p *planner) planIntersect(s *parserapi.IntersectStmt) (plannerapi.Plan, error) {
+	leftPlan, err := p.Plan(s.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightPlan, err := p.Plan(s.Right)
+	if err != nil {
+		return nil, err
+	}
+	return &plannerapi.IntersectPlan{Left: leftPlan, Right: rightPlan}, nil
+}
+
+func (p *planner) planExcept(s *parserapi.ExceptStmt) (plannerapi.Plan, error) {
+	leftPlan, err := p.Plan(s.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightPlan, err := p.Plan(s.Right)
+	if err != nil {
+		return nil, err
+	}
+	return &plannerapi.ExceptPlan{Left: leftPlan, Right: rightPlan}, nil
 }
 
 func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
