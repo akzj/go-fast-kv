@@ -407,6 +407,12 @@ type TxnContext interface {
 	Commit() error
 	Rollback()
 	IsActive() bool
+	// AddPendingWrite records a key modified within this transaction.
+	// Used by SQL executor to track writes for rollback.
+	AddPendingWrite(key []byte)
+	// GetPendingWrites returns all keys modified within this transaction.
+	// Used by Tx.Rollback() to call store.DeleteWithXID for each.
+	GetPendingWrites() [][]byte
 }
 
 // TxnContextFactory creates TxnContext instances.

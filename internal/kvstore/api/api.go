@@ -92,6 +92,18 @@ type WriteBatch interface {
 	// Discard releases resources without committing.
 	// Safe to call multiple times. After Discard, the batch cannot be reused.
 	Discard()
+
+	// PutWithXID writes a key-value pair with a specific transaction ID.
+	// Unlike Put which allocates a fresh XID, this writes directly to the
+	// btree with the given txnID. Used by SQL executor for deferred-write
+	// transactions where writes should share the transaction's XID.
+	PutWithXID(key, value []byte, txnID uint64) error
+
+	// DeleteWithXID marks a key as deleted with a specific transaction ID.
+	// Unlike Delete which allocates a fresh XID, this marks txnMax=txnID
+	// directly in the btree. Used by SQL executor for deferred-write
+	// transactions to enable rollback via self-delete.
+	DeleteWithXID(key []byte, txnID uint64) error
 }
 
 // ─── Store ──────────────────────────────────────────────────────────
@@ -217,6 +229,20 @@ type Store interface {
 	// UnregisterSnapshot removes a transaction's snapshot from readSnaps.
 	// Called when the transaction commits or rolls back.
 	UnregisterSnapshot(txnXID uint64)
+
+	// PutWithXID writes a key-value pair with a specific transaction ID.
+	// Unlike Put which allocates a fresh XID via BeginTxn+Commit, this writes
+	// directly to the btree with the given txnID. Used by the SQL executor for
+	// deferred-write transactions so that all writes share the transaction's
+	// XID (enabling own-write visibility via txnMin==s.XID rule) and rollback
+	// via self-delete (txnMax==txnXID).
+	PutWithXID(key, value []byte, txnID uint64) error
+
+	// DeleteWithXID marks a key as deleted with a specific transaction ID.
+	// Unlike Delete which allocates a fresh XID, this marks txnMax=txnID
+	// directly. Used for SQL rollback: a self-delete (txnMax==txnXID) makes
+	// the entry invisible without restoring the original value.
+	DeleteWithXID(key []byte, txnID uint64) error
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────

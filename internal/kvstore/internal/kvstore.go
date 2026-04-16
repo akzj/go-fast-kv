@@ -560,6 +560,63 @@ func (s *store) Delete(key []byte) error {
 	return nil
 }
 
+// PutWithXID writes a key-value pair directly with a specific transaction ID.
+// Unlike Put which allocates a fresh XID and auto-commits, this writes to the
+// btree with the given txnID and does NOT commit or abort. The caller is
+// responsible for managing the transaction lifecycle (via txnMgr.Commit/Abort).
+//
+// This is used by the SQL executor for deferred-write transactions:
+// - All writes share the transaction's XID (own-write visibility via txnMin==s.XID)
+// - Rollback marks entries as deleted with the same XID (txnMax==txnXID → invisible)
+//
+// WARNING: Caller must call txnMgr.Commit/Abort on txnID to update CLOG.
+// WARNING: This method does NOT write WAL entries — caller must ensure WAL
+// durability before committing. For SQL transactions, this is done by the
+// SQL layer's commit protocol.
+func (s *store) PutWithXID(key, value []byte, txnID uint64) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+	if len(key) > btreeapi.MaxKeySize {
+		return kvstoreapi.ErrKeyTooLarge
+	}
+
+	// Write directly to btree with given txnID — no new XID allocation.
+	// No WAL entry written here — caller handles WAL durability.
+	// If crash occurs before CLOG update, entry is rolled back like a normal abort.
+	return s.tree.Put(key, value, txnID)
+}
+
+// DeleteWithXID marks a key as deleted directly with a specific transaction ID.
+// Unlike Delete which allocates a fresh XID and auto-commits, this marks
+// txnMax=txnID in the btree and does NOT commit or abort. The caller is
+// responsible for managing the transaction lifecycle.
+//
+// For SQL rollback: a self-delete (txnMax==txnXID) makes the entry invisible
+// without needing to restore the original value (fundamental MVCC limitation).
+//
+// WARNING: Caller must call txnMgr.Commit/Abort on txnID to update CLOG.
+// WARNING: This method does NOT write WAL entries — caller must ensure WAL
+// durability before committing.
+func (s *store) DeleteWithXID(key []byte, txnID uint64) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	// Mark txnMax=txnID directly in btree — no new XID allocation, no WAL entry.
+	// The self-delete (txnMax==txnXID) rule makes the entry invisible.
+	err := s.tree.Delete(key, txnID)
+	if err == btreeapi.ErrKeyNotFound {
+		return kvstoreapi.ErrKeyNotFound
+	}
+	return err
+}
 
 // DeleteRange removes all keys in [start, end).
 // Uses WriteBatch internally for efficiency.
@@ -1108,4 +1165,39 @@ func (wb *writeBatch) Commit() error {
 func (wb *writeBatch) Discard() {
 	wb.ops = nil
 	wb.finished = true
+}
+
+// PutWithXID writes a key-value pair with a specific transaction ID.
+// Unlike Put which allocates a fresh XID and auto-commits, this writes
+// directly to the btree with the given txnID without allocating a new XID.
+// The write is NOT committed in CLOG — caller manages transaction lifecycle.
+// Used by SQL executor for deferred-write transactions.
+func (wb *writeBatch) PutWithXID(key, value []byte, txnID uint64) error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+	if len(key) > btreeapi.MaxKeySize {
+		return kvstoreapi.ErrKeyTooLarge
+	}
+
+	// Write directly to btree without new XID allocation or WAL entry.
+	// Caller handles WAL durability and CLOG commit/abort.
+	return wb.store.tree.Put(key, value, txnID)
+}
+
+// DeleteWithXID marks a key as deleted with a specific transaction ID.
+// Unlike Delete which allocates a fresh XID and auto-commits, this marks
+// txnMax=txnID directly in the btree without allocating a new XID.
+// The delete is NOT committed in CLOG — caller manages transaction lifecycle.
+// For SQL rollback: a self-delete (txnMax==txnXID) makes entry invisible.
+func (wb *writeBatch) DeleteWithXID(key []byte, txnID uint64) error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+
+	err := wb.store.tree.Delete(key, txnID)
+	if err == btreeapi.ErrKeyNotFound {
+		return kvstoreapi.ErrKeyNotFound
+	}
+	return err
 }

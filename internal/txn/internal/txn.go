@@ -391,11 +391,12 @@ func (tm *TxnManager) MarkInProgressAsAborted() {
 
 // txnContext implements api.TxnContext for SQL-layer transactions.
 type txnContext struct {
-	txnManager *TxnManager
-	xid        uint64
-	snap       *api.Snapshot
-	lockMgr    rowlock.LockManager
-	active     bool
+	txnManager   *TxnManager
+	xid          uint64
+	snap         *api.Snapshot
+	lockMgr      rowlock.LockManager
+	active       bool
+	pendingWrites [][]byte // keys modified within this transaction, for rollback
 }
 
 func (tc *txnContext) XID() uint64 {
@@ -439,6 +440,21 @@ func (tc *txnContext) Rollback() {
 
 func (tc *txnContext) IsActive() bool {
 	return tc.active
+}
+
+// AddPendingWrite records a key that was modified within this transaction.
+// Used by the SQL executor to track writes for potential rollback.
+// Keys are stored in insertion order (first write first).
+func (tc *txnContext) AddPendingWrite(key []byte) {
+	tc.pendingWrites = append(tc.pendingWrites, append([]byte(nil), key...))
+}
+
+// GetPendingWrites returns a copy of all keys modified within this transaction.
+// Used by Tx.Rollback() to iterate pending keys and call store.DeleteWithXID.
+func (tc *txnContext) GetPendingWrites() [][]byte {
+	result := make([][]byte, len(tc.pendingWrites))
+	copy(result, tc.pendingWrites)
+	return result
 }
 
 // BeginTxnContext starts a new SQL transaction with row-level locking.
