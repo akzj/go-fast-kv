@@ -790,6 +790,38 @@ SELECT 10 * NULL -- Returns: NULL
 
 ---
 
+## EXPLAIN
+
+Analyze and inspect query execution plans.
+
+### EXPLAIN
+
+Shows the logical execution plan for a statement without executing it.
+
+```sql
+EXPLAIN <statement>
+```
+
+**Example:**
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1
+```
+
+### EXPLAIN ANALYZE
+
+Executes the statement and returns both the execution plan and actual runtime statistics.
+
+```sql
+EXPLAIN ANALYZE <statement>
+```
+
+**Example:**
+```sql
+EXPLAIN ANALYZE SELECT name FROM users WHERE age > 18
+```
+
+---
+
 ## Complete Examples
 
 ### Example 1: Sales Report

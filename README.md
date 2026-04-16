@@ -37,6 +37,7 @@ go-fast-kv includes a full SQL query engine for relational queries over your key
 | **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
 | **Set Operations** | `UNION`, `INTERSECT`, `EXCEPT` |
 | **Expressions** | Subqueries, scalar expressions, `IN`, `BETWEEN`, `LIKE`, `DISTINCT` |
+| **Query Analysis** | `EXPLAIN`, `EXPLAIN ANALYZE` |
 
 ### Quick Example
 
