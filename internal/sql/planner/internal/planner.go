@@ -360,6 +360,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 			Offset:        offset,
 			Distinct:      stmt.Distinct,
 			LockMode:      stmt.LockMode,
+			LockWait:      stmt.LockWait,
 		}, nil
 	}
 
@@ -462,6 +463,7 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		Having: stmt.Having, OrderBy: orderBy, Limit: limit, Offset: offset,
 		Distinct: stmt.Distinct,
 		LockMode: stmt.LockMode,
+		LockWait: stmt.LockWait,
 	}, nil
 }
 
@@ -589,6 +591,7 @@ func (p *planner) planDerivedTableSelect(stmt *parserapi.SelectStmt) (*plannerap
 		Offset:              offset,
 		Distinct:            stmt.Distinct,
 		LockMode:            stmt.LockMode,
+		LockWait:            stmt.LockWait,
 		DerivedTableSubplan: subPlan,
 		DerivedTableAlias:   dt.Alias,
 	}, nil
@@ -936,6 +939,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 				LeftColumnCount:  len(leftSchema),
 				Distinct:         stmt.Distinct,
 				LockMode:         stmt.LockMode,
+				LockWait:         stmt.LockWait,
 			}, nil
 		}
 
@@ -968,6 +972,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 				LeftColumnCount:  len(leftSchema),
 				Distinct:         stmt.Distinct,
 				LockMode:         stmt.LockMode,
+				LockWait:         stmt.LockWait,
 			}, nil
 		}
 
@@ -1016,6 +1021,7 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 		LeftColumnCount:  len(leftSchema),
 		Distinct:         stmt.Distinct,
 		LockMode:         stmt.LockMode,
+		LockWait:         stmt.LockWait,
 	}, nil
 }
 

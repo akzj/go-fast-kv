@@ -13,6 +13,8 @@ package txnapi
 import (
 	"errors"
 	"math"
+
+	rowlockapi "github.com/akzj/go-fast-kv/internal/rowlock/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -336,6 +338,10 @@ type TxnManager interface {
 	// Use for SSI-aware write operations (Put, Delete).
 	BeginSSITxn() Transaction
 
+	// BeginTxnContext starts a new SQL transaction with row-level locking.
+	// Used by the SQL engine for BEGIN/COMMIT/ROLLBACK semantics.
+	BeginTxnContext() TxnContext
+
 	// ReadSnapshot creates a read-only snapshot WITHOUT allocating a XID.
 	// Returns a logical readID (equal to nextXID at snapshot time) and a
 	// frozen Snapshot. The readID is NOT added to the active set and NO
@@ -388,3 +394,46 @@ type WALEntry struct {
 	Type uint8  // walapi.RecordTxnCommit (7) or walapi.RecordTxnAbort (8)
 	ID   uint64 // XID
 }
+
+// ─── TxnContext (SQL Layer) ─────────────────────────────────────────
+
+// TxnContext represents an active SQL transaction with row-level locking.
+// Created by TxnManager.BeginTxnContext().
+type TxnContext interface {
+	XID() uint64
+	Snapshot() *Snapshot
+	LockManager() LockManager
+	AddLock(rowKey string, mode LockMode) bool
+	Commit() error
+	Rollback()
+	IsActive() bool
+}
+
+// TxnContextFactory creates TxnContext instances.
+type TxnContextFactory interface {
+	BeginTxnContext() TxnContext
+}
+
+// LockManager is the row lock manager interface (re-exported from rowlock).
+type LockManager = rowlockapi.LockManager
+
+// LockMode represents the type of lock (re-exported from rowlock).
+type LockMode = rowlockapi.LockMode
+
+// LockShared is a shared lock allowing multiple readers.
+const LockShared = rowlockapi.LockShared
+
+// LockExclusive is an exclusive lock preventing other readers/writers.
+const LockExclusive = rowlockapi.LockExclusive
+
+// LockContext contains configuration for lock acquisition.
+type LockContext = rowlockapi.LockContext
+
+// TxnID is a transaction identifier.
+type TxnID = rowlockapi.TxnID
+
+// LockStats contains statistics about the lock manager.
+type LockStats = rowlockapi.LockStats
+
+// ShardStat contains statistics for a single shard.
+type ShardStat = rowlockapi.ShardStat

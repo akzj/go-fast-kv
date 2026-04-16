@@ -7,8 +7,11 @@
 package internal
 
 import (
+	"fmt"
 	"sync"
 
+	"github.com/akzj/go-fast-kv/internal/rowlock"
+	rowlockapi "github.com/akzj/go-fast-kv/internal/rowlock/api"
 	"github.com/akzj/go-fast-kv/internal/ssi"
 	ssiapi "github.com/akzj/go-fast-kv/internal/ssi/api"
 	api "github.com/akzj/go-fast-kv/internal/txn/api"
@@ -376,5 +379,98 @@ func (tm *TxnManager) MarkInProgressAsAborted() {
 		if status == api.TxnInProgress {
 			tm.clog.statuses[xid] = api.TxnAborted
 		}
+	}
+}
+
+// ─── TxnContext Implementation ──────────────────────────────────────
+
+// txnContext implements api.TxnContext for SQL-layer transactions.
+type txnContext struct {
+	txnManager *TxnManager
+	xid        uint64
+	snap       *api.Snapshot
+	lockMgr    rowlock.LockManager
+	active     bool
+}
+
+func (tc *txnContext) XID() uint64 {
+	return tc.xid
+}
+
+func (tc *txnContext) Snapshot() *api.Snapshot {
+	return tc.snap
+}
+
+func (tc *txnContext) LockManager() rowlock.LockManager {
+	return tc.lockMgr
+}
+
+func (tc *txnContext) AddLock(rowKey string, mode rowlockapi.LockMode) bool {
+	ctx := rowlockapi.LockContext{
+		TxnID:     tc.xid,
+		TimeoutMs: 5000, // 5 second default timeout
+	}
+	return tc.lockMgr.Acquire(rowKey, ctx, mode)
+}
+
+func (tc *txnContext) Commit() error {
+	if !tc.active {
+		return fmt.Errorf("txn: transaction already closed")
+	}
+	tc.active = false
+	tc.lockMgr.ReleaseAll(tc.xid)
+	tc.txnManager.Commit(tc.xid)
+	return nil
+}
+
+func (tc *txnContext) Rollback() {
+	if !tc.active {
+		return
+	}
+	tc.active = false
+	tc.lockMgr.ReleaseAll(tc.xid)
+	tc.txnManager.Abort(tc.xid)
+}
+
+func (tc *txnContext) IsActive() bool {
+	return tc.active
+}
+
+// BeginTxnContext starts a new SQL transaction with row-level locking.
+func (tm *TxnManager) BeginTxnContext() api.TxnContext {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	xid := tm.nextXID
+	tm.nextXID++
+	tm.active[xid] = struct{}{}
+
+	activeXIDs := make(map[uint64]struct{}, len(tm.active)-1)
+	for id := range tm.active {
+		if id != xid {
+			activeXIDs[id] = struct{}{}
+		}
+	}
+
+	xmin := tm.nextXID
+	for id := range activeXIDs {
+		if id < xmin {
+			xmin = id
+		}
+	}
+
+	snap := &api.Snapshot{
+		XID:        xid,
+		Xmin:       xmin,
+		Xmax:       tm.nextXID,
+		ActiveXIDs: activeXIDs,
+	}
+
+	return &txnContext{
+		txnManager: tm,
+		xid:        xid,
+		snap:       snap,
+		lockMgr:    rowlock.New(),
+		active:     true,
 	}
 }

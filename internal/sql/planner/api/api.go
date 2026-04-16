@@ -139,6 +139,7 @@ type SelectPlan struct {
 	Offset        int                        // -1 if no OFFSET
 	Distinct      bool                       // true for SELECT DISTINCT
 	LockMode      parserapi.LockMode         // lock mode for FOR UPDATE
+	LockWait      parserapi.LockWait         // lock wait behavior for FOR UPDATE
 
 	Join            JoinPlanNode           // nil for non-join; non-nil for JOIN
 	LeftColumnCount int                    // number of columns in left table (for JOIN projection)
