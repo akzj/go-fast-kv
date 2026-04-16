@@ -104,6 +104,8 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 		return e.execDelete(p)
 	case *plannerapi.UpdatePlan:
 		return e.execUpdate(p)
+	case *plannerapi.UnionPlan:
+		return e.execUnion(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -1675,6 +1677,45 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	return &executorapi.Result{
 		Columns: colNames,
 		Rows:    projected,
+	}, nil
+}
+
+func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, error) {
+	leftResult, err := e.Execute(plan.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightResult, err := e.Execute(plan.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	rows := append(leftResult.Rows, rightResult.Rows...)
+
+	if !plan.UnionAll {
+		seen := make(map[string]bool)
+		var deduped [][]catalogapi.Value
+		for _, row := range rows {
+			var key strings.Builder
+			for _, v := range row {
+				if v.IsNull {
+					key.WriteString("NULL")
+				} else {
+					key.WriteString(fmt.Sprintf("%v", v))
+				}
+				key.WriteByte(0) // separator between columns
+			}
+			if !seen[key.String()] {
+				seen[key.String()] = true
+				deduped = append(deduped, row)
+			}
+		}
+		rows = deduped
+	}
+
+	return &executorapi.Result{
+		Rows:    rows,
+		Columns: leftResult.Columns,
 	}, nil
 }
 
