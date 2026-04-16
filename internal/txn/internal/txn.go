@@ -88,6 +88,9 @@ type TxnManager struct {
 	// SSI support
 	ssiIndex   ssiapi.Index // SSI index for conflict detection
 	ssiEnabled bool         // Whether SSI is enabled
+
+	// Shared row lock manager for all transactions from this TxnManager
+	lockMgr rowlock.LockManager
 }
 
 // New creates a new TxnManager (without SSI).
@@ -97,6 +100,7 @@ func New() api.TxnManager {
 		nextXID: 1,
 		active:  make(map[uint64]struct{}),
 		clog:    newCommitLog(),
+		lockMgr: rowlock.New(),
 	}
 }
 
@@ -110,6 +114,7 @@ func NewWithSSI() *TxnManager {
 		clog:       newCommitLog(),
 		ssiIndex:   ssi.NewIndex(),
 		ssiEnabled: true,
+		lockMgr:    rowlock.New(),
 	}
 }
 
@@ -470,7 +475,7 @@ func (tm *TxnManager) BeginTxnContext() api.TxnContext {
 		txnManager: tm,
 		xid:        xid,
 		snap:       snap,
-		lockMgr:    rowlock.New(),
+		lockMgr:    tm.lockMgr, // SHARED across all TxnContexts from same TxnManager
 		active:     true,
 	}
 }

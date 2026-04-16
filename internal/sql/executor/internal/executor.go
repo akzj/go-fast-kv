@@ -16,6 +16,8 @@ import (
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
 	encoding "github.com/akzj/go-fast-kv/internal/sql/encoding"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
+	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
+	rowlockapi "github.com/akzj/go-fast-kv/internal/rowlock/api"
 )
 
 // Compile-time interface check.
@@ -37,6 +39,8 @@ type executor struct {
 	// For correlated subquery support - outer query context set before filter evaluation
 	outerCols []catalogapi.ColumnDef
 	outerVals []catalogapi.Value
+	// TxnContext provides row-level locking for SELECT FOR UPDATE
+	txnCtx txnapi.TxnContext
 }
 
 // New creates a new Executor.
@@ -83,6 +87,18 @@ func (e *executor) execSubquery(plan parserapi.SubqueryPlan) (catalogapi.Value, 
 
 // Execute dispatches a plan to the appropriate handler.
 func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
+	return e.ExecuteWithTxn(plan, nil)
+}
+
+// ExecuteWithTxn dispatches a plan to the appropriate handler with transaction context.
+// txnCtx provides row-level locking for SELECT FOR UPDATE.
+// If txnCtx is nil, behaves like Execute (no row locking).
+func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*executorapi.Result, error) {
+	// Set transaction context for row locking
+	e.txnCtx = txnCtx
+	// Ensure cleanup on any exit path
+	defer func() { e.txnCtx = nil }()
+
 	switch p := plan.(type) {
 	case *plannerapi.CreateTablePlan:
 		return e.execCreateTable(p)
@@ -117,6 +133,82 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 		return e.execExplain(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
+	}
+}
+
+// ─── Row Locking Helpers ──────────────────────────────────────────
+
+// rowLockKey constructs a lock key for a row.
+// Format: "tableID:rowID" where both are decimal representations.
+func (e *executor) rowLockKey(tableID uint32, rowID uint64) string {
+	return fmt.Sprintf("%d:%d", tableID, rowID)
+}
+
+// lockModeToRowLockMode converts parser LockMode to rowlock LockMode.
+func lockModeToRowLockMode(mode parserapi.LockMode) rowlockapi.LockMode {
+	switch mode {
+	case parserapi.UpdateExclusive:
+		return rowlockapi.LockExclusive
+	case parserapi.UpdateShared:
+		return rowlockapi.LockShared
+	default:
+		return rowlockapi.LockExclusive
+	}
+}
+
+// acquireRowLock attempts to acquire a lock on a row based on plan.LockMode and plan.LockWait.
+// Returns:
+//   - true: lock acquired (row should be included)
+//   - false: lock not acquired due to SKIP LOCKED (row should be skipped)
+//
+// If NOWAIT is set and lock cannot be acquired immediately, returns (false, error).
+func (e *executor) acquireRowLock(tableID uint32, rowID uint64, lockMode parserapi.LockMode, lockWait parserapi.LockWait) (bool, error) {
+	if e.txnCtx == nil {
+		return true, nil // No transaction context, no locking
+	}
+
+	lockMgr := e.txnCtx.LockManager()
+	if lockMgr == nil {
+		return true, nil
+	}
+
+	rowKey := e.rowLockKey(tableID, rowID)
+	rowLockMode := lockModeToRowLockMode(lockMode)
+
+	switch lockWait {
+	case parserapi.LockWaitSkipLocked:
+		// SKIP LOCKED: check if locked, skip if yes, acquire if not
+		if lockMgr.IsLocked(rowKey) {
+			return false, nil // Skip this row
+		}
+		// Not locked, try to acquire
+		ctx := rowlockapi.LockContext{
+			TxnID:     e.txnCtx.XID(),
+			TimeoutMs: 0, // No timeout, just acquire
+		}
+		if lockMgr.Acquire(rowKey, ctx, rowLockMode) {
+			return true, nil
+		}
+		// Lost race to another txn, skip
+		return false, nil
+
+	case parserapi.LockWaitNowait:
+		// NOWAIT: return immediately if lock cannot be acquired
+		if lockMgr.TryAcquire(rowKey, e.txnCtx.XID(), rowLockMode) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: could not obtain lock on row", executorapi.ErrExecFailed)
+
+	default:
+		// Default: wait for lock with default timeout
+		ctx := rowlockapi.LockContext{
+			TxnID:     e.txnCtx.XID(),
+			TimeoutMs: 5000, // 5 second default timeout
+		}
+		if lockMgr.Acquire(rowKey, ctx, rowLockMode) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: lock acquisition timed out", executorapi.ErrExecFailed)
 	}
 }
 
@@ -1971,6 +2063,23 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply row locking for SELECT FOR UPDATE
+	// LockMode is set when the query has FOR UPDATE clause
+	if plan.LockMode != parserapi.NoUpdate {
+		var lockedRows []*engineapi.Row
+		for _, row := range rows {
+			locked, err := e.acquireRowLock(plan.Table.TableID, row.RowID, plan.LockMode, plan.LockWait)
+			if err != nil {
+				return nil, err // NOWAIT: lock contention error
+			}
+			if locked {
+				lockedRows = append(lockedRows, row)
+			}
+			// SKIP LOCKED: if locked=false, row was skipped silently
+		}
+		rows = lockedRows
 	}
 
 	// Build columns with Table field populated so that evalColumnRef can
