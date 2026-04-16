@@ -153,6 +153,15 @@ type UpdatePlan struct {
 
 func (*UpdatePlan) planNode() {}
 
+// UnionPlan: SELECT ... UNION [ALL] SELECT ...
+type UnionPlan struct {
+	Left     Plan
+	Right    Plan
+	UnionAll bool
+}
+
+func (*UnionPlan) planNode() {}
+
 // ─── Scan Plans ─────────────────────────────────────────────────────
 
 // TableScanPlan performs a full table scan.
