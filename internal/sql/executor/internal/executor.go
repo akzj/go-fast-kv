@@ -96,8 +96,20 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*executorapi.Result, error) {
 	// Set transaction context for row locking
 	e.txnCtx = txnCtx
-	// Ensure cleanup on any exit path
-	defer func() { e.txnCtx = nil }()
+	// Panic recovery: rollback transaction and re-panic so caller knows.
+	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
+	defer func() {
+		if r := recover(); r != nil {
+			if e.txnCtx != nil {
+				e.txnCtx.Rollback()
+			}
+			panic(r)
+		}
+	}()
+	// Ensure cleanup on any exit path — runs after panic recovery.
+	defer func() {
+		e.txnCtx = nil
+	}()
 
 	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
 	// within this transaction use the same snapshot. This provides true snapshot

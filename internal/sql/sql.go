@@ -204,7 +204,9 @@ func (db *DB) exec(sql string) (*Result, error) {
 			if db.txnCtx == nil {
 				return nil, fmt.Errorf("sql: no active transaction to commit")
 			}
-			err := db.txnCtx.Commit()
+			xid := db.txnCtx.XID()
+			err := db.store.CommitWithXID(xid)
+			db.store.ClearActiveTxnContext()
 			db.txnCtx = nil
 			return &executorapi.Result{}, err
 
@@ -213,9 +215,15 @@ func (db *DB) exec(sql string) (*Result, error) {
 				// Rollback with no transaction: no-op (per MySQL/Postgres compatibility)
 				return &executorapi.Result{}, nil
 			}
-			db.txnCtx.Rollback()
+			xid := db.txnCtx.XID()
+			// Roll back pending writes: mark each key as deleted (txnMax==xid → invisible).
+			for _, key := range db.txnCtx.GetPendingWrites() {
+				db.store.DeleteWithXID(key, xid)
+			}
+			err := db.store.AbortWithXID(xid)
+			db.store.ClearActiveTxnContext()
 			db.txnCtx = nil
-			return &executorapi.Result{}, nil
+			return &executorapi.Result{}, err
 		}
 	}
 

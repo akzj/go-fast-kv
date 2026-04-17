@@ -509,6 +509,8 @@ func (s *lsm) Close() error {
 		}
 	}
 
+	// Ensure all async manifest saves are complete before returning.
+	s.manifest.Flush()
 	return nil
 }
 
