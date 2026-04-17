@@ -528,9 +528,14 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	}
 
 	// Phase 3: MVCC delete (mark TxnMax)
+	// Two cases:
+	// 1. Our own entry (txnMin == txnID): always find it, even if self-deleted.
+	//    This enables SQL rollback via self-delete (txnMax=txnXID → invisible).
+	// 2. Other entries: must be visible via normal MVCC rules.
 	for i := range leaf.Entries {
 		e := &leaf.Entries[i]
-		if bytes.Equal(e.Key, key) && t.isVisible(e.TxnMin, e.TxnMax, txnID) {
+		isOwn := e.TxnMin == txnID
+		if bytes.Equal(e.Key, key) && (isOwn || t.isVisible(e.TxnMin, e.TxnMax, txnID)) {
 			e.TxnMax = txnID
 			if err := t.pages.WritePage(leafPID, leaf); err != nil {
 				t.pageLocks.WUnlock(leafPID)

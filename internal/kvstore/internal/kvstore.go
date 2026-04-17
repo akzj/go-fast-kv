@@ -117,6 +117,13 @@ type store struct {
 	// Get/Scan register a snapshot before reading, unregister after.
 	readSnaps sync.Map // map[uint64]*txnapi.Snapshot
 
+	// Goroutine-local active transaction context.
+	// When set (via SetActiveTxnContext), Get/Scan use this snapshot
+	// instead of creating a fresh one via ReadSnapshot().
+	// This enables deferred-write transactions: writes use txnCtx.XID(),
+	// reads use the same txnCtx snapshot for own-write visibility.
+	activeTxnCtx sync.Map // map[int64]txnapi.TxnContext
+
 	closed bool
 }
 
@@ -462,25 +469,34 @@ func (s *store) Get(key []byte) ([]byte, error) {
 		return nil, kvstoreapi.ErrClosed
 	}
 
+	// Check for a goroutine-local active transaction context.
+	// If set, use the transaction's snapshot for reads so that own writes
+	// (PutWithXID using the same txnCtx.XID) are visible.
+	gid := goroutineID()
+	if txnCtxRaw, ok := s.activeTxnCtx.Load(gid); ok {
+		txnCtx := txnCtxRaw.(txnapi.TxnContext)
+		snap := txnCtx.Snapshot()
+		if snap != nil {
+			s.readSnaps.Store(txnCtx.XID(), snap)
+			defer s.readSnaps.Delete(txnCtx.XID())
+			val, err := s.tree.Get(key, txnCtx.XID())
+			if err == btreeapi.ErrKeyNotFound {
+				return nil, kvstoreapi.ErrKeyNotFound
+			}
+			return val, err
+		}
+	}
+
 	// Snapshot read: create a read-only snapshot WITHOUT allocating a XID.
-	// This avoids inflating the CLOG and active set under high read load.
-	// The snapshot captures ActiveXIDs at this moment, making visibility
-	// immune to concurrent commits (true point-in-time isolation).
 	readXID, snap := s.txnMgr.ReadSnapshot()
 	s.readSnaps.Store(readXID, snap)
-	defer func() {
-		s.readSnaps.Delete(readXID)
-		// No Abort() needed — ReadSnapshot doesn't allocate a real XID
-	}()
+	defer s.readSnaps.Delete(readXID)
 
 	val, err := s.tree.Get(key, readXID)
-	if err != nil {
-		if err == btreeapi.ErrKeyNotFound {
-			return nil, kvstoreapi.ErrKeyNotFound
-		}
-		return nil, err
+	if err == btreeapi.ErrKeyNotFound {
+		return nil, kvstoreapi.ErrKeyNotFound
 	}
-	return val, nil
+	return val, err
 }
 
 // ─── Delete ─────────────────────────────────────────────────────────
@@ -666,25 +682,35 @@ func (s *store) DeleteRange(start, end []byte) (int, error) {
 
 func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if s.closed {
-		s.mu.RUnlock()
 		return &errIterator{err: kvstoreapi.ErrClosed}
 	}
 
+	// Check for a goroutine-local active transaction context.
+	gid := goroutineID()
+	if txnCtxRaw, ok := s.activeTxnCtx.Load(gid); ok {
+		txnCtx := txnCtxRaw.(txnapi.TxnContext)
+		snap := txnCtx.Snapshot()
+		if snap != nil {
+			s.readSnaps.Store(txnCtx.XID(), snap)
+			btreeIter := s.tree.Scan(start, end, txnCtx.XID())
+			return &snapshotIterator{
+				inner:   btreeIter,
+				store:   s,
+				readXID: txnCtx.XID(),
+				cleanup: func() { s.readSnaps.Delete(txnCtx.XID()) },
+			}
+		}
+	}
+
 	// Snapshot read: create a read-only snapshot WITHOUT allocating a XID.
-	// This avoids inflating the CLOG and active set under high read load.
-	// The snapshot captures ActiveXIDs at this moment, providing true
-	// point-in-time isolation for the entire scan (immune to concurrent commits).
 	readXID, snap := s.txnMgr.ReadSnapshot()
 	s.readSnaps.Store(readXID, snap)
 
-	// B-tree Scan is concurrent-safe (per-page RwLocks).
-	// RLock held during iterator creation to prevent Close() race.
 	btreeIter := s.tree.Scan(start, end, readXID)
-	s.mu.RUnlock()
 
-	// Snapshot cleanup happens in snapshotIterator.Close()
 	return &snapshotIterator{
 		inner:   btreeIter,
 		store:   s,
@@ -720,6 +746,19 @@ func (s *store) RegisterSnapshot(txnXID uint64, snap *txnapi.Snapshot) {
 // UnregisterSnapshot removes a transaction's snapshot from readSnaps.
 func (s *store) UnregisterSnapshot(txnXID uint64) {
 	s.readSnaps.Delete(txnXID)
+}
+
+// SetActiveTxnContext registers a goroutine-local active transaction context.
+// Called by the SQL layer at the start of a transaction (BEGIN).
+// Get/Scan check this to use the transaction's snapshot for own-write visibility.
+func (s *store) SetActiveTxnContext(txnCtx txnapi.TxnContext) {
+	s.activeTxnCtx.Store(goroutineID(), txnCtx)
+}
+
+// ClearActiveTxnContext removes the goroutine-local active transaction context.
+// Called by the SQL layer after Commit or Rollback.
+func (s *store) ClearActiveTxnContext() {
+	s.activeTxnCtx.Delete(goroutineID())
 }
 
 // ─── Close ──────────────────────────────────────────────────────────
@@ -994,6 +1033,7 @@ type snapshotIterator struct {
 	inner   btreeapi.Iterator
 	store   *store
 	readXID uint64
+	cleanup func() // optional cleanup func called on Close()
 }
 
 func (it *snapshotIterator) Next() bool    { return it.inner.Next() }
@@ -1003,8 +1043,11 @@ func (it *snapshotIterator) Err() error    { return it.inner.Err() }
 func (it *snapshotIterator) Close() {
 	it.inner.Close()
 	// Clean up the read snapshot so the VisibilityChecker no longer references it.
-	// No Abort() needed — ReadSnapshot doesn't allocate a real XID.
-	it.store.readSnaps.Delete(it.readXID)
+	if it.cleanup != nil {
+		it.cleanup()
+	} else {
+		it.store.readSnaps.Delete(it.readXID)
+	}
 }
 
 // errIterator is returned when the store is closed.

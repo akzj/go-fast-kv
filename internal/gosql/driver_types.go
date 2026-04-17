@@ -148,6 +148,11 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 
 	// Execute via the internal SQL layer.
 	db := s.conn.getDB()
+	// If inside a transaction, wire the transaction context so that
+	// SQL execution uses ExecuteWithTxn (deferred-write + own-write visibility).
+	if s.conn.tx != nil {
+		db.SetTxnContext(s.conn.tx.txnCtx)
+	}
 	result, err := db.Exec(query)
 	if err != nil {
 		return nil, err
@@ -173,7 +178,15 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 
 	// Execute via the internal SQL layer.
 	db := s.conn.getDB()
+	// If inside a transaction, wire the transaction context so that
+	// SQL execution uses ExecuteWithTxn (deferred-write + own-write visibility).
+	if s.conn.tx != nil {
+		db.SetTxnContext(s.conn.tx.txnCtx)
+	}
 	result, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +239,8 @@ func (t *Tx) Commit() error {
 	}
 	t.committed = true
 	err := t.txnCtx.Commit()
-	t.conn.tx = nil // clear the transaction
+	t.conn.txnDB.EndTxn() // clear txnCtx in the SQL DB
+	t.conn.tx = nil        // clear the transaction
 	return err
 }
 
@@ -250,13 +264,15 @@ func (t *Tx) Rollback() error {
 	// we cannot restore deleted rows, only hide our own writes).
 	store := t.conn.db.store
 	xid := t.txnCtx.XID()
-	for _, key := range t.txnCtx.GetPendingWrites() {
+	pending := t.txnCtx.GetPendingWrites()
+	for _, key := range pending {
 		// Ignore ErrKeyNotFound — key may have been already deleted or not exist.
 		_ = store.DeleteWithXID(key, xid)
 	}
 
 	t.txnCtx.Rollback()
-	t.conn.tx = nil // clear the transaction
+	t.conn.txnDB.EndTxn() // clear txnCtx in the SQL DB
+	t.conn.tx = nil        // clear the transaction
 	return nil
 }
 
@@ -283,6 +299,9 @@ func (s *TxStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Wire the transaction context into txnDB so that SQL execution uses
+	// ExecuteWithTxn with the real transaction's snapshot and pending writes.
+	s.tx.conn.txnDB.SetTxnContext(s.tx.txnCtx)
 	result, err := s.tx.conn.txnDB.Exec(query)
 	if err != nil {
 		return nil, err
@@ -295,6 +314,9 @@ func (s *TxStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Wire the transaction context into txnDB so that SQL execution uses
+	// ExecuteWithTxn with the real transaction's snapshot and pending writes.
+	s.tx.conn.txnDB.SetTxnContext(s.tx.txnCtx)
 	result, err := s.tx.conn.txnDB.Query(query)
 	if err != nil {
 		return nil, err

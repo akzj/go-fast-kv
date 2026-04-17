@@ -230,6 +230,15 @@ type Store interface {
 	// Called when the transaction commits or rolls back.
 	UnregisterSnapshot(txnXID uint64)
 
+	// SetActiveTxnContext registers a goroutine-local active transaction context.
+	// Used by the SQL layer to enable store.Get/Scan to use the txnCtx snapshot
+	// for own-write visibility within a transaction.
+	SetActiveTxnContext(txnCtx txnapi.TxnContext)
+
+	// ClearActiveTxnContext removes the goroutine-local active transaction context.
+	// Called when the transaction commits or rolls back.
+	ClearActiveTxnContext()
+
 	// PutWithXID writes a key-value pair with a specific transaction ID.
 	// Unlike Put which allocates a fresh XID via BeginTxn+Commit, this writes
 	// directly to the btree with the given txnID. Used by the SQL executor for

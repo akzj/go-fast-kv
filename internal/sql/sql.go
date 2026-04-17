@@ -226,3 +226,19 @@ func (db *DB) exec(sql string) (*Result, error) {
 	}
 	return db.executor.Execute(plan)
 }
+
+// SetTxnContext sets the active transaction context for SQL execution.
+// Used by the gosql driver to pass gosql.Tx's TxnContext to the SQL layer.
+func (db *DB) SetTxnContext(txnCtx txnapi.TxnContext) {
+	db.txnCtx = txnCtx
+	// Also register the txnCtx in the store's goroutine-local map so that
+	// store.Get/Scan use the txnCtx's snapshot for own-write visibility.
+	db.store.SetActiveTxnContext(txnCtx)
+}
+
+// EndTxn marks the current transaction as ended (committed or rolled back).
+// Called by the gosql driver after Commit/Rollback.
+func (db *DB) EndTxn() {
+	db.store.ClearActiveTxnContext()
+	db.txnCtx = nil
+}
