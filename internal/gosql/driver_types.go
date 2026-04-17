@@ -231,6 +231,8 @@ func (t *Tx) Commit() error {
 }
 
 // Rollback implements driver.Tx.Rollback.
+// Rolls back all pending writes (via DeleteWithXID for each pending key),
+// then releases locks and marks the transaction as aborted in CLOG.
 func (t *Tx) Rollback() error {
 	if t.committed {
 		return nil // already committed: no-op (per MySQL/Postgres)
@@ -242,6 +244,17 @@ func (t *Tx) Rollback() error {
 		return nil // not active: no-op
 	}
 	t.rollbacked = true
+
+	// Roll back all pending writes: mark each key as deleted with txnMax==txnXID.
+	// This makes the entries invisible (fundamental MVCC rollback limitation:
+	// we cannot restore deleted rows, only hide our own writes).
+	store := t.conn.db.store
+	xid := t.txnCtx.XID()
+	for _, key := range t.txnCtx.GetPendingWrites() {
+		// Ignore ErrKeyNotFound — key may have been already deleted or not exist.
+		_ = store.DeleteWithXID(key, xid)
+	}
+
 	t.txnCtx.Rollback()
 	t.conn.tx = nil // clear the transaction
 	return nil
