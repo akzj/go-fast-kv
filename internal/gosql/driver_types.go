@@ -226,7 +226,7 @@ type Tx struct {
 }
 
 // Commit implements driver.Tx.Commit.
-// Commits the transaction via txnCtx.Commit().
+// Flushes pending WAL entries and updates CLOG via store.CommitWithXID().
 func (t *Tx) Commit() error {
 	if t.committed {
 		return fmt.Errorf("gosql: transaction already committed")
@@ -238,7 +238,11 @@ func (t *Tx) Commit() error {
 		return fmt.Errorf("gosql: transaction not active")
 	}
 	t.committed = true
-	err := t.txnCtx.Commit()
+
+	// Write pending WAL entries (from PutWithXID/DeleteWithXID) + fsync,
+	// then update CLOG. This ensures SQL transaction writes survive crashes.
+	store := t.conn.db.store
+	err := store.CommitWithXID(t.txnCtx.XID())
 	t.conn.txnDB.EndTxn() // clear txnCtx in the SQL DB
 	t.conn.tx = nil        // clear the transaction
 	return err
@@ -246,7 +250,7 @@ func (t *Tx) Commit() error {
 
 // Rollback implements driver.Tx.Rollback.
 // Rolls back all pending writes (via DeleteWithXID for each pending key),
-// then releases locks and marks the transaction as aborted in CLOG.
+// writes TxnAbort WAL record, and marks the transaction as aborted in CLOG.
 func (t *Tx) Rollback() error {
 	if t.committed {
 		return nil // already committed: no-op (per MySQL/Postgres)
@@ -270,10 +274,11 @@ func (t *Tx) Rollback() error {
 		_ = store.DeleteWithXID(key, xid)
 	}
 
-	t.txnCtx.Rollback()
+	// Write TxnAbort WAL record for crash-consistency.
+	err := store.AbortWithXID(xid)
 	t.conn.txnDB.EndTxn() // clear txnCtx in the SQL DB
 	t.conn.tx = nil        // clear the transaction
-	return nil
+	return err
 }
 
 // Stmt implements driver.Tx.Stmt.

@@ -252,6 +252,18 @@ type Store interface {
 	// directly. Used for SQL rollback: a self-delete (txnMax==txnXID) makes
 	// the entry invisible without restoring the original value.
 	DeleteWithXID(key []byte, txnID uint64) error
+
+	// CommitWithXID finalizes a SQL transaction by flushing pending WAL entries
+	// to disk and updating CLOG. Called by the SQL layer at COMMIT time.
+	// PutWithXID/DeleteWithXID register collectors that capture page/blob entries.
+	// CommitWithXID collects those entries, writes them to WAL (fsync), and
+	// updates CLOG. This ensures SQL transaction writes survive crashes.
+	CommitWithXID(xid uint64) error
+
+	// AbortWithXID rolls back a SQL transaction by writing a TxnAbort WAL record.
+	// Called by the SQL layer at ROLLBACK time. On recovery, aborted transactions
+	// are ignored (entries already marked self-deleted via txnMax==txnXID).
+	AbortWithXID(xid uint64) error
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────

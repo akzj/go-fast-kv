@@ -586,9 +586,8 @@ func (s *store) Delete(key []byte) error {
 // - Rollback marks entries as deleted with the same XID (txnMax==txnXID → invisible)
 //
 // WARNING: Caller must call txnMgr.Commit/Abort on txnID to update CLOG.
-// WARNING: This method does NOT write WAL entries — caller must ensure WAL
-// durability before committing. For SQL transactions, this is done by the
-// SQL layer's commit protocol.
+// WARNING: This method registers WAL collectors for page/blob changes so that
+// SQL transaction commit can flush these entries to WAL for crash durability.
 func (s *store) PutWithXID(key, value []byte, txnID uint64) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -600,9 +599,15 @@ func (s *store) PutWithXID(key, value []byte, txnID uint64) error {
 		return kvstoreapi.ErrKeyTooLarge
 	}
 
+	// Register collectors for WAL tracking. The collector persists for the
+	// entire transaction (NOT unregistered here). CommitWithXID/AbortWithXID
+	// calls CollectAndClear to retrieve and delete the collector entries.
+	// Multiple PutWithXID calls on the same goroutine share one collector.
+	s.provider.RegisterCollector()
+	s.blobAdapter.registerCollector()
+
 	// Write directly to btree with given txnID — no new XID allocation.
-	// No WAL entry written here — caller handles WAL durability.
-	// If crash occurs before CLOG update, entry is rolled back like a normal abort.
+	// WAL entries are captured in the collectors above for later flush.
 	return s.tree.Put(key, value, txnID)
 }
 
@@ -615,8 +620,7 @@ func (s *store) PutWithXID(key, value []byte, txnID uint64) error {
 // without needing to restore the original value (fundamental MVCC limitation).
 //
 // WARNING: Caller must call txnMgr.Commit/Abort on txnID to update CLOG.
-// WARNING: This method does NOT write WAL entries — caller must ensure WAL
-// durability before committing.
+// WARNING: This method registers WAL collectors for crash durability.
 func (s *store) DeleteWithXID(key []byte, txnID uint64) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -625,13 +629,101 @@ func (s *store) DeleteWithXID(key []byte, txnID uint64) error {
 		return kvstoreapi.ErrClosed
 	}
 
+	// Register collectors for WAL tracking (shared across transaction).
+	s.provider.RegisterCollector()
+	s.blobAdapter.registerCollector()
+
 	// Mark txnMax=txnID directly in btree — no new XID allocation, no WAL entry.
 	// The self-delete (txnMax==txnXID) rule makes the entry invisible.
+	// WAL entries captured in collectors above for later flush.
 	err := s.tree.Delete(key, txnID)
 	if err == btreeapi.ErrKeyNotFound {
 		return kvstoreapi.ErrKeyNotFound
 	}
 	return err
+}
+
+// CommitWithXID finalizes a SQL transaction by flushing pending WAL entries to disk
+// and updating CLOG. This is called by the SQL layer at COMMIT time.
+//
+// The flow: PutWithXID/DeleteWithXID register collectors (goroutine-keyed),
+// tree.Put/Delete writes pages → WritePage routes entries to the same collectors.
+// At commit, we collect those entries, write them to WAL, and update CLOG.
+//
+// This ensures SQL transaction writes survive crashes (WAL durability).
+func (s *store) CommitWithXID(xid uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	// Collect WAL entries from this goroutine's collectors (registered by PutWithXID/DeleteWithXID).
+	pageEntries := s.provider.CollectAndClear()
+	blobEntries := s.blobAdapter.CollectAndClear()
+	rootPageID := s.tree.RootPageID()
+
+	// Build WAL batch with page mappings + transaction commit record.
+	batch := walapi.NewBatch()
+	for _, e := range pageEntries {
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	for _, e := range blobEntries {
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordTxnCommit, xid, 0, 0)
+
+	// WAL fsync — provides durability. If this fails, the transaction is NOT committed.
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		return err
+	}
+
+	// WAL succeeded — now update CLOG to make the transaction visible.
+	s.txnMgr.Commit(xid)
+	return nil
+}
+
+// AbortWithXID rolls back a SQL transaction by writing a TxnAbort WAL record.
+// This is called by the SQL layer at ROLLBACK time.
+//
+// Rollback marks entries as self-deleted (txnMax=txnXID) already happened
+// during the DML operations. This method writes the abort record to WAL
+// for crash-consistency: on recovery, aborted transactions are ignored.
+func (s *store) AbortWithXID(xid uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	// Collect any remaining WAL entries from this goroutine's collectors.
+	pageEntries := s.provider.CollectAndClear()
+	blobEntries := s.blobAdapter.CollectAndClear()
+	rootPageID := s.tree.RootPageID()
+
+	// Build WAL batch with abort record.
+	batch := walapi.NewBatch()
+	for _, e := range pageEntries {
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	for _, e := range blobEntries {
+		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
+	// RecordTxnAbort = 8 (from txn/api/api.go WALEntry definition)
+	batch.Add(walapi.ModuleTree, 8, xid, 0, 0)
+
+	// Write WAL batch (fsync).
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		return err
+	}
+
+	// Update CLOG to mark transaction as aborted.
+	s.txnMgr.Abort(xid)
+	return nil
 }
 
 // DeleteRange removes all keys in [start, end).
@@ -986,6 +1078,19 @@ func (a *blobWriterAdapter) registerCollector() (*blobCollector, func()) {
 	c := &blobCollector{}
 	a.collectors.Store(gid, c)
 	return c, func() { a.collectors.Delete(gid) }
+}
+
+// CollectAndClear retrieves all blob WAL entries from the current goroutine's collector,
+// clears the collector, and returns the entries. Used by SQL transaction commit.
+func (a *blobWriterAdapter) CollectAndClear() []blobstoreapi.WALEntry {
+	gid := goroutineID()
+	if c, ok := a.collectors.LoadAndDelete(gid); ok {
+		collector := c.(*blobCollector)
+		entries := make([]blobstoreapi.WALEntry, len(collector.Entries))
+		copy(entries, collector.Entries)
+		return entries
+	}
+	return nil
 }
 
 func (a *blobWriterAdapter) WriteBlob(data []byte) (uint64, error) {

@@ -158,6 +158,22 @@ func (p *RealPageProvider) RegisterCollector() (*WALCollector, func()) {
 	return c, func() { p.collectors.Delete(gid) }
 }
 
+// CollectAndClear retrieves all WAL entries from the current goroutine's collector,
+// clears the collector, and returns the entries. Used by SQL transaction commit
+// to gather WAL entries for the transaction's deferred-write operations.
+//
+// Returns nil if no collector is registered for the current goroutine.
+func (p *RealPageProvider) CollectAndClear() []pagestoreapi.WALEntry {
+	gid := goroutineID()
+	if c, ok := p.collectors.LoadAndDelete(gid); ok {
+		collector := c.(*WALCollector)
+		entries := make([]pagestoreapi.WALEntry, len(collector.PageEntries))
+		copy(entries, collector.PageEntries)
+		return entries
+	}
+	return nil
+}
+
 // AllocPage allocates a new page via the underlying PageStore.
 func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 	return p.store.Alloc()
