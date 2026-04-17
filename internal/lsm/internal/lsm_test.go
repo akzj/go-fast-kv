@@ -215,7 +215,38 @@ func TestManifest(t *testing.T) {
 	m.Flush()
 }
 
+func TestLSMStoreBasic(t *testing.T) {
+	Dir := t.TempDir()
+	cfg := lsmapi.Config{Dir: Dir, MemtableSize: 1024}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
 
+	// Test page mappings
+	l.SetPageMapping(1, 100)
+	l.SetPageMapping(2, 200)
+
+	vaddr, ok := l.GetPageMapping(1)
+	if !ok || vaddr != 100 {
+		t.Errorf("GetPageMapping(1): got (%d, %v), want (100, true)", vaddr, ok)
+	}
+
+	// Test blob mappings
+	l.SetBlobMapping(10, 1000, 500)
+	vaddr, size, ok := l.GetBlobMapping(10)
+	if !ok || vaddr != 1000 || size != 500 {
+		t.Errorf("GetBlobMapping(10): got (%d, %d, %v), want (1000, 500, true)", vaddr, size, ok)
+	}
+
+	// Test delete
+	l.DeleteBlobMapping(10)
+	_, _, ok = l.GetBlobMapping(10)
+	if ok {
+		t.Errorf("GetBlobMapping(10) after delete: got ok=true, want ok=false")
+	}
+}
 
 func TestLSMCheckpoint(t *testing.T) {
 	Dir := t.TempDir()
