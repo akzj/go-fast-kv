@@ -36,6 +36,8 @@ const (
 	ModuleBlob ModuleType = 2
 	// ModuleLSM represents LSM Store (mapping) records.
 	ModuleLSM ModuleType = 3
+	// ModuleSegment represents segment lifecycle records (e.g., seal events).
+	ModuleSegment ModuleType = 4
 )
 
 func (m ModuleType) String() string {
@@ -46,6 +48,8 @@ func (m ModuleType) String() string {
 		return "Blob"
 	case ModuleLSM:
 		return "LSM"
+	case ModuleSegment:
+		return "Segment"
 	default:
 		return "Unknown"
 	}
@@ -80,6 +84,10 @@ const (
 
 	// RecordTxnAbort records a transaction abort: xid aborted.
 	RecordTxnAbort RecordType = 8
+
+	// RecordSegmentSealed records a segment seal event: emitted by PageStore/BlobStore
+	// after successful rotation. Used by GC to track segment boundaries.
+	RecordSegmentSealed RecordType = 9
 )
 
 // String returns a human-readable name for the record type.
@@ -101,6 +109,8 @@ func (t RecordType) String() string {
 		return "TxnCommit"
 	case RecordTxnAbort:
 		return "TxnAbort"
+	case RecordSegmentSealed:
+		return "SegmentSealed"
 	default:
 		return "Unknown"
 	}
