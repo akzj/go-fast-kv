@@ -214,17 +214,12 @@ func TestChecksum_RecordFormat(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	_, err := ps.Write(pageID, data)
+	entry, err := ps.Write(pageID, data)
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	// Read the raw record from segment
-	ps.mu.Lock()
-	// getMapping removed: LSM handles page→VAddr internally
-	ps.mu.Unlock()
-
-	vaddr := segmentapi.UnpackVAddr(packed)
+	vaddr := segmentapi.UnpackVAddr(entry.VAddr)
 	raw, err := segMgr.ReadAt(vaddr, pagestoreapi.PageRecordSize)
 	if err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
