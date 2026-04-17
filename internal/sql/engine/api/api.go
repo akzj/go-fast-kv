@@ -143,6 +143,23 @@ type TableEngine interface {
 
 	// PersistCounter writes the current row counter value into a WriteBatch.
 	PersistCounter(batch kvstoreapi.WriteBatch, tableID uint32) error
+
+	// IncrementCounter atomically increments the row counter for a table.
+	// Used by the SQL executor for transactional inserts that bypass WriteBatch.
+	IncrementCounter(tableID uint32)
+
+	// GetCounter returns the current counter value without modification.
+	// Used by the SQL executor to read the counter after IncrementCounter.
+	GetCounter(tableID uint32) uint64
+
+	// AllocRowID atomically allocates a new rowID for a table.
+	// Reads from KV if the counter is not cached, then increments and returns.
+	// Used by the SQL executor for transactional inserts that bypass WriteBatch.
+	AllocRowID(tableID uint32) (uint64, error)
+
+	// EncodeRow serializes a row's values into a byte slice using the table's codec.
+	// Used by the SQL executor for transactional inserts that bypass WriteBatch.
+	EncodeRow(values []catalogapi.Value) []byte
 }
 
 // ─── IndexEngine ────────────────────────────────────────────────────

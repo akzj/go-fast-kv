@@ -101,6 +101,57 @@ func (te *tableEngine) PersistCounter(batch kvstoreapi.WriteBatch, tableID uint3
 	return batch.Put(metaKey, buf)
 }
 
+// IncrementCounter atomically increments the row counter for a table.
+// Used by the SQL executor for transactional inserts to advance the counter
+// in-memory before persisting via PutWithXID.
+func (te *tableEngine) IncrementCounter(tableID uint32) {
+	te.mu.Lock()
+	defer te.mu.Unlock()
+	te.rowCounters[tableID]++
+}
+
+// GetCounter returns the current counter value without modification.
+// Used by the SQL executor to read the counter after IncrementCounter.
+func (te *tableEngine) GetCounter(tableID uint32) uint64 {
+	te.mu.Lock()
+	defer te.mu.Unlock()
+	return te.rowCounters[tableID]
+}
+
+// AllocRowID atomically allocates a new rowID for a table.
+// Reads from KV if the counter is not cached, then increments and returns.
+// Used by the SQL executor for transactional inserts that bypass WriteBatch.
+func (te *tableEngine) AllocRowID(tableID uint32) (uint64, error) {
+	te.mu.Lock()
+	defer te.mu.Unlock()
+	if rid, ok := te.rowCounters[tableID]; ok {
+		return rid, nil
+	}
+	// Read from KV.
+	metaKey := encodeMetaKey(tableID)
+	data, err := te.store.Get(metaKey)
+	if err == kvstoreapi.ErrKeyNotFound {
+		te.rowCounters[tableID] = 2
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(data) < 8 {
+		te.rowCounters[tableID] = 2
+		return 1, nil
+	}
+	rid := binary.BigEndian.Uint64(data)
+	te.rowCounters[tableID] = rid + 1
+	return rid, nil
+}
+
+// EncodeRow serializes a row's values into a byte slice using the table's codec.
+// Used by the SQL executor for transactional inserts that bypass WriteBatch.
+func (te *tableEngine) EncodeRow(values []catalogapi.Value) []byte {
+	return te.codec.EncodeRow(values)
+}
+
 // ─── TableEngine implementation ─────────────────────────────────────
 
 func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi.Value) (uint64, error) {

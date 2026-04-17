@@ -422,7 +422,57 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
 	}
 
-	// I-C3: use a single WriteBatch for all rows and index entries.
+	// When in a transaction, use PutWithXID so writes share the transaction's XID.
+	// This enables own-write visibility (txnMin==s.XID) and rollback (txnMax==txnXID).
+	// When NOT in a transaction, use WriteBatch for auto-commit per statement.
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for _, row := range plan.Rows {
+			// Allocate rowID via table engine (in-memory only, no persistence yet).
+			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
+			if err != nil {
+				return nil, fmt.Errorf("%w: alloc rowid: %v", executorapi.ErrExecFailed, err)
+			}
+
+			// Write row data directly with transaction's XID.
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, rowID)
+			rowVal := e.tableEngine.EncodeRow(row)
+			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+				return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+			}
+			e.txnCtx.AddPendingWrite(rowKey)
+
+			// Write index entries with same XID.
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 {
+					continue
+				}
+				val := row[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey)
+			}
+		}
+
+		// Persist counter with transaction's XID.
+		// In-line the counter persistence logic (tableEngine is not used for transactional writes).
+		tableID := plan.Table.TableID
+		e.tableEngine.IncrementCounter(tableID) // advance in-memory counter
+		metaKey := encodeMetaKeyLocal(tableID)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(tableID))
+		if err := e.store.PutWithXID(metaKey, buf, xid); err != nil {
+			return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+		}
+		e.txnCtx.AddPendingWrite(metaKey)
+
+		return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
+	}
+
+	// Non-transactional path: use WriteBatch for auto-commit per statement.
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range plan.Rows {
@@ -435,7 +485,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 		// Insert index entries into the same batch.
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 {
 				continue
 			}
@@ -2419,14 +2469,46 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 		return nil, err
 	}
 
-	// F-W3: use a single WriteBatch for all deletes.
+	var count int64
+
+	// When in a transaction, use DeleteWithXID so deletes share the transaction's XID.
+	// Rollback marks entries as deleted with txnMax==txnXID → invisible.
+	// When NOT in a transaction, use WriteBatch for auto-commit per statement.
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for _, row := range rows {
+			// Delete index entries with transaction's XID.
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 {
+					continue
+				}
+				val := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, row.RowID)
+				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey)
+			}
+
+			// Delete row with transaction's XID.
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+			if err := e.store.DeleteWithXID(rowKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+				return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
+			}
+			e.txnCtx.AddPendingWrite(rowKey)
+			count++
+		}
+		return &executorapi.Result{RowsAffected: count}, nil
+	}
+
+	// Non-transactional path: use WriteBatch for auto-commit per statement.
 	batch := e.store.NewWriteBatch()
 
-	var count int64
 	for _, row := range rows {
-		// Delete index entries (auto-commit per entry — see TODO in execInsert).
+		// Delete index entries.
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 {
 				continue
 			}
@@ -2472,14 +2554,69 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		return nil, err
 	}
 
-	// F-W3: use a single WriteBatch for all updates.
+	var count int64
+
+	// When in a transaction, use DeleteWithXID/PutWithXID for deferred-write.
+	// All writes share the transaction's XID. Rollback marks them as deleted
+	// with txnMax==txnXID → invisible.
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for _, row := range rows {
+			// Delete old index entries for changed columns with transaction's XID.
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 || !changedCols[colIdx] {
+					continue
+				}
+				oldVal := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
+				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey)
+			}
+
+			// Merge old values with new assignments
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			for colIdx, val := range plan.Assignments {
+				newValues[colIdx] = val
+			}
+
+			// Update row with transaction's XID.
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+			rowVal := e.tableEngine.EncodeRow(newValues)
+			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+				return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+			}
+			e.txnCtx.AddPendingWrite(rowKey)
+
+			// Insert new index entries for changed columns.
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 || !changedCols[colIdx] {
+					continue
+				}
+				newVal := newValues[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
+				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey)
+			}
+
+			count++
+		}
+		return &executorapi.Result{RowsAffected: count}, nil
+	}
+
+	// Non-transactional path: use WriteBatch for auto-commit per statement.
 	batch := e.store.NewWriteBatch()
 
-	var count int64
 	for _, row := range rows {
 		// Delete old index entries for changed columns.
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
@@ -2506,7 +2643,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 
 		// Insert new index entries for changed columns.
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
@@ -2874,6 +3011,23 @@ func maxValueForColumn(rows []*engineapi.Row, colIdx int) catalogapi.Value {
 		return catalogapi.Value{Type: catalogapi.TypeText, Text: maxText}
 	}
 	return catalogapi.Value{IsNull: true}
+}
+
+// encodeMetaKeyLocal returns the metadata key for a table's row counter.
+// Matches tableEngine.encodeMetaKey: "t{tableID}m" (6 bytes).
+func encodeMetaKeyLocal(tableID uint32) []byte {
+	buf := make([]byte, 6)
+	buf[0] = 't'
+	binary.BigEndian.PutUint32(buf[1:5], tableID)
+	buf[5] = 'm'
+	return buf
+}
+
+// nilValueForIndex returns an empty slice used as the value for index entries.
+// Index entries store only the key (which encodes tableID, indexID, value, rowID);
+// the value is always empty.
+func nilValueForIndex() []byte {
+	return []byte{}
 }
 
 // findColumnIndexByName returns the index of a column by name (case-insensitive).
