@@ -2,11 +2,86 @@ package internal
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
+
+// mockWAL is a test double for walapi.WAL.
+type mockWAL struct {
+	mu       sync.Mutex
+	records  []walapi.Record
+	curLSN   uint64
+	batches  []*walapi.Batch
+	closed   bool
+}
+
+func newMockWAL() *mockWAL {
+	return &mockWAL{}
+}
+
+func (w *mockWAL) WriteBatch(batch *walapi.Batch) (lastLSN uint64, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, walapi.ErrClosed
+	}
+	for _, rec := range batch.Records {
+		w.curLSN++
+		r := rec
+		r.LSN = w.curLSN
+		w.records = append(w.records, r)
+	}
+	w.batches = append(w.batches, batch)
+	lastLSN = w.curLSN
+	return lastLSN, nil
+}
+
+func (w *mockWAL) Replay(afterLSN uint64, fn func(walapi.Record) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, r := range w.records {
+		if r.LSN <= afterLSN {
+			continue
+		}
+		if err := fn(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *mockWAL) CurrentLSN() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.curLSN
+}
+
+func (w *mockWAL) Truncate(upToLSN uint64) error { return nil }
+func (w *mockWAL) Rotate() error                 { return nil }
+func (w *mockWAL) DeleteSegmentsBefore(lsn uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var kept []walapi.Record
+	for _, r := range w.records {
+		if r.LSN > lsn {
+			kept = append(kept, r)
+		}
+	}
+	w.records = kept
+	return nil
+}
+func (w *mockWAL) ListSegments() []string { return nil }
+func (w *mockWAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return nil
+}
+
 
 func TestMemtableBasic(t *testing.T) {
 	m := newMemtable()
@@ -314,5 +389,228 @@ func TestLSMRecoveryStoreApply(t *testing.T) {
 	rs.SetCheckpointLSN(1000)
 	if rs.lsm.CheckpointLSN() != 1000 {
 		t.Errorf("CheckpointLSN: got %d, want 1000", rs.lsm.CheckpointLSN())
+	}
+}
+
+// ─── WAL Integration Tests ───────────────────────────────────────────
+
+func TestLSMWALFlush(t *testing.T) {
+	lsmDir := t.TempDir()
+
+	w := newMockWAL()
+	cfg := lsmapi.Config{Dir: lsmDir, MemtableSize: 1024}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	l.SetWAL(w)
+	defer l.Close()
+
+	// Write page and blob mappings
+	l.SetPageMapping(1, 100)
+	l.SetPageMapping(2, 200)
+	l.SetBlobMapping(10, 1000, 500)
+
+	// Flush to WAL
+	lastLSN, err := l.FlushToWAL()
+	if err != nil {
+		t.Fatalf("FlushToWAL: %v", err)
+	}
+	if lastLSN == 0 {
+		t.Errorf("FlushToWAL: expected non-zero LSN, got 0")
+	}
+
+	// Verify data still accessible after flush
+	vaddr, ok := l.GetPageMapping(1)
+	if !ok || vaddr != 100 {
+		t.Errorf("GetPageMapping(1): got (%d, %v), want (100, true)", vaddr, ok)
+	}
+
+	vaddr, size, ok := l.GetBlobMapping(10)
+	if !ok || vaddr != 1000 || size != 500 {
+		t.Errorf("GetBlobMapping(10): got (%d, %d, %v), want (1000, 500, true)", vaddr, size, ok)
+	}
+
+	// Verify LastLSN
+	if l.LastLSN() != lastLSN {
+		t.Errorf("LastLSN: got %d, want %d", l.LastLSN(), lastLSN)
+	}
+
+	// Verify WAL received correct record types
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.records) < 3 {
+		t.Errorf("expected ≥3 WAL records, got %d", len(w.records))
+	}
+	for _, r := range w.records {
+		if r.ModuleType != walapi.ModuleLSM {
+			t.Errorf("ModuleType: got %v, want ModuleLSM", r.ModuleType)
+		}
+	}
+}
+
+func TestLSMWALCheckpoint(t *testing.T) {
+	lsmDir := t.TempDir()
+
+	w := newMockWAL()
+	cfg := lsmapi.Config{Dir: lsmDir, MemtableSize: 1024}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	l.SetWAL(w)
+	defer l.Close()
+
+	// Write without checkpoint — no WAL flush yet
+	l.SetPageMapping(1, 100)
+
+	// Checkpoint flushes WAL and records LSN
+	if err := l.Checkpoint(42); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	if l.CheckpointLSN() != 42 {
+		t.Errorf("CheckpointLSN: got %d, want 42", l.CheckpointLSN())
+	}
+
+	// Verify data persisted
+	vaddr, ok := l.GetPageMapping(1)
+	if !ok || vaddr != 100 {
+		t.Errorf("GetPageMapping(1): got (%d, %v), want (100, true)", vaddr, ok)
+	}
+
+	// Verify WAL received the entry
+	w.mu.Lock()
+	hasPageMap := false
+	for _, r := range w.records {
+		if r.Type == walapi.RecordPageMap && r.ID == 1 {
+			hasPageMap = true
+			break
+		}
+	}
+	w.mu.Unlock()
+	if !hasPageMap {
+		t.Errorf("WAL did not receive RecordPageMap for pageID=1")
+	}
+}
+
+func TestLSMWALDeleteBlob(t *testing.T) {
+	lsmDir := t.TempDir()
+
+	w := newMockWAL()
+	cfg := lsmapi.Config{Dir: lsmDir, MemtableSize: 1024}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	l.SetWAL(w)
+	defer l.Close()
+
+	// Write blob then delete
+	l.SetBlobMapping(10, 1000, 500)
+	l.DeleteBlobMapping(10)
+
+	// Flush to WAL
+	_, err = l.FlushToWAL()
+	if err != nil {
+		t.Fatalf("FlushToWAL: %v", err)
+	}
+
+	// Verify deleted
+	_, _, ok := l.GetBlobMapping(10)
+	if ok {
+		t.Errorf("GetBlobMapping(10) after delete: got ok=true, want ok=false")
+	}
+
+	// Verify WAL has both BlobMap and BlobFree records
+	w.mu.Lock()
+	hasMap, hasFree := false, false
+	for _, r := range w.records {
+		if r.Type == walapi.RecordBlobMap && r.ID == 10 {
+			hasMap = true
+		}
+		if r.Type == walapi.RecordBlobFree && r.ID == 10 {
+			hasFree = true
+		}
+	}
+	w.mu.Unlock()
+	if !hasMap {
+		t.Errorf("WAL missing RecordBlobMap for blobID=10")
+	}
+	if !hasFree {
+		t.Errorf("WAL missing RecordBlobFree for blobID=10")
+	}
+}
+
+func TestLSMWALReplay(t *testing.T) {
+	lsmDir := t.TempDir()
+
+	// Create LSM with mock WAL, write and checkpoint
+	w := newMockWAL()
+	cfg := lsmapi.Config{Dir: lsmDir, MemtableSize: 1024}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	l.SetWAL(w)
+
+	l.SetPageMapping(1, 100)
+	l.SetBlobMapping(10, 1000, 500)
+	l.Checkpoint(1)
+
+	l.Close()
+
+	// Verify WAL collected entries
+	w.mu.Lock()
+	pageRecs, blobRecs := 0, 0
+	for _, r := range w.records {
+		if r.ModuleType == walapi.ModuleLSM {
+			switch r.Type {
+			case walapi.RecordPageMap:
+				pageRecs++
+			case walapi.RecordBlobMap:
+				blobRecs++
+			}
+		}
+	}
+	w.mu.Unlock()
+
+	if pageRecs == 0 {
+		t.Errorf("expected at least 1 page WAL record, got 0")
+	}
+	if blobRecs == 0 {
+		t.Errorf("expected at least 1 blob WAL record, got 0")
+	}
+
+	// Replay into recovery store
+	lsmDir2 := t.TempDir()
+	rs, err := NewRecoveryStore(lsmDir2)
+	if err != nil {
+		t.Fatalf("NewRecoveryStore: %v", err)
+	}
+
+	for _, r := range w.records {
+		if r.ModuleType != walapi.ModuleLSM {
+			continue
+		}
+		switch r.Type {
+		case walapi.RecordPageMap:
+			rs.ApplyPageMapping(r.ID, r.VAddr)
+		case walapi.RecordBlobMap:
+			rs.ApplyBlobMapping(r.ID, r.VAddr, r.Size)
+		case walapi.RecordBlobFree:
+			rs.ApplyBlobDelete(r.ID)
+		}
+	}
+
+	// Verify replayed data
+	vaddr, ok := rs.lsm.GetPageMapping(1)
+	if !ok || vaddr != 100 {
+		t.Errorf("GetPageMapping(1) after replay: got (%d, %v), want (100, true)", vaddr, ok)
+	}
+
+	vaddr, size, ok := rs.lsm.GetBlobMapping(10)
+	if !ok || vaddr != 1000 || size != 500 {
+		t.Errorf("GetBlobMapping(10) after replay: got (%d, %d, %v), want (1000, 500, true)", vaddr, size, ok)
 	}
 }

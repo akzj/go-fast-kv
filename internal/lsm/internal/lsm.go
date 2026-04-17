@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
 // ─── LSM Store ─────────────────────────────────────────────────────
@@ -34,10 +36,66 @@ type lsm struct {
 	// Checkpoint LSN
 	checkpointLSN uint64
 
+	// WAL for durability (LSM entries collected per-goroutine)
+	wal walapi.WAL
+
 	// Auto-compaction
 	compactInterval time.Duration // interval between compaction checks
 	stopCh          chan struct{}  // stop compaction goroutine
 	stopped         atomic.Bool
+}
+
+// ─── Goroutine-local WAL collectors ─────────────────────────────────
+//
+// Same pattern as Phase 6 btree. WAL entries are collected per-goroutine
+// and flushed at checkpoint/commit time for fsync durability.
+var lsmWALCollectors sync.Map // map[int64]*[]walapi.Record
+
+// goroutineID returns the current goroutine's numeric ID.
+func goroutineID() int64 {
+	var buf [32]byte
+	n := runtime.Stack(buf[:], false)
+	// The format is "goroutine N ..." — extract the number.
+	for i := 0; i < n; i++ {
+		if buf[i] == 'g' && i+8 < n && string(buf[i:i+8]) == "goroutine" {
+			j := i + 9
+			for j < n && buf[j] >= '0' && buf[j] <= '9' {
+				j++
+			}
+			if j > i+9 {
+				id := int64(0)
+				for k := i + 9; k < j; k++ {
+					id = id*10 + int64(buf[k]-'0')
+				}
+				return id
+			}
+		}
+	}
+	return 0
+}
+
+// registerLSMWALCollector registers a fresh collector for the current goroutine
+// only if one is not already registered (idempotent per operation).
+func registerLSMWALCollector() {
+	gid := goroutineID()
+	if _, exists := lsmWALCollectors.Load(gid); exists {
+		return // already registered
+	}
+	var records []walapi.Record
+	lsmWALCollectors.Store(gid, &records)
+}
+
+// getAndClearLSMWALCollector retrieves and clears the current goroutine's collector.
+// Returns nil if no collector is registered.
+func getAndClearLSMWALCollector() []walapi.Record {
+	gid := goroutineID()
+	if v, ok := lsmWALCollectors.Load(gid); ok {
+		collector := v.(*[]walapi.Record)
+		records := *collector
+		*collector = nil // clear
+		return records
+	}
+	return nil
 }
 
 const defaultMemtableSize = 64 * 1024 * 1024 // 64MB
@@ -79,10 +137,59 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 	return s, nil
 }
 
+// SetWAL sets the WAL for LSM durability. Must be called before any Set*Mapping calls.
+func (s *lsm) SetWAL(wal walapi.WAL) {
+	s.wal = wal
+}
+
+// FlushToWAL collects pending WAL entries and writes them to WAL with fsync.
+// Returns the last LSN written, or 0 if no entries.
+func (s *lsm) FlushToWAL() (lastLSN uint64, err error) {
+	records := getAndClearLSMWALCollector()
+	if s.wal == nil || len(records) == 0 {
+		return 0, nil
+	}
+
+	// Build batch from collected records
+	batch := walapi.NewBatch()
+	for _, rec := range records {
+		batch.Records = append(batch.Records, rec)
+	}
+
+	lastLSN, err = s.wal.WriteBatch(batch)
+	if err != nil {
+		return lastLSN, err
+	}
+	return lastLSN, nil
+}
+
+// LastLSN returns the LSN of the last WAL entry written.
+func (s *lsm) LastLSN() uint64 {
+	if s.wal == nil {
+		return 0
+	}
+	return s.wal.CurrentLSN()
+}
+
 // ─── Page Mappings ─────────────────────────────────────────────────
 
-// SetPageMapping sets a page mapping.
+// SetPageMapping sets a page mapping and records it to WAL for durability.
 func (s *lsm) SetPageMapping(pageID uint64, vaddr uint64) {
+	// Register collector for this goroutine (idempotent per call)
+	registerLSMWALCollector()
+
+	// Append WAL entry to per-goroutine collector
+	gid := goroutineID()
+	if v, ok := lsmWALCollectors.Load(gid); ok {
+		records := v.(*[]walapi.Record)
+		*records = append(*records, walapi.Record{
+			ModuleType: walapi.ModuleLSM,
+			Type:       walapi.RecordPageMap,
+			ID:         pageID,
+			VAddr:      vaddr,
+		})
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.active.SetPageMapping(pageID, vaddr)
@@ -142,8 +249,24 @@ func searchPages(pages []sstEntry, key uint64) int {
 
 // ─── Blob Mappings ─────────────────────────────────────────────────
 
-// SetBlobMapping sets a blob mapping.
+// SetBlobMapping sets a blob mapping and records it to WAL for durability.
 func (s *lsm) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	// Register collector for this goroutine
+	registerLSMWALCollector()
+
+	// Append WAL entry to per-goroutine collector
+	gid := goroutineID()
+	if v, ok := lsmWALCollectors.Load(gid); ok {
+		records := v.(*[]walapi.Record)
+		*records = append(*records, walapi.Record{
+			ModuleType: walapi.ModuleLSM,
+			Type:       walapi.RecordBlobMap,
+			ID:         blobID,
+			VAddr:      vaddr,
+			Size:       size,
+		})
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.active.SetBlobMapping(blobID, vaddr, size)
@@ -201,8 +324,22 @@ func searchBlobs(blobs []sstEntry, key uint64) int {
 	return lo
 }
 
-// DeleteBlobMapping deletes a blob mapping.
+// DeleteBlobMapping deletes a blob mapping and records the deletion to WAL for durability.
 func (s *lsm) DeleteBlobMapping(blobID uint64) {
+	// Register collector for this goroutine
+	registerLSMWALCollector()
+
+	// Append WAL entry to per-goroutine collector
+	gid := goroutineID()
+	if v, ok := lsmWALCollectors.Load(gid); ok {
+		records := v.(*[]walapi.Record)
+		*records = append(*records, walapi.Record{
+			ModuleType: walapi.ModuleLSM,
+			Type:       walapi.RecordBlobFree,
+			ID:         blobID,
+		})
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.active.DeleteBlobMapping(blobID)
@@ -210,8 +347,13 @@ func (s *lsm) DeleteBlobMapping(blobID uint64) {
 
 // ─── Checkpoint ───────────────────────────────────────────────────
 
-// Checkpoint records the checkpoint LSN.
+// Checkpoint records the checkpoint LSN after flushing pending WAL entries.
 func (s *lsm) Checkpoint(lsn uint64) error {
+	// Flush any pending WAL entries first (durability guarantee)
+	if _, err := s.FlushToWAL(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.checkpointLSN = lsn
@@ -375,10 +517,23 @@ func (r *RecoveryStore) ApplyBlobDelete(blobID uint64) {
 	r.lsm.active.DeleteBlobMapping(blobID)
 }
 
+// ApplyPageDelete applies a page deletion (removes from active memtable).
+// Pages are immutable once written, so this is only for recovery replay.
+func (r *RecoveryStore) ApplyPageDelete(pageID uint64) {
+	r.lsm.active.DeletePageMapping(pageID)
+}
+
 // SetCheckpointLSN sets the checkpoint LSN.
 func (r *RecoveryStore) SetCheckpointLSN(lsn uint64) {
 	r.lsm.mu.Lock()
 	r.lsm.checkpointLSN = lsn
+	r.lsm.mu.Unlock()
+}
+
+// SetNextSegmentID sets the next segment ID for SSTable naming.
+func (r *RecoveryStore) SetNextSegmentID(id uint64) {
+	r.lsm.mu.Lock()
+	r.lsm.manifest.data.NextSegmentID = id
 	r.lsm.mu.Unlock()
 }
 

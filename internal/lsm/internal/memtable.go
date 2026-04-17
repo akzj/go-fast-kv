@@ -89,6 +89,17 @@ func (m *memtable) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok 
 	return vaddr, size, true
 }
 
+// DeletePageMapping deletes a page mapping.
+func (m *memtable) DeletePageMapping(pageID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.pageMappings.Load(pageID); ok {
+		m.pageMappings.Delete(pageID)
+		m.size -= 16
+	}
+}
+
 // DeleteBlobMapping deletes a blob mapping.
 func (m *memtable) DeleteBlobMapping(blobID uint64) {
 	m.mu.Lock()
