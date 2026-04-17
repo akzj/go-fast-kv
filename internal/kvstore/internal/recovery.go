@@ -55,8 +55,10 @@ func (s *store) recover() error {
 		lsmRecovery.SetCheckpointLSN(cpData.LSN)
 	}
 
-	// Replay WAL entries. We always replay from beginning (afterLSN=0) so that
-	// page→VAddr mappings written before the checkpoint are also restored.
+	// Replay WAL entries. Only records with LSN > checkpoint.LSN are replayed.
+	// The checkpoint file already contains the full state snapshot at that LSN,
+	// so pre-checkpoint records are redundant. The active WAL segment (which
+	// holds post-checkpoint records) is never deleted by Truncate().
 	// (LSM entries are ModuleLSM; blob/tree entries are ModuleTree or Type=0.)
 	err = s.wal.Replay(afterLSN, func(r walapi.Record) error {
 
