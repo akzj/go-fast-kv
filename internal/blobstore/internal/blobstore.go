@@ -59,10 +59,7 @@ type blobStore struct {
 // BlobIDs start at 1 (0 is reserved as invalid).
 // The mapping table is initialized with cfg.InitialCapacity slots
 // (defaults to 1024).
-func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager, statsMgr ...interface {
-	Increment(segID uint32, count, bytes int64)
-	Decrement(segID uint32, count, bytes int64)
-}) blobstoreapi.BlobStore {
+func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager) blobstoreapi.BlobStore {
 	cap := cfg.InitialCapacity
 	if cap <= 0 {
 		cap = defaultInitialCapacity
@@ -72,8 +69,8 @@ func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager, statsMgr ...
 		mapping:    make([]blobstoreapi.BlobMeta, cap),
 		nextBlobID: 1, // 0 is reserved
 	}
-	if len(statsMgr) > 0 {
-		bs.statsMgr = statsMgr[0]
+	if cfg.StatsManager != nil {
+		bs.statsMgr = cfg.StatsManager
 	}
 	return bs
 }

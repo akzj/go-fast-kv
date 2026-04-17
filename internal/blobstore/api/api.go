@@ -151,3 +151,10 @@ type Config struct {
 		Decrement(segID uint32, count, bytes int64)
 	}
 }
+
+// StatsManager is the interface for segment-level live-record statistics.
+// Implemented by kvstore's segmentStatsManager; passed to BlobStore.New.
+type StatsManager interface {
+	Increment(segID uint32, count, bytes int64)
+	Decrement(segID uint32, count, bytes int64)
+}

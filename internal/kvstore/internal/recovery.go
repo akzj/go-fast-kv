@@ -53,6 +53,9 @@ func (s *store) recover() error {
 		rootPageID = cpData.RootPageID
 		maxTxnXID = cpData.NextXID
 		lsmRecovery.SetCheckpointLSN(cpData.LSN)
+
+		// Load GC stats from checkpoint
+		s.gcStats.LoadAll(cpData.Stats)
 	}
 
 	// Replay WAL entries. Only records with LSN > checkpoint.LSN are replayed.

@@ -326,12 +326,12 @@ func TestCheckpointFormatVersion(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	// Version byte must be 1.
+	// Version byte must be 2 (v2 = checkpoint with segment stats).
 	if len(raw) < 1 {
 		t.Fatal("checkpoint file is empty")
 	}
-	if raw[0] != 1 {
-		t.Fatalf("version byte: got %d, want 1", raw[0])
+	if raw[0] != 2 {
+		t.Fatalf("version byte: got %d, want 2", raw[0])
 	}
 
 	// Verify that deserialization reads and validates the version.
@@ -348,26 +348,27 @@ func TestCheckpointFormatVersion(t *testing.T) {
 // ─── TestCheckpointUnknownVersionRejected ────────────────────────────
 
 func TestCheckpointUnknownVersionRejected(t *testing.T) {
-	// Manually construct a v2 checkpoint buffer (version byte = 2)
+	// Manually construct a v3 checkpoint buffer (version byte = 3)
 	// to simulate a future unsupported format.
-	// Header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
-	//              + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + reserved(4)
-	//              = 57 bytes, then CRC32(4) = 61 bytes total for zero-data checkpoint.
-	buf := make([]byte, 57+4)
-	buf[0] = 2                          // version = 2 (unsupported)
+	// V2/v3 header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
+	// + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + StatsCount(4) + reserved(4)
+	// = 61 bytes, then CRC32(4) = 65 bytes total for zero-data checkpoint.
+	buf := make([]byte, 61+4)
+	buf[0] = 3                           // version = 3 (unsupported)
 	binary.LittleEndian.PutUint64(buf[1:], 100)   // LSN
 	binary.LittleEndian.PutUint64(buf[9:], 10)    // NextXID
-	binary.LittleEndian.PutUint64(buf[17:], 1)   // RootPageID
-	binary.LittleEndian.PutUint64(buf[25:], 2)   // NextPageID
-	binary.LittleEndian.PutUint64(buf[33:], 3)   // NextBlobID
+	binary.LittleEndian.PutUint64(buf[17:], 1)    // RootPageID
+	binary.LittleEndian.PutUint64(buf[25:], 2)    // NextPageID
+	binary.LittleEndian.PutUint64(buf[33:], 3)    // NextBlobID
 	binary.LittleEndian.PutUint32(buf[41:], 0)    // PageCount = 0
 	binary.LittleEndian.PutUint32(buf[45:], 0)    // BlobCount = 0
 	binary.LittleEndian.PutUint32(buf[49:], 0)    // CLOGCount = 0
+	binary.LittleEndian.PutUint32(buf[53:], 0)    // StatsCount = 0
 	// reserved = 0 already
 
 	// Compute and write CRC (covers bytes 0-60).
-	crc := crc32.Checksum(buf[:57], crc32.MakeTable(crc32.Castagnoli))
-	binary.LittleEndian.PutUint32(buf[57:], crc)
+	crc := crc32.Checksum(buf[:61], crc32.MakeTable(crc32.Castagnoli))
+	binary.LittleEndian.PutUint32(buf[61:], crc)
 
 	// Try to deserialize — should fail with version mismatch.
 	_, err := deserializeCheckpoint(buf)

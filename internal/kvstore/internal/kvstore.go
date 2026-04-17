@@ -31,6 +31,7 @@ import (
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
 	"github.com/akzj/go-fast-kv/internal/btree"
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
+	gcapi "github.com/akzj/go-fast-kv/internal/gc/api"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	"github.com/akzj/go-fast-kv/internal/lock"
 	lsm "github.com/akzj/go-fast-kv/internal/lsm"
@@ -115,6 +116,24 @@ type store struct {
 	vacuumWg sync.WaitGroup // tracks in-flight vacuum goroutines for Close()
 	closing  atomic.Bool   // set early in Close() to signal vacuum goroutines to exit
 
+	// GC — segment garbage collection (Phase 2).
+	gcMu    sync.RWMutex
+	gcStats *segmentStatsManager
+	pageGC  gcapi.PageGC
+	blobGC  gcapi.BlobGC
+	pageGCTrigger struct {
+		mu      sync.Mutex
+		running bool
+		dirty   atomic.Bool
+	}
+	blobGCTrigger struct {
+		mu      sync.Mutex
+		running bool
+		dirty   atomic.Bool
+	}
+	pageGCWg  sync.WaitGroup
+	blobGCWg sync.WaitGroup
+
 	// Read snapshots: maps readTxnID → Snapshot for MVCC visibility.
 	// Get/Scan register a snapshot before reading, unregister after.
 	readSnaps sync.Map // map[uint64]*txnapi.Snapshot
@@ -187,9 +206,12 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	}
 	lsmStore.SetWAL(w)
 
-	// Create PageStore and BlobStore
-	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize}, pageSegMgr, lsmStore)
-	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
+	// Init GC stats manager (local var, assigned to store below)
+	gcStats := newSegmentStatsManager()
+
+	// Create PageStore and BlobStore (with stats tracking for GC)
+	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize, StatsManager: gcStats}, pageSegMgr, lsmStore)
+	bs := blobstore.New(blobstoreapi.Config{StatsManager: gcStats}, blobSegMgr)
 
 	// Create TxnManager — use SSI mode if configured
 	// When SSI is configured, BeginSSITxn() tracks RWSet/WWSet for conflict detection.
@@ -270,6 +292,7 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		provider:    provider,
 		blobAdapter: ba,
 		txnMgr:      tm,
+		gcStats:     gcStats,
 	}
 	// Wire up the storeRef so the VisibilityChecker closure can access readSnaps.
 	storeRef = s
@@ -298,6 +321,12 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 			plp.PageLocks(),
 		)
 	}
+
+	// Init GC instances (page GC and blob GC)
+	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)
+	s.pageGC = gcapi.NewPageGC(s.pageSegMgr, s.pageStore, psRecovery, s.wal)
+	s.blobGC = gcapi.NewBlobGC(s.blobSegMgr, s.blobStore, bsRecovery, s.wal)
 
 	// Attempt crash recovery
 	if err := s.recover(); err != nil {
@@ -907,10 +936,6 @@ func (s *store) Close() error {
 
 	s.closed = true
 
-	// Wait for any in-flight vacuum goroutines to finish.
-	// This prevents vacuum from running against a closed store.
-	s.vacuumWg.Wait()
-
 	return s.closeAll()
 }
 
@@ -1049,6 +1074,133 @@ func (s *store) checkAutoVacuum() {
 			}
 		}
 	}()
+}
+
+// ─── Auto-GC trigger ────────────────────────────────────────────────
+
+// checkAutoGC decides whether to spawn a lazy GC goroutine for page or blob segments.
+// Called after every Put/Delete. Returns immediately — GC runs async.
+//
+// Thread safety: a mutex per GC type ensures only one goroutine runs at a time.
+// If more sealed segments accumulate while running, the 'dirty' flag self-triggers.
+func (s *store) checkAutoGC() {
+	if s.gcStats == nil {
+		return
+	}
+
+	// Page GC trigger
+	pageThreshold := 5 // sealed page segments
+	pageSealed := s.pageSegMgr.SealedSegments()
+	if len(pageSealed) >= pageThreshold {
+		s.pageGCTrigger.mu.Lock()
+		if !s.pageGCTrigger.running {
+			s.pageGCTrigger.running = true
+			s.pageGCTrigger.mu.Unlock()
+			s.pageGCWg.Add(1)
+			go func() {
+				defer s.pageGCWg.Done()
+				defer func() {
+					s.pageGCTrigger.mu.Lock()
+					s.pageGCTrigger.running = false
+					s.pageGCTrigger.mu.Unlock()
+				}()
+				if s.closing.Load() {
+					return
+				}
+				s.runPageGC()
+			}()
+		} else {
+			s.pageGCTrigger.dirty.Store(true)
+			s.pageGCTrigger.mu.Unlock()
+		}
+	}
+
+	// Blob GC trigger
+	blobThreshold := 5 // sealed blob segments
+	blobSealed := s.blobSegMgr.SealedSegments()
+	if len(blobSealed) >= blobThreshold {
+		s.blobGCTrigger.mu.Lock()
+		if !s.blobGCTrigger.running {
+			s.blobGCTrigger.running = true
+			s.blobGCTrigger.mu.Unlock()
+			s.blobGCWg.Add(1)
+			go func() {
+				defer s.blobGCWg.Done()
+				defer func() {
+					s.blobGCTrigger.mu.Lock()
+					s.blobGCTrigger.running = false
+					s.blobGCTrigger.mu.Unlock()
+				}()
+				if s.closing.Load() {
+					return
+				}
+				s.runBlobGC()
+			}()
+		} else {
+			s.blobGCTrigger.dirty.Store(true)
+			s.blobGCTrigger.mu.Unlock()
+		}
+	}
+}
+
+// runPageGC collects page segments until no more have dead bytes.
+func (s *store) runPageGC() {
+	for {
+		if !s.pageGCTrigger.dirty.Load() {
+			return
+		}
+		s.pageGCTrigger.dirty.Store(false)
+
+		sealed := s.pageSegMgr.SealedSegments()
+		if len(sealed) == 0 {
+			return
+		}
+
+		// Collect one segment at a time (CollectOne picks internally).
+		stats, err := s.pageGC.CollectOne()
+		if err != nil {
+			return
+		}
+		if stats == nil {
+			return
+		}
+
+		// After CollectOne: old sealed segment's stats are now 0 (all records moved or dead).
+		// Active segment gained LiveRecords. Update stats accordingly.
+		activeSegID := s.pageSegMgr.ActiveSegmentID()
+		s.gcStats.Decrement(stats.SegmentID, int64(stats.TotalRecords), 0)
+		s.gcStats.Increment(activeSegID, int64(stats.LiveRecords), 0)
+	}
+}
+
+// runBlobGC collects blob segments until no more have dead bytes.
+func (s *store) runBlobGC() {
+	for {
+		if !s.blobGCTrigger.dirty.Load() {
+			return
+		}
+		s.blobGCTrigger.dirty.Store(false)
+
+		sealed := s.blobSegMgr.SealedSegments()
+		if len(sealed) == 0 {
+			return
+		}
+
+		// Collect one segment at a time.
+		stats, err := s.blobGC.CollectOne()
+		if err != nil {
+			return
+		}
+		if stats == nil {
+			return
+		}
+
+		// After CollectOne: old sealed segment's stats are now 0 (all records moved or dead).
+		// Active segment gained LiveRecords.
+		activeSegID := s.blobSegMgr.ActiveSegmentID()
+		s.gcStats.Decrement(stats.SegmentID, int64(stats.TotalRecords), 0)
+		s.gcStats.Increment(activeSegID, int64(stats.LiveRecords), 0)
+	}
 }
 
 // ─── assembleBatchFromCollectors ────────────────────────────────────
@@ -1348,6 +1500,7 @@ func (wb *writeBatch) Commit() error {
 		s.vacuumTrigger.opsCount.Add(int64(len(wb.ops)))
 		s.vacuumTrigger.dirty.Store(true)
 		s.checkAutoVacuum()
+		s.checkAutoGC()
 	}
 
 	return nil

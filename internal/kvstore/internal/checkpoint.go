@@ -113,6 +113,7 @@ func (s *store) checkpointLocked() error {
 		RootPageID: s.tree.RootPageID(),
 		NextPageID: s.pageStore.NextPageID(),
 		NextBlobID: s.blobStore.NextBlobID(),
+		Stats:      s.gcStats.ExportAll(),
 	}
 
 	for _, p := range pageMappings {

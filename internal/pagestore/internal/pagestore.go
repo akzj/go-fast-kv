@@ -131,14 +131,16 @@ type statsManagerInterface interface {
 	Decrement(segID uint32, count, bytes int64)
 }
 
-func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager, lsmStore lsmapi.MappingStore, statsMgr ...statsManagerInterface) pagestoreapi.PageStore {
+func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager, lsmStore lsmapi.MappingStore) pagestoreapi.PageStore {
 	ps := &pageStore{
 		segMgr:     segMgr,
 		lsm:        lsmStore,
 		nextPageID: 1,
 	}
-	if len(statsMgr) > 0 {
-		ps.statsMgr = statsMgr[0]
+	if cfg.StatsManager != nil {
+		if sm, ok := cfg.StatsManager.(statsManagerInterface); ok {
+			ps.statsMgr = sm
+		}
 	}
 	if cfg.PageCacheSize > 0 {
 		ps.cache = newLRUCache(cfg.PageCacheSize)
@@ -326,5 +328,3 @@ func (ps *pageStore) SetNextPageID(nextID pagestoreapi.PageID) {
 func (ps *pageStore) LSMLifecycle() pagestoreapi.LSMLifecycle {
 	return ps.lsm.(pagestoreapi.LSMLifecycle)
 }
-
-
