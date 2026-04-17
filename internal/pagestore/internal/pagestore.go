@@ -189,7 +189,7 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 	}
 	vaddr, ok := ps.lsm.GetPageMapping(uint64(pageID))
 	ps.mu.Unlock()
-	if !ok {
+	if !ok || vaddr == 0 {
 		return nil, pagestoreapi.ErrPageNotFound
 	}
 	raw, err := ps.segMgr.ReadAt(segmentapi.UnpackVAddr(vaddr), pagestoreapi.PageRecordSize)
@@ -255,11 +255,6 @@ func (ps *pageStore) LoadMapping(entries []pagestoreapi.MappingEntry) {
 	if ps.cache != nil {
 		ps.cache.Clear()
 	}
-}
-
-func (ps *pageStore) ExportMapping() []pagestoreapi.MappingEntry {
-	// LSM handles its own persistence — checkpoint no longer serializes page mapping.
-	return nil
 }
 
 func (ps *pageStore) ApplyPageMap(pageID pagestoreapi.PageID, vaddr uint64) {

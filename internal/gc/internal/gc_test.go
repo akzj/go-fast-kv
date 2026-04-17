@@ -529,13 +529,29 @@ func (m *mockLSMForTests) GetBlobMapping(blobID uint64) (uint64, uint32, bool) {
 	return b.vaddr, b.size, ok
 }
 func (m *mockLSMForTests) DeleteBlobMapping(blobID uint64) { delete(m.blobs, blobID) }
-func (m *mockLSMForTests) SetWAL(wal walapi.WAL)          {}
+func (m *mockLSMForTests) SetWAL(wal walapi.WAL) {}
 func (m *mockLSMForTests) FlushToWAL() (uint64, error)    { return 0, nil }
 func (m *mockLSMForTests) LastLSN() uint64                { return 0 }
 func (m *mockLSMForTests) Checkpoint(lsn uint64) error    { return nil }
 func (m *mockLSMForTests) CheckpointLSN() uint64          { return 0 }
 func (m *mockLSMForTests) MaybeCompact() error            { return nil }
 func (m *mockLSMForTests) Close() error                  { return nil }
+
+// LSMLifecycle methods required by pagestoreapi.LSMLifecycle.
+func (m *mockLSMForTests) ApplyPageMapping(pageID uint64, vaddr uint64) {
+	m.pages[pageID] = vaddr
+}
+func (m *mockLSMForTests) ApplyPageDelete(pageID uint64) {
+	delete(m.pages, pageID)
+}
+func (m *mockLSMForTests) ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+}
+func (m *mockLSMForTests) ApplyBlobDelete(blobID uint64) {
+	delete(m.blobs, blobID)
+}
+func (m *mockLSMForTests) SetCheckpointLSN(lsn uint64) {}
+func (m *mockLSMForTests) DrainCollector() []walapi.Record { return nil }
 
 
 func TestGC_MultipleSegments(t *testing.T) {

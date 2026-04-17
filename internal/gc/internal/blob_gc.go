@@ -72,14 +72,6 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 		return nil, err
 	}
 
-	// 3. Build liveness map from current BlobStore mapping.
-	//    map[blobID] → packed VAddr
-	entries := gc.recovery.ExportMapping()
-	liveMap := make(map[uint64]uint64, len(entries))
-	for _, e := range entries {
-		liveMap[e.BlobID] = e.VAddr
-	}
-
 	// 4. Scan all blob records in the segment.
 	stats := &gcapi.GCStats{
 		SegmentID: segID,
@@ -115,9 +107,8 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 
 		stats.TotalRecords++
 
-		// Check liveness.
-		currentVAddr := headerAddr.Pack()
-		if mappedVAddr, ok := liveMap[blobID]; ok && mappedVAddr == currentVAddr {
+		// Check liveness: if BlobStore can read this blobID, it's live.
+		if _, err := gc.bs.Read(blobstoreapi.BlobID(blobID)); err == nil {
 			// Live — read full record and copy to active segment.
 			fullRecord, err := gc.segMgr.ReadAt(headerAddr, fullRecordSize)
 			if err != nil {
@@ -132,8 +123,6 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 			newPacked := newAddr.Pack()
 			batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, blobID, newPacked, dataSize)
 			updates = append(updates, mappingUpdate{blobID: blobID, vaddr: newPacked, size: dataSize})
-
-			liveMap[blobID] = newPacked
 
 			stats.LiveRecords++
 		} else {

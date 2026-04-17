@@ -89,7 +89,6 @@ func (s *store) checkpointLocked() error {
 
 	// Collect state
 	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
-	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)
 
 	// Flush LSM WAL entries to the kvstore WAL before checkpoint.
 	// SetPageMapping/SetBlobMapping collect entries in a per-goroutine collector.
@@ -100,8 +99,10 @@ func (s *store) checkpointLocked() error {
 		return fmt.Errorf("checkpoint: flush LSM WAL: %w", err)
 	}
 
-	pageMappings := psRecovery.ExportMapping()
-	blobMappings := bsRecovery.ExportMapping()
+	// pageMappings: PageStore no longer exports mappings (LSM handles persistence).
+	// BlobStore: ExportMapping via public BlobStore interface.
+	pageMappings := []pagestoreapi.MappingEntry(nil)
+	blobMappings := s.blobStore.ExportMapping()
 	clogEntries := s.txnMgr.CLOG().Entries()
 
 	data := &checkpointData{

@@ -152,9 +152,6 @@ type PageStoreRecovery interface {
 	// Called once during recovery before WAL replay.
 	LoadMapping(entries []MappingEntry)
 
-	// ExportMapping returns all non-zero page mappings for checkpoint serialization.
-	ExportMapping() []MappingEntry
-
 	// ApplyPageMap applies a WAL RecordPageMap record during replay.
 	ApplyPageMap(pageID PageID, vaddr uint64)
 
@@ -183,6 +180,9 @@ type LSMLifecycle interface {
 	// DrainCollector retrieves and clears the per-goroutine WAL collector.
 	// Used by kvstore.CommitWithXID to include LSM entries in the WAL batch.
 	DrainCollector() []walapi.Record
+	// GetPageMapping returns the current VAddr for a pageID and whether it exists.
+	// Used by GC for liveness checks during segment collection.
+	GetPageMapping(pageID uint64) (vaddr uint64, ok bool)
 }
 
 // ─── Config ─────────────────────────────────────────────────────────

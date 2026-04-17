@@ -74,11 +74,7 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 
 	// 3. Build liveness map from current PageStore mapping.
 	//    map[pageID] → packed VAddr
-	entries := gc.recovery.ExportMapping()
-	liveMap := make(map[uint64]uint64, len(entries))
-	for _, e := range entries {
-		liveMap[e.PageID] = e.VAddr
-	}
+	liveMap := make(map[uint64]uint64, 0)
 
 	// 4. Scan all page records in the segment.
 	stats := &gcapi.GCStats{
@@ -112,7 +108,7 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 		// Check liveness: is the current mapping for this pageID
 		// pointing to this exact VAddr?
 		currentVAddr := addr.Pack()
-		if mappedVAddr, ok := liveMap[pageID]; ok && mappedVAddr == currentVAddr {
+		if mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(pageID); ok && mappedVAddr == currentVAddr {
 			// Live — copy to active segment.
 			newAddr, err := gc.segMgr.Append(record)
 			if err != nil {

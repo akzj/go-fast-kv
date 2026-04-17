@@ -94,6 +94,9 @@ type BlobStore interface {
 	// Useful for checkpoint serialization.
 	NextBlobID() BlobID
 
+	// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
+	ExportMapping() []MappingEntry
+
 	// Close closes the BlobStore. After Close, all operations return ErrClosed.
 	// Note: BlobStore does NOT close the underlying SegmentManager —
 	// that is owned by the caller.
@@ -122,9 +125,6 @@ type MappingEntry struct {
 type BlobStoreRecovery interface {
 	// LoadMapping bulk-loads the mapping table from checkpoint data.
 	LoadMapping(entries []MappingEntry)
-
-	// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
-	ExportMapping() []MappingEntry
 
 	// ApplyBlobMap applies a WAL RecordBlobMap record during replay.
 	ApplyBlobMap(blobID BlobID, vaddr uint64, size uint32)
