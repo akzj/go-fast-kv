@@ -15,6 +15,7 @@ type manifest struct {
 	mu   sync.RWMutex
 	path string
 	data manifestData
+	wg   sync.WaitGroup // tracks in-flight async saves
 }
 
 // manifestData is the on-disk format of the manifest.
@@ -88,15 +89,19 @@ func (m *manifest) NextID() uint64 {
 	id := m.data.NextSegmentID
 	m.data.NextSegmentID++
 	// Save asynchronously
-	go m.saveAsync()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.saveLocked()
+	}()
 	return id
 }
 
-// saveAsync saves the manifest to disk.
-func (m *manifest) saveAsync() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.saveLocked()
+// Flush waits for all pending async saves to complete.
+func (m *manifest) Flush() {
+	m.wg.Wait()
 }
 
 // Segments returns the list of segments.
