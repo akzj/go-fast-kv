@@ -119,13 +119,26 @@ type pageStore struct {
 	nextPageID uint64
 	closed     bool
 	cache      *lruCache
+	statsMgr   interface {
+		Increment(segID uint32, count, bytes int64)
+		Decrement(segID uint32, count, bytes int64)
+	}
 }
 
-func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager, lsmStore lsmapi.MappingStore) pagestoreapi.PageStore {
+// statsManagerInterface is the interface for segment stats tracking.
+type statsManagerInterface interface {
+	Increment(segID uint32, count, bytes int64)
+	Decrement(segID uint32, count, bytes int64)
+}
+
+func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager, lsmStore lsmapi.MappingStore, statsMgr ...statsManagerInterface) pagestoreapi.PageStore {
 	ps := &pageStore{
 		segMgr:     segMgr,
 		lsm:        lsmStore,
 		nextPageID: 1,
+	}
+	if len(statsMgr) > 0 {
+		ps.statsMgr = statsMgr[0]
 	}
 	if cfg.PageCacheSize > 0 {
 		ps.cache = newLRUCache(cfg.PageCacheSize)
@@ -150,6 +163,10 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 	if ps.closed {
 		return pagestoreapi.WALEntry{}, pagestoreapi.ErrClosed
 	}
+
+	// Look up old mapping before overwriting (needed for stats decrement).
+	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
+
 	record := make([]byte, pagestoreapi.PageRecordSize)
 	binary.BigEndian.PutUint64(record[:8], pageID)
 	copy(record[8:8+pagestoreapi.PageSize], data)
@@ -171,6 +188,18 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
+
+	// Stats update — decrement old segment, increment new.
+	// Decrement always goes to old segment (even if same as new, net=0 — correct).
+	// Increment always goes to new segment.
+	if ps.statsMgr != nil {
+		if oldPacked != 0 {
+			oldSegID := uint32(oldPacked >> 32)
+			ps.statsMgr.Decrement(oldSegID, 1, int64(pagestoreapi.PageRecordSize))
+		}
+		ps.statsMgr.Increment(vaddr.SegmentID, 1, int64(pagestoreapi.PageRecordSize))
+	}
+
 	return pagestoreapi.WALEntry{Type: 1, ID: pageID, VAddr: packed, Size: 0}, nil
 }
 
@@ -213,11 +242,22 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 func (ps *pageStore) Free(pageID pagestoreapi.PageID) pagestoreapi.WALEntry {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+
+	// Look up old mapping before clearing (needed for stats decrement).
+	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
+
 	// Mark page as deleted in LSM (value = 0 signals deleted)
 	ps.lsm.SetPageMapping(uint64(pageID), 0)
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
+
+	// Stats update — decrement old segment.
+	if ps.statsMgr != nil && oldPacked != 0 {
+		oldSegID := uint32(oldPacked >> 32)
+		ps.statsMgr.Decrement(oldSegID, 1, int64(pagestoreapi.PageRecordSize))
+	}
+
 	return pagestoreapi.WALEntry{Type: 4, ID: pageID, VAddr: 0, Size: 0}
 }
 

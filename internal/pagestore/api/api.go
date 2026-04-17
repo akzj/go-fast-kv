@@ -198,4 +198,11 @@ type Config struct {
 	// PageCacheSize is the number of pages to cache (LRU).
 	// 0 or negative means no cache. Default is 0 (cache disabled).
 	PageCacheSize int
+
+	// StatsManager is an optional stats tracker for GC segment dead-byte analysis.
+	// If non-nil, PageStore will call Increment/Decrement on writes and frees.
+	StatsManager interface {
+		Increment(segID uint32, count, bytes int64)
+		Decrement(segID uint32, count, bytes int64)
+	}
 }
