@@ -18,14 +18,15 @@ import (
 
 // checkpointData holds all state needed to restore the store.
 type checkpointData struct {
-	LSN        uint64
-	NextXID    uint64
-	RootPageID uint64
-	NextPageID uint64
-	NextBlobID uint64
-	Pages      []pageMapping
-	Blobs      []blobMapping
+	LSN         uint64
+	NextXID     uint64
+	RootPageID  uint64
+	NextPageID  uint64
+	NextBlobID  uint64
+	Pages       []pageMapping
+	Blobs       []blobMapping
 	CLOGEntries []clogEntry
+	Stats       []segmentStatEntry
 }
 
 type pageMapping struct {
@@ -46,7 +47,7 @@ type clogEntry struct {
 
 // ─── Checkpoint header layout ───────────────────────────────────────
 //
-// [0:1]   byte    Version (1 = current)
+// [0:1]   byte    Version (2 = current, with stats)
 // [1:9]   uint64  LSN
 // [9:17]  uint64  NextXID
 // [17:25] uint64  RootPageID
@@ -55,12 +56,13 @@ type clogEntry struct {
 // [41:45] uint32  PageCount
 // [45:49] uint32  BlobCount
 // [49:53] uint32  CLOGCount
-// [53:57] uint32  reserved (padding)
+// [53:57] uint32  StatsCount (v2: was reserved)
+// [57:61] uint32  reserved
 //
-// Total header: 57 bytes
+// Total header: 61 bytes
 
-const checkpointHeaderSize = 57
-const checkpointVersion = 1
+const checkpointHeaderSize = 61
+const checkpointVersion = 2
 
 // ─── Store.Checkpoint ───────────────────────────────────────────────
 
@@ -219,13 +221,15 @@ func serializeCheckpoint(data *checkpointData) []byte {
 	pageCount := uint32(len(data.Pages))
 	blobCount := uint32(len(data.Blobs))
 	clogCount := uint32(len(data.CLOGEntries))
+	statsCount := uint32(len(data.Stats))
 
 	// Calculate total size:
-	// header(57) + pages(16 each) + blobs(20 each) + clog(9 each) + crc(4)
+	// header(61) + pages(16 each) + blobs(20 each) + clog(9 each) + stats(20 each) + crc(4)
 	totalSize := checkpointHeaderSize +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
+		int(statsCount)*20 +
 		4 // trailing CRC32
 
 	buf := make([]byte, totalSize)
@@ -249,6 +253,8 @@ func serializeCheckpoint(data *checkpointData) []byte {
 	binary.LittleEndian.PutUint32(buf[off:], blobCount)
 	off += 4
 	binary.LittleEndian.PutUint32(buf[off:], clogCount)
+	off += 4
+	binary.LittleEndian.PutUint32(buf[off:], statsCount)
 	off += 4
 	// reserved padding
 	binary.LittleEndian.PutUint32(buf[off:], 0)
@@ -278,6 +284,16 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off += 8
 		buf[off] = c.Status
 		off++
+	}
+
+	// Stats entries (statsCount already written in header at offset 53)
+	for _, e := range data.Stats {
+		binary.LittleEndian.PutUint32(buf[off:], e.SegID)
+		off += 4
+		binary.LittleEndian.PutUint64(buf[off:], e.AliveCount)
+		off += 8
+		binary.LittleEndian.PutUint64(buf[off:], e.AliveBytes)
+		off += 8
 	}
 
 	// CRC32-C over everything before the CRC field (includes version byte)
@@ -340,14 +356,17 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 	off += 4
 	clogCount := binary.LittleEndian.Uint32(buf[off:])
 	off += 4
-	// skip reserved
+	statsCount := binary.LittleEndian.Uint32(buf[off:])
+	off += 4
+	// skip reserved padding
 	off += 4
 
-	// Validate size
+	// Validate size (v2 format: header=61, stats=20 bytes/entry)
 	expected := checkpointHeaderSize +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
+		int(statsCount)*20 +
 		4
 	if len(buf) != expected {
 		return nil, fmt.Errorf("checkpoint: size mismatch (got %d, expected %d)", len(buf), expected)
@@ -380,6 +399,17 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off += 8
 		data.CLOGEntries[i].Status = buf[off]
 		off++
+	}
+
+	// Stats entries
+	data.Stats = make([]segmentStatEntry, statsCount)
+	for i := range data.Stats {
+		data.Stats[i].SegID = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		data.Stats[i].AliveCount = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.Stats[i].AliveBytes = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
 	}
 
 	return data, nil
