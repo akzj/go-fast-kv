@@ -131,6 +131,26 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 		stopCh:          make(chan struct{}),
 	}
 
+	// Load existing SSTables into memtable (recovery from previous close).
+	// Without this, reopen creates a fresh empty memtable and loses all
+	// page/blob mappings written by the previous session's lsm.Close().
+	// Load existing SSTables into memtable (recovery from previous close).
+	// Without this, reopen creates a fresh empty memtable and loses all
+	// page/blob mappings written by the previous session's lsm.Close().
+	for _, seg := range manifest.Segments() {
+		path := filepath.Join(cfg.Dir, seg)
+		pages, blobs, err := readSSTable(path)
+		if err != nil {
+			continue
+		}
+		for _, p := range pages {
+			s.active.SetPageMapping(p.key, p.value)
+		}
+		for _, b := range blobs {
+			s.active.SetBlobMapping(b.key, b.value, b.size)
+		}
+	}
+
 	// Start background compaction goroutine
 	go s.backgroundCompaction()
 
@@ -464,22 +484,29 @@ func (s *lsm) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.active.Size() > 0 {
-		var pageEntries, blobEntries []sstEntry
-		s.active.RangePages(func(pageID uint64, vaddr uint64) bool {
-			pageEntries = append(pageEntries, sstEntry{key: pageID, value: vaddr})
-			return true
-		})
-		s.active.RangeBlobs(func(blobID uint64, vaddr uint64, size uint32) bool {
-			blobEntries = append(blobEntries, sstEntry{key: blobID, value: vaddr, size: size})
-			return true
-		})
+	// Collect all entries from active memtable.
+	// NOTE: Do NOT use s.active.Size() > 0 as a guard — the size counter
+	// can go negative due to update/delete accounting, even when entries exist.
+	var pageEntries, blobEntries []sstEntry
+	s.active.RangePages(func(pageID uint64, vaddr uint64) bool {
+		pageEntries = append(pageEntries, sstEntry{key: pageID, value: vaddr})
+		return true
+	})
+	s.active.RangeBlobs(func(blobID uint64, vaddr uint64, size uint32) bool {
+		blobEntries = append(blobEntries, sstEntry{key: blobID, value: vaddr, size: size})
+		return true
+	})
 
+	if len(pageEntries) > 0 || len(blobEntries) > 0 {
 		segID := s.manifest.NextID()
 		segName := fmt.Sprintf("segment-%03d.sst", segID)
 		segPath := filepath.Join(s.dir, segName)
-		writeSSTable(segPath, pageEntries, blobEntries)
-		s.manifest.AddSegment(segName)
+		if err := writeSSTable(segPath, pageEntries, blobEntries); err != nil {
+			return err
+		}
+		if err := s.manifest.AddSegment(segName); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -589,6 +616,19 @@ func (s *lsm) ApplyBlobDelete(blobID uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.active.DeleteBlobMapping(blobID)
+}
+
+func (s *lsm) SetCheckpointLSN(lsn uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checkpointLSN = lsn
+}
+
+// DrainCollector retrieves and clears the current goroutine's WAL collector.
+// Used by kvstore.assembleBatchFromCollectors to add LSM entries to the WAL batch
+// with ModuleLSM module type.
+func (s *lsm) DrainCollector() []walapi.Record {
+	return getAndClearLSMWALCollector()
 }
 
 // NewRecoveryStore creates a recovery store.

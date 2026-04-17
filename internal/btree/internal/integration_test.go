@@ -11,7 +11,6 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
-	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 

@@ -22,7 +22,6 @@ import (
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 	"github.com/akzj/go-fast-kv/internal/wal"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
-	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
 
 // ─── Test environment ───────────────────────────────────────────────

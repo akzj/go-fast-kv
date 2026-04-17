@@ -323,9 +323,11 @@ func (s *store) Put(key, value []byte) error {
 
 	// Register per-operation WAL collectors (goroutine-keyed).
 	// WritePage/WriteBlob route entries here via goroutine ID.
-	pageCollector, unregPage := s.provider.RegisterCollector()
+	// Note: LSM's registerLSMWALCollector is idempotent — SetPageMapping inside
+	// tree.Put will use the same collector, not create a new one.
+	_, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
-	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	_, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
 
 	// Start SSI-aware transaction if configured
@@ -360,7 +362,7 @@ func (s *store) Put(key, value []byte) error {
 	// We write the commit record to WAL BEFORE updating CLOG in memory,
 	// so the entry remains invisible until WAL succeeds.
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
+	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
 
 	// WAL fsync provides durability. If this fails, abort the transaction
 	// so the entry never becomes visible.
@@ -523,9 +525,9 @@ func (s *store) Delete(key []byte) error {
 	}
 
 	// Register per-operation WAL collectors (goroutine-keyed).
-	pageCollector, unregPage := s.provider.RegisterCollector()
+	_, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
-	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	_, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
 
 	// Start SSI-aware transaction if configured
@@ -561,7 +563,7 @@ func (s *store) Delete(key []byte) error {
 
 	// Build WAL commit entry manually. Write WAL BEFORE committing in CLOG.
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
+	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
 
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		if ssiTxn != nil {
@@ -679,11 +681,21 @@ func (s *store) CommitWithXID(xid uint64) error {
 
 	// Build WAL batch with page mappings + transaction commit record.
 	batch := walapi.NewBatch()
+	// Page entries → ModuleLSM (LSM handles page→vaddr mapping persistence)
 	for _, e := range pageEntries {
-		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
+	// Blob entries → ModuleLSM (LSM handles blob→vaddr mapping persistence)
 	for _, e := range blobEntries {
-		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	// LSM collector: entries from SetPageMapping/SetBlobMapping during this transaction
+	// Drain via LSMLifecycle interface and add as ModuleLSM records.
+	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+	if lsm := psRecovery.LSMLifecycle(); lsm != nil {
+		for _, rec := range lsm.DrainCollector() {
+			batch.Records = append(batch.Records, rec)
+		}
 	}
 	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
 	batch.Add(walapi.ModuleTree, walapi.RecordTxnCommit, xid, 0, 0)
@@ -1043,28 +1055,46 @@ func (s *store) checkAutoVacuum() {
 
 // assembleBatchFromCollectors builds a WAL batch from per-operation collectors.
 // This replaces the old assembleBatch that drained shared buffers.
+//
+// lsmRecovery is the PageStore's LSM lifecycle interface. It provides access to
+// the goroutine-local WAL collector (populated by SetPageMapping/SetBlobMapping
+// calls) via DrainCollector(), and we add those entries as ModuleLSM records.
 func assembleBatchFromCollectors(
-	pageCollector *btree.WALCollector,
-	blobCollector *blobCollector,
+	provider *btree.RealPageProvider,
+	blobAdapter *blobWriterAdapter,
+	lsmRecovery pagestoreapi.LSMLifecycle,
 	rootPageID uint64,
 	commitEntry txnapi.WALEntry,
 ) *walapi.Batch {
 	batch := walapi.NewBatch()
 
-	// Page WAL entries
-	for _, e := range pageCollector.PageEntries {
-		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	// Drain collectors AFTER tree.Put completes (inside this function, not before).
+	// The btree collector was populated during tree.Put → WritePage.
+	pageEntries := provider.CollectAndClear()
+	blobEntries := blobAdapter.CollectAndClear()
+
+	// Page WAL entries → ModuleLSM (LSM handles page→vaddr mapping persistence)
+	for _, e := range pageEntries {
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
-	// Blob WAL entries
-	for _, e := range blobCollector.Entries {
-		batch.Add(walapi.ModuleTree, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	// Blob WAL entries → ModuleLSM (LSM handles blob→vaddr mapping persistence)
+	for _, e := range blobEntries {
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
 	}
 
-	// Root pointer change
+	// LSM collector: entries collected by SetPageMapping/SetBlobMapping during this operation
+	// Drain and add as ModuleLSM so recovery can replay them.
+	if lsmRecovery != nil {
+		for _, rec := range lsmRecovery.DrainCollector() {
+			batch.Records = append(batch.Records, rec)
+		}
+	}
+
+	// Root pointer change → ModuleTree (btree root)
 	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
 
-	// Transaction commit/abort
+	// Transaction commit/abort → ModuleTree
 	batch.Add(walapi.ModuleTree, walapi.RecordType(commitEntry.Type), commitEntry.ID, 0, 0)
 
 	return batch
@@ -1246,9 +1276,11 @@ func (wb *writeBatch) Commit() error {
 	}
 
 	// Register per-operation WAL collectors (goroutine-keyed).
-	pageCollector, unregPage := s.provider.RegisterCollector()
+	// LSM's registerLSMWALCollector is idempotent — SetPageMapping inside
+	// tree.Put uses the same collector, not a new one.
+	_, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
-	blobCollector, unregBlob := s.blobAdapter.registerCollector()
+	_, unregBlob := s.blobAdapter.registerCollector()
 	defer unregBlob()
 
 	// Start transaction (SSI or regular)
@@ -1292,7 +1324,7 @@ func (wb *writeBatch) Commit() error {
 	// checks CLOG, and xid is still InProgress. This guarantees atomicity:
 	// readers see either all entries (after Commit) or none (before Commit).
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
-	batch := assembleBatchFromCollectors(pageCollector, blobCollector, rootPageID, commitWALEntry)
+	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		if ssiTxn != nil {
 			ssiTxn.Abort()

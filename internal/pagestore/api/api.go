@@ -10,6 +10,8 @@ package pagestoreapi
 
 import (
 	"errors"
+
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -169,13 +171,18 @@ type PageStoreRecovery interface {
 }
 
 // LSMLifecycle represents the LSM store's recovery surface.
-// Used by recovery.go to route ModuleLSM WAL records.
+// Used by recovery.go to route ModuleLSM WAL records and by CommitWithXID
+// to drain the LSM collector into the WAL batch.
 type LSMLifecycle interface {
 	ApplyPageMapping(pageID uint64, vaddr uint64)
 	ApplyPageDelete(pageID uint64)
 	ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32)
 	ApplyBlobDelete(blobID uint64)
 	SetCheckpointLSN(lsn uint64)
+	FlushToWAL() (lastLSN uint64, err error)
+	// DrainCollector retrieves and clears the per-goroutine WAL collector.
+	// Used by kvstore.CommitWithXID to include LSM entries in the WAL batch.
+	DrainCollector() []walapi.Record
 }
 
 // ─── Config ─────────────────────────────────────────────────────────

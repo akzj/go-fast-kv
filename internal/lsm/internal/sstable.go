@@ -52,7 +52,6 @@ func writeSSTable(path string, pageMappings []sstEntry, blobMappings []sstEntry)
 	if err != nil {
 		return fmt.Errorf("create sst: %w", err)
 	}
-	defer f.Close()
 
 	// Sort entries by key
 	sort.Slice(pageMappings, func(i, j int) bool {
@@ -121,6 +120,13 @@ func writeSSTable(path string, pageMappings []sstEntry, blobMappings []sstEntry)
 		}
 	}
 
+	// Fsync to ensure SSTable data is durable before close.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sst sync: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("sst close: %w", err)
+	}
 	return nil
 }
 

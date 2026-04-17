@@ -230,7 +230,16 @@ func (ps *pageStore) NextPageID() pagestoreapi.PageID {
 func (ps *pageStore) Close() error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if ps.closed {
+		return nil
+	}
 	ps.closed = true
+	// Flush LSM memtable to SSTable before closing.
+	// Without this, the in-memory memtable data is lost on close,
+	// causing "page not found" after reopen (LSM has no SSTable data to read).
+	if err := ps.lsm.Close(); err != nil {
+		return err
+	}
 	if ps.cache != nil {
 		ps.cache.Clear()
 	}

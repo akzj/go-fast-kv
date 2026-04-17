@@ -7,7 +7,7 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
-	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
 // newTestSegMgr creates a real SegmentManager in a temp directory.
@@ -26,7 +26,7 @@ func newTestSegMgr(t *testing.T) segmentapi.SegmentManager {
 func newTestPageStore(t *testing.T) *pageStore {
 	t.Helper()
 	segMgr := newTestSegMgr(t)
-	ps := New(pagestoreapi.Config{}, segMgr)
+	ps := New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	return ps.(*pageStore)
 }
 
@@ -221,7 +221,7 @@ func TestWALEntryValues(t *testing.T) {
 
 func TestRecoveryLoadMapping(t *testing.T) {
 	segMgr := newTestSegMgr(t)
-	ps := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 
 	// Write a page to get a real VAddr
 	pid := ps.Alloc()
@@ -232,7 +232,7 @@ func TestRecoveryLoadMapping(t *testing.T) {
 	}
 
 	// Create a new PageStore and recover via LoadMapping
-	ps2 := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps2 := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 	recovery := pagestoreapi.PageStoreRecovery(ps2)
 	recovery.LoadMapping([]pagestoreapi.MappingEntry{
 		{PageID: pid, VAddr: walEntry.VAddr},
@@ -250,7 +250,7 @@ func TestRecoveryLoadMapping(t *testing.T) {
 
 func TestRecoveryApplyPageMap(t *testing.T) {
 	segMgr := newTestSegMgr(t)
-	ps := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 
 	// Write a page
 	pid := ps.Alloc()
@@ -261,7 +261,7 @@ func TestRecoveryApplyPageMap(t *testing.T) {
 	}
 
 	// New PageStore, apply via ApplyPageMap
-	ps2 := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps2 := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 	recovery := pagestoreapi.PageStoreRecovery(ps2)
 	recovery.ApplyPageMap(pid, walEntry.VAddr)
 	recovery.SetNextPageID(pid + 1)
@@ -277,7 +277,7 @@ func TestRecoveryApplyPageMap(t *testing.T) {
 
 func TestRecoveryApplyPageFree(t *testing.T) {
 	segMgr := newTestSegMgr(t)
-	ps := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 
 	// Write a page
 	pid := ps.Alloc()
@@ -288,7 +288,7 @@ func TestRecoveryApplyPageFree(t *testing.T) {
 	}
 
 	// New PageStore, load then free
-	ps2 := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps2 := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 	recovery := pagestoreapi.PageStoreRecovery(ps2)
 	recovery.ApplyPageMap(pid, walEntry.VAddr)
 	recovery.ApplyPageFree(pid)

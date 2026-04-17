@@ -59,6 +59,7 @@ func (s *store) recover() error {
 	// page→VAddr mappings written before the checkpoint are also restored.
 	// (LSM entries are ModuleLSM; blob/tree entries are ModuleTree or Type=0.)
 	err = s.wal.Replay(afterLSN, func(r walapi.Record) error {
+
 		switch r.ModuleType {
 		case walapi.ModuleTree, 0: // ModuleTree or legacy records
 			switch r.Type {

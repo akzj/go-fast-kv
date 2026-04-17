@@ -16,7 +16,6 @@ import (
 	"github.com/akzj/go-fast-kv/internal/pagestore"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	"github.com/akzj/go-fast-kv/internal/wal"
-	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────

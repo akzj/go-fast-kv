@@ -162,29 +162,38 @@ func (w *wal) convertOldWAL(oldPath string) error {
 }
 
 // findOrCreateActiveSegment finds an existing active segment or creates a new one.
-// If segments exist, it replays them to find the current LSN.
+// For closed segments, endLSN from the filename is used.
+// For the active segment, we replay it (fn=nil) to discover the actual currentLSN,
+// since the active segment's endLSN is 0 (unknown until read).
+// This replay is safe: fn=nil means no records are delivered to the caller;
+// s.recover() will later call Replay() which resets currentLSN and replays again.
 func (w *wal) findOrCreateActiveSegment() error {
 	segments := w.listSegmentsInternal()
 	if len(segments) == 0 {
 		return w.createNewSegment()
 	}
 
-	// Replay all segments to find current LSN
+	// Track currentLSN from closed segment metadata.
 	for _, seg := range segments {
-		f, err := os.Open(seg.path)
-		if err != nil {
-			return fmt.Errorf("wal: open segment %s: %w", seg.name, err)
+		if !seg.isActive && seg.endLSN > w.currentLSN {
+			w.currentLSN = seg.endLSN
 		}
-		if err := w.replaySegment(f, 0, nil); err != nil {
-			f.Close()
-			return fmt.Errorf("wal: replay segment %s: %w", seg.name, err)
-		}
-		f.Close()
 	}
 
-	// Find and open the active segment
 	for _, seg := range segments {
 		if seg.isActive {
+			// Replay active segment to find actual currentLSN.
+			rf, err := os.Open(seg.path)
+			if err != nil {
+				return fmt.Errorf("wal: open active segment for replay: %w", err)
+			}
+			if err := w.replaySegment(rf, 0, nil); err != nil {
+				rf.Close()
+				return fmt.Errorf("wal: replay active segment: %w", err)
+			}
+			rf.Close()
+
+			// Open for append writes.
 			f, err := os.OpenFile(seg.path, os.O_APPEND|os.O_RDWR, 0644)
 			if err != nil {
 				return fmt.Errorf("wal: open active segment: %w", err)
@@ -194,8 +203,6 @@ func (w *wal) findOrCreateActiveSegment() error {
 			return nil
 		}
 	}
-
-	// No active segment found - create one
 	return w.createNewSegment()
 }
 
@@ -497,6 +504,11 @@ func (w *wal) Replay(afterLSN uint64, fn func(walapi.Record) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Reset currentLSN so ALL records with LSN > afterLSN are replayed.
+	// Without this, records from the current segment are skipped if a previous
+	// Replay call already set currentLSN to the segment's end.
+	w.currentLSN = 0
+
 	segments := w.listSegmentsInternal()
 	if len(segments) == 0 {
 		return nil
@@ -573,7 +585,6 @@ func (w *wal) replaySegment(f *os.File, afterLSN uint64, fn func(walapi.Record) 
 			}
 		}
 	}
-
 	return nil
 }
 

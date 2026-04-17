@@ -55,7 +55,10 @@ func newManifest(dir string) (*manifest, error) {
 	return m, nil
 }
 
-// AddSegment adds a segment to the manifest.
+// AddSegment adds a segment to the manifest synchronously.
+// Unlike NextID (which saves async), this waits for the file system
+// to acknowledge the update before returning. Called during LSM close
+// when data durability is critical.
 func (m *manifest) AddSegment(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

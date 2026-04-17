@@ -26,7 +26,7 @@ func openChecksumTestStore(t *testing.T) (*pageStore, segmentapi.SegmentManager,
 	if err != nil {
 		t.Fatal(err)
 	}
-	ps := New(pagestoreapi.Config{}, segMgr).(*pageStore)
+	ps := New(pagestoreapi.Config{}, segMgr, newMockLSM()).(*pageStore)
 	return ps, segMgr, segDir
 }
 
