@@ -32,6 +32,8 @@ func openChecksumTestStore(t *testing.T) (*pageStore, segmentapi.SegmentManager,
 
 // TestChecksum_WriteReadVerify writes a page and reads it back,
 // verifying the CRC32 checksum passes transparently.
+
+
 func TestChecksum_WriteReadVerify(t *testing.T) {
 	ps, segMgr, _ := openChecksumTestStore(t)
 	defer segMgr.Close()
@@ -219,7 +221,7 @@ func TestChecksum_RecordFormat(t *testing.T) {
 
 	// Read the raw record from segment
 	ps.mu.Lock()
-	packed := ps.getMapping(pageID)
+	// getMapping removed: LSM handles page→VAddr internally
 	ps.mu.Unlock()
 
 	vaddr := segmentapi.UnpackVAddr(packed)

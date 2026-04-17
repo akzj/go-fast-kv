@@ -22,6 +22,7 @@ import (
 	vacuumapi "github.com/akzj/go-fast-kv/internal/vacuum/api"
 	"github.com/akzj/go-fast-kv/internal/wal"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
 
 // ─── Test environment ───────────────────────────────────────────────
@@ -90,7 +91,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 
-	ps := pagestore.New(pagestoreapi.Config{}, pageSegMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, pageSegMgr, newMockLSM())
 	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
 	tm := txnmod.New()
 	provider := btree.NewRealPageProvider(ps, 0)
@@ -294,6 +295,38 @@ func (env *testEnv) countLeaves(t *testing.T) int {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 // Test 1: Empty tree returns ErrNoLeaves
+
+// mockLSMForTests is a simple in-memory LSM MappingStore for tests.
+type mockLSMForTests struct {
+	pages map[uint64]uint64
+	blobs map[uint64]struct{ vaddr uint64; size uint32 }
+}
+
+func newMockLSM() *mockLSMForTests {
+	return &mockLSMForTests{pages: make(map[uint64]uint64), blobs: make(map[uint64]struct{ vaddr uint64; size uint32 })}
+}
+
+func (m *mockLSMForTests) SetPageMapping(pageID uint64, vaddr uint64) { m.pages[pageID] = vaddr }
+func (m *mockLSMForTests) GetPageMapping(pageID uint64) (uint64, bool) {
+	v, ok := m.pages[pageID]
+	return v, ok
+}
+func (m *mockLSMForTests) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+}
+func (m *mockLSMForTests) GetBlobMapping(blobID uint64) (uint64, uint32, bool) {
+	b, ok := m.blobs[blobID]
+	return b.vaddr, b.size, ok
+}
+func (m *mockLSMForTests) DeleteBlobMapping(blobID uint64) { delete(m.blobs, blobID) }
+func (m *mockLSMForTests) SetWAL(wal walapi.WAL) {}
+func (m *mockLSMForTests) FlushToWAL() (uint64, error) { return 0, nil }
+func (m *mockLSMForTests) LastLSN() uint64 { return 0 }
+func (m *mockLSMForTests) Checkpoint(lsn uint64) error { return nil }
+func (m *mockLSMForTests) CheckpointLSN() uint64 { return 0 }
+func (m *mockLSMForTests) MaybeCompact() error { return nil }
+func (m *mockLSMForTests) Close() error { return nil }
+
 func TestVacuum_EmptyTree(t *testing.T) {
 	env := setupTestEnv(t)
 	v := env.newVacuum()

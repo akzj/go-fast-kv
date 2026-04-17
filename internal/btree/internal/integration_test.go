@@ -11,6 +11,8 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -33,7 +35,7 @@ func setupReal(t *testing.T) *realSetup {
 		t.Fatalf("segment.New: %v", err)
 	}
 
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	provider := NewRealPageProvider(ps, 0)
 	tree := New(btreeapi.Config{}, provider, nil)
 
@@ -74,7 +76,7 @@ func (s *realSetup) reopen(t *testing.T) *realSetup {
 		t.Fatalf("segment.New (reopen): %v", err)
 	}
 
-	ps2 := pagestore.New(pagestoreapi.Config{}, segMgr2)
+	ps2 := pagestore.New(pagestoreapi.Config{}, segMgr2, newMockLSM())
 	recovery := ps2.(pagestoreapi.PageStoreRecovery)
 
 	// Replay WAL entries to restore the mapping table
@@ -116,6 +118,35 @@ func assertEqual(t *testing.T, expected, actual []byte, msg string) {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
+
+
+// mockLSMForTests is a simple in-memory LSM MappingStore for tests.
+type mockLSMForTests struct {
+	pages map[uint64]uint64
+	blobs map[uint64]struct{ vaddr uint64; size uint32 }
+}
+func newMockLSM() *mockLSMForTests {
+	return &mockLSMForTests{pages: make(map[uint64]uint64), blobs: make(map[uint64]struct{ vaddr uint64; size uint32 })}
+}
+func (m *mockLSMForTests) SetPageMapping(pageID uint64, vaddr uint64) { m.pages[pageID] = vaddr }
+func (m *mockLSMForTests) GetPageMapping(pageID uint64) (uint64, bool) {
+	v, ok := m.pages[pageID]; return v, ok
+}
+func (m *mockLSMForTests) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+}
+func (m *mockLSMForTests) GetBlobMapping(blobID uint64) (uint64, uint32, bool) {
+	b, ok := m.blobs[blobID]; return b.vaddr, b.size, ok
+}
+func (m *mockLSMForTests) DeleteBlobMapping(blobID uint64) { delete(m.blobs, blobID) }
+func (m *mockLSMForTests) SetWAL(wal walapi.WAL) {}
+func (m *mockLSMForTests) FlushToWAL() (uint64, error) { return 0, nil }
+func (m *mockLSMForTests) LastLSN() uint64 { return 0 }
+func (m *mockLSMForTests) Checkpoint(lsn uint64) error { return nil }
+func (m *mockLSMForTests) CheckpointLSN() uint64 { return 0 }
+func (m *mockLSMForTests) MaybeCompact() error { return nil }
+func (m *mockLSMForTests) Close() error { return nil }
+
 
 func TestIntegrationPutGet(t *testing.T) {
 	s := setupReal(t)

@@ -14,8 +14,9 @@ import (
 // Called during Open.
 //
 // Recovery flow (DESIGN.md §3.6):
-//  1. Load checkpoint (if exists) → restore mappings, CLOG, nextXID, rootPageID
-//  2. Replay WAL after checkpoint LSN (or from 0 if no checkpoint)
+//  1. Load checkpoint (if exists) → restore CLOG, nextXID, nextPageID, nextBlobID
+//  2. Replay WAL entries from beginning (LSN 0) to restore all page→VAddr mappings
+//     via LSM's in-memory state (SSTables rebuilt from disk by RecoveryStore.Build)
 //  3. MarkInProgressAsAborted → any in-flight txn at crash is aborted
 //  4. Set btree root
 func (s *store) recover() error {
@@ -24,6 +25,7 @@ func (s *store) recover() error {
 	// Recovery interfaces for PageStore and BlobStore
 	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
 	bsRecovery := s.blobStore.(blobstoreapi.BlobStoreRecovery)
+	lsmRecovery := psRecovery.LSMLifecycle()
 
 	var afterLSN uint64
 	var rootPageID uint64
@@ -34,53 +36,68 @@ func (s *store) recover() error {
 		if !os.IsNotExist(err) {
 			return err
 		}
-		// No checkpoint — replay WAL from the very beginning (LSN 0).
-		// afterLSN=0 means Replay will process all records with LSN > 0,
-		// which is every record in the WAL.
+		// No checkpoint — replay WAL from the beginning (LSN 0).
 		afterLSN = 0
 		rootPageID = 0
 		maxTxnXID = 0
 	} else {
-		// Checkpoint exists — restore state from it, then replay WAL
-		// for records after the checkpoint LSN.
-		psRecovery.LoadMapping(cpData.toPageMappings())
+		// Checkpoint exists — restore state from it.
+		// Page→VAddr mappings: no longer in checkpoint file (LSM handles persistence).
+		// CLOG, XID, page IDs, blob IDs, root: still restored from checkpoint.
 		psRecovery.SetNextPageID(cpData.NextPageID)
-
 		bsRecovery.LoadMapping(cpData.toBlobMappings())
 		bsRecovery.SetNextBlobID(cpData.NextBlobID)
-
 		s.txnMgr.LoadCLOG(cpData.toCLOGEntries())
 		s.txnMgr.SetNextXID(cpData.NextXID)
-
 		afterLSN = cpData.LSN
 		rootPageID = cpData.RootPageID
 		maxTxnXID = cpData.NextXID
+		lsmRecovery.SetCheckpointLSN(cpData.LSN)
 	}
 
-	// Replay WAL after the checkpoint LSN (or from 0 if no checkpoint).
+	// Replay WAL entries. We always replay from beginning (afterLSN=0) so that
+	// page→VAddr mappings written before the checkpoint are also restored.
+	// (LSM entries are ModuleLSM; blob/tree entries are ModuleTree or Type=0.)
 	err = s.wal.Replay(afterLSN, func(r walapi.Record) error {
-		switch r.Type {
-		case walapi.RecordPageMap:
-			psRecovery.ApplyPageMap(r.ID, r.VAddr)
-			s.updateNextPageID(psRecovery, r.ID)
-		case walapi.RecordPageFree:
-			psRecovery.ApplyPageFree(r.ID)
-		case walapi.RecordBlobMap:
-			bsRecovery.ApplyBlobMap(r.ID, r.VAddr, r.Size)
-			s.updateNextBlobID(bsRecovery, r.ID)
-		case walapi.RecordBlobFree:
-			bsRecovery.ApplyBlobFree(r.ID)
-		case walapi.RecordSetRoot:
-			rootPageID = r.ID
-		case walapi.RecordTxnCommit:
-			s.txnMgr.CLOG().Set(r.ID, txnapi.TxnCommitted)
-			if r.ID >= maxTxnXID {
-				maxTxnXID = r.ID + 1
+		switch r.ModuleType {
+		case walapi.ModuleTree, 0: // ModuleTree or legacy records
+			switch r.Type {
+			case walapi.RecordPageMap:
+				// Old page map record — apply to LSM
+				lsmRecovery.ApplyPageMapping(r.ID, r.VAddr)
+				s.updateNextPageID(psRecovery, r.ID)
+			case walapi.RecordPageFree:
+				lsmRecovery.ApplyPageDelete(r.ID)
+			case walapi.RecordBlobMap:
+				bsRecovery.ApplyBlobMap(r.ID, r.VAddr, r.Size)
+				s.updateNextBlobID(bsRecovery, r.ID)
+			case walapi.RecordBlobFree:
+				bsRecovery.ApplyBlobFree(r.ID)
+			case walapi.RecordSetRoot:
+				rootPageID = r.ID
+			case walapi.RecordTxnCommit:
+				s.txnMgr.CLOG().Set(r.ID, txnapi.TxnCommitted)
+				if r.ID >= maxTxnXID {
+					maxTxnXID = r.ID + 1
+				}
+			case walapi.RecordTxnAbort:
+				s.txnMgr.CLOG().Set(r.ID, txnapi.TxnAborted)
+				if r.ID >= maxTxnXID {
+					maxTxnXID = r.ID + 1
+				}
 			}
-		case walapi.RecordTxnAbort:
-			s.txnMgr.CLOG().Set(r.ID, txnapi.TxnAborted)
-			if r.ID >= maxTxnXID {
-				maxTxnXID = r.ID + 1
+		case walapi.ModuleLSM:
+			// New LSM page/blob mapping records
+			switch r.Type {
+			case walapi.RecordPageMap:
+				lsmRecovery.ApplyPageMapping(r.ID, r.VAddr)
+				s.updateNextPageID(psRecovery, r.ID)
+			case walapi.RecordPageFree:
+				lsmRecovery.ApplyPageDelete(r.ID)
+			case walapi.RecordBlobMap:
+				lsmRecovery.ApplyBlobMapping(r.ID, r.VAddr, r.Size)
+			case walapi.RecordBlobFree:
+				lsmRecovery.ApplyBlobDelete(r.ID)
 			}
 		}
 		return nil

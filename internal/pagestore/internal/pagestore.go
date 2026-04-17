@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"sync"
 
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 )
@@ -16,10 +17,6 @@ var (
 	_ pagestoreapi.PageStore         = (*pageStore)(nil)
 	_ pagestoreapi.PageStoreRecovery = (*pageStore)(nil)
 )
-
-const defaultInitialCapacity = 1024
-
-// ─── LRU Cache ───────────────────────────────────────────────────────
 
 type lruCache struct {
 	pages   map[uint64]*list.Element
@@ -118,20 +115,16 @@ func (c *lruCache) Clear() {
 type pageStore struct {
 	mu         sync.Mutex
 	segMgr     segmentapi.SegmentManager
-	mapping    []uint64
+	lsm        lsmapi.MappingStore
 	nextPageID uint64
 	closed     bool
 	cache      *lruCache
 }
 
-func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager) pagestoreapi.PageStore {
-	cap := cfg.InitialCapacity
-	if cap <= 0 {
-		cap = defaultInitialCapacity
-	}
+func New(cfg pagestoreapi.Config, segMgr segmentapi.SegmentManager, lsmStore lsmapi.MappingStore) pagestoreapi.PageStore {
 	ps := &pageStore{
 		segMgr:     segMgr,
-		mapping:    make([]uint64, cap),
+		lsm:        lsmStore,
 		nextPageID: 1,
 	}
 	if cfg.PageCacheSize > 0 {
@@ -145,7 +138,6 @@ func (ps *pageStore) Alloc() pagestoreapi.PageID {
 	defer ps.mu.Unlock()
 	id := ps.nextPageID
 	ps.nextPageID++
-	ps.ensureCapacity(id)
 	return id
 }
 
@@ -174,8 +166,8 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 		return pagestoreapi.WALEntry{}, err
 	}
 	packed := vaddr.Pack()
-	ps.ensureCapacity(pageID)
-	ps.mapping[pageID] = packed
+	// LSM handles page mapping persistence (with WAL integration)
+	ps.lsm.SetPageMapping(uint64(pageID), packed)
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
@@ -195,13 +187,12 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 		ps.mu.Unlock()
 		return nil, pagestoreapi.ErrClosed
 	}
-	packed := ps.getMapping(pageID)
+	vaddr, ok := ps.lsm.GetPageMapping(uint64(pageID))
 	ps.mu.Unlock()
-	if packed == 0 {
+	if !ok {
 		return nil, pagestoreapi.ErrPageNotFound
 	}
-	vaddr := segmentapi.UnpackVAddr(packed)
-	raw, err := ps.segMgr.ReadAt(vaddr, pagestoreapi.PageRecordSize)
+	raw, err := ps.segMgr.ReadAt(segmentapi.UnpackVAddr(vaddr), pagestoreapi.PageRecordSize)
 	if err != nil {
 		return nil, err
 	}
@@ -222,9 +213,8 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 func (ps *pageStore) Free(pageID pagestoreapi.PageID) pagestoreapi.WALEntry {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if pageID < uint64(len(ps.mapping)) {
-		ps.mapping[pageID] = 0
-	}
+	// Mark page as deleted in LSM (value = 0 signals deleted)
+	ps.lsm.SetPageMapping(uint64(pageID), 0)
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
@@ -251,8 +241,7 @@ func (ps *pageStore) LoadMapping(entries []pagestoreapi.MappingEntry) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	for _, e := range entries {
-		ps.ensureCapacity(e.PageID)
-		ps.mapping[e.PageID] = e.VAddr
+		ps.lsm.SetPageMapping(e.PageID, e.VAddr)
 	}
 	if ps.cache != nil {
 		ps.cache.Clear()
@@ -260,22 +249,14 @@ func (ps *pageStore) LoadMapping(entries []pagestoreapi.MappingEntry) {
 }
 
 func (ps *pageStore) ExportMapping() []pagestoreapi.MappingEntry {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	var entries []pagestoreapi.MappingEntry
-	for i, v := range ps.mapping {
-		if v != 0 {
-			entries = append(entries, pagestoreapi.MappingEntry{PageID: uint64(i), VAddr: v})
-		}
-	}
-	return entries
+	// LSM handles its own persistence — checkpoint no longer serializes page mapping.
+	return nil
 }
 
 func (ps *pageStore) ApplyPageMap(pageID pagestoreapi.PageID, vaddr uint64) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	ps.ensureCapacity(pageID)
-	ps.mapping[pageID] = vaddr
+	ps.lsm.SetPageMapping(uint64(pageID), vaddr)
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
@@ -284,9 +265,7 @@ func (ps *pageStore) ApplyPageMap(pageID pagestoreapi.PageID, vaddr uint64) {
 func (ps *pageStore) ApplyPageFree(pageID pagestoreapi.PageID) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if pageID < uint64(len(ps.mapping)) {
-		ps.mapping[pageID] = 0
-	}
+	ps.lsm.SetPageMapping(uint64(pageID), 0)
 	if ps.cache != nil {
 		ps.cache.Invalidate(uint64(pageID))
 	}
@@ -298,21 +277,10 @@ func (ps *pageStore) SetNextPageID(nextID pagestoreapi.PageID) {
 	ps.nextPageID = nextID
 }
 
-func (ps *pageStore) ensureCapacity(pageID uint64) {
-	for pageID >= uint64(len(ps.mapping)) {
-		newCap := len(ps.mapping) * 2
-		if newCap == 0 {
-			newCap = defaultInitialCapacity
-		}
-		grown := make([]uint64, newCap)
-		copy(grown, ps.mapping)
-		ps.mapping = grown
-	}
+// LSMLifecycle returns the LSM store for WAL replay routing.
+// The underlying *lsm implements both MappingStore and LSMLifecycle interfaces.
+func (ps *pageStore) LSMLifecycle() pagestoreapi.LSMLifecycle {
+	return ps.lsm.(pagestoreapi.LSMLifecycle)
 }
 
-func (ps *pageStore) getMapping(pageID uint64) uint64 {
-	if pageID >= uint64(len(ps.mapping)) {
-		return 0
-	}
-	return ps.mapping[pageID]
-}
+

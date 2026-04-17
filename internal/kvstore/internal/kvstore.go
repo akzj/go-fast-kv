@@ -33,6 +33,8 @@ import (
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	"github.com/akzj/go-fast-kv/internal/lock"
+	lsm "github.com/akzj/go-fast-kv/internal/lsm"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	"github.com/akzj/go-fast-kv/internal/pagestore"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	"github.com/akzj/go-fast-kv/internal/segment"
@@ -149,7 +151,8 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	pageSeg := filepath.Join(cfg.Dir, "page_segments")
 	blobSeg := filepath.Join(cfg.Dir, "blob_segments")
 	walDir := filepath.Join(cfg.Dir, "wal")
-	for _, d := range []string{pageSeg, blobSeg, walDir} {
+	lsmDir := filepath.Join(cfg.Dir, "lsm")
+	for _, d := range []string{pageSeg, blobSeg, walDir, lsmDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return nil, err
 		}
@@ -174,8 +177,18 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		return nil, err
 	}
 
+	// Create LSM for PageStore mapping, attach WAL for durability
+	lsmStore, err := lsm.New(lsmapi.Config{Dir: lsmDir})
+	if err != nil {
+		pageSegMgr.Close()
+		blobSegMgr.Close()
+		w.Close()
+		return nil, err
+	}
+	lsmStore.SetWAL(w)
+
 	// Create PageStore and BlobStore
-	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize}, pageSegMgr)
+	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize}, pageSegMgr, lsmStore)
 	bs := blobstore.New(blobstoreapi.Config{}, blobSegMgr)
 
 	// Create TxnManager — use SSI mode if configured

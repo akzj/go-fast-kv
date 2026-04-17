@@ -502,42 +502,7 @@ func NewRecoveryStore(dir string) (*RecoveryStore, error) {
 	return &RecoveryStore{lsm: l}, nil
 }
 
-// ApplyPageMapping applies a page mapping update.
-func (r *RecoveryStore) ApplyPageMapping(pageID uint64, vaddr uint64) {
-	r.lsm.active.SetPageMapping(pageID, vaddr)
-}
-
-// ApplyBlobMapping applies a blob mapping update.
-func (r *RecoveryStore) ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32) {
-	r.lsm.active.SetBlobMapping(blobID, vaddr, size)
-}
-
-// ApplyBlobDelete applies a blob deletion.
-func (r *RecoveryStore) ApplyBlobDelete(blobID uint64) {
-	r.lsm.active.DeleteBlobMapping(blobID)
-}
-
-// ApplyPageDelete applies a page deletion (removes from active memtable).
-// Pages are immutable once written, so this is only for recovery replay.
-func (r *RecoveryStore) ApplyPageDelete(pageID uint64) {
-	r.lsm.active.DeletePageMapping(pageID)
-}
-
-// SetCheckpointLSN sets the checkpoint LSN.
-func (r *RecoveryStore) SetCheckpointLSN(lsn uint64) {
-	r.lsm.mu.Lock()
-	r.lsm.checkpointLSN = lsn
-	r.lsm.mu.Unlock()
-}
-
-// SetNextSegmentID sets the next segment ID for SSTable naming.
-func (r *RecoveryStore) SetNextSegmentID(id uint64) {
-	r.lsm.mu.Lock()
-	r.lsm.manifest.data.NextSegmentID = id
-	r.lsm.mu.Unlock()
-}
-
-// Build rebuilds the in-memory structures.
+// Build rebuilds the in-memory structures from SSTables.
 func (r *RecoveryStore) Build() error {
 	segments := r.lsm.manifest.Segments()
 	for _, seg := range segments {
@@ -555,3 +520,75 @@ func (r *RecoveryStore) Build() error {
 	}
 	return nil
 }
+
+// ApplyPageMapping applies a page mapping update.
+func (r *RecoveryStore) ApplyPageMapping(pageID uint64, vaddr uint64) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.active.SetPageMapping(pageID, vaddr)
+}
+
+// ApplyBlobMapping applies a blob mapping update.
+func (r *RecoveryStore) ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.active.SetBlobMapping(blobID, vaddr, size)
+}
+
+// ApplyBlobDelete applies a blob deletion.
+func (r *RecoveryStore) ApplyBlobDelete(blobID uint64) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.active.DeleteBlobMapping(blobID)
+}
+
+// ApplyPageDelete applies a page deletion.
+func (r *RecoveryStore) ApplyPageDelete(pageID uint64) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.active.DeletePageMapping(pageID)
+}
+
+// SetCheckpointLSN sets the checkpoint LSN.
+func (r *RecoveryStore) SetCheckpointLSN(lsn uint64) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.checkpointLSN = lsn
+}
+
+// SetNextSegmentID sets the next segment ID for SSTable naming.
+func (r *RecoveryStore) SetNextSegmentID(id uint64) {
+	r.lsm.mu.Lock()
+	defer r.lsm.mu.Unlock()
+	r.lsm.manifest.data.NextSegmentID = id
+}
+
+// ─── LSMLifecycle: Recovery surface for WAL replay ───────────────────
+//
+// These methods are on *lsm (not RecoveryStore) so that recovery.go
+// can get the LSM via PageStore.LSMLifecycle() and replay ModuleLSM records.
+func (s *lsm) ApplyPageMapping(pageID uint64, vaddr uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active.SetPageMapping(pageID, vaddr)
+}
+
+func (s *lsm) ApplyPageDelete(pageID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active.DeletePageMapping(pageID)
+}
+
+func (s *lsm) ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active.SetBlobMapping(blobID, vaddr, size)
+}
+
+func (s *lsm) ApplyBlobDelete(blobID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active.DeleteBlobMapping(blobID)
+}
+
+// NewRecoveryStore creates a recovery store.

@@ -6,7 +6,11 @@
 // Design reference: docs/CHECKPOINT_DESIGN.md
 package lsmapi
 
-import "errors"
+import (
+	"errors"
+
+	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
+)
 
 // ─── Errors ─────────────────────────────────────────────────────────
 
@@ -66,6 +70,11 @@ type MappingStore interface {
 	GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok bool)
 	DeleteBlobMapping(blobID uint64)
 
+	// WAL integration: attach WAL and flush pending entries
+	SetWAL(wal walapi.WAL)
+	FlushToWAL() (lastLSN uint64, err error)
+	LastLSN() uint64
+
 	// Checkpoint: record the checkpoint LSN
 	Checkpoint(lsn uint64) error
 
@@ -83,6 +92,9 @@ type MappingStore interface {
 type RecoveryStore interface {
 	// ApplyPageMapping applies a page mapping update.
 	ApplyPageMapping(pageID uint64, vaddr uint64)
+
+	// ApplyPageDelete applies a page deletion (marks page as removed).
+	ApplyPageDelete(pageID uint64)
 
 	// ApplyBlobMapping applies a blob mapping update.
 	ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32)

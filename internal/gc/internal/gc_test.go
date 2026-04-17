@@ -16,6 +16,7 @@ import (
 	"github.com/akzj/go-fast-kv/internal/pagestore"
 	"github.com/akzj/go-fast-kv/internal/segment"
 	"github.com/akzj/go-fast-kv/internal/wal"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ func writeBlobViaStore(t *testing.T, bs blobstoreapi.BlobStore, w walapi.WAL, se
 func TestPageGC_NoSealedSegments(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
@@ -111,7 +112,7 @@ func TestPageGC_NoSealedSegments(t *testing.T) {
 func TestPageGC_AllDead(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	// Write 3 pages into segment 1.
@@ -172,7 +173,7 @@ func TestPageGC_AllDead(t *testing.T) {
 func TestPageGC_AllLive(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	// Write 3 pages into segment 1.
@@ -231,7 +232,7 @@ func TestPageGC_AllLive(t *testing.T) {
 func TestPageGC_MixedLiveness(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	// Write 5 pages into segment 1.
@@ -286,7 +287,7 @@ func TestPageGC_MixedLiveness(t *testing.T) {
 func TestPageGC_DuplicatePageInSegment(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	// Write page 1 three times in segment 1. Only the last write is live.
@@ -503,10 +504,45 @@ func TestBlobGC_MixedLiveness(t *testing.T) {
 
 // ─── Test 10: Multiple sealed segments — collect one at a time ──
 
+
+// mockLSMForTests is a simple in-memory LSM MappingStore for tests.
+type mockLSMForTests struct {
+	pages map[uint64]uint64
+	blobs map[uint64]struct{ vaddr uint64; size uint32 }
+}
+
+func newMockLSM() *mockLSMForTests {
+	return &mockLSMForTests{pages: make(map[uint64]uint64), blobs: make(map[uint64]struct{ vaddr uint64; size uint32 })}
+}
+
+func (m *mockLSMForTests) SetPageMapping(pageID uint64, vaddr uint64) {
+	m.pages[pageID] = vaddr
+}
+func (m *mockLSMForTests) GetPageMapping(pageID uint64) (uint64, bool) {
+	v, ok := m.pages[pageID]
+	return v, ok
+}
+func (m *mockLSMForTests) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
+	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+}
+func (m *mockLSMForTests) GetBlobMapping(blobID uint64) (uint64, uint32, bool) {
+	b, ok := m.blobs[blobID]
+	return b.vaddr, b.size, ok
+}
+func (m *mockLSMForTests) DeleteBlobMapping(blobID uint64) { delete(m.blobs, blobID) }
+func (m *mockLSMForTests) SetWAL(wal walapi.WAL)          {}
+func (m *mockLSMForTests) FlushToWAL() (uint64, error)    { return 0, nil }
+func (m *mockLSMForTests) LastLSN() uint64                { return 0 }
+func (m *mockLSMForTests) Checkpoint(lsn uint64) error    { return nil }
+func (m *mockLSMForTests) CheckpointLSN() uint64          { return 0 }
+func (m *mockLSMForTests) MaybeCompact() error            { return nil }
+func (m *mockLSMForTests) Close() error                  { return nil }
+
+
 func TestGC_MultipleSegments(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
 	w := newWAL(t)
-	ps := pagestore.New(pagestoreapi.Config{}, segMgr)
+	ps := pagestore.New(pagestoreapi.Config{}, segMgr, newMockLSM())
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	// Segment 1: write 2 pages.

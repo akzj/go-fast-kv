@@ -162,6 +162,20 @@ type PageStoreRecovery interface {
 	// SetNextPageID sets the next allocatable PageID.
 	// Called during recovery after loading checkpoint.
 	SetNextPageID(nextID PageID)
+
+	// LSMLifecycle returns the LSM store for WAL replay routing.
+	// Returns the underlying LSM so recovery.go can delegate ModuleLSM records.
+	LSMLifecycle() LSMLifecycle
+}
+
+// LSMLifecycle represents the LSM store's recovery surface.
+// Used by recovery.go to route ModuleLSM WAL records.
+type LSMLifecycle interface {
+	ApplyPageMapping(pageID uint64, vaddr uint64)
+	ApplyPageDelete(pageID uint64)
+	ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32)
+	ApplyBlobDelete(blobID uint64)
+	SetCheckpointLSN(lsn uint64)
 }
 
 // ─── Config ─────────────────────────────────────────────────────────
