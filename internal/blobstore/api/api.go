@@ -143,4 +143,11 @@ type Config struct {
 	// InitialCapacity is the initial size of the mapping table (number of slots).
 	// Defaults to 1024 if zero.
 	InitialCapacity int
+
+	// StatsManager is an optional stats tracker for GC segment dead-byte analysis.
+	// If non-nil, BlobStore will call Increment/Decrement on writes and deletes.
+	StatsManager interface {
+		Increment(segID uint32, count, bytes int64)
+		Decrement(segID uint32, count, bytes int64)
+	}
 }

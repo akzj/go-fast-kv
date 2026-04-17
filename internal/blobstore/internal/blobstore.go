@@ -48,6 +48,10 @@ type blobStore struct {
 	mapping    []blobstoreapi.BlobMeta // dense array: index = blobID, value = BlobMeta
 	nextBlobID uint64
 	closed     bool
+	statsMgr   interface {
+		Increment(segID uint32, count, bytes int64)
+		Decrement(segID uint32, count, bytes int64)
+	}
 }
 
 // New creates a new BlobStore backed by the given SegmentManager.
@@ -55,16 +59,23 @@ type blobStore struct {
 // BlobIDs start at 1 (0 is reserved as invalid).
 // The mapping table is initialized with cfg.InitialCapacity slots
 // (defaults to 1024).
-func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager) blobstoreapi.BlobStore {
+func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager, statsMgr ...interface {
+	Increment(segID uint32, count, bytes int64)
+	Decrement(segID uint32, count, bytes int64)
+}) blobstoreapi.BlobStore {
 	cap := cfg.InitialCapacity
 	if cap <= 0 {
 		cap = defaultInitialCapacity
 	}
-	return &blobStore{
+	bs := &blobStore{
 		segMgr:     segMgr,
 		mapping:    make([]blobstoreapi.BlobMeta, cap),
 		nextBlobID: 1, // 0 is reserved
 	}
+	if len(statsMgr) > 0 {
+		bs.statsMgr = statsMgr[0]
+	}
+	return bs
 }
 
 // ─── BlobStore interface ────────────────────────────────────────────
@@ -120,6 +131,12 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 	// Update mapping
 	bs.ensureCapacity(blobID)
 	bs.mapping[blobID] = blobstoreapi.BlobMeta{VAddr: packed, Size: dataLen}
+
+	// Stats update — increment new segment.
+	if bs.statsMgr != nil {
+		recordSize := int64(blobHeaderSize) + int64(dataLen) + int64(blobChecksumSize)
+		bs.statsMgr.Increment(vaddr.SegmentID, 1, recordSize)
+	}
 
 	return blobID, blobstoreapi.WALEntry{
 		Type:  2, // RecordBlobMap
@@ -177,8 +194,18 @@ func (bs *blobStore) Delete(blobID blobstoreapi.BlobID) blobstoreapi.WALEntry {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
+	// Look up old meta before clearing (needed for stats decrement).
+	oldMeta := bs.getMapping(blobID)
+
 	if blobID < uint64(len(bs.mapping)) {
 		bs.mapping[blobID] = blobstoreapi.BlobMeta{}
+	}
+
+	// Stats update — decrement old segment.
+	if bs.statsMgr != nil && !oldMeta.IsZero() {
+		oldSegID := uint32(oldMeta.VAddr >> 32)
+		recordSize := int64(oldMeta.Size) + int64(blobHeaderSize) + int64(blobChecksumSize)
+		bs.statsMgr.Decrement(oldSegID, 1, recordSize)
 	}
 
 	return blobstoreapi.WALEntry{
