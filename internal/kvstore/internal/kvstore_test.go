@@ -791,6 +791,57 @@ func TestKVStoreBulkLoadMVCC(t *testing.T) {
 	}
 }
 
+// TestBulkLoadVisibilityAfterAbort verifies that bulk loaded entries
+// (txnMin=0) remain visible after an aborted delete transaction.
+// This is a regression test for the bug where txnMax CLOG status
+// was not checked for bulk loaded entries.
+func TestBulkLoadVisibilityAfterAbort(t *testing.T) {
+	store := openTestStore(t)
+
+	// Bulk load an entry - this creates entry with txnMin=0
+	pairs := []btreeapi.KVPair{
+		{Key: []byte("key"), Value: []byte("value")},
+	}
+	if err := store.BulkLoad(pairs); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the entry is visible
+	val, err := store.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get after BulkLoad: %v", err)
+	}
+	if string(val) != "value" {
+		t.Fatalf("got %q, want %q", val, "value")
+	}
+
+	// Delete the bulk loaded entry with txnID=999 (simulating SQL DELETE)
+	// This marks the entry with txnMax=999 in the btree
+	if err := store.DeleteWithXID([]byte("key"), 999); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without the fix, entry would be invisible even after abort
+	// because the visibility checker only checked txnMax==TxnMaxInfinity.
+	// After the fix, we check CLOG status.
+
+	// Abort the transaction (txnMax=999)
+	// This sets CLOG[999]=Aborted
+	if err := store.AbortWithXID(999); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the bulk loaded entry is visible again after abort
+	// The fix checks CLOG[999] != Committed, so entry becomes visible
+	val, err = store.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get after AbortWithXID(999): %v", err)
+	}
+	if string(val) != "value" {
+		t.Fatalf("got %q, want %q after aborted delete", val, "value")
+	}
+}
+
 // TestCloseDuringCheckpoint verifies that Close() aborts a background
 // checkpoint cleanly, leaving no temp files and no pinned segments.
 func TestCloseDuringCheckpoint(t *testing.T) {

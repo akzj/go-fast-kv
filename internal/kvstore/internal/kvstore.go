@@ -256,8 +256,18 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 
 			// BulkLoad entries have txnMin=0, treated as "always committed".
 			// This allows Delete to find entries loaded via BulkLoad.
+			// However, if a delete was attempted (txnMax set), we must check
+			// whether that delete transaction was committed.
 			if txnMin == 0 {
-				return txnMax == txnapi.TxnMaxInfinity
+				// Bulk loaded entry: check if txnMax transaction was committed
+				if txnMax == txnapi.TxnMaxInfinity {
+					return true // entry is still alive, never deleted
+				}
+				// txnMax is set: check if the delete was committed
+				if tm.CLOG().Get(txnMax) != txnapi.TxnCommitted {
+					return true // delete was not committed, entry is still visible
+				}
+				return false // delete was committed, entry is deleted
 			}
 
 			if storeRef != nil {
