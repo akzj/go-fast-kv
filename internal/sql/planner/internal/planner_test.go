@@ -471,7 +471,7 @@ func TestPlan_SelectOrderByLimit(t *testing.T) {
 		Columns: []parserapi.SelectColumn{
 			{Expr: &parserapi.StarExpr{}},
 		},
-		OrderBy: &parserapi.OrderByClause{Column: "AGE", Desc: true},
+		OrderBy: []*parserapi.OrderByClause{{Column: "AGE", Desc: true}},
 		Limit:   &parserapi.Literal{Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: 10}},
 	}
 
@@ -481,13 +481,13 @@ func TestPlan_SelectOrderByLimit(t *testing.T) {
 	}
 
 	sp := plan.(*plannerapi.SelectPlan)
-	if sp.OrderBy == nil {
+	if len(sp.OrderBy) == 0 {
 		t.Fatal("expected OrderBy plan")
 	}
-	if sp.OrderBy.ColumnIndex != 2 { // AGE is index 2
-		t.Errorf("expected ORDER BY column index 2, got %d", sp.OrderBy.ColumnIndex)
+	if sp.OrderBy[0].ColumnIndex != 2 { // AGE is index 2
+		t.Errorf("expected ORDER BY column index 2, got %d", sp.OrderBy[0].ColumnIndex)
 	}
-	if !sp.OrderBy.Desc {
+	if !sp.OrderBy[0].Desc {
 		t.Error("expected DESC=true")
 	}
 	if sp.Limit != 10 {
@@ -649,7 +649,7 @@ func TestPlan_Errors(t *testing.T) {
 		stmt := &parserapi.SelectStmt{
 			Table:   "USERS",
 			Columns: []parserapi.SelectColumn{{Expr: &parserapi.StarExpr{}}},
-			OrderBy: &parserapi.OrderByClause{Column: "NONEXISTENT"},
+			OrderBy: []*parserapi.OrderByClause{{Column: "NONEXISTENT"}},
 		}
 		_, err := p.Plan(stmt)
 		if !errors.Is(err, plannerapi.ErrColumnNotFound) {

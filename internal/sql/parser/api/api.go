@@ -209,7 +209,7 @@ type SelectStmt struct {
 	Where   Expr        // nil if no WHERE
 	GroupBy []Expr      // nil if no GROUP BY
 	Having  Expr        // nil if no HAVING
-	OrderBy *OrderByClause // nil if no ORDER BY
+	OrderBy []*OrderByClause // nil if no ORDER BY
 	Limit   Expr        // nil if no LIMIT
 	Offset  Expr        // nil if no OFFSET
 	Distinct bool       // true for SELECT DISTINCT

@@ -1670,29 +1670,38 @@ func (e *executor) filterJoinRows(rows [][]catalogapi.Value, filter parserapi.Ex
 }
 
 // sortJoinRows sorts merged rows by ORDER BY columns.
-func sortJoinRows(rows [][]catalogapi.Value, orderBy *plannerapi.OrderByPlan, columns []catalogapi.ColumnDef) {
-	if orderBy == nil || len(rows) == 0 {
+// Uses lexicographic comparison: sort by first column, then second, etc.
+func sortJoinRows(rows [][]catalogapi.Value, orderBy []*plannerapi.OrderByPlan, columns []catalogapi.ColumnDef) {
+	if len(orderBy) == 0 || len(rows) == 0 {
 		return
 	}
-	colIdx := orderBy.ColumnIndex
-	desc := orderBy.Desc
 	sort.Slice(rows, func(i, j int) bool {
-		a := rows[i][colIdx]
-		b := rows[j][colIdx]
-		if a.IsNull && b.IsNull {
-			return false
+		for _, ob := range orderBy {
+			colIdx := ob.ColumnIndex
+			a := rows[i][colIdx]
+			b := rows[j][colIdx]
+
+			// NULL handling: NULLs sort first for ASC, last for DESC
+			if a.IsNull && b.IsNull {
+				continue // equal, check next column
+			}
+			if a.IsNull {
+				return !ob.Desc
+			}
+			if b.IsNull {
+				return ob.Desc
+			}
+
+			cmp := compareValues(a, b)
+			if cmp < 0 {
+				return !ob.Desc
+			}
+			if cmp > 0 {
+				return ob.Desc
+			}
+			// equal, continue to next ORDER BY column
 		}
-		if a.IsNull {
-			return true
-		}
-		if b.IsNull {
-			return false
-		}
-		cmp := compareValues(a, b)
-		if desc {
-			cmp = -cmp
-		}
-		return cmp < 0
+		return false // all columns equal
 	})
 }
 

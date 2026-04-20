@@ -633,31 +633,39 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	}
 
 	// Optional ORDER BY — parse via parseExpr so qualified names (t.col) work
+	// Supports multiple columns: ORDER BY col1, col2 DESC, col3
 	if p.cur.Type == api.TokOrder {
 		p.advance()
 		if err := p.expect(api.TokBy); err != nil {
 			return nil, err
 		}
-		expr, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		// Extract column from expression (parseExpr handles t.col via parsePrimary)
-		if ref, ok := expr.(*api.ColumnRef); ok {
-			col := ref.Column
-			if ref.Table != "" {
-				col = ref.Table + "." + ref.Column
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
 			}
-			ob := &api.OrderByClause{Column: col}
-			if p.cur.Type == api.TokDesc {
-				ob.Desc = true
-				p.advance()
-			} else if p.cur.Type == api.TokAsc {
-				p.advance()
+			// Extract column from expression (parseExpr handles t.col via parsePrimary)
+			if ref, ok := expr.(*api.ColumnRef); ok {
+				col := ref.Column
+				if ref.Table != "" {
+					col = ref.Table + "." + ref.Column
+				}
+				ob := &api.OrderByClause{Column: col}
+				if p.cur.Type == api.TokDesc {
+					ob.Desc = true
+					p.advance()
+				} else if p.cur.Type == api.TokAsc {
+					p.advance()
+				}
+				stmt.OrderBy = append(stmt.OrderBy, ob)
+			} else {
+				return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
 			}
-			stmt.OrderBy = ob
-		} else {
-			return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
+			// Check for comma (more columns)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume comma
 		}
 	}
 
@@ -873,31 +881,38 @@ func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
 		stmt.Having = expr
 	}
 
-	// Optional ORDER BY
+	// Optional ORDER BY — supports multiple columns: ORDER BY col1, col2 DESC
 	if p.cur.Type == api.TokOrder {
 		p.advance()
 		if err := p.expect(api.TokBy); err != nil {
 			return nil, err
 		}
-		expr, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		if ref, ok := expr.(*api.ColumnRef); ok {
-			col := ref.Column
-			if ref.Table != "" {
-				col = ref.Table + "." + ref.Column
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
 			}
-			ob := &api.OrderByClause{Column: col}
-			if p.cur.Type == api.TokDesc {
-				ob.Desc = true
-				p.advance()
-			} else if p.cur.Type == api.TokAsc {
-				p.advance()
+			if ref, ok := expr.(*api.ColumnRef); ok {
+				col := ref.Column
+				if ref.Table != "" {
+					col = ref.Table + "." + ref.Column
+				}
+				ob := &api.OrderByClause{Column: col}
+				if p.cur.Type == api.TokDesc {
+					ob.Desc = true
+					p.advance()
+				} else if p.cur.Type == api.TokAsc {
+					p.advance()
+				}
+				stmt.OrderBy = append(stmt.OrderBy, ob)
+			} else {
+				return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
 			}
-			stmt.OrderBy = ob
-		} else {
-			return nil, p.errorf("ORDER BY must be a column reference, got %T", expr)
+			// Check for comma (more columns)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume comma
 		}
 	}
 

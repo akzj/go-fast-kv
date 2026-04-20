@@ -133,7 +133,7 @@ type SelectPlan struct {
 	Filter        parserapi.Expr            // residual filter not handled by index; nil = no filter
 	GroupByExprs  []parserapi.Expr           // nil if no GROUP BY
 	Having        parserapi.Expr             // nil if no HAVING
-	OrderBy       *OrderByPlan               // nil if no ORDER BY
+	OrderBy       []*OrderByPlan             // nil if no ORDER BY
 	Limit         int                        // -1 if no LIMIT
 	Offset        int                        // -1 if no OFFSET
 	Distinct      bool                       // true for SELECT DISTINCT
@@ -652,8 +652,14 @@ func (p *SelectPlan) String() string {
 	if p.Having != nil {
 		b.WriteString("\n└─ HAVING: " + formatExpr(p.Having))
 	}
-	if p.OrderBy != nil {
-		b.WriteString(fmt.Sprintf("\n└─ ORDER BY column=%d desc=%v", p.OrderBy.ColumnIndex, p.OrderBy.Desc))
+	if len(p.OrderBy) > 0 {
+		for i, ob := range p.OrderBy {
+			if i == 0 {
+				b.WriteString(fmt.Sprintf("\n└─ ORDER BY column=%d desc=%v", ob.ColumnIndex, ob.Desc))
+			} else {
+				b.WriteString(fmt.Sprintf("\n  ORDER BY column=%d desc=%v", ob.ColumnIndex, ob.Desc))
+			}
+		}
 	}
 	if p.Limit > 0 {
 		b.WriteString(fmt.Sprintf("\n└─ LIMIT %d", p.Limit))

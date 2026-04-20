@@ -351,12 +351,14 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		// SELECT 1, SELECT 1+1, SELECT 'hello'
 		// No table scan needed — evaluate expressions directly
 		// ORDER BY on constants: sort the single row (no-op but wire through)
-		var orderBy *plannerapi.OrderByPlan
-		if stmt.OrderBy != nil {
-			// For constant SELECT, ORDER BY just returns the single row
-			// We still need a column index — resolve against SELECT columns
-			orderBy = &plannerapi.OrderByPlan{ColumnIndex: 0, Desc: stmt.OrderBy.Desc}
+		var orderBy []*plannerapi.OrderByPlan
+	if len(stmt.OrderBy) > 0 {
+		// For constant SELECT, ORDER BY just returns the single row
+		// We still need a column index — resolve against SELECT columns
+		for _, ob := range stmt.OrderBy {
+			orderBy = append(orderBy, &plannerapi.OrderByPlan{ColumnIndex: 0, Desc: ob.Desc})
 		}
+	}
 		limit := -1
 		if stmt.Limit != nil {
 			val, err := resolveExprToValue(stmt.Limit)
@@ -437,13 +439,15 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		}
 	}
 
-	var orderBy *plannerapi.OrderByPlan
-	if stmt.OrderBy != nil {
-		idx := findColumnIndex(tbl, stmt.OrderBy.Column)
-		if idx < 0 {
-			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
+	var orderBy []*plannerapi.OrderByPlan
+	if len(stmt.OrderBy) > 0 {
+		for _, ob := range stmt.OrderBy {
+			idx := findColumnIndex(tbl, ob.Column)
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, ob.Column)
+			}
+			orderBy = append(orderBy, &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: ob.Desc})
 		}
-		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
 	}
 
 	limit := -1
@@ -536,46 +540,47 @@ func (p *planner) planDerivedTableSelect(stmt *parserapi.SelectStmt) (*plannerap
 		return nil, fmt.Errorf("HAVING requires GROUP BY")
 	}
 
-	// Resolve ORDER BY against derived schema
-	var orderBy *plannerapi.OrderByPlan
-	if stmt.OrderBy != nil {
-		orderCol := stmt.OrderBy.Column
-		orderTable := ""
-		if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
-			orderTable = orderCol[:dot]
-			orderCol = orderCol[dot+1:]
-		}
-		idx := -1
-		for i, c := range derivedSchema.Columns {
-			if strings.EqualFold(c.Name, orderCol) {
-				if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
-					idx = i
-					break
-				}
-				if idx < 0 {
-					idx = i
-				}
+	// Resolve ORDER BY against derived schema (supports multiple columns)
+	var orderBy []*plannerapi.OrderByPlan
+	if len(stmt.OrderBy) > 0 {
+		for _, ob := range stmt.OrderBy {
+			orderCol := ob.Column
+			orderTable := ""
+			if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
+				orderTable = orderCol[:dot]
+				orderCol = orderCol[dot+1:]
 			}
-		}
-		if idx < 0 {
-			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
-		}
-		// Map ORDER BY index from derivedSchema to projected output
-		if len(colIndices) > 0 {
-			mappedIdx := -1
-			for selectPos, derivedIdx := range colIndices {
-				if derivedIdx == idx {
-					mappedIdx = selectPos
-					break
+			idx := -1
+			for i, c := range derivedSchema.Columns {
+				if strings.EqualFold(c.Name, orderCol) {
+					if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
+						idx = i
+						break
+					}
+					if idx < 0 {
+						idx = i
+					}
 				}
 			}
-			if mappedIdx >= 0 {
-				idx = mappedIdx
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, ob.Column)
 			}
+			// Map ORDER BY index from derivedSchema to projected output
+			if len(colIndices) > 0 {
+				mappedIdx := -1
+				for selectPos, derivedIdx := range colIndices {
+					if derivedIdx == idx {
+						mappedIdx = selectPos
+						break
+					}
+				}
+				if mappedIdx >= 0 {
+					idx = mappedIdx
+				}
+			}
+			orderBy = append(orderBy, &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: ob.Desc})
 		}
-		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
 	}
-
 	// Resolve LIMIT
 	limit := -1
 	if stmt.Limit != nil {
@@ -859,49 +864,51 @@ func (p *planner) planJoinSelect(stmt *parserapi.SelectStmt) (*plannerapi.Select
 	}
 
 	// ORDER BY for JOIN — resolve against combined schema with table qualifier support
-	var orderBy *plannerapi.OrderByPlan
-	if stmt.OrderBy != nil {
-		idx := -1
-		// Split qualified name (e.g., "users.name") into table and column
-		orderCol := stmt.OrderBy.Column
-		orderTable := ""
-		if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
-			orderTable = orderCol[:dot]
-			orderCol = orderCol[dot+1:]
-		}
-		for i, c := range combinedSchema {
-			if strings.EqualFold(c.Name, orderCol) {
-				if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
-					idx = i
-					break
-				}
-				// Unqualified: remember first match but keep looking for qualified match
-				if idx < 0 {
-					idx = i
-				}
+	// Supports multiple columns: ORDER BY col1, col2 DESC
+	var orderBy []*plannerapi.OrderByPlan
+	if len(stmt.OrderBy) > 0 {
+		for _, ob := range stmt.OrderBy {
+			idx := -1
+			// Split qualified name (e.g., "users.name") into table and column
+			orderCol := ob.Column
+			orderTable := ""
+			if dot := strings.LastIndex(orderCol, "."); dot >= 0 {
+				orderTable = orderCol[:dot]
+				orderCol = orderCol[dot+1:]
 			}
-		}
-		if idx < 0 {
-			return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, stmt.OrderBy.Column)
-		}
-		// If GROUP BY is present, map the ORDER BY index from combinedSchema
-		// to the position in SELECT columns. After GROUP BY, the result only
-		// contains SELECT columns,not the full combined schema.
-		if stmt.GroupBy != nil {
-			mappedIdx := -1
-			for selectPos, combinedIdx := range colIndices {
-				if combinedIdx == idx {
-					mappedIdx = selectPos
-					break
+			for i, c := range combinedSchema {
+				if strings.EqualFold(c.Name, orderCol) {
+					if orderTable == "" || strings.EqualFold(c.Table, orderTable) {
+						idx = i
+						break
+					}
+					// Unqualified: remember first match but keep looking for qualified match
+					if idx < 0 {
+						idx = i
+					}
 				}
 			}
-			if mappedIdx >= 0 {
-				idx = mappedIdx
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: ORDER BY %s", plannerapi.ErrColumnNotFound, ob.Column)
 			}
+			// If GROUP BY is present, map the ORDER BY index from combinedSchema
+			// to the position in SELECT columns. After GROUP BY, the result only
+			// contains SELECT columns, not the full combined schema.
+			if stmt.GroupBy != nil {
+				mappedIdx := -1
+				for selectPos, combinedIdx := range colIndices {
+					if combinedIdx == idx {
+						mappedIdx = selectPos
+						break
+					}
+				}
+				if mappedIdx >= 0 {
+					idx = mappedIdx
+				}
+			}
+			orderBy = append(orderBy, &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: ob.Desc})
 		}
-		orderBy = &plannerapi.OrderByPlan{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
 	}
-
 	// LIMIT for JOIN
 	limit := -1
 	if stmt.Limit != nil {
@@ -1267,13 +1274,15 @@ func (p *planner) planScan(tbl *catalogapi.TableSchema, where parserapi.Expr) (p
 
 // isCoveringIndex checks if the given index can satisfy the query without reading table pages.
 // For a covering index, all required columns (SELECT, WHERE, ORDER BY) must be the indexed column.
-func isCoveringIndex(tbl *catalogapi.TableSchema, selectCols []parserapi.SelectColumn, orderBy *parserapi.OrderByClause, index *catalogapi.IndexSchema) bool {
+func isCoveringIndex(tbl *catalogapi.TableSchema, selectCols []parserapi.SelectColumn, orderBy []*parserapi.OrderByClause, index *catalogapi.IndexSchema) bool {
 	indexedColumn := index.Column
 
-	// Check ORDER BY column (if present)
-	if orderBy != nil {
-		if orderBy.Column != indexedColumn {
-			return false
+	// Check ORDER BY columns (if present) — index must cover ALL ORDER BY columns
+	if len(orderBy) > 0 {
+		for _, ob := range orderBy {
+			if ob.Column != indexedColumn {
+				return false
+			}
 		}
 	}
 

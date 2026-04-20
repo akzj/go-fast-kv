@@ -481,13 +481,13 @@ func TestParse_Select(t *testing.T) {
 			t.Fatalf("parse error: %v", err)
 		}
 		sel := stmt.(*api.SelectStmt)
-		if sel.OrderBy == nil {
+		if len(sel.OrderBy) == 0 {
 			t.Fatal("expected ORDER BY clause")
 		}
-		if sel.OrderBy.Column != "AGE" {
-			t.Errorf("expected AGE, got %s", sel.OrderBy.Column)
+		if sel.OrderBy[0].Column != "AGE" {
+			t.Errorf("expected AGE, got %s", sel.OrderBy[0].Column)
 		}
-		if !sel.OrderBy.Desc {
+		if !sel.OrderBy[0].Desc {
 			t.Error("expected DESC=true")
 		}
 	})
@@ -524,7 +524,7 @@ func TestParse_Select(t *testing.T) {
 		if sel.Where == nil {
 			t.Error("expected WHERE")
 		}
-		if sel.OrderBy == nil || sel.OrderBy.Column != "NAME" || sel.OrderBy.Desc {
+		if len(sel.OrderBy) == 0 || sel.OrderBy[0].Column != "NAME" || sel.OrderBy[0].Desc {
 			t.Error("expected ORDER BY NAME ASC")
 		}
 		if sel.Limit == nil {

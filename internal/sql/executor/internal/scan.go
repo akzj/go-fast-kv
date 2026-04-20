@@ -314,43 +314,54 @@ func projectRows(rows []*engineapi.Row, colIndices []int) [][]catalogapi.Value {
 	return result
 }
 
-// sortRawRows sorts raw engine rows by the ORDER BY column BEFORE projection.
+// sortRawRows sorts raw engine rows by the ORDER BY columns BEFORE projection.
 // This ensures ORDER BY works even when the sort column is not in the SELECT list.
-func sortRawRows(rows []*engineapi.Row, orderBy *plannerapi.OrderByPlan) {
-	colIdx := orderBy.ColumnIndex
+// Uses lexicographic comparison: sort by first column, then second, etc.
+func sortRawRows(rows []*engineapi.Row, orderBy []*plannerapi.OrderByPlan) {
+	if len(orderBy) == 0 {
+		return
+	}
 
 	sort.SliceStable(rows, func(i, j int) bool {
-		var va, vb catalogapi.Value
-		if colIdx < len(rows[i].Values) {
-			va = rows[i].Values[colIdx]
-		} else {
-			va = catalogapi.Value{IsNull: true}
-		}
-		if colIdx < len(rows[j].Values) {
-			vb = rows[j].Values[colIdx]
-		} else {
-			vb = catalogapi.Value{IsNull: true}
-		}
+		for _, ob := range orderBy {
+			colIdx := ob.ColumnIndex
 
-		// NULL sorts first (ASC) or last (DESC)
-		if va.IsNull && vb.IsNull {
-			return false
-		}
-		if va.IsNull {
-			return !orderBy.Desc
-		}
-		if vb.IsNull {
-			return orderBy.Desc
-		}
+			var va, vb catalogapi.Value
+			if colIdx < len(rows[i].Values) {
+				va = rows[i].Values[colIdx]
+			} else {
+				va = catalogapi.Value{IsNull: true}
+			}
+			if colIdx < len(rows[j].Values) {
+				vb = rows[j].Values[colIdx]
+			} else {
+				vb = catalogapi.Value{IsNull: true}
+			}
 
-		cmp, err := encoding.CompareValues(va, vb)
-		if err != nil {
-			return false
+			// NULL sorts first (ASC) or last (DESC)
+			if va.IsNull && vb.IsNull {
+				continue // equal, check next column
+			}
+			if va.IsNull {
+				return !ob.Desc
+			}
+			if vb.IsNull {
+				return ob.Desc
+			}
+
+			cmp, err := encoding.CompareValues(va, vb)
+			if err != nil {
+				continue // on error, treat as equal
+			}
+			if cmp < 0 {
+				return !ob.Desc
+			}
+			if cmp > 0 {
+				return ob.Desc
+			}
+			// equal, continue to next ORDER BY column
 		}
-		if orderBy.Desc {
-			return cmp > 0
-		}
-		return cmp < 0
+		return false // all columns equal
 	})
 }
 

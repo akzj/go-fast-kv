@@ -337,6 +337,86 @@ func TestExec_SelectOrderByLimit(t *testing.T) {
 	}
 }
 
+func TestExec_OrderByMultipleColumns(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+	// Insert test data with same age but different names
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Charlie', 30)") // Same age as Alice
+	env.execSQL(t, "INSERT INTO users VALUES (4, 'Diana', 25)")  // Same age as Bob
+
+	// ORDER BY age ASC, name ASC
+	// Expected: Bob(25), Diana(25), Alice(30), Charlie(30)
+	// (Bob < Diana alphabetically, Alice < Charlie)
+	result := env.execSQL(t, "SELECT name, age FROM users ORDER BY age, name")
+	if len(result.Rows) != 4 {
+		t.Fatalf("rows = %d, want 4", len(result.Rows))
+	}
+
+	// Verify the order: Bob(25), Diana(25), Alice(30), Charlie(30)
+	expected := []struct {
+		name string
+		age  int64
+	}{
+		{"Bob", 25},
+		{"Diana", 25},
+		{"Alice", 30},
+		{"Charlie", 30},
+	}
+
+	for i, exp := range expected {
+		if result.Rows[i][0].Text != exp.name {
+			t.Errorf("row[%d].name = %q, want %q", i, result.Rows[i][0].Text, exp.name)
+		}
+		if result.Rows[i][1].Int != exp.age {
+			t.Errorf("row[%d].age = %d, want %d", i, result.Rows[i][1].Int, exp.age)
+		}
+	}
+
+	// ORDER BY age DESC, name ASC (secondary sort ascending)
+	// Expected: Charlie(30), Alice(30), Diana(25), Bob(25)
+	// (Age DESC first, then name ASC within same age)
+	result = env.execSQL(t, "SELECT name, age FROM users ORDER BY age DESC, name")
+	if len(result.Rows) != 4 {
+		t.Fatalf("rows = %d, want 4", len(result.Rows))
+	}
+
+	expectedDesc := []struct {
+		name string
+		age  int64
+	}{
+		{"Alice", 30},   // 30s: Alice < Charlie
+		{"Charlie", 30},
+		{"Bob", 25},     // 25s: Bob < Diana
+		{"Diana", 25},
+	}
+
+	for i, exp := range expectedDesc {
+		if result.Rows[i][0].Text != exp.name {
+			t.Errorf("row[%d].name = %q, want %q", i, result.Rows[i][0].Text, exp.name)
+		}
+		if result.Rows[i][1].Int != exp.age {
+			t.Errorf("row[%d].age = %d, want %d", i, result.Rows[i][1].Int, exp.age)
+		}
+	}
+
+	// ORDER BY name, age (both ASC - lexicographic on combined)
+	// Expected: Alice(30), Bob(25), Charlie(30), Diana(25)
+	result = env.execSQL(t, "SELECT name, age FROM users ORDER BY name, age")
+	if len(result.Rows) != 4 {
+		t.Fatalf("rows = %d, want 4", len(result.Rows))
+	}
+
+	expectedNameAge := []string{"Alice", "Bob", "Charlie", "Diana"}
+	for i, exp := range expectedNameAge {
+		if result.Rows[i][0].Text != exp {
+			t.Errorf("row[%d].name = %q, want %q", i, result.Rows[i][0].Text, exp)
+		}
+	}
+}
+
 func TestExec_Delete(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
