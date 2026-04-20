@@ -5,6 +5,8 @@ package internal
 import (
 	"sync/atomic"
 	"time"
+
+	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 )
 
 // ─── latencyRing ────────────────────────────────────────────────────
@@ -120,11 +122,11 @@ func (tw *throughputWindow) inc() {
 // elapsed time in seconds, giving operations/sec. Returns 0 on first call
 // or if fewer than 2 buckets have been touched.
 func (tw *throughputWindow) rate() uint64 {
-	now := time.Now().UnixNano()
+	nowNanos := time.Now().UnixNano()
 	var total int64
-	var minTime, maxTime int64
+	var minTime int64
 
-	// Collect bucket counts and find time range.
+	// Collect bucket counts and find earliest touched bucket time.
 	for i := 0; i < 10; i++ {
 		c := tw.buckets[i].Load()
 		if c > 0 {
@@ -133,14 +135,15 @@ func (tw *throughputWindow) rate() uint64 {
 			if minTime == 0 || bt < minTime {
 				minTime = bt
 			}
-			if bt > maxTime {
-				maxTime = bt
-			}
 		}
 	}
 
-	elapsed := maxTime - minTime
-	if elapsed <= 0 || total <= 0 {
+	if total <= 0 || minTime == 0 {
+		return 0
+	}
+
+	elapsed := nowNanos - minTime
+	if elapsed <= 0 {
 		return 0
 	}
 
@@ -176,7 +179,7 @@ type metricsCollector struct {
 	// Background status (set by GC/compaction goroutines)
 	gcRunning           atomic.Bool
 	compactionRunning    atomic.Bool
-	compactionProgress   atomic.Float64
+	compactionProgress   atomic.Uint64 // packed: pct*1000 as uint64
 
 	// Resource estimates (updated periodically by background tick)
 	walSizeBytes atomic.Uint64
@@ -213,9 +216,10 @@ func (mc *metricsCollector) setGCRunning(running bool) {
 }
 
 // setCompaction updates compaction status and progress.
+// Progress is packed as uint64(pct*1000) to avoid atomic.Float64.
 func (mc *metricsCollector) setCompaction(running bool, progressPct float64) {
 	mc.compactionRunning.Store(running)
-	mc.compactionProgress.Store(progressPct)
+	mc.compactionProgress.Store(uint64(progressPct * 1000))
 }
 
 // setWALSize updates the WAL size estimate.
@@ -224,8 +228,8 @@ func (mc *metricsCollector) setWALSize(bytes uint64) {
 }
 
 // collect returns a snapshot of all metrics.
-func (mc *metricsCollector) collect() Metrics {
-	return Metrics{
+func (mc *metricsCollector) collect() *kvstoreapi.Metrics {
+	return &kvstoreapi.Metrics{
 		GetLatencyP50:         mc.getLatency.percentile(0.50),
 		GetLatencyP90:         mc.getLatency.percentile(0.90),
 		GetLatencyP99:         mc.getLatency.percentile(0.99),
@@ -236,8 +240,8 @@ func (mc *metricsCollector) collect() Metrics {
 		WriteThroughput:       mc.writeWindow.rate(),
 		TotalErrors:           uint64(mc.totalErrors.Load()),
 		ErrorRate:             0, // computed below if needed
-		CompactionRunning:     mc.compactionRunning.Load(),
-		CompactionProgressPct: mc.compactionProgress.Load(),
+		CompactionRunning:      mc.compactionRunning.Load(),
+		CompactionProgressPct: float64(mc.compactionProgress.Load()) / 1000.0,
 		GCRunning:             mc.gcRunning.Load(),
 		PageCacheUsed:         0, // TODO: wire from page store stats
 		MemTableUsed:          0, // TODO: wire from LSM memtable stats
@@ -247,5 +251,4 @@ func (mc *metricsCollector) collect() Metrics {
 
 // ─── Metrics ───────────────────────────────────────────────────────
 
-// Metrics re-exports the API struct for use in internal package.
-type Metrics = Metrics
+// Metrics is an alias for the public API Metrics type.

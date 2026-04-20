@@ -116,6 +116,10 @@ type store struct {
 	vacuumWg sync.WaitGroup // tracks in-flight vacuum goroutines for Close()
 	closing  atomic.Bool   // set early in Close() to signal vacuum goroutines to exit
 
+	// Metrics collection — zero-overhead atomics for Put/Get paths.
+	metrics metricsCollector
+	metricsTickWg sync.WaitGroup // background goroutine for throughput window advancement
+
 	// GC — segment garbage collection (Phase 2).
 	gcMu    sync.RWMutex
 	gcStats *segmentStatsManager
@@ -338,6 +342,7 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 // ─── Put ────────────────────────────────────────────────────────────
 
 func (s *store) Put(key, value []byte) error {
+	startNs := time.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -365,6 +370,7 @@ func (s *store) Put(key, value []byte) error {
 	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Put(key, value, xid); err != nil {
 		s.txnMgr.Abort(xid)
+		s.metrics.incError()
 		return err
 	}
 
@@ -381,11 +387,15 @@ func (s *store) Put(key, value []byte) error {
 	// so the entry never becomes visible.
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		s.txnMgr.Abort(xid)
+		s.metrics.incError()
 		return err
 	}
 
 	// WAL succeeded — commit the transaction to make entry visible.
 	s.txnMgr.Commit(xid)
+
+	// Record successful write in metrics (sampling).
+	s.metrics.incWrite(startNs)
 
 	// Trigger auto-vacuum check (lazy async goroutine).
 	s.vacuumTrigger.opsCount.Add(1)
@@ -474,6 +484,7 @@ func (s *store) bulkLoad(pairs []btreeapi.KVPair, mode btreeapi.BulkMode, txnID 
 // ─── Get ────────────────────────────────────────────────────────────
 
 func (s *store) Get(key []byte) ([]byte, error) {
+	startNs := time.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -495,6 +506,11 @@ func (s *store) Get(key []byte) ([]byte, error) {
 			if err == btreeapi.ErrKeyNotFound {
 				return nil, kvstoreapi.ErrKeyNotFound
 			}
+			if err != nil {
+				s.metrics.incError()
+				return val, err
+			}
+			s.metrics.incRead(startNs)
 			return val, err
 		}
 	}
@@ -508,12 +524,18 @@ func (s *store) Get(key []byte) ([]byte, error) {
 	if err == btreeapi.ErrKeyNotFound {
 		return nil, kvstoreapi.ErrKeyNotFound
 	}
+	if err != nil {
+		s.metrics.incError()
+		return val, err
+	}
+	s.metrics.incRead(startNs)
 	return val, err
 }
 
 // ─── Delete ─────────────────────────────────────────────────────────
 
 func (s *store) Delete(key []byte) error {
+	startNs := time.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -535,6 +557,7 @@ func (s *store) Delete(key []byte) error {
 	// checks CLOG, and xid is still InProgress.
 	if err := s.tree.Delete(key, xid); err != nil {
 		s.txnMgr.Abort(xid)
+		s.metrics.incError()
 		if err == btreeapi.ErrKeyNotFound {
 			return kvstoreapi.ErrKeyNotFound
 		}
@@ -550,11 +573,15 @@ func (s *store) Delete(key []byte) error {
 
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		s.txnMgr.Abort(xid)
+		s.metrics.incError()
 		return err
 	}
 
 	// WAL succeeded — commit the transaction to make entry visible.
 	s.txnMgr.Commit(xid)
+
+	// Record successful write in metrics (sampling).
+	s.metrics.incWrite(startNs)
 
 	// Trigger auto-vacuum check (lazy async goroutine).
 	s.vacuumTrigger.opsCount.Add(1)
@@ -1472,4 +1499,30 @@ func (wb *writeBatch) DeleteWithXID(key []byte, txnID uint64) error {
 		return kvstoreapi.ErrKeyNotFound
 	}
 	return err
+}
+
+
+// ─── GetMetrics ─────────────────────────────────────────────────────
+
+// GetMetrics returns a snapshot of current operational metrics.
+// Zero blocking — all fields are populated atomically from lock-free data structures.
+func (s *store) GetMetrics() *kvstoreapi.Metrics {
+	// Update background status from vacuum goroutine flags.
+	m := s.metrics.collect()
+
+	// Update GC status from trigger flags.
+	m.GCRunning = s.vacuumTrigger.running || s.pageGCTrigger.running || s.blobGCTrigger.running
+
+	// Approximate WAL size from segment manager.
+	// This acquires a read lock internally but is fast.
+	if wal, ok := s.wal.(walSizeProvider); ok {
+		m.WALSizeBytes = wal.SizeBytes()
+	}
+
+	return m
+}
+
+// walSizeProvider is implemented by WAL to expose its byte size.
+type walSizeProvider interface {
+	SizeBytes() uint64
 }

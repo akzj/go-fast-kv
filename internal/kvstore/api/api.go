@@ -259,6 +259,11 @@ type Store interface {
 	// CommitWithXID collects those entries, writes them to WAL (fsync), and
 	// updates CLOG. This ensures SQL transaction writes survive crashes.
 	CommitWithXID(xid uint64) error
+
+	// GetMetrics returns current operational metrics.
+	// Zero blocking — all fields are populated atomically.
+	// Latency percentiles are calculated from a fixed-size ring buffer.
+	GetMetrics() *Metrics
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────

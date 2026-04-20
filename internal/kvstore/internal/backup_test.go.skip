@@ -1,0 +1,266 @@
+package internal
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+)
+
+// TestBackupRestore tests the Backup/Restore functionality.
+func TestBackupRestore(t *testing.T) {
+	// Create a temporary directory for the store.
+	storeDir := t.TempDir()
+
+	// Open a store and write some data.
+	s, err := Open(kvstoreapi.Config{Dir: storeDir})
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	// Cast to our internal store type for Backup method.
+	internalStore := s.(*store)
+
+	// Write some test data.
+	for i := 0; i < 100; i++ {
+		key := []byte("key-")
+		key = append(key, byte(i))
+		value := []byte("value-")
+		value = append(value, byte(i)*2)
+		if err := s.Put(key, value); err != nil {
+			t.Fatalf("failed to put key %d: %v", i, err)
+		}
+	}
+
+	// Trigger a checkpoint to ensure we have checkpoint data.
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("failed to checkpoint: %v", err)
+	}
+
+	// Create backup directory.
+	backupDir := filepath.Join(t.TempDir(), "backup")
+
+	// Run backup.
+	if err := internalStore.Backup(backupDir); err != nil {
+		t.Fatalf("failed to backup: %v", err)
+	}
+
+	// Verify backup manifest exists.
+	manifestPath := filepath.Join(backupDir, "backup.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to read manifest: %v", err)
+	}
+
+	var manifest backupManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("failed to parse manifest: %v", err)
+	}
+
+	if manifest.Version != 1 {
+		t.Errorf("expected manifest version 1, got %d", manifest.Version)
+	}
+
+	if manifest.CheckpointLSN == 0 {
+		t.Error("expected non-zero checkpoint LSN")
+	}
+
+	// Verify checkpoint file was copied.
+	cpPath := filepath.Join(backupDir, "checkpoint")
+	if _, err := os.Stat(cpPath); os.IsNotExist(err) {
+		t.Error("checkpoint file missing from backup")
+	}
+
+	// Verify WAL directory exists.
+	walPath := filepath.Join(backupDir, "wal")
+	if info, err := os.Stat(walPath); os.IsNotExist(err) || !info.IsDir() {
+		t.Error("wal directory missing from backup")
+	}
+
+	// Verify LSM directory exists.
+	lsmPath := filepath.Join(backupDir, "lsm")
+	if info, err := os.Stat(lsmPath); os.IsNotExist(err) || !info.IsDir() {
+		t.Error("lsm directory missing from backup")
+	}
+
+	// Verify page_segments directory exists.
+	pageSegPath := filepath.Join(backupDir, "page_segments")
+	if info, err := os.Stat(pageSegPath); os.IsNotExist(err) || !info.IsDir() {
+		t.Error("page_segments directory missing from backup")
+	}
+
+	// Verify blob_segments directory exists.
+	blobSegPath := filepath.Join(backupDir, "blob_segments")
+	if info, err := os.Stat(blobSegPath); os.IsNotExist(err) || !info.IsDir() {
+		t.Error("blob_segments directory missing from backup")
+	}
+
+	// Verify all manifest files exist with correct checksums.
+	for _, entry := range manifest.Files {
+		fullPath := filepath.Join(backupDir, entry.Name)
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+			t.Errorf("manifest references missing file: %s", entry.Name)
+		}
+	}
+
+	// Close the original store.
+	if err := s.Close(); err != nil {
+		t.Fatalf("failed to close store: %v", err)
+	}
+
+	// Restore from backup to a new directory.
+	restoreDir := filepath.Join(t.TempDir(), "restore")
+	restoredStore, err := Restore(backupDir, restoreDir)
+	if err != nil {
+		t.Fatalf("failed to restore: %v", err)
+	}
+	defer restoredStore.Close()
+
+	// Verify data is restored correctly.
+	for i := 0; i < 100; i++ {
+		key := []byte("key-")
+		key = append(key, byte(i))
+		value, err := restoredStore.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key %d after restore: %v", i, err)
+			continue
+		}
+		expectedValue := []byte("value-")
+		expectedValue = append(expectedValue, byte(i)*2)
+		if string(value) != string(expectedValue) {
+			t.Errorf("key %d: expected %s, got %s", i, expectedValue, value)
+		}
+	}
+}
+
+// TestBackupEmptyStore tests backup on an empty store.
+func TestBackupEmptyStore(t *testing.T) {
+	storeDir := t.TempDir()
+
+	s, err := Open(kvstoreapi.Config{Dir: storeDir})
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer s.Close()
+
+	internalStore := s.(*store)
+	backupDir := filepath.Join(t.TempDir(), "backup")
+
+	// Backup should work even on empty store (after checkpoint).
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("failed to checkpoint: %v", err)
+	}
+	if err := internalStore.Backup(backupDir); err != nil {
+		t.Fatalf("backup of empty store failed: %v", err)
+	}
+}
+
+// TestBackupConcurrentWrites tests backup while writes are happening.
+func TestBackupConcurrentWrites(t *testing.T) {
+	storeDir := t.TempDir()
+
+	s, err := Open(kvstoreapi.Config{Dir: storeDir})
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	internalStore := s.(*store)
+
+	// Write initial data.
+	for i := 0; i < 50; i++ {
+		key := []byte("key-")
+		key = append(key, byte(i))
+		value := []byte("value-")
+		value = append(value, byte(i)*3)
+		if err := s.Put(key, value); err != nil {
+			t.Fatalf("failed to put key %d: %v", i, err)
+		}
+	}
+
+	// Trigger checkpoint before backup.
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("failed to checkpoint: %v", err)
+	}
+
+	backupDir := filepath.Join(t.TempDir(), "backup-concurrent")
+
+	// Run backup while store is still open.
+	if err := internalStore.Backup(backupDir); err != nil {
+		t.Fatalf("backup failed: %v", err)
+	}
+
+	// Close store.
+	if err := s.Close(); err != nil {
+		t.Fatalf("failed to close store: %v", err)
+	}
+
+	// Restore and verify.
+	restoreDir := filepath.Join(t.TempDir(), "restore-concurrent")
+	restoredStore, err := Restore(backupDir, restoreDir)
+	if err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	defer restoredStore.Close()
+
+	// Verify initial data is present.
+	for i := 0; i < 50; i++ {
+		key := []byte("key-")
+		key = append(key, byte(i))
+		value, err := restoredStore.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key %d after restore: %v", i, err)
+			continue
+		}
+		expectedValue := []byte("value-")
+		expectedValue = append(expectedValue, byte(i)*3)
+		if string(value) != string(expectedValue) {
+			t.Errorf("key %d: expected %s, got %s", i, expectedValue, value)
+		}
+	}
+}
+
+// TestBackupChecksumMismatch verifies that restore detects corrupted files.
+func TestBackupChecksumMismatch(t *testing.T) {
+	storeDir := t.TempDir()
+
+	s, err := Open(kvstoreapi.Config{Dir: storeDir})
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	internalStore := s.(*store)
+
+	// Write some data.
+	if err := s.Put([]byte("key1"), []byte("value1")); err != nil {
+		t.Fatalf("failed to put: %v", err)
+	}
+
+	// Checkpoint and backup.
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("failed to checkpoint: %v", err)
+	}
+
+	backupDir := filepath.Join(t.TempDir(), "backup-corrupt")
+	if err := internalStore.Backup(backupDir); err != nil {
+		t.Fatalf("backup failed: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("failed to close store: %v", err)
+	}
+
+	// Corrupt a file in the backup.
+	corruptPath := filepath.Join(backupDir, "checkpoint")
+	if err := os.WriteFile(corruptPath, []byte("corrupted data"), 0644); err != nil {
+		t.Fatalf("failed to corrupt file: %v", err)
+	}
+
+	// Restore should fail due to checksum mismatch.
+	restoreDir := filepath.Join(t.TempDir(), "restore-corrupt")
+	_, err = Restore(backupDir, restoreDir)
+	if err == nil {
+		t.Error("expected error for corrupted backup, got nil")
+	}
+}
