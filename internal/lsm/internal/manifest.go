@@ -37,9 +37,11 @@ type manifestData struct {
 // Refcount is incremented when checkpoint pins the segment and
 // decremented when checkpoint completes or is aborted.
 // GC checks refcount==0 before deleting any SSTable.
+// bloomFilter stores the deserialized bloom filter for this SSTable.
 type segmentEntry struct {
-	name     string
-	refcount atomic.Int64
+	name        string
+	refcount    atomic.Int64
+	bloomFilter *BloomFilter // cached bloom filter, nil if not yet loaded
 }
 
 // Pin increments the reference count for a segment.
@@ -137,6 +139,32 @@ func (m *manifest) CanDelete(name string) bool {
 		}
 	}
 	return false // segment doesn't exist
+}
+
+// GetBloomFilter returns the cached bloom filter for a segment, or nil if not cached.
+func (m *manifest) GetBloomFilter(name string) *BloomFilter {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, seg := range m.segments {
+		if seg.name == name {
+			return seg.bloomFilter
+		}
+	}
+	return nil
+}
+
+// SetBloomFilter sets the bloom filter for a segment (called after lazy loading from disk).
+func (m *manifest) SetBloomFilter(name string, bf *BloomFilter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			m.segments[i].bloomFilter = bf
+			return
+		}
+	}
 }
 
 // GetSegmentName returns the filename for a given segment ID.

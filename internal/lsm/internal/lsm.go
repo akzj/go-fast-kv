@@ -319,11 +319,28 @@ func (s *lsm) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
 }
 
 // getPageFromSSTables looks up a page mapping in SSTables.
+// Uses bloom filters to skip SSTables that definitely don't contain the key.
 func (s *lsm) getPageFromSSTables(pageID uint64) (uint64, bool) {
 	segments := s.manifest.Segments()
 	for i := len(segments) - 1; i >= 0; i-- {
-		path := filepath.Join(s.dir, segments[i])
-		pages, _, err := readSSTable(path)
+		segName := segments[i]
+		segPath := filepath.Join(s.dir, segName)
+
+		// Check bloom filter first to skip SSTable if key is definitely not present
+		bloom := s.manifest.GetBloomFilter(segName)
+		if bloom == nil {
+			// No bloom filter available, try to read it lazily from disk
+			bloom = readBloomFilter(segPath)
+			if bloom != nil {
+				s.manifest.SetBloomFilter(segName, bloom)
+			}
+		}
+		if bloom != nil && !bloom.Contains(pageID) {
+			// Bloom filter says key definitely not in this SSTable, skip it
+			continue
+		}
+
+		pages, _, err := readSSTable(segPath)
 		if err != nil {
 			continue
 		}
@@ -439,11 +456,28 @@ func (s *lsm) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok bool)
 }
 
 // getBlobFromSSTables looks up a blob mapping in SSTables.
+// Uses bloom filters to skip SSTables that definitely don't contain the key.
 func (s *lsm) getBlobFromSSTables(blobID uint64) (uint64, uint32, bool) {
 	segments := s.manifest.Segments()
 	for i := len(segments) - 1; i >= 0; i-- {
-		path := filepath.Join(s.dir, segments[i])
-		_, blobs, err := readSSTable(path)
+		segName := segments[i]
+		segPath := filepath.Join(s.dir, segName)
+
+		// Check bloom filter first to skip SSTable if key is definitely not present
+		bloom := s.manifest.GetBloomFilter(segName)
+		if bloom == nil {
+			// No bloom filter available, try to read it lazily from disk
+			bloom = readBloomFilter(segPath)
+			if bloom != nil {
+				s.manifest.SetBloomFilter(segName, bloom)
+			}
+		}
+		if bloom != nil && !bloom.Contains(blobID) {
+			// Bloom filter says key definitely not in this SSTable, skip it
+			continue
+		}
+
+		_, blobs, err := readSSTable(segPath)
 		if err != nil {
 			continue
 		}

@@ -617,3 +617,46 @@ func TestLSMWALReplay(t *testing.T) {
 		t.Errorf("GetBlobMapping(10) after replay: got (%d, %d, %v), want (1000, 500, true)", vaddr, size, ok)
 	}
 }
+
+// ─── Bloom Filter Benchmark ──────────────────────────────────────────
+
+// BenchmarkLSMBloomFilter benchmarks read performance with bloom filters.
+// With bloom filters, negative lookups (key not present) skip SSTables quickly.
+func BenchmarkLSMBloomFilter(b *testing.B) {
+	dir := b.TempDir()
+
+	// Create LSM with small memtable to force multiple SSTables
+	cfg := lsmapi.Config{Dir: dir, MemtableSize: 512} // Very small to force many SSTables
+	l, err := New(cfg)
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	// Insert enough data to create multiple SSTables
+	// Each SSTable will have ~30 entries (512 bytes / ~17 bytes per entry)
+	for i := uint64(1); i <= 1000; i++ {
+		l.SetPageMapping(i, i*100)
+	}
+
+	// Trigger compaction to create SSTables
+	l.MaybeCompact()
+	time.Sleep(200 * time.Millisecond)
+
+	b.ResetTimer()
+	b.Run("PositiveLookup", func(b *testing.B) {
+		// Lookup existing keys - should find in earliest SSTable
+		for i := 0; i < b.N; i++ {
+			pageID := uint64((i % 1000) + 1)
+			l.GetPageMapping(pageID)
+		}
+	})
+
+	b.Run("NegativeLookup", func(b *testing.B) {
+		// Lookup non-existing keys - bloom filters should skip many SSTables
+		for i := 0; i < b.N; i++ {
+			pageID := uint64(1000000 + i) // Keys definitely not in any SSTable
+			l.GetPageMapping(pageID)
+		}
+	})
+}
