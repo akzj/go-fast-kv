@@ -158,16 +158,18 @@ func (tw *throughputWindow) rate() uint64 {
 // ─── metricsCollector ───────────────────────────────────────────────
 
 // metricsCollector holds all metrics state for a store.
-// All fields are accessed via atomics from operation paths (Put/Get).
+// All fields are accessed via atomics from operation paths (Put/Get/Scan).
 // GetMetrics() reads atomically — zero blocking.
 type metricsCollector struct {
 	// Latency rings
 	getLatency latencyRing
 	putLatency latencyRing
+	scanLatency latencyRing
 
 	// Throughput windows
 	readWindow  throughputWindow
 	writeWindow throughputWindow
+	scanWindow  throughputWindow
 
 	// Error counters
 	totalErrors atomic.Int64
@@ -175,6 +177,7 @@ type metricsCollector struct {
 	// Sampling counters for latency rings
 	getSampleCounter atomic.Uint64
 	putSampleCounter atomic.Uint64
+	scanSampleCounter atomic.Uint64
 
 	// Background status (set by GC/compaction goroutines)
 	gcRunning           atomic.Bool
@@ -202,6 +205,16 @@ func (mc *metricsCollector) incWrite(startNs int64) {
 	idx := mc.putSampleCounter.Add(1)
 	if idx%latencySampleMod == 0 {
 		mc.putLatency.record(startNs)
+	}
+}
+
+// incScan records a scan operation. Called from Scan/ScanWithParams paths.
+func (mc *metricsCollector) incScan(startNs int64) {
+	mc.scanWindow.inc()
+	// Sample latency: record 1 in every sampleMod scans.
+	idx := mc.scanSampleCounter.Add(1)
+	if idx%latencySampleMod == 0 {
+		mc.scanLatency.record(startNs)
 	}
 }
 
@@ -236,8 +249,12 @@ func (mc *metricsCollector) collect() *kvstoreapi.Metrics {
 		PutLatencyP50:         mc.putLatency.percentile(0.50),
 		PutLatencyP90:         mc.putLatency.percentile(0.90),
 		PutLatencyP99:         mc.putLatency.percentile(0.99),
+		ScanLatencyP50:        mc.scanLatency.percentile(0.50),
+		ScanLatencyP90:        mc.scanLatency.percentile(0.90),
+		ScanLatencyP99:        mc.scanLatency.percentile(0.99),
 		ReadThroughput:        mc.readWindow.rate(),
 		WriteThroughput:       mc.writeWindow.rate(),
+		ScanThroughput:        mc.scanWindow.rate(),
 		TotalErrors:           uint64(mc.totalErrors.Load()),
 		ErrorRate:             0, // computed below if needed
 		CompactionRunning:      mc.compactionRunning.Load(),

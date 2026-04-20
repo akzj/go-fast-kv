@@ -86,6 +86,9 @@ const (
 	// Class P0 — PL/pgSQL Error
 	SQLStatePLPGSQLError = "P0000"
 
+	// Class 0A — Feature Not Supported
+	SQLStateFeatureNotSupported = "0A000"
+
 	// Class XX — Internal Error
 	SQLStateInternalError = "XX000"
 )
@@ -275,6 +278,94 @@ func ErrInternalError(message string) *SQLError {
 	return &SQLError{
 		SQLState: SQLStateInternalError,
 		Message:  message,
+	}
+}
+
+// ErrDivisionByZero returns an error for division by zero.
+func ErrDivisionByZero() *SQLError {
+	return &SQLError{
+		SQLState: SQLStateDivisionByZero,
+		Message:  "division by zero",
+	}
+}
+
+// ErrTransactionRollback returns an error when a transaction must be rolled back.
+func ErrTransactionRollback(reason string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateTransactionRollback,
+		Message:  fmt.Sprintf("current transaction is aborted, %s", reason),
+	}
+}
+
+// ErrFeatureNotSupported returns an error for unsupported SQL features.
+func ErrFeatureNotSupported(feature string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateFeatureNotSupported,
+		Message:  fmt.Sprintf("feature not supported: %s", feature),
+	}
+}
+
+// ErrInvalidTextRepresentation returns an error for invalid text input syntax.
+func ErrInvalidTextRepresentation(input, targetType string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateInvalidTextRepresentation,
+		Message:  fmt.Sprintf("invalid input syntax for type %s: %q", targetType, input),
+	}
+}
+
+// ErrTooManyRows returns an error when a subquery returns more than one row.
+func ErrTooManyRows() *SQLError {
+	return &SQLError{
+		SQLState: SQLStateCardinalityViolation,
+		Message:  "query returns more than one row",
+	}
+}
+
+// ErrAmbiguousColumn returns an error when a column reference is ambiguous.
+func ErrAmbiguousColumn(columnName string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateAmbiguousColumn,
+		Message:  fmt.Sprintf("column reference %q is ambiguous", columnName),
+	}
+}
+
+// ErrAmbiguousFunction returns an error when a function call is ambiguous.
+func ErrAmbiguousFunction(funcName string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateAmbiguousFunction,
+		Message:  fmt.Sprintf("function name %q is ambiguous", funcName),
+	}
+}
+
+// ErrDuplicateAlias returns an error when a table/alias is duplicated in a query.
+func ErrDuplicateAlias(aliasName string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateDuplicateAlias,
+		Message:  fmt.Sprintf("table alias %q specified more than once", aliasName),
+	}
+}
+
+// ErrTooManyArguments returns an error when a function call has too many arguments.
+func ErrTooManyArguments(funcName string, maxArgs int) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateTooManyArguments,
+		Message:  fmt.Sprintf("function %q called with too many arguments (max %d)", funcName, maxArgs),
+	}
+}
+
+// ErrOutOfMemory returns an error when the database runs out of memory.
+func ErrOutOfMemory() *SQLError {
+	return &SQLError{
+		SQLState: SQLStateOutOfMemory,
+		Message:  "out of memory",
+	}
+}
+
+// ErrDiskFull returns an error when the disk is full.
+func ErrDiskFull() *SQLError {
+	return &SQLError{
+		SQLState: SQLStateDiskFull,
+		Message:  "disk is full",
 	}
 }
 

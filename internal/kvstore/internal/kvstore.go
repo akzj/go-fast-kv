@@ -803,6 +803,7 @@ func (s *store) DeleteRange(start, end []byte) (int, error) {
 // ─── Scan ───────────────────────────────────────────────────────────
 
 func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
+	startNs := time.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -818,6 +819,7 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 		if snap != nil {
 			s.readSnaps.Store(txnCtx.XID(), snap)
 			btreeIter := s.tree.Scan(start, end, txnCtx.XID())
+			s.metrics.incScan(startNs)
 			return &snapshotIterator{
 				inner:   btreeIter,
 				store:   s,
@@ -832,6 +834,7 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 	s.readSnaps.Store(readXID, snap)
 
 	btreeIter := s.tree.Scan(start, end, readXID)
+	s.metrics.incScan(startNs)
 
 	return &snapshotIterator{
 		inner:   btreeIter,
@@ -842,6 +845,7 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 
 // ScanWithParams returns an iterator over keys in [start, end) with optional LIMIT/OFFSET.
 func (s *store) ScanWithParams(start, end []byte, params kvstoreapi.ScanParams) kvstoreapi.Iterator {
+	startNs := time.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -870,6 +874,7 @@ func (s *store) ScanWithParams(start, end []byte, params kvstoreapi.ScanParams) 
 	}
 
 	btreeIter := s.tree.Scan(start, end, readXID)
+	s.metrics.incScan(startNs)
 
 	return &limitIterator{
 		inner:    btreeIter,

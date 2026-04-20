@@ -689,3 +689,39 @@ func TestEdgeCase_CaseElseNull(t *testing.T) {
 		t.Errorf("CASE without ELSE should return 2 rows")
 	}
 }
+
+func TestEdgeCase_AggregateWithoutGroupBy(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE t (a INT, b INT)")
+	env.execSQL(t, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+
+	// These queries mix aggregate with non-aggregate columns — must return error, NOT panic.
+	testCases := []struct {
+		name string
+		sql  string
+	}{
+		{"COUNT with column ref", "SELECT COUNT(a), b FROM t"},
+		{"SUM with column ref", "SELECT SUM(a), b FROM t"},
+		{"AVG with column ref", "SELECT AVG(a), b FROM t"},
+		{"Multiple aggregates with column", "SELECT COUNT(*), a FROM t"},
+		{"Aggregate and constant", "SELECT COUNT(*), 42 FROM t"}, // constant is fine (always same)
+		{"Multiple aggregates only", "SELECT COUNT(*), SUM(a) FROM t"}, // all aggregate = fine
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := env.execSQLErr(t, tc.sql)
+			if tc.name == "Aggregate and constant" || tc.name == "Multiple aggregates only" {
+				// These are valid — should NOT error
+				if err != nil {
+					t.Errorf("SQL %q should succeed, got error: %v", tc.sql, err)
+				}
+			} else {
+				// These must return an error, not panic
+				if err == nil {
+					t.Errorf("SQL %q should return error (aggregate without GROUP BY), got nil", tc.sql)
+				}
+			}
+		})
+	}
+}

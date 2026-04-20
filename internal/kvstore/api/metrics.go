@@ -14,10 +14,14 @@ type Metrics struct {
 	PutLatencyP50  float64
 	PutLatencyP90  float64
 	PutLatencyP99  float64
+	ScanLatencyP50 float64
+	ScanLatencyP90 float64
+	ScanLatencyP99 float64
 
 	// Throughput in operations/sec, measured over a rolling 10-second window.
 	ReadThroughput  uint64
 	WriteThroughput uint64
+	ScanThroughput  uint64
 
 	// Error tracking.
 	TotalErrors uint64
