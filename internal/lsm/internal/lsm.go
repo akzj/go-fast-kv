@@ -47,13 +47,19 @@ type lsm struct {
 	compactInterval time.Duration // interval between compaction checks
 	stopCh          chan struct{}  // stop compaction goroutine
 	stopped         atomic.Bool
+	compactWG       sync.WaitGroup // tracks pending background compaction goroutines
 
 	// Per-key sharded locks for fine-grained CAS operations.
 	// Reduces contention vs global s.mu — concurrent CAS on different keys
 	// can proceed in parallel.
 	casLocks    []sync.Mutex
 	casLockMask uint64 // mask for fast modulo: lockCount must be power of 2
+
+	// Worker pool for parallel SSTable reads during lookups.
+	readPool *workerPool
 }
+
+const defaultReadPoolWorkers = 4
 
 const defaultCASLockCount = 256 // must be power of 2
 
@@ -170,6 +176,9 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 	lockCount := uint64(defaultCASLockCount)
 	s.casLocks = make([]sync.Mutex, lockCount)
 	s.casLockMask = lockCount - 1
+
+	// Initialize worker pool for parallel SSTable reads.
+	s.readPool = newWorkerPool(defaultReadPoolWorkers)
 
 	// Load existing SSTables into memtable (recovery from previous close).
 	// Without this, reopen creates a fresh empty memtable and loses all
@@ -318,18 +327,31 @@ func (s *lsm) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
 	return s.getPageFromSSTables(pageID)
 }
 
-// getPageFromSSTables looks up a page mapping in SSTables.
+// pageResult holds the result of a parallel SSTable page lookup.
+type pageResult struct {
+	value   uint64
+	found   bool
+}
+
+// getPageFromSSTables looks up a page mapping in SSTables using parallel reads.
 // Uses bloom filters to skip SSTables that definitely don't contain the key.
+// Releases lock during SSTable file I/O for better concurrency.
 func (s *lsm) getPageFromSSTables(pageID uint64) (uint64, bool) {
-	segments := s.manifest.Segments()
+	segments := s.manifest.SegmentNames()
+
+	// Phase 1: Check bloom filters to find candidate SSTables (lock-free, read-only)
+	type candidate struct {
+		name string
+		path string
+	}
+	candidates := make([]candidate, 0, len(segments))
 	for i := len(segments) - 1; i >= 0; i-- {
 		segName := segments[i]
 		segPath := filepath.Join(s.dir, segName)
 
-		// Check bloom filter first to skip SSTable if key is definitely not present
 		bloom := s.manifest.GetBloomFilter(segName)
 		if bloom == nil {
-			// No bloom filter available, try to read it lazily from disk
+			// No bloom filter cached, try to read it lazily from disk
 			bloom = readBloomFilter(segPath)
 			if bloom != nil {
 				s.manifest.SetBloomFilter(segName, bloom)
@@ -339,17 +361,77 @@ func (s *lsm) getPageFromSSTables(pageID uint64) (uint64, bool) {
 			// Bloom filter says key definitely not in this SSTable, skip it
 			continue
 		}
+		candidates = append(candidates, candidate{name: segName, path: segPath})
+	}
 
-		pages, _, err := readSSTable(segPath)
-		if err != nil {
-			continue
-		}
+	// No candidates after bloom filter check
+	if len(candidates) == 0 {
+		return 0, false
+	}
 
-		idx := searchPages(pages, pageID)
-		if idx < len(pages) && pages[idx].key == pageID {
-			return pages[idx].value, true
+	// Phase 2: Fan out SSTable reads in parallel using worker pool
+	type result struct {
+		segIdx int
+		value  uint64
+		found  bool
+	}
+	results := newResultCollector[result](len(candidates))
+
+	for idx, cand := range candidates {
+		segIdx := idx
+		s.readPool.Submit(func() {
+			pages, _, err := readSSTable(cand.path)
+			if err != nil {
+				return
+			}
+			pos := searchPages(pages, pageID)
+			if pos < len(pages) && pages[pos].key == pageID {
+				results.Add(result{segIdx: segIdx, value: pages[pos].value, found: true})
+			}
+		})
+	}
+
+	// Wait for all parallel reads to complete
+	// We need to wait for pool completion - this requires synchronization
+	// The pool's Wait() closes the task channel, but we need a way to know when done
+	// Solution: track in-flight reads with a waitgroup
+	type pendingResult struct {
+		result result
+		ready  chan struct{}
+	}
+	pending := make([]pendingResult, len(candidates))
+	var readWG sync.WaitGroup
+
+	for idx, cand := range candidates {
+		segIdx := idx
+		pending[idx].ready = make(chan struct{}, 1)
+		readWG.Add(1)
+		s.readPool.Submit(func() {
+			defer readWG.Done()
+			pages, _, err := readSSTable(cand.path)
+			if err != nil {
+				close(pending[segIdx].ready)
+				return
+			}
+			pos := searchPages(pages, pageID)
+			if pos < len(pages) && pages[pos].key == pageID {
+				pending[segIdx].result = result{segIdx: segIdx, value: pages[pos].value, found: true}
+			}
+			close(pending[segIdx].ready)
+		})
+	}
+
+	// Wait for all reads to complete
+	readWG.Wait()
+
+	// Phase 3: Find the newest (lowest index) matching segment
+	// Candidates are newest-to-oldest, so lower index = newer
+	for i := 0; i < len(pending); i++ {
+		if pending[i].result.found {
+			return pending[i].result.value, true
 		}
 	}
+
 	return 0, false
 }
 
@@ -579,6 +661,7 @@ func (s *lsm) backgroundCompaction() {
 }
 
 // compact flushes the active memtable to SSTable.
+// Non-blocking: uses atomic swap and background goroutine for I/O.
 func (s *lsm) compact() error {
 	s.mu.Lock()
 
@@ -587,13 +670,25 @@ func (s *lsm) compact() error {
 		return nil
 	}
 
+	// Atomic swap: new active, old becomes immutable
 	frozen := s.active
 	s.active = newMemtable()
 	s.immutables = append(s.immutables, frozen)
 	s.mu.Unlock()
 
-	s.runCompaction(frozen)
+	// Background flush (non-blocking) — writers continue immediately
+	s.compactWG.Add(1)
+	go func() {
+		defer s.compactWG.Done()
+		s.runCompaction(frozen)
+	}()
 	return nil
+}
+
+// WaitForCompaction waits for all pending background compaction goroutines to complete.
+// Used by tests to ensure compaction finishes before assertions.
+func (s *lsm) WaitForCompaction() {
+	s.compactWG.Wait()
 }
 
 // runCompaction writes the frozen memtable to SSTable and updates manifest.
@@ -639,6 +734,9 @@ func (s *lsm) Close() error {
 
 	// Stop background compaction
 	close(s.stopCh)
+
+	// Wait for any pending background compaction goroutines
+	s.compactWG.Wait()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

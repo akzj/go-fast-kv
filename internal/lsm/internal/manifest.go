@@ -173,6 +173,19 @@ func (m *manifest) GetSegmentName(segID uint64) string {
 	return fmt.Sprintf("segment-%03d.sst", segID)
 }
 
+// SegmentNames returns a copy of all segment names for parallel iteration.
+// This is more efficient than Segments() when you only need names.
+func (m *manifest) SegmentNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]string, len(m.segments))
+	for i, seg := range m.segments {
+		result[i] = seg.name
+	}
+	return result
+}
+
 // SetSegments sets the segment list from checkpoint (v3+).
 // This initializes the manifest with checkpoint-pinned segments,
 // skipping rebuild from WAL for pre-checkpoint entries.

@@ -1,7 +1,10 @@
 package internal
 
 import (
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 )
@@ -28,6 +31,9 @@ func TestAutoCompaction(t *testing.T) {
 	
 	// Trigger compaction directly
 	l.MaybeCompact()
+	
+	// Wait for background compaction to complete (non-blocking flush)
+	l.WaitForCompaction()
 	
 	// Check that SSTable was created
 	segments := l.manifest.Segments()
@@ -160,5 +166,76 @@ func TestMaybeCompact(t *testing.T) {
 	}
 	if v != 500 {
 		t.Errorf("Wrong value: got %d, want %d", v, 500)
+	}
+}
+
+// TestNonBlockingCompaction verifies that writes are not blocked during compaction.
+// Background flush runs in goroutine while writes continue immediately.
+func TestNonBlockingCompaction(t *testing.T) {
+	dir := t.TempDir()
+	
+	cfg := lsmapi.Config{
+		Dir:           dir,
+		MemtableSize:  1024, // Small to trigger frequent compaction
+	}
+	
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer l.Close()
+	
+	// Fill and trigger compaction multiple times while writing
+	var wg sync.WaitGroup
+	errors := make(chan error, 10)
+	
+	// Writer goroutine - should not be blocked by compaction
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := uint64(0); i < 500; i++ {
+			l.SetPageMapping(i, i*100)
+			// Trigger compaction periodically
+			if i%50 == 0 {
+				l.MaybeCompact()
+			}
+		}
+	}()
+	
+	// Reader goroutine - should always succeed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_, ok := l.GetPageMapping(uint64(i%100) + 500) // May or may not exist
+			_ = ok
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+	
+	// Wait with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		// Success - no blocking
+	case <-time.After(5 * time.Second):
+		t.Error("Compaction blocked writes (timeout)")
+		errors <- fmt.Errorf("timeout")
+	}
+	
+	// Verify all written data is accessible
+	for i := uint64(0); i < 500; i++ {
+		v, ok := l.GetPageMapping(i)
+		if !ok {
+			t.Errorf("Key %d not found after concurrent compaction", i)
+		}
+		if v != i*100 {
+			t.Errorf("Key %d wrong value: got %d, want %d", i, v, i*100)
+		}
 	}
 }
