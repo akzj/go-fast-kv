@@ -6,7 +6,9 @@
 package internal
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"os"
@@ -15,25 +17,53 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// SegmentHeaderSize is the fixed size of the segment header (64 bytes).
+	SegmentHeaderSize = 64
+	// SegmentHeaderVersion is the current version of the segment header format.
+	SegmentHeaderVersion = 1
+)
+
+// segmentHeader represents the 64-byte header at the start of new segments.
+// Layout (little-endian):
+// [0:8]    magic number (8 bytes, e.g. "PAGESEGM", "BLOBSEGM")
+// [8:12]   version (uint32)
+// [12:16]  crc32 checksum of header bytes [0:60] (uint32)
+// [16:24]  create timestamp (unix nanos, uint64)
+// [24:64]  reserved (40 bytes, 0 for now)
+type segmentHeader struct {
+	Magic        [8]byte
+	Version      uint32
+	CRC32        uint32
+	CreateTime   uint64
+	Reserved     [40]byte
+}
+
 // segmentFile represents a single segment file on disk.
 type segmentFile struct {
-	id     uint32
-	file   *os.File
-	size   int64
-	sealed bool
-	data   []byte // non-nil = mmap'd slice (read-only); nil = fall back to file.ReadAt
+	id         uint32
+	file       *os.File
+	size       int64
+	sealed     bool
+	data       []byte // non-nil = mmap'd slice (read-only); nil = fall back to file.ReadAt
+	headerSize int64  // 0 for legacy segments, SegmentHeaderSize for new segments
 }
+
+// crc32cTable is the Castagnoli CRC32 table for header checksums.
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 // segmentManager implements segmentapi.SegmentManager.
 type segmentManager struct {
 	mu            sync.RWMutex
 	dir           string
 	maxSize       int64
+	magic         string // 8-byte magic for new segments, empty = legacy mode
 	active        *segmentFile
 	sealed        map[uint32]*segmentFile
 	nextSegmentID uint32
@@ -55,6 +85,9 @@ func New(cfg segmentapi.Config) (segmentapi.SegmentManager, error) {
 	if maxSize > (1 << 32) {
 		return nil, segmentapi.ErrMaxSizeOverflow
 	}
+	if len(cfg.Magic) > 8 {
+		return nil, fmt.Errorf("segment: magic string cannot exceed 8 bytes")
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("segment: mkdir %s: %w", dir, err)
@@ -63,6 +96,7 @@ func New(cfg segmentapi.Config) (segmentapi.SegmentManager, error) {
 	sm := &segmentManager{
 		dir:     dir,
 		maxSize: maxSize,
+		magic:   cfg.Magic,
 		sealed:  make(map[uint32]*segmentFile),
 	}
 
@@ -146,10 +180,50 @@ func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFil
 		return nil, fmt.Errorf("segment: stat %s: %w", path, err)
 	}
 
+	var headerSize int64 = 0
+	// Check if file has a valid segment header
+	if info.Size() >= SegmentHeaderSize {
+		// Read first 64 bytes
+		headerBuf := make([]byte, SegmentHeaderSize)
+		n, err := f.ReadAt(headerBuf, 0)
+		if err != nil && err != io.EOF {
+			f.Close()
+			return nil, fmt.Errorf("segment: read header %s: %w", path, err)
+		}
+		if n == SegmentHeaderSize {
+			// Check if magic matches expected (if set) or is a valid known magic
+			magic := string(headerBuf[:8])
+			if (sm.magic != "" && magic == sm.magic) || (magic == "PAGESEGM" || magic == "BLOBSEGM") {
+				// Valid header, validate CRC32
+				version := binary.LittleEndian.Uint32(headerBuf[8:12])
+				storedCRC := binary.LittleEndian.Uint32(headerBuf[12:16])
+				// Calculate CRC of first 60 bytes
+				computedCRC := crc32.Checksum(headerBuf[:60], crc32cTable)
+				if storedCRC != computedCRC {
+					f.Close()
+					return nil, fmt.Errorf("segment: header checksum mismatch for segment %d: stored=0x%08x computed=0x%08x", id, storedCRC, computedCRC)
+				}
+				if version > SegmentHeaderVersion {
+					f.Close()
+					return nil, fmt.Errorf("segment: unsupported header version %d for segment %d (max supported %d)", version, id, SegmentHeaderVersion)
+				}
+				headerSize = SegmentHeaderSize
+			}
+		}
+		// Seek back to start for writable files
+		if writable {
+			if _, err := f.Seek(0, io.SeekEnd); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("segment: seek end %s: %w", path, err)
+			}
+		}
+	}
+
 	sf := &segmentFile{
-		id:   id,
-		file: f,
-		size: info.Size(),
+		id:         id,
+		file:       f,
+		size:       info.Size(),
+		headerSize: headerSize,
 	}
 
 	// Memory-map read-only files for fast zero-syscall reads.
@@ -191,10 +265,45 @@ func (sm *segmentManager) createSegment(id uint32) error {
 		return fmt.Errorf("segment: create %s: %w", path, err)
 	}
 
+	var headerSize int64 = 0
+	if sm.magic != "" {
+		// Write new style segment header
+		var header segmentHeader
+		copy(header.Magic[:], []byte(sm.magic))
+		header.Version = SegmentHeaderVersion
+		header.CreateTime = uint64(time.Now().UnixNano())
+		// Calculate CRC32 of header bytes [0:60]
+		headerBytes := make([]byte, 60)
+		copy(headerBytes[0:8], header.Magic[:])
+		binary.LittleEndian.PutUint32(headerBytes[8:12], header.Version)
+		binary.LittleEndian.PutUint64(headerBytes[16:24], header.CreateTime)
+		header.CRC32 = crc32.Checksum(headerBytes, crc32cTable)
+
+		// Write full 64-byte header
+		fullHeader := make([]byte, SegmentHeaderSize)
+		copy(fullHeader[0:8], header.Magic[:])
+		binary.LittleEndian.PutUint32(fullHeader[8:12], header.Version)
+		binary.LittleEndian.PutUint32(fullHeader[12:16], header.CRC32)
+		binary.LittleEndian.PutUint64(fullHeader[16:24], header.CreateTime)
+		// Reserved bytes are zero
+
+		n, err := f.Write(fullHeader)
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("segment: write header %s: %w", path, err)
+		}
+		if n != SegmentHeaderSize {
+			f.Close()
+			return fmt.Errorf("segment: short header write %s: %d/%d bytes", path, n, SegmentHeaderSize)
+		}
+		headerSize = SegmentHeaderSize
+	}
+
 	sm.active = &segmentFile{
-		id:   id,
-		file: f,
-		size: 0,
+		id:         id,
+		file:       f,
+		size:       headerSize,
+		headerSize: headerSize,
 	}
 	sm.nextSegmentID = id + 1
 	return nil
@@ -250,22 +359,24 @@ func (sm *segmentManager) ReadAt(addr segmentapi.VAddr, size uint32) ([]byte, er
 		return nil, fmt.Errorf("segment %d not found: %w", addr.SegmentID, segmentapi.ErrInvalidVAddr)
 	}
 
-	end := int64(addr.Offset) + int64(size)
+	// Calculate actual offset in file: logical offset + header size
+	fileOffset := sf.headerSize + int64(addr.Offset)
+	end := fileOffset + int64(size)
 	if end > sf.size {
-		return nil, fmt.Errorf("read beyond segment end (off=%d size=%d segSize=%d): %w",
-			addr.Offset, size, sf.size, segmentapi.ErrInvalidVAddr)
+		return nil, fmt.Errorf("read beyond segment end (off=%d size=%d segSize=%d headerSize=%d): %w",
+			addr.Offset, size, sf.size, sf.headerSize, segmentapi.ErrInvalidVAddr)
 	}
 
 	// Fast path: read from mmap'd slice (no syscall).
 	if sf.data != nil {
 		result := make([]byte, size)
-		copy(result, sf.data[int64(addr.Offset):int64(addr.Offset)+int64(size)])
+		copy(result, sf.data[fileOffset:fileOffset+int64(size)])
 		return result, nil
 	}
 
 	// Slow path: syscall ReadAt (active segment, or mmap fallback).
 	buf := make([]byte, size)
-	n, err := sf.file.ReadAt(buf, int64(addr.Offset))
+	n, err := sf.file.ReadAt(buf, fileOffset)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("segment: readat: %w", err)
 	}
@@ -394,7 +505,15 @@ func (sm *segmentManager) SegmentSize(segID uint32) (int64, error) {
 		return 0, fmt.Errorf("segment %d not found: %w", segID, segmentapi.ErrInvalidVAddr)
 	}
 
-	return sf.size, nil
+	// Return logical size (excluding header) for backward compatibility
+	return sf.size - sf.headerSize, nil
+}
+
+// StorageDir returns the directory where segment files are stored.
+func (sm *segmentManager) StorageDir() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.dir
 }
 
 func (sm *segmentManager) SealedSegments() []uint32 {

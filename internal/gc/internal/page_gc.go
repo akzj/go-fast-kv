@@ -83,8 +83,9 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 
 	// Collect WAL entries and mapping updates for live pages.
 	type mappingUpdate struct {
-		pageID uint64
-		vaddr  uint64
+		pageID   uint64
+		oldVAddr uint64 // VAddr in the old (being-collected) segment
+		newVAddr uint64 // VAddr in the new (active) segment
 	}
 	var updates []mappingUpdate
 	batch := walapi.NewBatch()
@@ -107,8 +108,8 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 
 		// Check liveness: is the current mapping for this pageID
 		// pointing to this exact VAddr?
-		currentVAddr := addr.Pack()
-		if mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(pageID); ok && mappedVAddr == currentVAddr {
+		oldVAddr := addr.Pack()
+		if mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(pageID); ok && mappedVAddr == oldVAddr {
 			// Live — copy to active segment.
 			newAddr, err := gc.segMgr.Append(record)
 			if err != nil {
@@ -117,7 +118,7 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 
 			newPacked := newAddr.Pack()
 			batch.Add(walapi.ModuleTree, walapi.RecordPageMap, pageID, newPacked, 0)
-			updates = append(updates, mappingUpdate{pageID: pageID, vaddr: newPacked})
+			updates = append(updates, mappingUpdate{pageID: pageID, oldVAddr: oldVAddr, newVAddr: newPacked})
 
 			// Update liveMap so subsequent records for the same pageID
 			// in this segment won't also be considered live.
@@ -132,7 +133,7 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 		offset += recordSize
 	}
 
-	// 5. Sync segment data, write WAL batch, apply mapping updates, remove old segment.
+	// 5. Sync segment data, write WAL batch, apply CAS mapping updates, remove old segment.
 	// First Sync: flush the old sealed segment being collected.
 	if err := gc.segMgr.Sync(); err != nil {
 		return nil, err
@@ -151,9 +152,20 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 		}
 	}
 
-	// Apply mapping updates to in-memory state.
+	// Apply mapping updates using CAS to prevent race with concurrent writes.
+	// If CAS fails (mapping was concurrently updated), the page data in the old
+	// segment is now stale — it will be handled in the next GC cycle.
+	// This prevents blind SetPageMapping from silently overwriting user data.
 	for _, u := range updates {
-		gc.recovery.ApplyPageMap(u.pageID, u.vaddr)
+		// Use CompareAndSetPageMapping: only update if current value still equals oldVAddr.
+		// This prevents the race between GC's mapping check and the update.
+		if gc.recovery.LSMLifecycle().CompareAndSetPageMapping(u.pageID, u.oldVAddr, u.newVAddr) {
+			// CAS succeeded — invalidate any cached stale entry for this page.
+			gc.ps.InvalidatePage(u.pageID)
+		}
+		// If CAS fails: concurrent write updated the mapping after our scan.
+		// The old segment's data for this page is now stale — skip update.
+		// GC will clean up the stale data in the next cycle.
 	}
 
 	// Remove the old segment.

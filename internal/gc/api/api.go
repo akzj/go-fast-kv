@@ -20,6 +20,7 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
+	"golang.org/x/sys/unix"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -28,6 +29,9 @@ var (
 	// ErrNoSegmentsToGC is returned when there are no sealed segments
 	// eligible for garbage collection.
 	ErrNoSegmentsToGC = errors.New("gc: no sealed segments to collect")
+	// ErrInsufficientDiskSpace is returned when there is not enough disk space
+	// to safely perform GC (needs at least 2x the size of live data).
+	ErrInsufficientDiskSpace = errors.New("gc: insufficient disk space to run GC")
 )
 
 // ─── Stats ──────────────────────────────────────────────────────────
@@ -114,6 +118,16 @@ func NewBlobGC(
 // Compile-time interface check.
 var _ PageGC = (*gcPageGC)(nil)
 
+// getAvailableDiskSpace returns the number of available bytes on the filesystem
+// containing the given directory.
+func getAvailableDiskSpace(dir string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(dir, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
+
 // gcPageGC implements PageGC.
 type gcPageGC struct {
 	segMgr   segmentapi.SegmentManager
@@ -136,15 +150,16 @@ func (gc *gcPageGC) CollectOne() (*GCStats, error) {
 	}
 
 	stats := &GCStats{SegmentID: segID}
-	type mappingUpdate struct {
+	type liveRecord struct {
 		pageID uint64
-		vaddr  uint64
+		addr   segmentapi.VAddr
+		record []byte
 	}
-	var updates []mappingUpdate
-	batch := walapi.NewBatch()
+	var liveRecords []liveRecord
 	var offset uint32
 	recordSize := uint32(pagestoreapi.PageRecordSize)
 
+	// First pass: identify all live records and calculate total live size
 	for int64(offset)+int64(recordSize) <= segSize {
 		addr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
 		record, err := gc.segMgr.ReadAt(addr, recordSize)
@@ -155,19 +170,54 @@ func (gc *gcPageGC) CollectOne() (*GCStats, error) {
 		pageID := binary.BigEndian.Uint64(record[:8])
 		currentVAddr := addr.Pack()
 		if mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(pageID); ok && mappedVAddr == currentVAddr {
-			newAddr, err := gc.segMgr.Append(record)
-			if err != nil {
-				return nil, err
-			}
-			newPacked := newAddr.Pack()
-			batch.Add(walapi.ModuleTree, walapi.RecordPageMap, pageID, newPacked, 0)
-			updates = append(updates, mappingUpdate{pageID: pageID, vaddr: newPacked})
+			liveRecords = append(liveRecords, liveRecord{
+				pageID: pageID,
+				addr:   addr,
+				record: record,
+			})
 			stats.LiveRecords++
 		} else {
 			stats.DeadRecords++
 			stats.BytesFreed += int64(recordSize)
 		}
 		offset += recordSize
+	}
+
+	// Disk space pre-check: need at least 2x the size of live data
+	totalLiveSize := uint64(len(liveRecords)) * uint64(recordSize)
+	available, err := getAvailableDiskSpace(gc.segMgr.StorageDir())
+	if err != nil {
+		return nil, err
+	}
+	if available < 2*totalLiveSize {
+		return nil, ErrInsufficientDiskSpace
+	}
+
+	// Second pass: copy live records to active segment
+	type mappingUpdate struct {
+		pageID  uint64
+		oldVAddr uint64
+		newVAddr uint64
+	}
+	var updates []mappingUpdate
+	batch := walapi.NewBatch()
+	for _, lr := range liveRecords {
+		oldVAddr := lr.addr.Pack()
+		// Re-check liveness (GetPageMapping acquires internal read lock automatically, thread-safe with concurrent writes)
+		mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(lr.pageID)
+		if !ok || mappedVAddr != oldVAddr {
+			// Record was modified/deleted during first pass, skip
+			continue
+		}
+		// Copy the record
+		newAddr, err := gc.segMgr.Append(lr.record)
+		if err != nil {
+			return nil, err
+		}
+
+		newPacked := newAddr.Pack()
+		batch.Add(walapi.ModuleTree, walapi.RecordPageMap, lr.pageID, newPacked, 0)
+		updates = append(updates, mappingUpdate{pageID: lr.pageID, oldVAddr: oldVAddr, newVAddr: newPacked})
 	}
 
 	if err := gc.segMgr.Sync(); err != nil {
@@ -181,8 +231,11 @@ func (gc *gcPageGC) CollectOne() (*GCStats, error) {
 			return nil, err
 		}
 	}
+	// Apply mapping updates to in-memory state with CAS atomic update
 	for _, u := range updates {
-		gc.recovery.ApplyPageMap(u.pageID, u.vaddr)
+		// Use CAS atomic update: only set if current mapping still equals oldVAddr
+		// If CAS fails, the page was modified by concurrent user writes, skip update
+		gc.recovery.LSMLifecycle().CompareAndSetPageMapping(u.pageID, u.oldVAddr, u.newVAddr)
 	}
 	if err := gc.segMgr.RemoveSegment(segID); err != nil {
 		return nil, err
@@ -220,15 +273,17 @@ func (gc *gcBlobGC) CollectOne() (*GCStats, error) {
 	}
 
 	stats := &GCStats{SegmentID: segID}
-	type mappingUpdate struct {
-		blobID uint64
-		vaddr  uint64
-		size   uint32
+	type liveRecord struct {
+		blobID         uint64
+		addr           segmentapi.VAddr
+		fullRecord     []byte
+		fullRecordSize uint32
+		dataSize       uint32
 	}
-	var updates []mappingUpdate
-	batch := walapi.NewBatch()
+	var liveRecords []liveRecord
 	var offset uint32
 
+	// First pass: identify all live records and calculate total live size
 	for int64(offset)+int64(gcBlobHeaderSize) <= segSize {
 		headerAddr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
 		header, err := gc.segMgr.ReadAt(headerAddr, gcBlobHeaderSize)
@@ -247,19 +302,60 @@ func (gc *gcBlobGC) CollectOne() (*GCStats, error) {
 			if err != nil {
 				return nil, err
 			}
-			newAddr, err := gc.segMgr.Append(fullRecord)
-			if err != nil {
-				return nil, err
-			}
-			newPacked := newAddr.Pack()
-			batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, blobID, newPacked, dataSize)
-			updates = append(updates, mappingUpdate{blobID: blobID, vaddr: newPacked, size: dataSize})
+			liveRecords = append(liveRecords, liveRecord{
+				blobID:         blobID,
+				addr:           headerAddr,
+				fullRecord:     fullRecord,
+				fullRecordSize: fullRecordSize,
+				dataSize:       dataSize,
+			})
 			stats.LiveRecords++
 		} else {
 			stats.DeadRecords++
 			stats.BytesFreed += int64(fullRecordSize)
 		}
 		offset += fullRecordSize
+	}
+
+	// Disk space pre-check: need at least 2x the size of live data
+	var totalLiveSize uint64
+	for _, lr := range liveRecords {
+		totalLiveSize += uint64(lr.fullRecordSize)
+	}
+	available, err := getAvailableDiskSpace(gc.segMgr.StorageDir())
+	if err != nil {
+		return nil, err
+	}
+	if available < 2*totalLiveSize {
+		return nil, ErrInsufficientDiskSpace
+	}
+
+	// Second pass: copy live records to active segment
+	type mappingUpdate struct {
+		blobID    uint64
+		oldVAddr  uint64
+		newVAddr  uint64
+		size      uint32
+	}
+	var updates []mappingUpdate
+	batch := walapi.NewBatch()
+	for _, lr := range liveRecords {
+		oldVAddr := lr.addr.Pack()
+		// Re-check liveness using blobstore Read (acquires internal blobstore lock automatically, thread-safe with concurrent writes)
+		_, err := gc.bs.Read(blobstoreapi.BlobID(lr.blobID))
+		if err != nil {
+			// Record was deleted during first pass, skip
+			continue
+		}
+		// Copy the record
+		newAddr, err := gc.segMgr.Append(lr.fullRecord)
+		if err != nil {
+			return nil, err
+		}
+
+		newPacked := newAddr.Pack()
+		batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, lr.blobID, newPacked, lr.dataSize)
+		updates = append(updates, mappingUpdate{blobID: lr.blobID, oldVAddr: oldVAddr, newVAddr: newPacked, size: lr.dataSize})
 	}
 
 	if err := gc.segMgr.Sync(); err != nil {
@@ -273,8 +369,11 @@ func (gc *gcBlobGC) CollectOne() (*GCStats, error) {
 			return nil, err
 		}
 	}
+	// Apply mapping updates to in-memory state with CAS atomic update
 	for _, u := range updates {
-		gc.recovery.ApplyBlobMap(u.blobID, u.vaddr, u.size)
+		// Use CAS atomic update: only set if current mapping still equals oldVAddr and size
+		// If CAS fails, the blob was modified by concurrent user writes, skip update
+		gc.bs.CompareAndSetBlobMapping(u.blobID, u.oldVAddr, u.size, u.newVAddr, u.size)
 	}
 	if err := gc.segMgr.RemoveSegment(segID); err != nil {
 		return nil, err

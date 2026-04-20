@@ -94,6 +94,15 @@ type BlobStore interface {
 	// Useful for checkpoint serialization.
 	NextBlobID() BlobID
 
+	// GetMeta returns the metadata for a blobID if it exists, or zero BlobMeta otherwise.
+	// Used by GC for CAS checks during mapping updates.
+	GetMeta(blobID BlobID) BlobMeta
+
+	// CompareAndSetBlobMapping atomically sets a blob mapping only if the current
+	// value equals expectedVAddr and expectedSize. Returns true if the update was applied.
+	// Used by GC for race-free mapping updates.
+	CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool
+
 	// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
 	ExportMapping() []MappingEntry
 

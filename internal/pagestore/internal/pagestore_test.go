@@ -70,6 +70,20 @@ func (m *mockLSMForTests) Checkpoint(lsn uint64) error { return nil }
 func (m *mockLSMForTests) CheckpointLSN() uint64 { return 0 }
 func (m *mockLSMForTests) MaybeCompact() error { return nil }
 func (m *mockLSMForTests) Close() error { return nil }
+func (m *mockLSMForTests) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newVAddr uint64) bool {
+	if v, ok := m.pages[pageID]; ok && v == expectedVAddr {
+		m.pages[pageID] = newVAddr
+		return true
+	}
+	return false
+}
+func (m *mockLSMForTests) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
+	if b, ok := m.blobs[blobID]; ok && b.vaddr == expectedVAddr && b.size == expectedSize {
+		m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{newVAddr, newSize}
+		return true
+	}
+	return false
+}
 
 func TestAllocIncrementing(t *testing.T) {
 	ps := newTestPageStore(t)

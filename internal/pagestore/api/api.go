@@ -114,6 +114,10 @@ type PageStore interface {
 	// Useful for checkpoint serialization.
 	NextPageID() PageID
 
+	// InvalidatePage invalidates any cached entry for the given PageID.
+	// Used by GC after CAS update to evict stale VAddr from the LRU cache.
+	InvalidatePage(pageID PageID)
+
 	// Close closes the PageStore. After Close, all operations return ErrClosed.
 	// Note: PageStore does NOT close the underlying SegmentManager or WAL —
 	// those are owned by the caller.
@@ -183,6 +187,17 @@ type LSMLifecycle interface {
 	// GetPageMapping returns the current VAddr for a pageID and whether it exists.
 	// Used by GC for liveness checks during segment collection.
 	GetPageMapping(pageID uint64) (vaddr uint64, ok bool)
+	// GetBlobMapping returns the current VAddr and size for a blobID and whether it exists.
+	// Used by GC for liveness checks during blob segment collection.
+	GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok bool)
+	// CompareAndSetPageMapping atomically sets a page mapping only if the current
+	// value equals expectedVAddr. Returns true if the update was applied.
+	// Used by GC for race-free mapping updates.
+	CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newVAddr uint64) bool
+	// CompareAndSetBlobMapping atomically sets a blob mapping only if the current
+	// value equals expectedVAddr and expectedSize. Returns true if the update was applied.
+	// Used by GC for race-free mapping updates.
+	CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool
 }
 
 // ─── Config ─────────────────────────────────────────────────────────

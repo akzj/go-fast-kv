@@ -21,7 +21,10 @@
 package sql
 
 import (
+	"bytes"
 	"fmt"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,24 +51,35 @@ type Result = executorapi.Result
 // Value represents a typed SQL value (INTEGER, FLOAT, TEXT, BLOB, or NULL).
 type Value = catalogapi.Value
 
+// goroutineID returns the current goroutine's numeric ID.
+// Used to track per-goroutine active transaction contexts.
+func goroutineID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	s := buf[:n]
+	s = s[len("goroutine "):]
+	s = s[:bytes.IndexByte(s, ' ')]
+	id, _ := strconv.ParseInt(string(s), 10, 64)
+	return id
+}
+
 // ─── DB ─────────────────────────────────────────────────────────────
 
 // DB represents a SQL database backed by a go-fast-kv store.
 //
-// All SQL operations are serialized via a single-writer mutex.
+// All SQL operations are fully concurrent, no global locking.
 // The underlying KV store is NOT closed when DB.Close() is called.
 type DB struct {
 	closed bool
-	mu     sync.Mutex
 	store  kvstoreapi.Store
 	catalog  catalogapi.CatalogManager
 	parser   parserapi.Parser
 	planner  plannerapi.Planner
 	executor executorapi.Executor
-	// Transaction state: txnMgr creates transactions, txnCtx is the active transaction.
-	// txnCtx is protected by db.mu (serializes all DB operations).
+	// Transaction state: txnMgr creates transactions, txnCtxMap tracks active transactions per goroutine.
+	// Uses goroutine ID as key, so each goroutine has its own independent transaction context.
 	txnMgr txnapi.TxnContextFactory
-	txnCtx txnapi.TxnContext
+	txnCtxMap sync.Map // map[int64]txnapi.TxnContext
 }
 
 // Open creates a new SQL database using the given KV store.
@@ -102,7 +116,6 @@ func Open(store kvstoreapi.Store) *DB {
 		planner:  pl,
 		executor: ex,
 		txnMgr:   store.TxnManager(),
-		txnCtx:   nil,
 	}
 }
 
@@ -113,9 +126,6 @@ func Open(store kvstoreapi.Store) *DB {
 //
 // Returns a Result with RowsAffected for DML statements.
 func (db *DB) Exec(sql string) (*Result, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	return db.exec(sql)
 }
 
@@ -127,9 +137,6 @@ func (db *DB) Exec(sql string) (*Result, error) {
 // In Phase 1, Query and Exec use the same code path.
 // In the future, Query may return a streaming iterator.
 func (db *DB) Query(sql string) (*Result, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	return db.exec(sql)
 }
 
@@ -137,18 +144,22 @@ func (db *DB) Query(sql string) (*Result, error) {
 // Close does NOT close the underlying KV store — the caller
 // is responsible for calling store.Close() separately.
 func (db *DB) Close() error {
-	db.mu.Lock()
 	db.closed = true
-	db.mu.Unlock()
 	return nil
 }
 
 // exec is the shared implementation for Exec and Query.
-// Caller must hold db.mu.
 func (db *DB) exec(sql string) (*Result, error) {
 	if db.closed {
 		return nil, fmt.Errorf("sql: database is closed")
 	}
+	goroutineID := goroutineID()
+	// Get per-goroutine transaction context (if any)
+	var txnCtx txnapi.TxnContext
+	if val, ok := db.txnCtxMap.Load(goroutineID); ok {
+		txnCtx = val.(txnapi.TxnContext)
+	}
+
 	// Parse SQL → AST
 	stmt, err := db.parser.Parse(sql)
 	if err != nil {
@@ -172,7 +183,13 @@ func (db *DB) exec(sql string) (*Result, error) {
 		if explainStmt.Analyze {
 			// Execute the plan to collect stats
 			start := time.Now()
-			result, err := db.executor.Execute(plan)
+			var result *Result
+			var err error
+			if txnCtx != nil {
+				result, err = db.executor.ExecuteWithTxn(plan, txnCtx)
+			} else {
+				result, err = db.executor.Execute(plan)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -191,46 +208,48 @@ func (db *DB) exec(sql string) (*Result, error) {
 	if plan == nil && stmt != nil {
 		switch stmt.(type) {
 		case *parserapi.BeginStmt:
-			if db.txnCtx != nil {
+			if txnCtx != nil {
 				return nil, fmt.Errorf("sql: transaction already active")
 			}
-			db.txnCtx = db.txnMgr.BeginTxnContext()
-			if db.txnCtx == nil {
+			newTxnCtx := db.txnMgr.BeginTxnContext()
+			if newTxnCtx == nil {
 				return nil, fmt.Errorf("sql: failed to begin transaction")
 			}
+			db.txnCtxMap.Store(goroutineID, newTxnCtx)
+			db.store.SetActiveTxnContext(newTxnCtx)
 			return &executorapi.Result{}, nil
 
 		case *parserapi.CommitStmt:
-			if db.txnCtx == nil {
+			if txnCtx == nil {
 				return nil, fmt.Errorf("sql: no active transaction to commit")
 			}
-			xid := db.txnCtx.XID()
+			xid := txnCtx.XID()
 			err := db.store.CommitWithXID(xid)
 			db.store.ClearActiveTxnContext()
-			db.txnCtx = nil
+			db.txnCtxMap.Delete(goroutineID)
 			return &executorapi.Result{}, err
 
 		case *parserapi.RollbackStmt:
-			if db.txnCtx == nil {
+			if txnCtx == nil {
 				// Rollback with no transaction: no-op (per MySQL/Postgres compatibility)
 				return &executorapi.Result{}, nil
 			}
-			xid := db.txnCtx.XID()
+			xid := txnCtx.XID()
 			// Roll back pending writes: mark each key as deleted (txnMax==xid → invisible).
-			for _, key := range db.txnCtx.GetPendingWrites() {
+			for _, key := range txnCtx.GetPendingWrites() {
 				db.store.DeleteWithXID(key, xid)
 			}
 			err := db.store.AbortWithXID(xid)
 			db.store.ClearActiveTxnContext()
-			db.txnCtx = nil
+			db.txnCtxMap.Delete(goroutineID)
 			return &executorapi.Result{}, err
 		}
 	}
 
 	// Normal plan execution
-	if db.txnCtx != nil {
+	if txnCtx != nil {
 		// Inside a transaction: use ExecuteWithTxn for row locking
-		return db.executor.ExecuteWithTxn(plan, db.txnCtx)
+		return db.executor.ExecuteWithTxn(plan, txnCtx)
 	}
 	return db.executor.Execute(plan)
 }
@@ -238,7 +257,8 @@ func (db *DB) exec(sql string) (*Result, error) {
 // SetTxnContext sets the active transaction context for SQL execution.
 // Used by the gosql driver to pass gosql.Tx's TxnContext to the SQL layer.
 func (db *DB) SetTxnContext(txnCtx txnapi.TxnContext) {
-	db.txnCtx = txnCtx
+	goroutineID := goroutineID()
+	db.txnCtxMap.Store(goroutineID, txnCtx)
 	// Also register the txnCtx in the store's goroutine-local map so that
 	// store.Get/Scan use the txnCtx's snapshot for own-write visibility.
 	db.store.SetActiveTxnContext(txnCtx)
@@ -247,6 +267,7 @@ func (db *DB) SetTxnContext(txnCtx txnapi.TxnContext) {
 // EndTxn marks the current transaction as ended (committed or rolled back).
 // Called by the gosql driver after Commit/Rollback.
 func (db *DB) EndTxn() {
+	goroutineID := goroutineID()
 	db.store.ClearActiveTxnContext()
-	db.txnCtx = nil
+	db.txnCtxMap.Delete(goroutineID)
 }

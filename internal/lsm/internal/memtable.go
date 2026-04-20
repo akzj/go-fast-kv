@@ -53,6 +53,28 @@ func (m *memtable) SetPageMapping(pageID uint64, vaddr uint64) {
 	m.pageMappings.Store(pageID, vaddr)
 }
 
+// CompareAndSetPageMapping atomically sets a page mapping only if the current
+// value equals expectedVAddr. Returns true if the update was applied,
+// false if the current value was not expected (concurrent modification).
+func (m *memtable) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newVAddr uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.pageMappings.Load(pageID)
+	if !ok || current.(uint64) != expectedVAddr {
+		return false // current value doesn't match expected
+	}
+	// Already locked, safe to update
+	_, loaded := m.pageMappings.Load(pageID)
+	if loaded {
+		m.size -= 16
+	} else {
+		m.size += 16
+	}
+	m.pageMappings.Store(pageID, newVAddr)
+	return true
+}
+
 // GetPageMapping gets a page mapping.
 func (m *memtable) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
 	val, ok := m.pageMappings.Load(pageID)
@@ -87,6 +109,35 @@ func (m *memtable) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok 
 	vaddr = packed >> 32
 	size = uint32(packed)
 	return vaddr, size, true
+}
+
+// CompareAndSetBlobMapping atomically sets a blob mapping only if the current
+// value equals expectedVAddr and expectedSize. Returns true if the update was applied,
+// false if the current value was not expected (concurrent modification).
+func (m *memtable) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.blobMappings.Load(blobID)
+	if !ok {
+		return false
+	}
+	packed := current.(uint64)
+	currentVAddr := packed >> 32
+	currentSize := uint32(packed)
+	if currentVAddr != expectedVAddr || currentSize != expectedSize {
+		return false // current value doesn't match expected
+	}
+	// Already locked, safe to update
+	newPacked := packBlobMeta(newVAddr, newSize)
+	_, loaded := m.blobMappings.Load(blobID)
+	if loaded {
+		m.size -= 16
+	} else {
+		m.size += 16
+	}
+	m.blobMappings.Store(blobID, newPacked)
+	return true
 }
 
 // DeletePageMapping deletes a page mapping.

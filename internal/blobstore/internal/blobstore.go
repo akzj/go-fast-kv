@@ -220,6 +220,32 @@ func (bs *blobStore) NextBlobID() blobstoreapi.BlobID {
 	return bs.nextBlobID
 }
 
+// GetMeta returns the metadata for a blobID if it exists, or zero BlobMeta otherwise.
+func (bs *blobStore) GetMeta(blobID blobstoreapi.BlobID) blobstoreapi.BlobMeta {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if bs.closed {
+		return blobstoreapi.BlobMeta{}
+	}
+	return bs.getMapping(blobID)
+}
+
+// CompareAndSetBlobMapping atomically sets a blob mapping only if the current
+// value equals expectedVAddr and expectedSize. Returns true if the update was applied.
+func (bs *blobStore) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if bs.closed {
+		return false
+	}
+	current := bs.getMapping(blobID)
+	if current.VAddr != expectedVAddr || current.Size != expectedSize {
+		return false
+	}
+	bs.mapping[blobID] = blobstoreapi.BlobMeta{VAddr: newVAddr, Size: newSize}
+	return true
+}
+
 // Close closes the BlobStore. After Close, all operations return ErrClosed.
 func (bs *blobStore) Close() error {
 	bs.mu.Lock()

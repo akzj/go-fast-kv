@@ -78,9 +78,10 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 	}
 
 	type mappingUpdate struct {
-		blobID uint64
-		vaddr  uint64
-		size   uint32
+		blobID   uint64
+		oldVAddr uint64 // VAddr in the old (being-collected) segment
+		newVAddr uint64 // VAddr in the new (active) segment
+		size     uint32
 	}
 	var updates []mappingUpdate
 	batch := walapi.NewBatch()
@@ -108,32 +109,47 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 		stats.TotalRecords++
 
 		// Check liveness: if BlobStore can read this blobID, it's live.
-		if _, err := gc.bs.Read(blobstoreapi.BlobID(blobID)); err == nil {
-			// Live — read full record and copy to active segment.
-			fullRecord, err := gc.segMgr.ReadAt(headerAddr, fullRecordSize)
-			if err != nil {
-				return nil, err
-			}
-
-			newAddr, err := gc.segMgr.Append(fullRecord)
-			if err != nil {
-				return nil, err
-			}
-
-			newPacked := newAddr.Pack()
-			batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, blobID, newPacked, dataSize)
-			updates = append(updates, mappingUpdate{blobID: blobID, vaddr: newPacked, size: dataSize})
-
-			stats.LiveRecords++
-		} else {
+		// Capture the current VAddr for CAS: only update if mapping still points to old segment.
+		oldMeta := gc.bs.GetMeta(blobstoreapi.BlobID(blobID))
+		if oldMeta.VAddr == 0 {
+			// Blob not found in mapping — dead.
 			stats.DeadRecords++
 			stats.BytesFreed += int64(fullRecordSize)
+			offset += fullRecordSize
+			continue
 		}
 
+		// Verify the current mapping points to the old segment (not already moved).
+		oldVAddr := headerAddr.Pack()
+		if oldMeta.VAddr != oldVAddr {
+			// Blob was already moved to a newer segment — this copy in the old
+			// segment is now stale. Skip it.
+			stats.DeadRecords++
+			stats.BytesFreed += int64(fullRecordSize)
+			offset += fullRecordSize
+			continue
+		}
+
+		// Live — read full record and copy to active segment.
+		fullRecord, err := gc.segMgr.ReadAt(headerAddr, fullRecordSize)
+		if err != nil {
+			return nil, err
+		}
+
+		newAddr, err := gc.segMgr.Append(fullRecord)
+		if err != nil {
+			return nil, err
+		}
+
+		newPacked := newAddr.Pack()
+		batch.Add(walapi.ModuleBlob, walapi.RecordBlobMap, blobID, newPacked, dataSize)
+		updates = append(updates, mappingUpdate{blobID: blobID, oldVAddr: oldVAddr, newVAddr: newPacked, size: dataSize})
+
+		stats.LiveRecords++
 		offset += fullRecordSize
 	}
 
-	// 5. Sync, WAL batch, apply updates, remove old segment.
+	// 5. Sync, WAL batch, apply CAS updates, remove old segment.
 	// First Sync: flush the old sealed segment being collected.
 	if err := gc.segMgr.Sync(); err != nil {
 		return nil, err
@@ -152,8 +168,15 @@ func (gc *blobGC) CollectOne() (*gcapi.GCStats, error) {
 		}
 	}
 
+	// Apply mapping updates using CAS to prevent race with concurrent writes.
+	// CompareAndSetBlobMapping holds BlobStore.mu during the CAS, which serializes
+	// with concurrent blob writes (also under BlobStore.mu). If CAS fails,
+	// the blob data in the old segment is now stale — handled in next GC cycle.
 	for _, u := range updates {
-		gc.recovery.ApplyBlobMap(u.blobID, u.vaddr, u.size)
+		gc.bs.CompareAndSetBlobMapping(u.blobID, u.oldVAddr, u.size, u.newVAddr, u.size)
+		// If CAS fails: concurrent write updated the mapping. Skip update.
+		// The old segment's data for this blob is now stale — will be cleaned
+		// in the next GC cycle.
 	}
 
 	if err := gc.segMgr.RemoveSegment(segID); err != nil {

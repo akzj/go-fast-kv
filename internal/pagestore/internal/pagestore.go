@@ -323,6 +323,14 @@ func (ps *pageStore) SetNextPageID(nextID pagestoreapi.PageID) {
 	ps.nextPageID = nextID
 }
 
+// InvalidatePage invalidates any cached entry for the given PageID.
+// Used by GC after CAS update to evict the old VAddr from the LRU cache.
+func (ps *pageStore) InvalidatePage(pageID pagestoreapi.PageID) {
+	if ps.cache != nil {
+		ps.cache.Invalidate(uint64(pageID))
+	}
+}
+
 // LSMLifecycle returns the LSM store for WAL replay routing.
 // The underlying *lsm implements both MappingStore and LSMLifecycle interfaces.
 func (ps *pageStore) LSMLifecycle() pagestoreapi.LSMLifecycle {

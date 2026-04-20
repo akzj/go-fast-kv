@@ -159,6 +159,9 @@ type SegmentManager interface {
 	// Close flushes and closes all segment files.
 	// After Close, all operations return ErrClosed.
 	Close() error
+
+	// StorageDir returns the directory where segment files are stored.
+	StorageDir() string
 }
 
 // ─── Config ─────────────────────────────────────────────────────────
@@ -173,4 +176,9 @@ type Config struct {
 	// MaxSize is the maximum size of a single segment file in bytes.
 	// Defaults to MaxSegmentSize (64MB) if zero.
 	MaxSize int64
+
+	// Magic is the 8-byte magic number for segment headers.
+	// Use "PAGESEGM" for page segments, "BLOBSEGM" for blob segments.
+	// If empty, segments are created without headers (legacy mode for backward compatibility).
+	Magic string
 }
