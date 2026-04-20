@@ -6,9 +6,10 @@ import (
 
 	kvstore "github.com/akzj/go-fast-kv/internal/kvstore"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	encoding "github.com/akzj/go-fast-kv/internal/sql/encoding"
+	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	catalog "github.com/akzj/go-fast-kv/internal/sql/catalog"
-	encoding "github.com/akzj/go-fast-kv/internal/sql/encoding"
 	engine "github.com/akzj/go-fast-kv/internal/sql/engine"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
 	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
@@ -26,6 +27,7 @@ type testEnv struct {
 	parser  parserapi.Parser
 	planner plannerapi.Planner
 	exec    executorapi.Executor
+	enc     encodingapi.KeyEncoder // exposed for testing index cleanup
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -51,6 +53,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		parser:  p,
 		planner: pl,
 		exec:    ex,
+		enc:     enc,
 	}
 }
 
@@ -138,6 +141,78 @@ func TestExec_DropTable(t *testing.T) {
 
 	// DROP IF EXISTS on non-existent should succeed
 	env.execSQL(t, "DROP TABLE IF EXISTS users")
+}
+
+func TestExec_DropTableWithIndexes(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create table with UNIQUE columns (auto-creates indexes)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, age INT UNIQUE)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'alice@example.com', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'bob@example.com', 25)")
+
+	// Verify indexes exist (index names use format uq_<table>_<column>)
+	idxEmail, err := env.cat.GetIndex("users", "uq_users_email")
+	if err != nil {
+		t.Fatalf("email index should exist: %v", err)
+	}
+	idxAge, err := env.cat.GetIndex("users", "uq_users_age")
+	if err != nil {
+		t.Fatalf("age index should exist: %v", err)
+	}
+
+	// Build prefixes to scan for orphaned index entries
+	emailPrefix := env.enc.EncodeIndexPrefix(1, idxEmail.IndexID)
+	emailPrefixEnd := env.enc.EncodeIndexPrefixEnd(1, idxEmail.IndexID)
+	agePrefix := env.enc.EncodeIndexPrefix(1, idxAge.IndexID)
+	agePrefixEnd := env.enc.EncodeIndexPrefixEnd(1, idxAge.IndexID)
+
+	// Verify index data exists before DROP
+	iter := env.store.Scan(emailPrefix, emailPrefixEnd)
+	emailCountBefore := 0
+	for iter.Next() {
+		emailCountBefore++
+	}
+	if emailCountBefore == 0 {
+		t.Fatal("email index should have entries before DROP")
+	}
+
+	iter = env.store.Scan(agePrefix, agePrefixEnd)
+	ageCountBefore := 0
+	for iter.Next() {
+		ageCountBefore++
+	}
+	if ageCountBefore == 0 {
+		t.Fatal("age index should have entries before DROP")
+	}
+
+	// Drop the table
+	env.execSQL(t, "DROP TABLE users")
+
+	// Verify table is gone
+	_, err = env.cat.GetTable("users")
+	if err != catalogapi.ErrTableNotFound {
+		t.Fatalf("expected ErrTableNotFound after DROP, got %v", err)
+	}
+
+	// Verify NO orphaned index entries remain
+	iter = env.store.Scan(emailPrefix, emailPrefixEnd)
+	emailCountAfter := 0
+	for iter.Next() {
+		emailCountAfter++
+	}
+	if emailCountAfter != 0 {
+		t.Errorf("email index: expected 0 orphaned entries after DROP, got %d", emailCountAfter)
+	}
+
+	iter = env.store.Scan(agePrefix, agePrefixEnd)
+	ageCountAfter := 0
+	for iter.Next() {
+		ageCountAfter++
+	}
+	if ageCountAfter != 0 {
+		t.Errorf("age index: expected 0 orphaned entries after DROP, got %d", ageCountAfter)
+	}
 }
 
 func TestExec_Insert(t *testing.T) {
