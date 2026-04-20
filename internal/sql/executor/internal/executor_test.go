@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strconv"
 	"testing"
 
 	kvstore "github.com/akzj/go-fast-kv/internal/kvstore"
@@ -10,6 +11,7 @@ import (
 	encoding "github.com/akzj/go-fast-kv/internal/sql/encoding"
 	engine "github.com/akzj/go-fast-kv/internal/sql/engine"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
+	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
 	parser "github.com/akzj/go-fast-kv/internal/sql/parser"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	planner "github.com/akzj/go-fast-kv/internal/sql/planner"
@@ -178,6 +180,81 @@ func TestExec_InsertMultipleRows(t *testing.T) {
 	}
 }
 
+func TestExec_UniqueConstraint(t *testing.T) {
+	env := newTestEnv(t)
+
+	t.Run("insert_duplicate_unique_column", func(t *testing.T) {
+		// Create table with UNIQUE column
+		env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE)")
+
+		// First insert should succeed
+		env.execSQL(t, "INSERT INTO users VALUES (1, 'alice@example.com')")
+
+		// Second insert with same email should fail
+		_, err := env.execSQLErr(t, "INSERT INTO users VALUES (2, 'alice@example.com')")
+		if err == nil {
+			t.Fatal("expected unique constraint violation error, got nil")
+		}
+		// Verify SQLSTATE is 23505 (unique violation)
+		if sqle, ok := err.(*sqlerrors.SQLError); ok {
+			if sqle.SQLState != "23505" {
+				t.Errorf("SQLState = %s, want 23505", sqle.SQLState)
+			}
+		} else {
+			t.Fatalf("expected SQLError, got %T", err)
+		}
+
+		// Verify first row still exists
+		sel := env.execSQL(t, "SELECT * FROM users")
+		if len(sel.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(sel.Rows))
+		}
+	})
+
+	t.Run("insert_different_unique_values", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE items (id INT PRIMARY KEY, code TEXT UNIQUE)")
+
+		// Insert with different values should succeed
+		env.execSQL(t, "INSERT INTO items VALUES (1, 'CODE1')")
+		env.execSQL(t, "INSERT INTO items VALUES (2, 'CODE2')")
+
+		sel := env.execSQL(t, "SELECT * FROM items")
+		if len(sel.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2", len(sel.Rows))
+		}
+	})
+
+	t.Run("insert_null_unique", func(t *testing.T) {
+		// NULL values don't violate UNIQUE constraint
+		env.execSQL(t, "CREATE TABLE logs (id INT PRIMARY KEY, ref TEXT UNIQUE)")
+
+		env.execSQL(t, "INSERT INTO logs VALUES (1, NULL)")
+		env.execSQL(t, "INSERT INTO logs VALUES (2, NULL)") // Should succeed
+
+		sel := env.execSQL(t, "SELECT * FROM logs")
+		if len(sel.Rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (NULLs allowed multiple times)", len(sel.Rows))
+		}
+	})
+
+	t.Run("update_violates_unique", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, sku TEXT UNIQUE)")
+		env.execSQL(t, "INSERT INTO products VALUES (1, 'SKU-A')")
+		env.execSQL(t, "INSERT INTO products VALUES (2, 'SKU-B')")
+
+		// Update row 2 to have same SKU as row 1
+		_, err := env.execSQLErr(t, "UPDATE products SET sku = 'SKU-A' WHERE id = 2")
+		if err == nil {
+			t.Fatal("expected unique constraint violation error on update, got nil")
+		}
+		if sqle, ok := err.(*sqlerrors.SQLError); ok {
+			if sqle.SQLState != "23505" {
+				t.Errorf("SQLState = %s, want 23505", sqle.SQLState)
+			}
+		}
+	})
+}
+
 func TestExec_SelectStar(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
@@ -292,6 +369,28 @@ func TestExec_DeleteAll(t *testing.T) {
 	sel := env.execSQL(t, "SELECT * FROM users")
 	if len(sel.Rows) != 0 {
 		t.Fatalf("rows = %d, want 0", len(sel.Rows))
+	}
+}
+
+func TestExec_DeleteAll_LargeTable(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE big (id INT PRIMARY KEY, val TEXT)")
+
+	// Insert 2500 rows
+	for i := 1; i <= 2500; i++ {
+		env.execSQL(t, "INSERT INTO big VALUES ("+strconv.Itoa(i)+", 'row"+strconv.Itoa(i)+"')")
+	}
+
+	// DELETE all without WHERE
+	result := env.execSQL(t, "DELETE FROM big")
+	if result.RowsAffected != 2500 {
+		t.Errorf("RowsAffected = %d, want 2500", result.RowsAffected)
+	}
+
+	// Verify no rows remain
+	sel := env.execSQL(t, "SELECT COUNT(*) FROM big")
+	if sel.Rows[0][0].Int != 0 {
+		t.Errorf("COUNT(*) = %d, want 0", sel.Rows[0][0].Int)
 	}
 }
 

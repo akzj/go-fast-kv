@@ -2495,6 +2495,9 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 	}, nil
 }
 
+// execDelete deletes rows from a table. It iterates until all rows are deleted,
+// scanning in batches to handle tables with more rows than any single scan can return.
+// This ensures DELETE without WHERE deletes ALL rows, not just the first batch.
 func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result, error) {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
@@ -2502,21 +2505,63 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
 	}
 
-	// Scan for rows to delete
-	rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
-	if err != nil {
-		return nil, err
-	}
-
 	var count int64
 
 	// When in a transaction, use DeleteWithXID so deletes share the transaction's XID.
 	// Rollback marks entries as deleted with txnMax==txnXID → invisible.
-	// When NOT in a transaction, use WriteBatch for auto-commit per statement.
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
+		for {
+			// Scan a batch of rows to delete
+			rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
+			if err != nil {
+				return nil, err
+			}
+			if len(rows) == 0 {
+				break // No more rows to delete
+			}
+			for _, row := range rows {
+				// Delete index entries with transaction's XID.
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+					if colIdx < 0 {
+						continue
+					}
+					val := row.Values[colIdx]
+					idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, row.RowID)
+					if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+						return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey)
+				}
+
+				// Delete row with transaction's XID.
+				rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+				if err := e.store.DeleteWithXID(rowKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+					return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(rowKey)
+				count++
+			}
+		}
+		return &executorapi.Result{RowsAffected: count}, nil
+	}
+
+	// Non-transactional path: use WriteBatch for auto-commit per statement.
+	for {
+		batch := e.store.NewWriteBatch()
+
+		// Scan a batch of rows to delete
+		rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break // No more rows to delete
+		}
+
 		for _, row := range rows {
-			// Delete index entries with transaction's XID.
+			// Delete index entries.
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 				if colIdx < 0 {
@@ -2524,52 +2569,24 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				}
 				val := row.Values[colIdx]
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, row.RowID)
-				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+				if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
+					batch.Discard()
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 				}
-				e.txnCtx.AddPendingWrite(idxKey)
 			}
 
-			// Delete row with transaction's XID.
-			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
-			if err := e.store.DeleteWithXID(rowKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+			// Delete row via batch.
+			if err := e.tableEngine.DeleteFrom(plan.Table, batch, row.RowID); err != nil {
+				batch.Discard()
 				return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
 			}
-			e.txnCtx.AddPendingWrite(rowKey)
 			count++
 		}
-		return &executorapi.Result{RowsAffected: count}, nil
-	}
 
-	// Non-transactional path: use WriteBatch for auto-commit per statement.
-	batch := e.store.NewWriteBatch()
-
-	for _, row := range rows {
-		// Delete index entries.
-		for _, idx := range indexes {
-			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-			if colIdx < 0 {
-				continue
-			}
-			val := row.Values[colIdx]
-			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, row.RowID)
-			if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
-				batch.Discard()
-				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
-			}
-		}
-
-		// Delete row via batch.
-		if err := e.tableEngine.DeleteFrom(plan.Table, batch, row.RowID); err != nil {
+		if err := batch.Commit(); err != nil {
 			batch.Discard()
-			return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
+			return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
 		}
-		count++
-	}
-
-	if err := batch.Commit(); err != nil {
-		batch.Discard()
-		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
 	}
 
 	return &executorapi.Result{RowsAffected: count}, nil
@@ -3289,6 +3306,48 @@ func checkNotNullConstraint(columns []catalogapi.ColumnDef, values []catalogapi.
 	for i, col := range columns {
 		if col.NotNull && i < len(values) && values[i].IsNull {
 			return sqlerrors.ErrNotNullViolation("", col.Name)
+		}
+	}
+	return nil
+}
+
+// checkUniqueConstraint validates that values don't violate UNIQUE constraints.
+// For each UNIQUE index, checks if the value already exists in the index.
+// Returns nil if all UNIQUE constraints are satisfied, or ErrUniqueViolation
+// if any UNIQUE column has a duplicate value.
+func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value) error {
+	indexes, err := e.catalog.ListIndexes(tableName)
+	if err != nil {
+		return err
+	}
+
+	for _, idx := range indexes {
+		if !idx.Unique {
+			continue
+		}
+
+		// Find the column index for this index
+		colIdx := findColumnIndexByName(columns, idx.Column)
+		if colIdx < 0 {
+			continue
+		}
+
+		val := values[colIdx]
+		// NULL values don't violate UNIQUE constraint (SQL standard)
+		if val.IsNull {
+			continue
+		}
+
+		// Scan the index for any existing row with this value
+		iter, err := e.indexEngine.Scan(0, idx.IndexID, encodingapi.OpEQ, val)
+		if err != nil {
+			return err
+		}
+		defer iter.Close()
+
+		if iter.Next() {
+			// Found a duplicate
+			return sqlerrors.ErrUniqueViolation(tableName, idx.Column)
 		}
 	}
 	return nil
