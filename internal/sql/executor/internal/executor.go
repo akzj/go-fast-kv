@@ -2002,9 +2002,12 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 		for _, sc := range plan.SelectColumns {
 			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 				hasScalarAgg = true
-			} else if nonAggCol == "" {
-				// Capture the first non-aggregate column name for the error message.
-				nonAggCol = columnNameFromExpr(sc.Expr)
+			} else if _, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				// Non-aggregate column ref — will be flagged below if no GROUP BY.
+				// Literals (constants) are allowed alongside aggregates.
+				if nonAggCol == "" {
+					nonAggCol = columnNameFromExpr(sc.Expr)
+				}
 			}
 		}
 		if hasScalarAgg {
@@ -2228,9 +2231,12 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		for _, sc := range plan.SelectColumns {
 			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 				hasScalarAgg = true
-			} else if nonAggCol == "" {
-				// Capture the first non-aggregate column name for the error message.
-				nonAggCol = columnNameFromExpr(sc.Expr)
+			} else if _, ok := sc.Expr.(*parserapi.ColumnRef); ok {
+				// Non-aggregate column ref — will be flagged below if no GROUP BY.
+				// Literals (constants) are allowed alongside aggregates.
+				if nonAggCol == "" {
+					nonAggCol = columnNameFromExpr(sc.Expr)
+				}
 			}
 		}
 		if hasScalarAgg {
