@@ -461,6 +461,11 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				return nil, err
 			}
 
+			// Check UNIQUE constraint before inserting.
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row); err != nil {
+				return nil, err
+			}
+
 			// Allocate rowID via table engine (in-memory only, no persistence yet).
 			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
 			if err != nil {
@@ -511,6 +516,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	for _, row := range plan.Rows {
 		// Check NOT NULL constraint before inserting.
 		if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check UNIQUE constraint before inserting.
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -2668,6 +2679,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				return nil, err
 			}
 
+			// Check UNIQUE constraint before updating.
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+				return nil, err
+			}
+
 			// Update row with transaction's XID.
 			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -2722,6 +2738,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 
 		// Check NOT NULL constraint before updating.
 		if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check UNIQUE constraint before updating.
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
 			batch.Discard()
 			return nil, err
 		}
