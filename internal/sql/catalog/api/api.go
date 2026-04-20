@@ -63,6 +63,7 @@ type ColumnDef struct {
 	Table string // table name for qualified column lookups
 	Name string
 	Type Type
+	NotNull bool // NOT NULL constraint
 }
 
 // IndexSchema describes an index on a table.

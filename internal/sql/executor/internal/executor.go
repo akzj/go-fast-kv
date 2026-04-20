@@ -291,6 +291,21 @@ func (e *executor) execCreateTable(plan *plannerapi.CreateTablePlan) (*executora
 		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Create indexes for UNIQUE columns.
+	for i := range plan.UniqueIndexes {
+		idxSchema := plan.UniqueIndexes[i]
+		// Allocate index ID
+		idxID, err := e.nextID(metaNextIndexID)
+		if err != nil {
+			return nil, err
+		}
+		idxSchema.IndexID = idxID
+		// Create index catalog entry
+		if err := e.catalog.CreateIndex(idxSchema); err != nil {
+			return nil, fmt.Errorf("%w: creating unique index %q: %v", executorapi.ErrExecFailed, idxSchema.Name, err)
+		}
+	}
+
 	return &executorapi.Result{RowsAffected: 0}, nil
 }
 
@@ -3321,6 +3336,12 @@ func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.
 		return err
 	}
 
+	// Get table schema for tableID
+	table, err := e.catalog.GetTable(tableName)
+	if err != nil {
+		return err
+	}
+
 	for _, idx := range indexes {
 		if !idx.Unique {
 			continue
@@ -3339,13 +3360,20 @@ func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.
 		}
 
 		// Scan the index for any existing row with this value
-		iter, err := e.indexEngine.Scan(0, idx.IndexID, encodingapi.OpEQ, val)
+		iter, err := e.indexEngine.Scan(table.TableID, idx.IndexID, encodingapi.OpEQ, val)
 		if err != nil {
 			return err
 		}
-		defer iter.Close()
 
-		if iter.Next() {
+		found := iter.Next()
+		err = iter.Err()
+		iter.Close()
+
+		if err != nil {
+			return err
+		}
+
+		if found {
 			// Found a duplicate
 			return sqlerrors.ErrUniqueViolation(tableName, idx.Column)
 		}

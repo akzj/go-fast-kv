@@ -72,8 +72,9 @@ type JoinPlanNode interface {
 
 // CreateTablePlan creates a new table.
 type CreateTablePlan struct {
-	Schema      catalogapi.TableSchema
-	IfNotExists bool
+	Schema       catalogapi.TableSchema
+	IfNotExists  bool
+	UniqueIndexes []catalogapi.IndexSchema // auto-created indexes for UNIQUE columns
 }
 
 func (*CreateTablePlan) planNode() {}

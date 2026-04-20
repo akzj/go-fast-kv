@@ -211,6 +211,23 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		}
 		col.PrimaryKey = true
 	}
+
+	// Optional UNIQUE
+	if p.cur.Type == api.TokUnique {
+		p.advance()
+		col.Unique = true
+	}
+
+	// Optional NOT NULL
+	if p.cur.Type == api.TokNot {
+		p.advance()
+		if p.cur.Type != api.TokNull {
+			return col, p.errorf("expected NULL after NOT")
+		}
+		p.advance()
+		col.NotNull = true
+	}
+
 	return col, nil
 }
 

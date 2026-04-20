@@ -81,7 +81,7 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		if err != nil {
 			return nil, err
 		}
-		cols[i] = catalogapi.ColumnDef{Name: c.Name, Type: t}
+		cols[i] = catalogapi.ColumnDef{Name: c.Name, Type: t, NotNull: c.NotNull}
 	}
 
 	pk := stmt.PrimaryKey
@@ -107,13 +107,29 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		}
 	}
 
+	// Collect indexes for UNIQUE columns (auto-created during table creation)
+	var uniqueIndexes []catalogapi.IndexSchema
+	for _, c := range stmt.Columns {
+		if c.Unique {
+			// Generate index name: uq_<table>_<column>
+			idxName := fmt.Sprintf("uq_%s_%s", strings.ToLower(stmt.Table), strings.ToLower(c.Name))
+			uniqueIndexes = append(uniqueIndexes, catalogapi.IndexSchema{
+				Name:   idxName,
+				Table:  stmt.Table,
+				Column: c.Name,
+				Unique: true,
+			})
+		}
+	}
+
 	return &plannerapi.CreateTablePlan{
 		Schema: catalogapi.TableSchema{
 			Name:       stmt.Table,
 			Columns:    cols,
 			PrimaryKey: pk,
 		},
-		IfNotExists: stmt.IfNotExists,
+		IfNotExists:  stmt.IfNotExists,
+		UniqueIndexes: uniqueIndexes,
 	}, nil
 }
 

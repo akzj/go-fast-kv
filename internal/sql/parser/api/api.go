@@ -475,6 +475,8 @@ type ColumnDef struct {
 	Name       string
 	TypeName   string // "INT", "INTEGER", "TEXT", "FLOAT", "BLOB"
 	PrimaryKey bool
+	NotNull    bool
+	Unique     bool
 }
 
 // ─── Parser Interface ─────────────────────────────────────────────
