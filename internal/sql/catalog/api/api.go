@@ -4,9 +4,8 @@
 package api
 
 import (
-	"errors"
-
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
 )
 
 // ─── Types ─────────────────────────────────────────────────────────
@@ -34,22 +33,20 @@ type Value struct {
 
 // ─── Errors ─────────────────────────────────────────────────────────
 
-var (
-	// ErrTableNotFound is returned when a table does not exist.
-	ErrTableNotFound = errors.New("catalog: table not found")
+// ErrTableNotFound is returned when a table does not exist.
+var ErrTableNotFound = sqlerrors.ErrTableNotFound("")
 
-	// ErrTableExists is returned when trying to create a table that already exists.
-	ErrTableExists = errors.New("catalog: table already exists")
+// ErrTableExists is returned when trying to create a table that already exists.
+var ErrTableExists = sqlerrors.ErrTableExists("")
 
-	// ErrIndexNotFound is returned when an index does not exist.
-	ErrIndexNotFound = errors.New("catalog: index not found")
+// ErrIndexNotFound is returned when an index does not exist.
+var ErrIndexNotFound = sqlerrors.ErrIndexNotFound("", "")
 
-	// ErrIndexExists is returned when trying to create an index that already exists.
-	ErrIndexExists = errors.New("catalog: index already exists")
+// ErrIndexExists is returned when trying to create an index that already exists.
+var ErrIndexExists = sqlerrors.ErrIndexExists("")
 
-	// ErrColumnNotFound is returned when a column does not exist in a table.
-	ErrColumnNotFound = errors.New("catalog: column not found")
-)
+// ErrColumnNotFound is returned when a column does not exist in a table.
+var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
 // ─── Schema Types ─────────────────────────────────────────────────
 
