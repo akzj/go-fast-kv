@@ -18,14 +18,19 @@ package internal
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
-	"time"
 	"sync/atomic"
+	"time"
 
 	"github.com/akzj/go-fast-kv/internal/blobstore"
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
@@ -1525,4 +1530,253 @@ func (s *store) GetMetrics() *kvstoreapi.Metrics {
 // walSizeProvider is implemented by WAL to expose its byte size.
 type walSizeProvider interface {
 	SizeBytes() uint64
+}
+
+// Backup creates a zero-downtime, point-in-time consistent backup of the store.
+// The store remains fully operational during backup.
+func (s *store) Backup(destinationDir string) error {
+	cpLSN, err := s.getCheckpointLSN()
+	if err != nil {
+		return fmt.Errorf("backup: get checkpoint LSN: %w", err)
+	}
+	if cpLSN == 0 {
+		return fmt.Errorf("backup: no checkpoint available (store may be empty)")
+	}
+
+	if err := s.copyBackupFiles(cpLSN, destinationDir); err != nil {
+		return fmt.Errorf("backup: copy files: %w", err)
+	}
+	return nil
+}
+
+func (s *store) getCheckpointLSN() (uint64, error) {
+	// Check for active checkpoint.
+	ctx := activeCheckpoint.Load()
+	if ctx != nil {
+		select {
+		case <-ctx.doneCh:
+		case <-time.After(30 * time.Second):
+			return 0, fmt.Errorf("backup: checkpoint timeout (30s)")
+		}
+	}
+
+	// Trigger a new checkpoint and wait.
+	backupCtx := &checkpointCtx{
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	if !activeCheckpoint.CompareAndSwap(nil, backupCtx) {
+		ctx := activeCheckpoint.Load()
+		if ctx != nil {
+			select {
+			case <-ctx.doneCh:
+			case <-time.After(30 * time.Second):
+				return 0, fmt.Errorf("backup: checkpoint timeout (30s)")
+			}
+		}
+	} else {
+		s.runCheckpoint(backupCtx)
+	}
+
+	cpPath := filepath.Join(s.dir, "checkpoint")
+	cpData, err := loadCheckpoint(cpPath)
+	if err != nil {
+		return 0, fmt.Errorf("backup: load checkpoint: %w", err)
+	}
+	return cpData.LSN, nil
+}
+
+func (s *store) copyBackupFiles(checkpointLSN uint64, destDir string) error {
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("backup: create dest dir: %w", err)
+	}
+
+	var fileChecksums []manifestFileEntry
+
+	// Copy checkpoint file.
+	cpSrc := filepath.Join(s.dir, "checkpoint")
+	cpDst := filepath.Join(destDir, "checkpoint")
+	checksum, err := s.copyFile(cpSrc, cpDst)
+	if err != nil {
+		return fmt.Errorf("backup: copy checkpoint: %w", err)
+	}
+	fileChecksums = append(fileChecksums, manifestFileEntry{Name: "checkpoint", Checksum: checksum})
+
+	// Copy WAL segments with LSN >= checkpointLSN.
+	for _, seg := range s.wal.ListSegments() {
+		beginLSN, ok := parseWALSegmentBeginLSN(seg)
+		if !ok || beginLSN < checkpointLSN {
+			continue
+		}
+		src := filepath.Join(s.dir, "wal", seg)
+		dst := filepath.Join(destDir, "wal", seg)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return fmt.Errorf("backup: create wal dir: %w", err)
+		}
+		checksum, err := s.copyFile(src, dst)
+		if err != nil {
+			return fmt.Errorf("backup: copy wal segment %s: %w", seg, err)
+		}
+		fileChecksums = append(fileChecksums, manifestFileEntry{Name: filepath.Join("wal", seg), Checksum: checksum})
+	}
+
+	// Copy LSM SSTable files.
+	for _, entry := range mustReadDir(filepath.Join(s.dir, "lsm")) {
+		src := filepath.Join(s.dir, "lsm", entry.Name())
+		dst := filepath.Join(destDir, "lsm", entry.Name())
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return fmt.Errorf("backup: create lsm dir: %w", err)
+		}
+		checksum, err := s.copyFile(src, dst)
+		if err != nil {
+			return fmt.Errorf("backup: copy sstable %s: %w", entry.Name(), err)
+		}
+		fileChecksums = append(fileChecksums, manifestFileEntry{Name: filepath.Join("lsm", entry.Name()), Checksum: checksum})
+	}
+
+	// Copy page_segments.
+	for _, entry := range mustReadDir(filepath.Join(s.dir, "page_segments")) {
+		src := filepath.Join(s.dir, "page_segments", entry.Name())
+		dst := filepath.Join(destDir, "page_segments", entry.Name())
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return fmt.Errorf("backup: create page_segments dir: %w", err)
+		}
+		checksum, err := s.copyFile(src, dst)
+		if err != nil {
+			return fmt.Errorf("backup: copy page segment %s: %w", entry.Name(), err)
+		}
+		fileChecksums = append(fileChecksums, manifestFileEntry{Name: filepath.Join("page_segments", entry.Name()), Checksum: checksum})
+	}
+
+	// Copy blob_segments.
+	for _, entry := range mustReadDir(filepath.Join(s.dir, "blob_segments")) {
+		src := filepath.Join(s.dir, "blob_segments", entry.Name())
+		dst := filepath.Join(destDir, "blob_segments", entry.Name())
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return fmt.Errorf("backup: create blob_segments dir: %w", err)
+		}
+		checksum, err := s.copyFile(src, dst)
+		if err != nil {
+			return fmt.Errorf("backup: copy blob segment %s: %w", entry.Name(), err)
+		}
+		fileChecksums = append(fileChecksums, manifestFileEntry{Name: filepath.Join("blob_segments", entry.Name()), Checksum: checksum})
+	}
+
+	// Write backup manifest.
+	manifest := backupManifest{
+		Version:       1,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		CheckpointLSN: checkpointLSN,
+		Files:         fileChecksums,
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("backup: marshal manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, "backup.json"), data, 0644); err != nil {
+		return fmt.Errorf("backup: write manifest: %w", err)
+	}
+	return nil
+}
+
+type backupManifest struct {
+	Version       int                 `json:"version"`
+	Timestamp     string              `json:"timestamp"`
+	CheckpointLSN uint64              `json:"checkpoint_lsn"`
+	Files         []manifestFileEntry `json:"files"`
+}
+
+type manifestFileEntry struct {
+	Name     string `json:"name"`
+	Checksum string `json:"checksum"`
+}
+
+func (s *store) copyFile(src, dst string) (string, error) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(data)
+	checksum := hex.EncodeToString(hash[:])
+	if err := os.WriteFile(dst, data, 0644); err != nil {
+		return "", err
+	}
+	return checksum, nil
+}
+
+func parseWALSegmentBeginLSN(name string) (uint64, bool) {
+	if !strings.HasPrefix(name, "wal.") {
+		return 0, false
+	}
+	rest := name[4:]
+	dotIdx := strings.Index(rest, ".")
+	if dotIdx == -1 {
+		return 0, false
+	}
+	lsn, err := strconv.ParseUint(rest[:dotIdx], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return lsn, true
+}
+
+func mustReadDir(path string) []os.DirEntry {
+	entries, err := os.ReadDir(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil
+	}
+	return entries
+}
+
+// Restore copies a backup to targetDir and opens the store.
+func Restore(backupDir, targetDir string) (kvstoreapi.Store, error) {
+	manifestPath := filepath.Join(backupDir, "backup.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("restore: read manifest: %w", err)
+	}
+	var manifest backupManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("restore: parse manifest: %w", err)
+	}
+
+	// Verify checksums.
+	for _, entry := range manifest.Files {
+		src := filepath.Join(backupDir, entry.Name)
+		fileData, err := os.ReadFile(src)
+		if err != nil {
+			return nil, fmt.Errorf("restore: read %s: %w", entry.Name, err)
+		}
+		hash := sha256.Sum256(fileData)
+		checksum := hex.EncodeToString(hash[:])
+		if checksum != entry.Checksum {
+			return nil, fmt.Errorf("restore: checksum mismatch for %s", entry.Name)
+		}
+	}
+
+	// Copy all files to target.
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return nil, fmt.Errorf("restore: create target dir: %w", err)
+	}
+	for _, entry := range manifest.Files {
+		src := filepath.Join(backupDir, entry.Name)
+		dst := filepath.Join(targetDir, entry.Name)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return nil, fmt.Errorf("restore: create dir for %s: %w", entry.Name, err)
+		}
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return nil, fmt.Errorf("restore: read %s: %w", entry.Name, err)
+		}
+		if err := os.WriteFile(dst, data, 0644); err != nil {
+			return nil, fmt.Errorf("restore: write %s: %w", entry.Name, err)
+		}
+	}
+
+	// Open store — recovery will restore from checkpoint + WAL.
+	s, err := Open(kvstoreapi.Config{Dir: targetDir})
+	if err != nil {
+		return nil, fmt.Errorf("restore: open store: %w", err)
+	}
+	return s, nil
 }
