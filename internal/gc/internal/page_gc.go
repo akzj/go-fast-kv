@@ -172,11 +172,14 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 	// This prevents GC from deleting SSTables that are pinned by an in-flight checkpoint.
 	// Only pre-snapshot SSTables have refcount > 0 and are blocked.
 	// New SSTables created after checkpoint snapshot have refcount == 0 and can be deleted.
+	// Skip check if manifest is nil (e.g., in tests with mock LSM).
 	manifest := gc.recovery.LSMLifecycle().Manifest()
-	segName := manifest.GetSegmentName(uint64(segID))
-	if !manifest.CanDelete(segName) {
-		// Segment is pinned by checkpoint — skip deletion, GC will retry later.
-		return stats, nil
+	if manifest != nil {
+		segName := manifest.GetSegmentName(uint64(segID))
+		if !manifest.CanDelete(segName) {
+			// Segment is pinned by checkpoint — skip deletion, GC will retry later.
+			return stats, nil
+		}
 	}
 
 	// Remove the old segment.

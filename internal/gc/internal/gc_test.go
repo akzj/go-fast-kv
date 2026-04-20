@@ -8,6 +8,7 @@ import (
 
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
 	gcapi "github.com/akzj/go-fast-kv/internal/gc/api"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
@@ -566,6 +567,9 @@ func (m *mockLSMForTests) ApplyBlobDelete(blobID uint64) {
 }
 func (m *mockLSMForTests) SetCheckpointLSN(lsn uint64) {}
 func (m *mockLSMForTests) DrainCollector() []walapi.Record { return nil }
+
+// Manifest returns a nil mock manifest for tests.
+func (m *mockLSMForTests) Manifest() lsmapi.Manifest { return nil }
 
 
 func TestGC_MultipleSegments(t *testing.T) {
