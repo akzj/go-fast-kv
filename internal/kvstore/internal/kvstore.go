@@ -840,6 +840,46 @@ func (s *store) Scan(start, end []byte) kvstoreapi.Iterator {
 	}
 }
 
+// ScanWithParams returns an iterator over keys in [start, end) with optional LIMIT/OFFSET.
+func (s *store) ScanWithParams(start, end []byte, params kvstoreapi.ScanParams) kvstoreapi.Iterator {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return &errIterator{err: kvstoreapi.ErrClosed}
+	}
+
+	// Fast path: no limit/offset — delegate to plain Scan
+	if params.Limit <= 0 && params.Offset <= 0 {
+		return s.Scan(start, end)
+	}
+
+	// Create snapshot for visibility checks
+	var readXID uint64
+	gid := goroutineID()
+	if txnCtxRaw, ok := s.activeTxnCtx.Load(gid); ok {
+		txnCtx := txnCtxRaw.(txnapi.TxnContext)
+		snap := txnCtx.Snapshot()
+		if snap != nil {
+			readXID = txnCtx.XID()
+			s.readSnaps.Store(readXID, snap)
+		}
+	} else {
+		readXID, snap := s.txnMgr.ReadSnapshot()
+		s.readSnaps.Store(readXID, snap)
+	}
+
+	btreeIter := s.tree.Scan(start, end, readXID)
+
+	return &limitIterator{
+		inner:   btreeIter,
+		store:   s,
+		readXID: readXID,
+		limit:   params.Limit,
+		offset:  params.Offset,
+		count:   0,
+	}
+}
 
 // SetTTL sets a key with expiration time.
 // Currently a stub - TTL is stored in value metadata.
@@ -1328,6 +1368,49 @@ func (it *snapshotIterator) Close() {
 	} else {
 		it.store.readSnaps.Delete(it.readXID)
 	}
+}
+
+// limitIterator wraps btreeapi.Iterator and applies LIMIT/OFFSET during iteration.
+// This enables push-down optimization: the storage layer stops scanning early
+// after returning the requested number of rows, avoiding unnecessary I/O.
+type limitIterator struct {
+	inner   btreeapi.Iterator
+	store   *store
+	readXID uint64
+	limit   int // maximum rows to return; 0 = no limit
+	offset  int // rows to skip; 0 = no offset
+	count   int // rows seen so far
+}
+
+func (it *limitIterator) Next() bool {
+	// Fast path: no limit
+	if it.limit <= 0 {
+		return it.inner.Next()
+	}
+
+	// Skip until we reach the offset
+	for it.count < it.offset {
+		if !it.inner.Next() {
+			return false
+		}
+		it.count++
+	}
+
+	// Return up to limit rows
+	if !it.inner.Next() {
+		return false
+	}
+	it.count++
+	return true
+}
+
+func (it *limitIterator) Key() []byte   { return it.inner.Key() }
+func (it *limitIterator) Value() []byte { return it.inner.Value() }
+func (it *limitIterator) Err() error    { return it.inner.Err() }
+
+func (it *limitIterator) Close() {
+	it.inner.Close()
+	it.store.readSnaps.Delete(it.readXID)
 }
 
 // errIterator is returned when the store is closed.

@@ -367,7 +367,7 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	if colIdx < 0 {
 		return nil, fmt.Errorf("%w: backfill column %q not found", executorapi.ErrExecFailed, schema.Column)
 	}
-	existingRows, err := e.tableScan(tbl, nil, nil)
+	existingRows, err := e.tableScan(tbl, nil, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
 	}
@@ -680,7 +680,7 @@ func (e *executor) execRegularJoin(jp *plannerapi.JoinPlan, plan *plannerapi.Sel
 		}
 	case plannerapi.ScanPlan:
 		var err error
-		leftRows, err = e.scanRows(jp.LeftTable, left, nil)
+		leftRows, err = e.scanRows(jp.LeftTable, left, nil, 0, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -688,7 +688,7 @@ func (e *executor) execRegularJoin(jp *plannerapi.JoinPlan, plan *plannerapi.Sel
 		return nil, fmt.Errorf("execJoinSelect: unexpected left type %T", jp.Left)
 	}
 
-	rightRows, err := e.scanRows(jp.RightTable, jp.Right, nil)
+	rightRows, err := e.scanRows(jp.RightTable, jp.Right, nil, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -838,7 +838,7 @@ func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *planne
 		default:
 			return nil, fmt.Errorf("execHashJoin: unsupported left scan type %T", left)
 		}
-		rows, err := e.scanRows(leftTbl, scan, nil)
+		rows, err := e.scanRows(leftTbl, scan, nil, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("execHashJoin: scan left: %w", err)
 		}
@@ -858,7 +858,7 @@ func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *planne
 	if err != nil {
 		return nil, fmt.Errorf("execHashJoin: get right table: %w", err)
 	}
-	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil)
+	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("execHashJoin: scan right: %w", err)
 	}
@@ -999,7 +999,7 @@ func (e *executor) execIndexNestedLoopJoinSelect(plan *plannerapi.SelectPlan, nl
 	default:
 		return nil, fmt.Errorf("execIndexNestedLoopJoinSelect: outer must be ScanPlan, got %T", nlplan.Outer)
 	}
-	outerRows, err := e.scanRows(outerTbl, outerScan, nil)
+	outerRows, err := e.scanRows(outerTbl, outerScan, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: scan outer: %v", executorapi.ErrExecFailed, err)
 	}
@@ -1325,7 +1325,7 @@ func (e *executor) executeHashJoinPlan(hplan *plannerapi.HashJoinPlan, subqueryR
 		if err != nil {
 			return nil, fmt.Errorf("executeHashJoinPlan: get left table: %w", err)
 		}
-		rows, err := e.scanRows(leftTbl, left, nil)
+		rows, err := e.scanRows(leftTbl, left, nil, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("executeHashJoinPlan: scan left: %w", err)
 		}
@@ -1339,7 +1339,7 @@ func (e *executor) executeHashJoinPlan(hplan *plannerapi.HashJoinPlan, subqueryR
 	if err != nil {
 		return nil, fmt.Errorf("executeHashJoinPlan: get right table: %w", err)
 	}
-	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil)
+	rightRows, err := e.scanRows(rightTbl, hplan.Right, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("executeHashJoinPlan: scan right: %w", err)
 	}
@@ -1384,7 +1384,7 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 		}
 	case plannerapi.ScanPlan:
 		var err error
-		leftRows, err = e.scanRows(jplan.LeftTable, left, nil)
+		leftRows, err = e.scanRows(jplan.LeftTable, left, nil, 0, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1392,7 +1392,7 @@ func (e *executor) execJoin(jplan *plannerapi.JoinPlan) (*executorapi.Result, er
 		return nil, fmt.Errorf("execJoin: unexpected left type %T", jplan.Left)
 	}
 
-	rightRows, err := e.scanRows(jplan.RightTable, jplan.Right, nil)
+	rightRows, err := e.scanRows(jplan.RightTable, jplan.Right, nil, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1544,9 +1544,10 @@ func (e *executor) joinMatch(left, right *engineapi.Row, jplan *plannerapi.JoinP
 }
 
 // collectRows executes a scan plan and returns all rows.
+// LIMIT/OFFSET are not pushed down - this collects all matching rows.
 func (e *executor) collectRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
-	return e.scanRows(table, scan, subqueryResults)
+	return e.scanRows(table, scan, subqueryResults, 0, 0)
 }
 
 // walkExprForJoinSubqueries finds SubqueryExpr nodes and pre-computes them.
@@ -2133,7 +2134,13 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	}
 
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
-	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults)
+	// LIMIT/OFFSET pushdown: only push down if there's no ORDER BY (ORDER BY requires all rows first)
+	var limit, offset int
+	if plan.OrderBy == nil && plan.GroupByExprs == nil {
+		limit = plan.Limit
+		offset = plan.Offset
+	}
+	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -2553,6 +2560,15 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Defensive: validate that all assignment column indices are within bounds.
+	// This guards against edge cases (e.g., planner bugs or concurrent schema changes).
+	for colIdx := range plan.Assignments {
+		if colIdx < 0 || colIdx >= len(plan.Table.Columns) {
+			return nil, fmt.Errorf("%w: assignment column index %d out of bounds (table %q has %d columns)",
+				executorapi.ErrExecFailed, colIdx, plan.Table.Name, len(plan.Table.Columns))
+		}
 	}
 
 	// Build set of changed column indices for index maintenance

@@ -15,12 +15,12 @@ import (
 
 // ─── Scan Helpers ───────────────────────────────────────────────────
 
-// scanRows collects rows matching a scan plan.
+// scanRows collects rows matching a scan plan with optional LIMIT/OFFSET pushdown.
 func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
-	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, limit, offset int) ([]*engineapi.Row, error) {
 	switch s := scan.(type) {
 	case *plannerapi.TableScanPlan:
-		return e.tableScan(table, s.Filter, subqueryResults)
+		return e.tableScan(table, s.Filter, subqueryResults, limit, offset)
 	case *plannerapi.IndexScanPlan:
 		return e.indexScan(table, s, subqueryResults)
 	case *plannerapi.IndexOnlyScanPlan:
@@ -37,9 +37,10 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 }
 
 // scanRowsForDML delegates to scanRows (consolidation: S1).
+// For DML operations, limit/offset are not pushed down (DML affects all matching rows).
 func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
-	return e.scanRows(table, scan, subqueryResults)
+	return e.scanRows(table, scan, subqueryResults, 0, 0)
 }
 
 // filterRows applies a residual filter to already-scanned rows (used by execSelect for SelectPlan.Filter).
@@ -69,10 +70,12 @@ func (e *executor) filterRows(rows []*engineapi.Row, filter parserapi.Expr, colu
 	return filtered
 }
 
-// tableScan iterates all rows and applies a filter.
+// tableScan iterates all rows and applies a filter with optional LIMIT/OFFSET pushdown.
 func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Expr,
-	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
-	iter, err := e.tableEngine.Scan(table)
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, limit, offset int) ([]*engineapi.Row, error) {
+	// Use ScanWithLimit for LIMIT/OFFSET pushdown optimization.
+	// If limit/offset are 0, ScanWithLimit falls back to plain Scan.
+	iter, err := e.tableEngine.ScanWithLimit(table, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("%w: scan: %v", executorapi.ErrExecFailed, err)
 	}

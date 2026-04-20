@@ -59,6 +59,17 @@ type Iterator interface {
 	Close()
 }
 
+// ScanParams contains optional parameters for ScanWithParams.
+type ScanParams struct {
+	// Limit restricts the number of keys returned.
+	// If 0, no limit is applied.
+	Limit int
+
+	// Offset skips the first Offset keys.
+	// If 0, no offset is applied.
+	Offset int
+}
+
 // ─── WriteBatch ─────────────────────────────────────────────────────
 
 // WriteBatch groups multiple Put/Delete operations into a single atomic batch.
@@ -146,6 +157,18 @@ type Store interface {
 	// The iterator sees a consistent snapshot (auto-commit read txn).
 	// Each key appears at most once (latest committed version).
 	Scan(start, end []byte) Iterator
+
+	// ScanWithParams returns an iterator over keys in [start, end) with optional LIMIT/OFFSET.
+	//
+	// If params.Limit > 0, at most params.Limit keys are returned.
+	// If params.Offset > 0, the first params.Offset keys are skipped.
+	// Combining offset and limit: returns keys [offset, offset+limit).
+	//
+	// This enables push-down optimization: instead of scanning all keys and filtering
+	// in the SQL executor, the storage layer stops early after returning the needed rows.
+	//
+	// The iterator sees a consistent snapshot (auto-commit read txn).
+	ScanWithParams(start, end []byte, params ScanParams) Iterator
 
 	// NewWriteBatch creates a new write batch for grouping operations.
 	// Multiple Put/Delete calls are staged and applied atomically on Commit.
@@ -259,6 +282,10 @@ type Store interface {
 	// CommitWithXID collects those entries, writes them to WAL (fsync), and
 	// updates CLOG. This ensures SQL transaction writes survive crashes.
 	CommitWithXID(xid uint64) error
+
+	// AbortWithXID rolls back a SQL transaction by writing a TxnAbort WAL record.
+	// Called by the SQL layer at ROLLBACK time.
+	AbortWithXID(xid uint64) error
 
 	// GetMetrics returns current operational metrics.
 	// Zero blocking — all fields are populated atomically.

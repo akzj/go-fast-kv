@@ -337,6 +337,32 @@ func (te *tableEngine) Scan(table *catalogapi.TableSchema) (engineapi.RowIterato
 	}, nil
 }
 
+// ScanWithLimit returns an iterator over all rows in the table with optional LIMIT/OFFSET.
+// If limit > 0, at most limit rows are returned.
+// If offset > 0, the first offset rows are skipped.
+// Combining offset and limit: returns rows [offset, offset+limit).
+//
+// This enables push-down optimization: the storage layer stops scanning early
+// after returning the requested number of rows, avoiding unnecessary I/O.
+func (te *tableEngine) ScanWithLimit(table *catalogapi.TableSchema, limit, offset int) (engineapi.RowIterator, error) {
+	if table.TableID == 0 {
+		return nil, engineapi.ErrTableIDNotSet
+	}
+	prefix := te.encoder.EncodeRowPrefix(table.TableID)
+	prefixEnd := te.encoder.EncodeRowPrefixEnd(table.TableID)
+	kvIter := te.store.ScanWithParams(prefix, prefixEnd, kvstoreapi.ScanParams{
+		Limit:  limit,
+		Offset: offset,
+	})
+
+	return &rowIterator{
+		kvIter:  kvIter,
+		encoder: te.encoder,
+		codec:   te.codec,
+		columns: table.Columns,
+	}, nil
+}
+
 func (te *tableEngine) Delete(table *catalogapi.TableSchema, rowID uint64) error {
 	if table.TableID == 0 {
 		return engineapi.ErrTableIDNotSet

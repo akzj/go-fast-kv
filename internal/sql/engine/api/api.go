@@ -118,6 +118,16 @@ type TableEngine interface {
 	// Caller must call Close() on the returned iterator.
 	Scan(table *catalogapi.TableSchema) (RowIterator, error)
 
+	// ScanWithLimit returns an iterator over all rows in the table with optional LIMIT/OFFSET.
+	// If limit > 0, at most limit rows are returned.
+	// If offset > 0, the first offset rows are skipped.
+	// Combining offset and limit: returns rows [offset, offset+limit).
+	//
+	// This enables push-down optimization: the storage layer stops scanning early
+	// after returning the requested number of rows, avoiding unnecessary I/O.
+	// Caller must call Close() on the returned iterator.
+	ScanWithLimit(table *catalogapi.TableSchema, limit, offset int) (RowIterator, error)
+
 	// Delete deletes a row by rowID.
 	// Returns ErrRowNotFound if the row does not exist.
 	Delete(table *catalogapi.TableSchema, rowID uint64) error
