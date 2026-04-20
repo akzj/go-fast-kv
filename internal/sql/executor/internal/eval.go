@@ -242,10 +242,9 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		return catalogapi.Value{}, err
 	}
 
-	// NULL comparison: any comparison with NULL yields false (SQL semantics)
+	// Any comparison with NULL returns NULL (SQL three-valued logic)
 	if left.IsNull || right.IsNull {
-		// != is special: NULL != X → false (not true)
-		return intVal(0), nil
+		return catalogapi.Value{IsNull: true}, nil
 	}
 
 	cmp, err := encoding.CompareValues(left, right)

@@ -19,7 +19,7 @@ func TestNullHandling_Comparisons(t *testing.T) {
 		t.Errorf("a = NULL should return 0 rows, got %d", len(r.Rows))
 	}
 
-	// IS NULL works
+	// IS NULL works (special operator, not general comparison)
 	r = env.execSQL(t, "SELECT * FROM t WHERE b IS NULL")
 	if len(r.Rows) != 1 {
 		t.Errorf("b IS NULL should return 1 row, got %d", len(r.Rows))
@@ -642,7 +642,7 @@ func TestEdgeCase_BooleanOperators(t *testing.T) {
 	env.execSQL(t, "INSERT INTO t VALUES (0), (1), (NULL)")
 
 	r := env.execSQL(t, "SELECT * FROM t WHERE NOT a = 1")
-	if len(r.Rows) != 2 {
+	if len(r.Rows) != 1 {
 		t.Errorf("NOT should work, got %d rows", len(r.Rows))
 	}
 
