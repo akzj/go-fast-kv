@@ -52,7 +52,15 @@ type blobStore struct {
 		Increment(segID uint32, count, bytes int64)
 		Decrement(segID uint32, count, bytes int64)
 	}
+
+	// Per-key sharded CAS locks for fine-grained concurrent access.
+	// Reduces contention vs global mu — concurrent CAS on different blobIDs
+	// can proceed in parallel. lockCount must be power of 2 for fast bitmask modulo.
+	casLocks    []sync.Mutex
+	casLockMask uint64
 }
+
+const defaultCASLockCount = 256 // must be power of 2
 
 // New creates a new BlobStore backed by the given SegmentManager.
 //
@@ -72,6 +80,12 @@ func New(cfg blobstoreapi.Config, segMgr segmentapi.SegmentManager) blobstoreapi
 	if cfg.StatsManager != nil {
 		bs.statsMgr = cfg.StatsManager
 	}
+	// Initialize per-key sharded CAS locks.
+	// Using 256 locks reduces contention vs global mu — concurrent CAS on different
+	// blobIDs proceeds in parallel. lockCount must be power of 2 for fast bitmask modulo.
+	lockCount := uint64(defaultCASLockCount)
+	bs.casLocks = make([]sync.Mutex, lockCount)
+	bs.casLockMask = lockCount - 1
 	return bs
 }
 
@@ -232,12 +246,23 @@ func (bs *blobStore) GetMeta(blobID blobstoreapi.BlobID) blobstoreapi.BlobMeta {
 
 // CompareAndSetBlobMapping atomically sets a blob mapping only if the current
 // value equals expectedVAddr and expectedSize. Returns true if the update was applied.
+//
+// Uses per-key sharded lock (not global mu) to allow concurrent CAS on different blobIDs.
 func (bs *blobStore) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
 	if bs.closed {
 		return false
 	}
+
+	// Per-key sharded lock — serializes CAS on this specific blobID.
+	lockIdx := blobID & bs.casLockMask
+	bs.casLocks[lockIdx].Lock()
+	defer bs.casLocks[lockIdx].Unlock()
+
+	// Re-check closed status under lock
+	if bs.closed {
+		return false
+	}
+
 	current := bs.getMapping(blobID)
 	if current.VAddr != expectedVAddr || current.Size != expectedSize {
 		return false
