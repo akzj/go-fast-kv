@@ -1591,6 +1591,28 @@ func (s *store) copyBackupFiles(checkpointLSN uint64, destDir string) error {
 		return fmt.Errorf("backup: create dest dir: %w", err)
 	}
 
+	// PIN LSM segments for the entire backup copy operation.
+	// This prevents GC from deleting segments while we copy them.
+	// Without pinning, compact could run between checkpoint completion and file copy,
+	// leaving us with mappings to deleted segments → restore fails.
+	var pinnedSegments []string
+	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+	if lsmRecovery, ok := psRecovery.LSMLifecycle().(interface{ Manifest() lsmapi.Manifest }); ok {
+		if manifest := lsmRecovery.Manifest(); manifest != nil {
+			pinnedSegments = manifest.PinAll()
+		}
+	}
+	// Ensure unpin on exit (even on error).
+	if len(pinnedSegments) > 0 {
+		defer func() {
+			if lsmRecovery, ok := psRecovery.LSMLifecycle().(interface{ Manifest() lsmapi.Manifest }); ok {
+				if manifest := lsmRecovery.Manifest(); manifest != nil {
+					manifest.UnpinAll(pinnedSegments)
+				}
+			}
+		}()
+	}
+
 	var fileChecksums []manifestFileEntry
 
 	// Copy checkpoint file.
@@ -1603,7 +1625,23 @@ func (s *store) copyBackupFiles(checkpointLSN uint64, destDir string) error {
 	fileChecksums = append(fileChecksums, manifestFileEntry{Name: "checkpoint", Checksum: checksum})
 
 	// Copy WAL segments with LSN >= checkpointLSN.
+	// Also copy the active WAL segment (contains entries AFTER checkpoint LSN).
 	for _, seg := range s.wal.ListSegments() {
+		// Always include active segment — it contains entries written after checkpoint.
+		if strings.HasSuffix(seg, ".active.log") {
+			src := filepath.Join(s.dir, "wal", seg)
+			dst := filepath.Join(destDir, "wal", seg)
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				return fmt.Errorf("backup: create wal dir: %w", err)
+			}
+			checksum, err := s.copyFile(src, dst)
+			if err != nil {
+				return fmt.Errorf("backup: copy wal segment %s: %w", seg, err)
+			}
+			fileChecksums = append(fileChecksums, manifestFileEntry{Name: filepath.Join("wal", seg), Checksum: checksum})
+			continue
+		}
+		// For sealed segments, only copy if beginLSN >= checkpointLSN.
 		beginLSN, ok := parseWALSegmentBeginLSN(seg)
 		if !ok || beginLSN < checkpointLSN {
 			continue

@@ -264,6 +264,19 @@ type Store interface {
 	// Zero blocking — all fields are populated atomically.
 	// Latency percentiles are calculated from a fixed-size ring buffer.
 	GetMetrics() *Metrics
+
+	// Backup creates a consistent point-in-time backup of the store to destDir.
+	// The backup runs while the store is fully operational (zero downtime).
+	// It includes: checkpoint file, all WAL segments needed for recovery,
+	// all SSTable files, page_segments, and blob_segments.
+	// A backup manifest (backup.json) is written with metadata and SHA256 checksums.
+	//
+	// Thread safety: Backup holds a read lock internally. Get/Put/Scan can
+	// run concurrently (they see their own snapshots). Checkpoint runs
+	// concurrently (lock-free async). Close cannot run concurrently.
+	//
+	// Restore is a package-level function: kvstore.Restore(backupDir, targetDir).
+	Backup(destDir string) error
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────

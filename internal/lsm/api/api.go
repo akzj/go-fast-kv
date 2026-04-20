@@ -64,6 +64,7 @@ type MappingStore interface {
 	// Page mappings
 	SetPageMapping(pageID uint64, vaddr uint64)
 	GetPageMapping(pageID uint64) (vaddr uint64, ok bool)
+	GetAllPageMappings() []walapi.Record // returns all mappings for checkpoint persistence
 
 	// Blob mappings
 	SetBlobMapping(blobID uint64, vaddr uint64, size uint32)

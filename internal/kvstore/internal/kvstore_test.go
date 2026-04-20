@@ -334,12 +334,12 @@ func TestCheckpointFormatVersion(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	// Version byte must be 2 (v2 = checkpoint with segment stats).
+	// Version byte must be 4 (v4 = checkpoint with page mappings for backup recovery).
 	if len(raw) < 1 {
 		t.Fatal("checkpoint file is empty")
 	}
-	if raw[0] != 3 {
-		t.Fatalf("version byte: got %d, want 3", raw[0])
+	if raw[0] != 4 {
+		t.Fatalf("version byte: got %d, want 4", raw[0])
 	}
 
 	// Verify that deserialization reads and validates the version.
@@ -356,27 +356,29 @@ func TestCheckpointFormatVersion(t *testing.T) {
 // ─── TestCheckpointUnknownVersionRejected ────────────────────────────
 
 func TestCheckpointUnknownVersionRejected(t *testing.T) {
-	// Manually construct a v3 checkpoint buffer (version byte = 3)
+	// Manually construct a v5 checkpoint buffer (version byte = 5)
 	// to simulate a future unsupported format.
-	// v4/future header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
-	// + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + StatsCount(4) + reserved(4)
-	// = 61 bytes, then CRC32(4) = 65 bytes total for zero-data checkpoint.
-	buf := make([]byte, 61+4)
-	buf[0] = 4                           // version = 4 (unsupported/future)
+	// v3/v4 header layout: version(1) + LSN(8) + SnapshotXID(8) + RootPageID(8) + NextPageID(8)
+	// + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + StatsCount(4) + LSMSegmentCount(4) + reserved(4)
+	// = 73 bytes, then CRC32(4) = 77 bytes total for zero-data checkpoint.
+	buf := make([]byte, 73+4)
+	buf[0] = 5                            // version = 5 (unsupported/future)
 	binary.LittleEndian.PutUint64(buf[1:], 100)   // LSN
 	binary.LittleEndian.PutUint64(buf[9:], 10)    // NextXID
-	binary.LittleEndian.PutUint64(buf[17:], 1)    // RootPageID
-	binary.LittleEndian.PutUint64(buf[25:], 2)    // NextPageID
-	binary.LittleEndian.PutUint64(buf[33:], 3)    // NextBlobID
-	binary.LittleEndian.PutUint32(buf[41:], 0)    // PageCount = 0
-	binary.LittleEndian.PutUint32(buf[45:], 0)    // BlobCount = 0
-	binary.LittleEndian.PutUint32(buf[49:], 0)    // CLOGCount = 0
-	binary.LittleEndian.PutUint32(buf[53:], 0)    // StatsCount = 0
+	binary.LittleEndian.PutUint64(buf[17:], 10)  // SnapshotXID
+	binary.LittleEndian.PutUint64(buf[25:], 1)    // RootPageID
+	binary.LittleEndian.PutUint64(buf[33:], 2)    // NextPageID
+	binary.LittleEndian.PutUint64(buf[41:], 3)    // NextBlobID
+	binary.LittleEndian.PutUint32(buf[49:], 0)    // PageCount = 0
+	binary.LittleEndian.PutUint32(buf[53:], 0)    // BlobCount = 0
+	binary.LittleEndian.PutUint32(buf[57:], 0)    // CLOGCount = 0
+	binary.LittleEndian.PutUint32(buf[61:], 0)    // StatsCount = 0
+	binary.LittleEndian.PutUint32(buf[65:], 0)    // LSMSegmentCount = 0
 	// reserved = 0 already
 
-	// Compute and write CRC (covers bytes 0-60).
-	crc := crc32.Checksum(buf[:61], crc32.MakeTable(crc32.Castagnoli))
-	binary.LittleEndian.PutUint32(buf[61:], crc)
+	// Compute and write CRC (covers bytes 0-72).
+	crc := crc32.Checksum(buf[:73], crc32.MakeTable(crc32.Castagnoli))
+	binary.LittleEndian.PutUint32(buf[73:], crc)
 
 	// Try to deserialize — should fail with version mismatch.
 	_, err := deserializeCheckpoint(buf)
@@ -883,15 +885,15 @@ func TestV3CheckpointRecovery(t *testing.T) {
 		t.Fatal("checkpoint file not created")
 	}
 
-	// Read version byte to verify v3 format.
+	// Read version byte to verify v4 format.
 	raw, err := os.ReadFile(cpPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	if raw[0] != 3 {
-		t.Fatalf("checkpoint version: got %d, want 3", raw[0])
+	if raw[0] != 4 {
+		t.Fatalf("checkpoint version: got %d, want 4", raw[0])
 	}
-	t.Logf("checkpoint version: v3")
+	t.Logf("checkpoint version: v4")
 
 	s.Close()
 

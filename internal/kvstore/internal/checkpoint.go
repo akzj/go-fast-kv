@@ -60,9 +60,9 @@ type checkpointCtx struct {
 	tempPath string         // path to temp file (for cleanup on abort)
 }
 
-// ─── Checkpoint header layout v3 ─────────────────────────────────────
+// ─── Checkpoint header layout v4 ─────────────────────────────────────
 //
-// [0:1]   byte    Version (3 = lock-free with LSM manifest)
+// [0:1]   byte    Version (4 = with page mappings for backup recovery)
 // [1:9]   uint64  LSN
 // [9:17]  uint64  NextXID
 // [17:25] uint64  SnapshotXID (xmax cutoff)
@@ -78,9 +78,10 @@ type checkpointCtx struct {
 //
 // Total header: 73 bytes
 
-const checkpointHeaderSizeV3 = 73
+const checkpointHeaderSizeV4 = 73
+const checkpointHeaderSizeV3 = 73 // v3 added SnapshotXID + LSM segment count, same size
 const checkpointHeaderSize = 61 // v1/v2 header size
-const checkpointVersion = 3
+const checkpointVersion = 4 // v4: includes page mappings for backup recovery
 
 // ─── Store.Checkpoint — lock-free background checkpoint ─────────────
 
@@ -163,6 +164,23 @@ func (s *store) runCheckpoint(ctx *checkpointCtx) {
 		ctx.pinnedSegments = pinnedSegments
 	}
 
+	// Collect page mappings from LSM (for checkpoint persistence).
+	// This is critical for recovery — without page mappings, we can't locate
+	// B-tree pages even if the segment files exist. Include ALL mappings so
+	// recovery doesn't depend on WAL replay.
+	// Note: GetAllPageMappings returns []walapi.Record{ID=pageID, VAddr=vaddr}.
+	var pageMappings []pagestoreapi.MappingEntry
+	if lsmStore, ok := lsmRecovery.(interface {
+		GetAllPageMappings() []walapi.Record
+	}); ok {
+		for _, rec := range lsmStore.GetAllPageMappings() {
+			pageMappings = append(pageMappings, pagestoreapi.MappingEntry{
+				PageID: rec.ID,
+				VAddr:  rec.VAddr,
+			})
+		}
+	}
+
 	// Collect blob mappings via COW copy (short write lock ~10ns).
 	blobMappings := s.blobStore.GetSnapshotMappings()
 
@@ -179,6 +197,14 @@ func (s *store) runCheckpoint(ctx *checkpointCtx) {
 		NextBlobID:  s.blobStore.NextBlobID(),
 		Stats:       s.gcStats.ExportAll(),
 		lsmSegments: pinnedSegments,
+	}
+
+	// Convert page mappings to internal format.
+	for _, p := range pageMappings {
+		data.Pages = append(data.Pages, pageMapping{
+			PageID: p.PageID,
+			VAddr:  p.VAddr,
+		})
 	}
 
 	// Convert blob mappings to internal format.
@@ -609,6 +635,35 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		data.SnapshotXID = data.NextXID // default for v1/v2
 	} else if version == 3 {
 		// v3 format.
+		headerSize = checkpointHeaderSizeV3
+
+		data.LSN = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextXID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.SnapshotXID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.RootPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextBlobID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		pageCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		blobCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		clogCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		statsCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		lsmCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		// reserved
+		off += 4
+	} else if version == 3 || version == 4 {
+		// v3/v4 format (same header size 73).
+		// v4 added page mappings for backup recovery; header layout is identical.
 		headerSize = checkpointHeaderSizeV3
 
 		data.LSN = binary.LittleEndian.Uint64(buf[off:])

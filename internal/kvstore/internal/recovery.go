@@ -42,8 +42,8 @@ func (s *store) recover() error {
 		maxTxnXID = 0
 	} else {
 		// Checkpoint exists — restore state from it.
-		// Page→VAddr mappings: no longer in checkpoint file (LSM handles persistence).
-		// CLOG, XID, page IDs, blob IDs, root: still restored from checkpoint.
+		// Page→VAddr mappings: loaded from checkpoint (v4+) or WAL replay (v1-v3).
+		// Blob mappings, CLOG, XID, page IDs, blob IDs, root: restored from checkpoint.
 		psRecovery.SetNextPageID(cpData.NextPageID)
 		bsRecovery.LoadMapping(cpData.toBlobMappings())
 		bsRecovery.SetNextBlobID(cpData.NextBlobID)
@@ -53,6 +53,15 @@ func (s *store) recover() error {
 		rootPageID = cpData.RootPageID
 		maxTxnXID = cpData.NextXID
 		lsmRecovery.SetCheckpointLSN(cpData.LSN)
+
+		// Load page mappings from checkpoint (v4+ format).
+		// This ensures recovery works even if WAL was truncated.
+		if pageMappings := cpData.toPageMappings(); len(pageMappings) > 0 {
+			for _, pm := range pageMappings {
+				lsmRecovery.ApplyPageMapping(pm.PageID, pm.VAddr)
+				s.updateNextPageID(psRecovery, pm.PageID)
+			}
+		}
 
 		// Load GC stats from checkpoint
 		s.gcStats.LoadAll(cpData.Stats)

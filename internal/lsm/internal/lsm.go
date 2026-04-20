@@ -327,6 +327,57 @@ func (s *lsm) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
 	return s.getPageFromSSTables(pageID)
 }
 
+// GetAllPageMappings returns all page mappings from active memtable, immutables, and SSTables.
+// Used by checkpoint to persist all page mappings so recovery doesn't depend on WAL replay.
+func (s *lsm) GetAllPageMappings() []walapi.Record {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Use map to dedupe (newer value wins)
+	mappings := make(map[uint64]uint64)
+
+	// Collect from active memtable
+	s.active.RangePages(func(pageID uint64, vaddr uint64) bool {
+		mappings[pageID] = vaddr
+		return true
+	})
+
+	// Collect from immutables (newer wins)
+	for i := len(s.immutables) - 1; i >= 0; i-- {
+		s.immutables[i].RangePages(func(pageID uint64, vaddr uint64) bool {
+			mappings[pageID] = vaddr
+			return true
+		})
+	}
+
+	// Collect from SSTables (earlier values, newer wins if duplicate)
+	for _, segName := range s.manifest.SegmentNames() {
+		segPath := filepath.Join(s.dir, segName)
+		pages, _, err := readSSTable(segPath)
+		if err != nil {
+			continue
+		}
+		for _, p := range pages {
+			// Only set if not already present (active/immutable takes precedence)
+			if _, exists := mappings[p.key]; !exists {
+				mappings[p.key] = p.value
+			}
+		}
+	}
+
+	// Convert to records
+	records := make([]walapi.Record, 0, len(mappings))
+	for pageID, vaddr := range mappings {
+		records = append(records, walapi.Record{
+			ModuleType: walapi.ModuleLSM,
+			Type:       walapi.RecordPageMap,
+			ID:         pageID,
+			VAddr:      vaddr,
+		})
+	}
+	return records
+}
+
 // sstReadJob represents a pending SSTable read job for the worker pool.
 type sstReadJob struct {
 	segIdx    int

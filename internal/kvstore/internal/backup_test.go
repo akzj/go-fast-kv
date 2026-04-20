@@ -2,6 +2,7 @@ package internal
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,9 +20,13 @@ func TestBackupRestore(t *testing.T) {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	// Write minimal test data.
-	if err := s.Put([]byte("key1"), []byte("value1")); err != nil {
-		t.Fatalf("failed to put: %v", err)
+	// Write more data to ensure checkpoint has real work.
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d", i))
+		if err := s.Put(key, value); err != nil {
+			t.Fatalf("failed to put: %v", err)
+		}
 	}
 
 	// Checkpoint (async - wait for it to complete).
@@ -84,17 +89,17 @@ func TestBackupRestore(t *testing.T) {
 	defer restoredStore.Close()
 
 	// Verify data restored.
-	val, err := restoredStore.Get([]byte("key1"))
-	if err != nil {
-		// Note: if GC ran between backup and restore, some page data might be missing
-		// due to LSM segment compaction. This is a known limitation of the current
-		// backup design that requires LSM-level consistency.
-		t.Logf("warning: failed to get key1 after restore: %v (may be GC-related)", err)
-		// Don't fail the test - just verify the backup/restore cycle completed
-		return
-	}
-	if string(val) != "value1" {
-		t.Errorf("expected 'value1', got '%s'", string(val))
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		val, err := restoredStore.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key-%d after restore: %v", i, err)
+			continue
+		}
+		expected := []byte(fmt.Sprintf("value-%d", i))
+		if string(val) != string(expected) {
+			t.Errorf("key-%d: expected %s, got %s", i, expected, val)
+		}
 	}
 }
 
