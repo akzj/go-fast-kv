@@ -259,11 +259,6 @@ type Store interface {
 	// CommitWithXID collects those entries, writes them to WAL (fsync), and
 	// updates CLOG. This ensures SQL transaction writes survive crashes.
 	CommitWithXID(xid uint64) error
-
-	// AbortWithXID rolls back a SQL transaction by writing a TxnAbort WAL record.
-	// Called by the SQL layer at ROLLBACK time. On recovery, aborted transactions
-	// are ignored (entries already marked self-deleted via txnMax==txnXID).
-	AbortWithXID(xid uint64) error
 }
 
 // ─── SyncMode ───────────────────────────────────────────────────────
@@ -343,4 +338,9 @@ type Config struct {
 	// Larger values improve read performance for workloads that exceed the
 	// default 8MB working set. Memory usage is proportional to this setting.
 	PageCacheSize int
+
+	// LockTimeoutMs is the timeout in milliseconds for acquiring row locks
+	// in SQL transactions (SELECT FOR UPDATE, etc.). Default: 5000 (5 seconds).
+	// Set to 0 for no timeout (wait indefinitely).
+	LockTimeoutMs int
 }

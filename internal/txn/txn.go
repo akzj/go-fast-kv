@@ -16,3 +16,10 @@ type TxnManager = internal.TxnManager
 func New() api.TxnManager {
 	return internal.New()
 }
+
+// NewWithLockTimeout creates a new TxnManager with a custom lock timeout.
+// lockTimeoutMs: timeout in milliseconds for row lock acquisition.
+// Set to 0 for no timeout (wait indefinitely).
+func NewWithLockTimeout(lockTimeoutMs int64) api.TxnManager {
+	return internal.NewWithLockTimeout(lockTimeoutMs)
+}

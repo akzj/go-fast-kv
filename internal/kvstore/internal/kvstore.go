@@ -213,8 +213,12 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	ps := pagestore.New(pagestoreapi.Config{PageCacheSize: cfg.PageCacheSize, StatsManager: gcStats}, pageSegMgr, lsmStore)
 	bs := blobstore.New(blobstoreapi.Config{StatsManager: gcStats}, blobSegMgr)
 
-	// Create TxnManager
-	var tm txnapi.TxnManager = txn.New()
+	// Create TxnManager with lock timeout from config
+	lockTimeoutMs := int64(cfg.LockTimeoutMs)
+	if lockTimeoutMs <= 0 {
+		lockTimeoutMs = 5000 // default 5 second timeout for backward compatibility
+	}
+	var tm txnapi.TxnManager = txn.NewWithLockTimeout(lockTimeoutMs)
 
 	// Create page provider and blob adapter
 	cacheSize := cfg.PageCacheSize

@@ -98,16 +98,34 @@ type TxnManager struct {
 
 	// Shared row lock manager for all transactions from this TxnManager
 	lockMgr rowlock.LockManager
+
+	// Default lock timeout in milliseconds for row locks
+	lockTimeoutMs int64
 }
 
 // New creates a new TxnManager.
 // nextXID starts at 1 (0 is reserved as invalid).
+// Default lock timeout is 5000ms (backward compatible).
 func New() api.TxnManager {
 	return &TxnManager{
-		nextXID: 1,
-		active:  make(map[uint64]struct{}),
-		clog:    newCommitLog(),
-		lockMgr: rowlock.New(),
+		nextXID:       1,
+		active:        make(map[uint64]struct{}),
+		clog:          newCommitLog(),
+		lockMgr:       rowlock.New(),
+		lockTimeoutMs: 5000, // default 5 second lock timeout
+	}
+}
+
+// NewWithLockTimeout creates a new TxnManager with a custom lock timeout.
+// lockTimeoutMs: timeout in milliseconds for row lock acquisition.
+// Set to 0 for no timeout (wait indefinitely).
+func NewWithLockTimeout(lockTimeoutMs int64) api.TxnManager {
+	return &TxnManager{
+		nextXID:       1,
+		active:        make(map[uint64]struct{}),
+		clog:          newCommitLog(),
+		lockMgr:       rowlock.New(),
+		lockTimeoutMs: lockTimeoutMs,
 	}
 }
 
@@ -251,11 +269,12 @@ func (tm *TxnManager) MarkInProgressAsAborted() {
 
 // txnContext implements api.TxnContext for SQL-layer transactions.
 type txnContext struct {
-	txnManager   *TxnManager
-	xid          uint64
-	snap         *api.Snapshot
-	lockMgr      rowlock.LockManager
-	active       bool
+	txnManager    *TxnManager
+	xid           uint64
+	snap          *api.Snapshot
+	lockMgr       rowlock.LockManager
+	lockTimeoutMs int64
+	active        bool
 	pendingWrites [][]byte // keys modified within this transaction, for rollback
 }
 
@@ -272,9 +291,13 @@ func (tc *txnContext) LockManager() rowlock.LockManager {
 }
 
 func (tc *txnContext) AddLock(rowKey string, mode rowlockapi.LockMode) bool {
+	timeoutMs := tc.lockTimeoutMs
+	if timeoutMs == 0 {
+		timeoutMs = 5000 // default for backward compatibility
+	}
 	ctx := rowlockapi.LockContext{
 		TxnID:     tc.xid,
-		TimeoutMs: 5000, // 5 second default timeout
+		TimeoutMs: timeoutMs,
 	}
 	return tc.lockMgr.Acquire(rowKey, ctx, mode)
 }
@@ -348,10 +371,11 @@ func (tm *TxnManager) BeginTxnContext() api.TxnContext {
 	}
 
 	return &txnContext{
-		txnManager: tm,
-		xid:        xid,
-		snap:       snap,
-		lockMgr:    tm.lockMgr, // SHARED across all TxnContexts from same TxnManager
-		active:     true,
+		txnManager:    tm,
+		xid:           xid,
+		snap:          snap,
+		lockMgr:       tm.lockMgr, // SHARED across all TxnContexts from same TxnManager
+		lockTimeoutMs: tm.lockTimeoutMs,
+		active:        true,
 	}
 }
