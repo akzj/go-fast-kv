@@ -161,6 +161,12 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 		return nil, fmt.Errorf("manifest: %w", err)
 	}
 
+	// Worker pool for parallel SSTable reads.
+	readWorkers := cfg.ParallelReadWorkers
+	if readWorkers <= 0 {
+		readWorkers = defaultReadPoolWorkers
+	}
+
 	s := &lsm{
 		dir:              cfg.Dir,
 		active:          newMemtable(),
@@ -178,7 +184,7 @@ func New(cfg lsmapi.Config) (*lsm, error) {
 	s.casLockMask = lockCount - 1
 
 	// Initialize worker pool for parallel SSTable reads.
-	s.readPool = newWorkerPool(defaultReadPoolWorkers)
+	s.readPool = newWorkerPool(readWorkers)
 
 	// Load existing SSTables into memtable (recovery from previous close).
 	// Without this, reopen creates a fresh empty memtable and loses all

@@ -279,4 +279,10 @@ type Config struct {
 	// When a segment reaches this size, it is rotated (closed and renamed).
 	// Default is 64MB (64 * 1024 * 1024).
 	SegmentSize int64
+
+	// MaxWALBatchSize controls the group commit channel capacity and the
+	// maximum number of requests drained per batch.
+	// Higher values improve throughput under high write concurrency.
+	// Default is 1024.
+	MaxWALBatchSize int
 }

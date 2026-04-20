@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
-	"time"
 	"strings"
+	"time"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
@@ -18,6 +18,7 @@ import (
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 	rowlockapi "github.com/akzj/go-fast-kv/internal/rowlock/api"
+	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
 )
 
 // Compile-time interface check.
@@ -440,6 +441,11 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for _, row := range plan.Rows {
+			// Check NOT NULL constraint before inserting.
+			if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
+				return nil, err
+			}
+
 			// Allocate rowID via table engine (in-memory only, no persistence yet).
 			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
 			if err != nil {
@@ -488,6 +494,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range plan.Rows {
+		// Check NOT NULL constraint before inserting.
+		if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Insert row into the shared batch.
 		rowID, err := e.tableEngine.InsertInto(plan.Table, batch, row)
 		if err != nil {
@@ -2619,6 +2631,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				newValues[colIdx] = val
 			}
 
+			// Check NOT NULL constraint before updating.
+			if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+				return nil, err
+			}
+
 			// Update row with transaction's XID.
 			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -2669,6 +2686,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		copy(newValues, row.Values)
 		for colIdx, val := range plan.Assignments {
 			newValues[colIdx] = val
+		}
+
+		// Check NOT NULL constraint before updating.
+		if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+			batch.Discard()
+			return nil, err
 		}
 
 		// Update row via batch.
@@ -3257,4 +3280,16 @@ func explainPlanDescription(plan plannerapi.Plan, analyze bool) string {
 		inner = fmt.Sprintf("%T", plan)
 	}
 	return prefix + "\n└─ " + inner
+}
+
+// checkNotNullConstraint validates that all NOT NULL columns have non-NULL values.
+// Returns nil if all constraints are satisfied, or ErrNotNullViolation if any
+// NOT NULL column has a NULL value.
+func checkNotNullConstraint(columns []catalogapi.ColumnDef, values []catalogapi.Value) error {
+	for i, col := range columns {
+		if col.NotNull && i < len(values) && values[i].IsNull {
+			return sqlerrors.ErrNotNullViolation("", col.Name)
+		}
+	}
+	return nil
 }

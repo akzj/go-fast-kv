@@ -65,6 +65,9 @@ type wal struct {
 	reqCh  chan walRequest
 	stopCh chan struct{} // closed by Close()
 	doneCh chan struct{} // closed when consumer exits
+
+	// Batch size limits
+	maxBatchSize int // max requests to drain per batch (from config, default 1024)
 }
 
 type segmentInfo struct {
@@ -86,13 +89,19 @@ func New(cfg walapi.Config) (walapi.WAL, error) {
 		segmentSize = defaultSegmentSize
 	}
 
+	maxBatchSize := cfg.MaxWALBatchSize
+	if maxBatchSize <= 0 {
+		maxBatchSize = 1024 // default for backward compatibility
+	}
+
 	w := &wal{
 		dir:         cfg.Dir,
 		syncMode:    cfg.SyncMode,
 		segmentSize: segmentSize,
-		reqCh:       make(chan walRequest, 1024),
+		reqCh:       make(chan walRequest, maxBatchSize),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
+		maxBatchSize: maxBatchSize,
 	}
 
 	// Check for old wal.log file (backward compatibility)
@@ -320,7 +329,7 @@ func (w *wal) consumeLoop() {
 
 		pending := []walRequest{req}
 		drain:
-		for {
+		for len(pending) < w.maxBatchSize {
 			select {
 			case r := <-w.reqCh:
 				pending = append(pending, r)

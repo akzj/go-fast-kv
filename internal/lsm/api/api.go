@@ -56,6 +56,10 @@ type Config struct {
 	// SegmentSize is the size threshold for triggering compaction.
 	// Default is 64MB.
 	SegmentSize int64
+
+	// ParallelReadWorkers is the number of workers for parallel SSTable reads.
+	// Default is 4.
+	ParallelReadWorkers int
 }
 
 // ─── Interface ─────────────────────────────────────────────────────
