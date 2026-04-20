@@ -296,11 +296,6 @@ const (
 	// Each Put/Delete operates in its own transaction.
 	// This is the default.
 	IsolationAutoCommit IsolationLevel = iota
-
-	// IsolationSerializable uses Serializable Snapshot Isolation (SSI).
-	// Transactions track read/write sets and detect write skew conflicts.
-	// Conflicting transactions are aborted and must be retried.
-	IsolationSerializable
 )
 
 // Config holds configuration for opening a KVStore.
@@ -330,7 +325,6 @@ type Config struct {
 
 	// IsolationLevel sets the transaction isolation mode.
 	// Defaults to IsolationAutoCommit (per-operation transactions).
-	// IsolationSerializable enables SSI with write skew detection.
 	IsolationLevel IsolationLevel
 
 	// AutoVacuumThreshold is the minimum number of Put+Delete operations

@@ -12,12 +12,7 @@ import (
 // Exported so kvstore can call BeginSSITxn().
 type TxnManager = internal.TxnManager
 
-// New creates a new TxnManager (without SSI).
+// New creates a new TxnManager.
 func New() api.TxnManager {
 	return internal.New()
-}
-
-// NewWithSSI creates a TxnManager with Serializable Snapshot Isolation enabled.
-func NewWithSSI() *TxnManager {
-	return internal.NewWithSSI()
 }

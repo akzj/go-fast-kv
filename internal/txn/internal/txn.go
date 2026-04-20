@@ -12,8 +12,6 @@ import (
 
 	"github.com/akzj/go-fast-kv/internal/rowlock"
 	rowlockapi "github.com/akzj/go-fast-kv/internal/rowlock/api"
-	"github.com/akzj/go-fast-kv/internal/ssi"
-	ssiapi "github.com/akzj/go-fast-kv/internal/ssi/api"
 	api "github.com/akzj/go-fast-kv/internal/txn/api"
 )
 
@@ -85,15 +83,11 @@ type TxnManager struct {
 	active  map[uint64]struct{}
 	clog    *commitLog
 
-	// SSI support
-	ssiIndex   ssiapi.Index // SSI index for conflict detection
-	ssiEnabled bool         // Whether SSI is enabled
-
 	// Shared row lock manager for all transactions from this TxnManager
 	lockMgr rowlock.LockManager
 }
 
-// New creates a new TxnManager (without SSI).
+// New creates a new TxnManager.
 // nextXID starts at 1 (0 is reserved as invalid).
 func New() api.TxnManager {
 	return &TxnManager{
@@ -101,153 +95,6 @@ func New() api.TxnManager {
 		active:  make(map[uint64]struct{}),
 		clog:    newCommitLog(),
 		lockMgr: rowlock.New(),
-	}
-}
-
-// NewWithSSI creates a TxnManager with Serializable Snapshot Isolation enabled.
-// When SSI is enabled, BeginSSITxn returns a Transaction that tracks reads/writes
-// and validates SSI conflicts at commit time.
-func NewWithSSI() *TxnManager {
-	return &TxnManager{
-		nextXID:    1,
-		active:     make(map[uint64]struct{}),
-		clog:       newCommitLog(),
-		ssiIndex:   ssi.NewIndex(),
-		ssiEnabled: true,
-		lockMgr:    rowlock.New(),
-	}
-}
-
-// ─── SSI Transaction ────────────────────────────────────────────────
-
-// ssiTransaction implements api.Transaction with SSI tracking.
-type ssiTransaction struct {
-	txnManager *TxnManager
-	xid        uint64
-	snap       *api.Snapshot
-	ssiState   *api.SSIState
-}
-
-func (txn *ssiTransaction) XID() uint64 {
-	return txn.xid
-}
-
-func (txn *ssiTransaction) Snapshot() *api.Snapshot {
-	return txn.snap
-}
-
-func (txn *ssiTransaction) State() *api.SSIState {
-	return txn.ssiState
-}
-
-func (txn *ssiTransaction) Get(key []byte) ([]byte, error) {
-	// SSI: track read in RWSet and index
-	txn.ssiState.MarkRead(string(key))
-	txn.txnManager.ssiIndex.SetReader(ssiapi.Key(key), txn.xid)
-	return nil, nil // actual read done by KVStore
-}
-
-func (txn *ssiTransaction) Put(key, value []byte) error {
-	// SSI: track write in WWSet
-	txn.ssiState.MarkWrite(string(key))
-	return nil // actual write done by KVStore
-}
-
-func (txn *ssiTransaction) Commit() error {
-	tm := txn.txnManager
-
-	if !tm.ssiEnabled {
-		return nil
-	}
-
-	// SSI commit validation: check RWSet for conflicts
-	xid := txn.xid
-
-	// For each key in RWSet (read), check for RW-conflict:
-	// If another committed transaction wrote this key while we were running
-	// (i.e., CommitTS >= Xmin), we have a read-write conflict.
-	for key := range txn.ssiState.RWSet {
-		info := tm.ssiIndex.GetWriteInfo(ssiapi.Key(key))
-		if info != nil {
-			// A committed transaction wrote this key.
-			// Check if that commit happened while we were running:
-			// - Xmin is the oldest active transaction at snapshot time
-			// - If CommitTS >= Xmin, the commit occurred at or after our snapshot start
-			// - This means we read stale data that was modified by a concurrent txn
-			if info.CommitTS >= txn.snap.Xmin {
-				// RW-conflict detected: we read a stale value
-				tm.Abort(xid)
-				return api.ErrSerializationFailure
-			}
-		}
-	}
-
-	// No conflicts detected — commit and update SSI index
-	tm.mu.Lock()
-	tm.clog.Set(xid, api.TxnCommitted)
-	delete(tm.active, xid)
-	tm.mu.Unlock()
-
-	// Update SSI index for committed writes
-	if txn.ssiState != nil {
-		for key := range txn.ssiState.WWSet {
-			tm.ssiIndex.SetWriteInfo(ssiapi.Key(key), &ssiapi.WriteInfo{
-				TxnID:    xid,
-				CommitTS: xid, // Use XID as commit timestamp
-			})
-		}
-		// Only update TIndex for keys that were ACTUALLY READ (in RWSet),
-		// not for all written keys. This prevents WW-conflict false positives.
-		// A transaction that writes a key it never read should not be flagged
-		// as a "reader" when other transactions write that key.
-		for key := range txn.ssiState.RWSet {
-			tm.ssiIndex.SetReader(ssiapi.Key(key), xid)
-		}
-	}
-
-	return nil
-}
-
-func (txn *ssiTransaction) Abort() {
-	txn.txnManager.Abort(txn.xid)
-}
-
-// BeginSSITxn starts an SSI-aware transaction with RWSet/WWSet tracking.
-func (tm *TxnManager) BeginSSITxn() api.Transaction {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	xid := tm.nextXID
-	tm.nextXID++
-
-	tm.active[xid] = struct{}{}
-
-	activeXIDs := make(map[uint64]struct{}, len(tm.active)-1)
-	for id := range tm.active {
-		if id != xid {
-			activeXIDs[id] = struct{}{}
-		}
-	}
-
-	xmin := tm.nextXID
-	for id := range activeXIDs {
-		if id < xmin {
-			xmin = id
-		}
-	}
-
-	snap := &api.Snapshot{
-		XID:        xid,
-		Xmin:       xmin,
-		Xmax:       tm.nextXID,
-		ActiveXIDs: activeXIDs,
-	}
-
-	return &ssiTransaction{
-		txnManager: tm,
-		xid:        xid,
-		snap:       snap,
-		ssiState:   api.NewSSIState(),
 	}
 }
 

@@ -23,10 +23,6 @@ var (
 	// ErrTxnNotFound is returned when querying a transaction ID that
 	// does not exist in the CLOG.
 	ErrTxnNotFound = errors.New("txn: transaction not found")
-
-	// ErrSerializationFailure is returned when SSI conflict detection
-	// finds a write skew or other SSI anomaly during commit.
-	ErrSerializationFailure = errors.New("txn: serialization failure (SSI conflict)")
 )
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -251,77 +247,7 @@ func BeginTxn(xidMgr XIDManager) (uint64, *Snapshot) {
 
 // ─── Transaction ─────────────────────────────────────────────────────
 
-// Transaction represents a read-write transaction with optional SSI tracking.
-// It wraps TxnManager with Get/Put operations and maintains per-txn RWSet/WWSet.
-//
-// Get tracks keys in the read-write set (RWSet).
-// Put tracks keys in the write-write set (WWSet).
-// Commit validates SSI conflicts before committing.
-//
-// When SSI is enabled, Commit returns ErrSerializationFailure if a write skew
-// or other SSI conflict is detected.
-//
-// Not thread-safe — create one Transaction per goroutine.
-type Transaction interface {
-	// XID returns the transaction's ID.
-	XID() uint64
 
-	// Snapshot returns the transaction's MVCC snapshot.
-	Snapshot() *Snapshot
-
-	// State returns the transaction's SSI state (for SSI-aware callers).
-	// Returns nil if SSI is not enabled.
-	State() *SSIState
-
-	// Get retrieves the value for a key using the transaction's snapshot.
-	//
-	// Tracks the key in the RWSet if SSI is enabled.
-	// Returns ErrKeyNotFound if the key does not exist.
-	Get(key []byte) ([]byte, error)
-
-	// Put stages a key-value pair for writing.
-	//
-	// Tracks the key in the WWSet if SSI is enabled.
-	// The write is not visible until Commit.
-	Put(key, value []byte) error
-
-	// Commit validates SSI conflicts (if enabled) and commits the transaction.
-	//
-	// If SSI conflict is detected, returns ErrSerializationFailure and aborts.
-	// On success, updates the SSI index (SIndex for written keys).
-	Commit() error
-
-	// Abort aborts the transaction without SSI validation.
-	// Safe to call even after Commit/Abort failure.
-	Abort()
-}
-
-// ─── SSI State ───────────────────────────────────────────────────────
-
-// SSIState wraps the per-transaction read/write sets for SSI validation.
-// Exported so KVStore can check for conflicts without importing ssiapi.
-type SSIState struct {
-	RWSet map[string]struct{} // Keys read by this transaction
-	WWSet map[string]struct{} // Keys written by this transaction
-}
-
-// NewSSIState creates a new SSI state for a transaction.
-func NewSSIState() *SSIState {
-	return &SSIState{
-		RWSet: make(map[string]struct{}),
-		WWSet: make(map[string]struct{}),
-	}
-}
-
-// MarkRead records a key as read by this transaction.
-func (s *SSIState) MarkRead(key string) {
-	s.RWSet[key] = struct{}{}
-}
-
-// MarkWrite records a key as written by this transaction.
-func (s *SSIState) MarkWrite(key string) {
-	s.WWSet[key] = struct{}{}
-}
 
 // ─── TxnManager combines XIDManager + CLOG + Snapshot management
 // into a single interface for convenience.
@@ -333,10 +259,7 @@ type TxnManager interface {
 	// Use for write transactions (Put, Delete, WriteBatch).
 	BeginTxn() (uint64, *Snapshot)
 
-	// BeginSSITxn starts a Serializable Snapshot Isolation transaction.
-	// Returns a Transaction with RWSet/WWSet tracking for conflict detection.
-	// Use for SSI-aware write operations (Put, Delete).
-	BeginSSITxn() Transaction
+
 
 	// BeginTxnContext starts a new SQL transaction with row-level locking.
 	// Used by the SQL engine for BEGIN/COMMIT/ROLLBACK semantics.
