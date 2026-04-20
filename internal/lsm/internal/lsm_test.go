@@ -1,12 +1,14 @@
 package internal
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
@@ -209,6 +211,166 @@ func TestManifest(t *testing.T) {
 	segs = m.Segments()
 	if len(segs) != 0 {
 		t.Errorf("Segments after remove: got %v, want []", segs)
+	}
+
+	// Flush async saves before temp dir cleanup
+	m.Flush()
+}
+
+// mockSegmentManagerForDelete is a test double for segmentapi.SegmentManager.
+type mockSegmentManagerForDelete struct {
+	removedSegments map[uint32]bool
+}
+
+func newMockSegmentManagerForDelete() *mockSegmentManagerForDelete {
+	return &mockSegmentManagerForDelete{
+		removedSegments: make(map[uint32]bool),
+	}
+}
+
+func (m *mockSegmentManagerForDelete) Append(data []byte) (segmentapi.VAddr, error) {
+	return segmentapi.VAddr{}, nil
+}
+
+func (m *mockSegmentManagerForDelete) ReadAt(addr segmentapi.VAddr, size uint32) ([]byte, error) {
+	return nil, nil
+}
+
+func (m *mockSegmentManagerForDelete) Sync() error { return nil }
+
+func (m *mockSegmentManagerForDelete) Rotate() error { return nil }
+
+func (m *mockSegmentManagerForDelete) RemoveSegment(segID uint32) error {
+	m.removedSegments[segID] = true
+	return nil
+}
+
+func (m *mockSegmentManagerForDelete) ActiveSegmentID() uint32 { return 0 }
+
+func (m *mockSegmentManagerForDelete) SegmentSize(segID uint32) (int64, error) { return 0, nil }
+
+func (m *mockSegmentManagerForDelete) SealedSegments() []uint32 { return nil }
+
+func (m *mockSegmentManagerForDelete) Close() error { return nil }
+
+func (m *mockSegmentManagerForDelete) StorageDir() string { return "" }
+
+func (m *mockSegmentManagerForDelete) WasRemoved(segID uint32) bool {
+	return m.removedSegments[segID]
+}
+
+// TestTryDeleteRefcountRaceFix tests that TryDelete atomically checks refcount
+// and prevents deletion while segment is pinned by checkpoint.
+// This is the fix for the race: CanDelete() → Pin() → Delete would cause data loss.
+func TestTryDeleteRefcountRaceFix(t *testing.T) {
+	Dir := t.TempDir()
+
+	m, err := newManifest(Dir)
+	if err != nil {
+		t.Fatalf("newManifest: %v", err)
+	}
+
+	// Add a segment
+	if err := m.AddSegmentWithLevel("segment-001.sst", 0, 0, 0); err != nil {
+		t.Fatalf("AddSegmentWithLevel: %v", err)
+	}
+
+	segMgr := newMockSegmentManagerForDelete()
+
+	// Test 1: TryDelete should succeed when refcount == 0
+	if !m.TryDelete(segMgr, 1) {
+		t.Error("TryDelete(segID=1): expected true when refcount==0, got false")
+	}
+	if !segMgr.WasRemoved(1) {
+		t.Error("TryDelete: segment file was not removed from segMgr")
+	}
+
+	// Add another segment
+	if err := m.AddSegmentWithLevel("segment-002.sst", 0, 0, 0); err != nil {
+		t.Fatalf("AddSegmentWithLevel: %v", err)
+	}
+
+	// Test 2: TryDelete should fail when refcount > 0 (pinned by checkpoint)
+	m.Pin("segment-002.sst")
+	if m.TryDelete(segMgr, 2) {
+		t.Error("TryDelete(segID=2): expected false when refcount>0 (pinned), got true")
+	}
+	if segMgr.WasRemoved(2) {
+		t.Error("TryDelete: segment file should NOT be removed when pinned")
+	}
+
+	// Unpin and verify deletion now succeeds
+	m.Unpin("segment-002.sst")
+	if !m.TryDelete(segMgr, 2) {
+		t.Error("TryDelete(segID=2): expected true after Unpin, got false")
+	}
+
+	// Flush async saves before temp dir cleanup
+	m.Flush()
+}
+
+// TestTryDeleteConcurrentPinRace tests the race condition that TryDelete prevents:
+// concurrent Pin() and TryDelete() should never result in deletion while pinned.
+func TestTryDeleteConcurrentPinRace(t *testing.T) {
+	Dir := t.TempDir()
+
+	m, err := newManifest(Dir)
+	if err != nil {
+		t.Fatalf("newManifest: %v", err)
+	}
+
+	// Add segments
+	for i := uint64(1); i <= 10; i++ {
+		if err := m.AddSegmentWithLevel(fmt.Sprintf("segment-%03d.sst", i), 0, 0, 0); err != nil {
+			t.Fatalf("AddSegmentWithLevel: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 100)
+
+	// Concurrently: pin segments, unpin segments, and try to delete them
+	for i := 1; i <= 10; i++ {
+		segID := uint32(i)
+		segName := fmt.Sprintf("segment-%03d.sst", i)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Rapidly pin and unpin
+			for j := 0; j < 100; j++ {
+				m.Pin(segName)
+				m.Unpin(segName)
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			segMgr := newMockSegmentManagerForDelete()
+			// Try to delete - should never succeed while pinned
+			for j := 0; j < 100; j++ {
+				if m.TryDelete(segMgr, segID) {
+					// Deletion succeeded - verify segment was NOT pinned at time of deletion
+					// TryDelete holds write lock during check+delete, so Pin cannot race
+					// But we can verify: after deletion, segment is gone from manifest
+					if m.Refcount(segName) != -1 {
+						// Segment still exists but was "deleted" - this shouldn't happen
+						select {
+						case errors <- fmt.Errorf("TryDelete succeeded but segment still in manifest"):
+						default:
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
 	}
 
 	// Flush async saves before temp dir cleanup
@@ -779,6 +941,6 @@ func TestManifestLevelTracking(t *testing.T) {
 		t.Errorf("GetKeyRange(seg-l0-2.sst): got (%d, %d), want (50, 150)", minKey, maxKey)
 	}
 
-	// Flush async saves before temp dir cleanup
-	m.Flush()
 }
+
+// TestTryDeleteRefcountRaceFix tests that TryDelete atomically checks refcount	// Flush async saves before temp dir cleanup

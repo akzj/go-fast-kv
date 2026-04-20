@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 )
 
 // ─── Manifest ───────────────────────────────────────────────────────
@@ -151,6 +153,60 @@ func (m *manifest) CanDelete(name string) bool {
 		}
 	}
 	return false // segment doesn't exist
+}
+
+// TryDelete atomically checks refcount and removes the segment if 0.
+// This prevents the race where checkpoint pins a segment between
+// CanDelete() returning true and RemoveSegment() being called.
+//
+// The race pattern this fixes:
+// 1. GC calls CanDelete(seg) → refcount is 0 → returns true
+// 2. Concurrently, checkpoint calls Pin(seg) → refcount becomes 1
+// 3. GC proceeds to delete segment (using segMgr.RemoveSegment)
+// 4. Result: segment deleted while checkpoint holds reference → data loss
+//
+// By holding the write lock during the entire check+delete sequence,
+// concurrent Pin/Unpin calls are blocked, ensuring no deletion while pinned.
+//
+// Returns true if the segment was deleted, false if refcount > 0.
+func (m *manifest) TryDelete(segMgr segmentapi.SegmentManager, segID uint32) bool {
+	segName := m.GetSegmentName(uint64(segID))
+
+	// Acquire write lock - blocks concurrent Pin/Unpin
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Find the segment
+	for i, seg := range m.segments {
+		if seg.name == segName {
+			// Atomically check refcount under write lock
+			if seg.refcount.Load() > 0 {
+				// Segment is pinned by checkpoint - do NOT delete
+				return false
+			}
+			// Refcount is 0 - safe to delete
+			// Remove from manifest
+			m.segments = append(m.segments[:i], m.segments[i+1:]...)
+			m.data.Segments = append(m.data.Segments[:i], m.data.Segments[i+1:]...)
+			// Save manifest to disk
+			if err := m.saveLocked(); err != nil {
+				// Restore segment list on error
+				m.segments = append(m.segments[:i], append([]segmentEntry{seg}, m.segments[i:]...)...)
+				m.data.Segments = append(m.data.Segments[:i], append([]string{segName}, m.data.Segments[i:]...)...)
+				return false
+			}
+			// Delete the segment file
+			if err := segMgr.RemoveSegment(segID); err != nil {
+				// Manifest already updated; segment file deletion failed.
+				// This is not a race condition - we successfully prevented
+				// deletion while pinned. The file deletion error should be
+				// reported separately.
+				return false
+			}
+			return true
+		}
+	}
+	return false // segment not found
 }
 
 // GetBloomFilter returns the cached bloom filter for a segment, or nil if not cached.

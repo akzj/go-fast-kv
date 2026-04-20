@@ -9,6 +9,7 @@ package lsmapi
 import (
 	"errors"
 
+	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
@@ -125,6 +126,13 @@ type Manifest interface {
 
 	// CanDelete returns true if a segment's refcount is 0.
 	CanDelete(name string) bool
+
+	// TryDelete atomically checks refcount and removes the segment if 0.
+	// This prevents the race where checkpoint pins a segment between
+	// CanDelete() returning true and RemoveSegment() being called.
+	// Returns true if the segment was deleted, false if pinned (refcount > 0).
+	// The segment manager's RemoveSegment is called to delete the file.
+	TryDelete(segMgr segmentapi.SegmentManager, segID uint32) bool
 
 	// GetSegmentName returns the filename for a given segment ID.
 	// Used by GC to construct the segment name before checking CanDelete.

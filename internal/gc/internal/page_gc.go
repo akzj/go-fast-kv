@@ -175,14 +175,17 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 	// Skip check if manifest is nil (e.g., in tests with mock LSM).
 	manifest := gc.recovery.LSMLifecycle().Manifest()
 	if manifest != nil {
-		segName := manifest.GetSegmentName(uint64(segID))
-		if !manifest.CanDelete(segName) {
-			// Segment is pinned by checkpoint — skip deletion, GC will retry later.
+		// Use TryDelete to atomically check refcount AND delete.
+		// This prevents the race: GC checks CanDelete (refcount=0) → checkpoint pins → GC deletes.
+		// TryDelete holds write lock during check+delete, blocking concurrent Pin/Unpin.
+		if !manifest.TryDelete(gc.segMgr, segID) {
+			// Segment is pinned by checkpoint or not found - skip deletion, GC will retry later.
 			return stats, nil
 		}
+		return stats, nil
 	}
 
-	// Remove the old segment.
+	// Manifest is nil - fall back to direct removal (for tests with mock LSM).
 	if err := gc.segMgr.RemoveSegment(segID); err != nil {
 		return nil, err
 	}
