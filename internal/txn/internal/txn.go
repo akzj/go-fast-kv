@@ -65,6 +65,19 @@ func (c *commitLog) Entries() map[uint64]api.TxnStatus {
 	return result
 }
 
+// EntriesUpTo returns all CLOG entries with XID < xmax.
+func (c *commitLog) EntriesUpTo(xmax uint64) map[uint64]api.TxnStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make(map[uint64]api.TxnStatus)
+	for xid, status := range c.statuses {
+		if xid < xmax {
+			result[xid] = status
+		}
+	}
+	return result
+}
+
 func (c *commitLog) LoadEntries(entries map[uint64]api.TxnStatus) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

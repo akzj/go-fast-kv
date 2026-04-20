@@ -56,6 +56,13 @@ func (s *store) recover() error {
 
 		// Load GC stats from checkpoint
 		s.gcStats.LoadAll(cpData.Stats)
+
+		// For v3 checkpoint: load LSM segment list from checkpoint.
+		// The LSM manifest will be initialized with these segments,
+		// skipping the rebuild from WAL for pre-checkpoint entries.
+		if lsmSegs := cpData.lsmSegments; len(lsmSegs) > 0 {
+			psRecovery.SetLSMSegments(lsmSegs)
+		}
 	}
 
 	// Replay WAL entries. Only records with LSN > checkpoint.LSN are replayed.

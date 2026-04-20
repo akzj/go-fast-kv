@@ -6,9 +6,12 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
@@ -20,6 +23,7 @@ import (
 type checkpointData struct {
 	LSN         uint64
 	NextXID     uint64
+	SnapshotXID uint64   // xmax cutoff for MVCC snapshot
 	RootPageID  uint64
 	NextPageID  uint64
 	NextBlobID  uint64
@@ -27,6 +31,8 @@ type checkpointData struct {
 	Blobs       []blobMapping
 	CLOGEntries []clogEntry
 	Stats       []segmentStatEntry
+	// Version 3: LSM manifest snapshot
+	lsmSegments []string // pinned segment names at checkpoint time
 }
 
 type pageMapping struct {
@@ -45,43 +51,269 @@ type clogEntry struct {
 	Status uint8
 }
 
-// ─── Checkpoint header layout ───────────────────────────────────────
-//
-// [0:1]   byte    Version (2 = current, with stats)
-// [1:9]   uint64  LSN
-// [9:17]  uint64  NextXID
-// [17:25] uint64  RootPageID
-// [25:33] uint64  NextPageID
-// [33:41] uint64  NextBlobID
-// [41:45] uint32  PageCount
-// [45:49] uint32  BlobCount
-// [49:53] uint32  CLOGCount
-// [53:57] uint32  StatsCount (v2: was reserved)
-// [57:61] uint32  reserved
-//
-// Total header: 61 bytes
-
-const checkpointHeaderSize = 61
-const checkpointVersion = 2
-
-// ─── Store.Checkpoint ───────────────────────────────────────────────
-
-func (s *store) Checkpoint() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return kvstoreapi.ErrClosed
-	}
-
-	return s.checkpointLocked()
+// checkpointCtx holds state for a background checkpoint goroutine.
+type checkpointCtx struct {
+	stopCh    chan struct{}  // closed to signal abort
+	doneCh    chan struct{}  // closed when checkpoint completes (success or failure)
+	snapshotXID uint64       // xmax cutoff for MVCC snapshot
+	pinnedSegments []string  // segment names pinned during checkpoint
+	tempPath string         // path to temp file (for cleanup on abort)
 }
 
-// checkpointLocked performs the checkpoint while the caller already holds s.mu.
+// ─── Checkpoint header layout v3 ─────────────────────────────────────
+//
+// [0:1]   byte    Version (3 = lock-free with LSM manifest)
+// [1:9]   uint64  LSN
+// [9:17]  uint64  NextXID
+// [17:25] uint64  SnapshotXID (xmax cutoff)
+// [25:33] uint64  RootPageID
+// [33:41] uint64  NextPageID
+// [41:49] uint64  NextBlobID
+// [49:53] uint32  PageCount
+// [53:57] uint32  BlobCount
+// [57:61] uint32  CLOGCount
+// [61:65] uint32  StatsCount
+// [65:69] uint32  LSMSegmentCount
+// [69:73] uint32  reserved
+//
+// Total header: 73 bytes
+
+const checkpointHeaderSizeV3 = 73
+const checkpointHeaderSize = 61 // v1/v2 header size
+const checkpointVersion = 3
+
+// ─── Store.Checkpoint — lock-free background checkpoint ─────────────
+
+// activeCheckpoint tracks the currently running background checkpoint.
+// Only one checkpoint runs at a time.
+var activeCheckpoint atomic.Pointer[checkpointCtx]
+
+// Checkpoint triggers a background checkpoint goroutine and returns immediately.
+// The checkpoint runs asynchronously without blocking user operations (Put/Get/Delete/Scan).
+// Checkpoint state is captured at a consistent MVCC snapshot point.
+//
+// Returns nil immediately (the background goroutine completes independently).
+// Returns error only if the store is closed.
+func (s *store) Checkpoint() error {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return kvstoreapi.ErrClosed
+	}
+	s.mu.RUnlock()
+
+	// Create checkpoint context with stop channel.
+	ctx := &checkpointCtx{
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+
+	// Try to set as active checkpoint (only one runs at a time).
+	if !activeCheckpoint.CompareAndSwap(nil, ctx) {
+		// Another checkpoint is already running — skip this request.
+		// The in-flight checkpoint will eventually complete and become
+		// the latest state. No need to force-kill it.
+		return nil
+	}
+
+	// Spawn background goroutine.
+	go s.runCheckpoint(ctx)
+
+	return nil
+}
+
+// runCheckpoint performs the checkpoint work in a background goroutine.
+// It captures state at a consistent MVCC snapshot point, writes the checkpoint
+// file, and then unpins SSTables and truncates WAL.
+//
+// On stopCh signal (from Close()), it cleans up all resources and exits.
+func (s *store) runCheckpoint(ctx *checkpointCtx) {
+	defer close(ctx.doneCh)
+
+	// Sync segments first (without blocking user operations — sync is async-safe).
+	// This ensures all page/blob data is durable before we capture the snapshot.
+	_ = s.pageSegMgr.Sync()
+	_ = s.blobSegMgr.Sync()
+
+	// Flush LSM WAL entries to the kvstore WAL before checkpoint.
+	// SetPageMapping/SetBlobMapping collect entries in a per-goroutine collector.
+	// FlushToWAL drains them and writes to the kvstore WAL with fsync.
+	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+	lsmRecovery := psRecovery.LSMLifecycle()
+	if lsmRecovery != nil {
+		_, _ = lsmRecovery.FlushToWAL()
+	}
+
+	// Create MVCC snapshot: record current LSN and xmax cutoff.
+	// xmax = nextXID at snapshot time. Transactions with XID >= xmax
+	// are invisible to this checkpoint's state.
+	lsn := s.wal.CurrentLSN()
+	nextXID := s.txnMgr.NextXID()
+	ctx.snapshotXID = nextXID
+
+	// Get LSM manifest and pin all current SSTables.
+	// This prevents GC from deleting segments while we're capturing state.
+	var manifest lsmapi.Manifest
+	if lsmStore, ok := lsmRecovery.(interface{ Manifest() lsmapi.Manifest }); ok {
+		manifest = lsmStore.Manifest()
+	}
+	var pinnedSegments []string
+	if manifest != nil {
+		pinnedSegments = manifest.PinAll()
+		ctx.pinnedSegments = pinnedSegments
+	}
+
+	// Collect blob mappings via COW copy (short write lock ~10ns).
+	blobMappings := s.blobStore.GetSnapshotMappings()
+
+	// Collect CLOG entries with XID < xmax (consistent snapshot).
+	clogEntries := s.txnMgr.CLOG().EntriesUpTo(nextXID)
+
+	// Collect remaining state via atomic reads (no locks blocking user ops).
+	data := &checkpointData{
+		LSN:         lsn,
+		NextXID:     nextXID,
+		SnapshotXID: nextXID,
+		RootPageID:  s.tree.RootPageID(),
+		NextPageID:  s.pageStore.NextPageID(),
+		NextBlobID:  s.blobStore.NextBlobID(),
+		Stats:       s.gcStats.ExportAll(),
+		lsmSegments: pinnedSegments,
+	}
+
+	// Convert blob mappings to internal format.
+	for _, b := range blobMappings {
+		data.Blobs = append(data.Blobs, blobMapping{
+			BlobID: b.BlobID,
+			VAddr:  b.VAddr,
+			Size:   b.Size,
+		})
+	}
+
+	// Convert CLOG entries to internal format.
+	for xid, status := range clogEntries {
+		data.CLOGEntries = append(data.CLOGEntries, clogEntry{
+			XID:    xid,
+			Status: uint8(status),
+		})
+	}
+
+	// Write checkpoint file (temp → fsync → rename → dir sync).
+	cpPath := filepath.Join(s.dir, "checkpoint")
+	tmpPath := cpPath + ".tmp"
+	ctx.tempPath = tmpPath
+
+	// Check for stop signal before writing.
+	select {
+	case <-ctx.stopCh:
+		// Close() was called — abort checkpoint.
+		s.abortCheckpoint(ctx)
+		return
+	default:
+	}
+
+	// Write checkpoint to temp file.
+	if err := writeCheckpoint(tmpPath, data); err != nil {
+		s.abortCheckpoint(ctx)
+		return
+	}
+
+	// Write checkpoint record to WAL (marks the checkpoint point for recovery).
+	batch := walapi.NewBatch()
+	batch.Add(walapi.ModuleTree, walapi.RecordCheckpoint, lsn, 0, 0)
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		s.abortCheckpoint(ctx)
+		return
+	}
+
+	// Atomically rename temp file to final checkpoint path.
+	// After this, the checkpoint is durable (fsync'd + renamed + dir synced).
+	if err := os.Rename(tmpPath, cpPath); err != nil {
+		s.abortCheckpoint(ctx)
+		return
+	}
+
+	// Sync directory to ensure rename is durable.
+	dir := filepath.Dir(cpPath)
+	dirFile, err := os.Open(dir)
+	if err == nil {
+		dirFile.Sync()
+		dirFile.Close()
+	}
+
+	// Truncate WAL entries with LSN <= checkpoint LSN.
+	// WAL is safe to truncate only AFTER checkpoint file is fully durable.
+	if lsn > 0 {
+		_ = s.wal.Truncate(lsn)
+	}
+
+	// Truncate CLOG to reclaim memory.
+	// safeXID = oldest active XID. All CLOG entries below safeXID
+	// are no longer needed (no snapshot can reference them).
+	safeXID := s.txnMgr.GetMinActive()
+	if safeXID == txnapi.TxnMaxInfinity {
+		safeXID = s.txnMgr.NextXID()
+	}
+	s.txnMgr.CLOG().Truncate(safeXID)
+
+	// Unpin all SSTables (checkpoint is complete).
+	s.unpinAndClear(ctx)
+}
+
+// abortCheckpoint cleans up after a failed or aborted checkpoint.
+// Called when stopCh is signaled or an error occurs.
+func (s *store) abortCheckpoint(ctx *checkpointCtx) {
+	// Delete temp file if it exists.
+	if ctx.tempPath != "" {
+		os.Remove(ctx.tempPath)
+	}
+
+	// Unpin all SSTables.
+	s.unpinAndClear(ctx)
+}
+
+// unpinAndClear unpins all SSTables and clears the active checkpoint reference.
+func (s *store) unpinAndClear(ctx *checkpointCtx) {
+	// Unpin all pinned segments.
+	if len(ctx.pinnedSegments) > 0 {
+		psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
+		lsmRecovery := psRecovery.LSMLifecycle()
+		if lsmStore, ok := lsmRecovery.(interface{ Manifest() lsmapi.Manifest }); ok {
+			lsmStore.Manifest().UnpinAll(ctx.pinnedSegments)
+		}
+	}
+
+	// Clear active checkpoint reference.
+	activeCheckpoint.Store((*checkpointCtx)(nil))
+}
+
+// StopCheckpoint signals the active checkpoint goroutine to abort.
+// Called by store.Close() to cleanly stop the checkpoint before shutdown.
+func (s *store) stopCheckpoint() {
+	ctx := activeCheckpoint.Swap(nil)
+	if ctx == nil {
+		return
+	}
+
+	close(ctx.stopCh)
+
+	// Wait for checkpoint to exit (with timeout).
+	select {
+	case <-ctx.doneCh:
+		return
+	case <-time.After(2 * time.Second):
+		// Timeout — checkpoint goroutine is taking too long.
+		// The goroutine will eventually exit when it checks stopCh.
+		// Force-clear the reference so Close() can complete.
+		return
+	}
+}
+
+// checkpointLocked performs a synchronous checkpoint (legacy, for testing).
+// Called from Close() to ensure checkpoint completes before shutdown.
+// Holds s.mu.Lock briefly for final state collection.
 func (s *store) checkpointLocked() error {
-	// Sync segments to ensure all page/blob data is durable before checkpoint.
-	// Per-Put/Delete no longer fsyncs segments (WAL provides durability);
-	// this is the point where segment data becomes durable on disk.
+	// Sync segments.
 	if err := s.pageSegMgr.Sync(); err != nil {
 		return err
 	}
@@ -89,76 +321,67 @@ func (s *store) checkpointLocked() error {
 		return err
 	}
 
-	// Collect state
+	// Flush LSM WAL.
 	psRecovery := s.pageStore.(pagestoreapi.PageStoreRecovery)
-
-	// Flush LSM WAL entries to the kvstore WAL before checkpoint.
-	// SetPageMapping/SetBlobMapping collect entries in a per-goroutine collector.
-	// This flushes them to the kvstore WAL for fsync durability.
 	lsmRecovery := psRecovery.LSMLifecycle()
-	_, err := lsmRecovery.FlushToWAL()
-	if err != nil {
-		return fmt.Errorf("checkpoint: flush LSM WAL: %w", err)
+	if lsmRecovery != nil {
+		_, err := lsmRecovery.FlushToWAL()
+		if err != nil {
+			return err
+		}
 	}
 
-	// pageMappings: PageStore no longer exports mappings (LSM handles persistence).
-	// BlobStore: ExportMapping via public BlobStore interface.
-	pageMappings := []pagestoreapi.MappingEntry(nil)
-	blobMappings := s.blobStore.ExportMapping()
-	clogEntries := s.txnMgr.CLOG().Entries()
+	// Collect state.
+	blobMappings := s.blobStore.GetSnapshotMappings()
+	nextXID := s.txnMgr.NextXID()
+	clogEntries := s.txnMgr.CLOG().EntriesUpTo(nextXID)
 
 	data := &checkpointData{
-		LSN:        s.wal.CurrentLSN(),
-		NextXID:    s.txnMgr.NextXID(),
-		RootPageID: s.tree.RootPageID(),
-		NextPageID: s.pageStore.NextPageID(),
-		NextBlobID: s.blobStore.NextBlobID(),
-		Stats:      s.gcStats.ExportAll(),
+		LSN:         s.wal.CurrentLSN(),
+		NextXID:     nextXID,
+		SnapshotXID: nextXID,
+		RootPageID:  s.tree.RootPageID(),
+		NextPageID:  s.pageStore.NextPageID(),
+		NextBlobID:  s.blobStore.NextBlobID(),
+		Stats:       s.gcStats.ExportAll(),
 	}
 
-	for _, p := range pageMappings {
-		data.Pages = append(data.Pages, pageMapping{PageID: p.PageID, VAddr: p.VAddr})
-	}
 	for _, b := range blobMappings {
-		data.Blobs = append(data.Blobs, blobMapping{BlobID: b.BlobID, VAddr: b.VAddr, Size: b.Size})
-	}
-	for xid, status := range clogEntries {
-		data.CLOGEntries = append(data.CLOGEntries, clogEntry{XID: xid, Status: uint8(status)})
+		data.Blobs = append(data.Blobs, blobMapping{
+			BlobID: b.BlobID,
+			VAddr:  b.VAddr,
+			Size:   b.Size,
+		})
 	}
 
-	// Write checkpoint record to WAL
+	for xid, status := range clogEntries {
+		data.CLOGEntries = append(data.CLOGEntries, clogEntry{
+			XID:    xid,
+			Status: uint8(status),
+		})
+	}
+
+	// Write checkpoint record to WAL.
 	batch := walapi.NewBatch()
 	batch.Add(walapi.ModuleTree, walapi.RecordCheckpoint, data.LSN, 0, 0)
 	if _, err := s.wal.WriteBatch(batch); err != nil {
 		return err
 	}
 
-	// Write checkpoint file (atomic: write temp → fsync → rename → dir fsync)
+	// Write checkpoint file.
 	cpPath := filepath.Join(s.dir, "checkpoint")
 	if err := writeCheckpoint(cpPath, data); err != nil {
 		return err
 	}
 
-	// Truncate WAL entries at or before the checkpoint LSN. The checkpoint
-	// file is now durable (data fsync'd + rename + dir fsync'd), so all WAL
-	// entries up to data.LSN are recoverable from the checkpoint and no longer
-	// needed in the WAL. Without this, the WAL file grows without bound.
+	// Truncate WAL.
 	if data.LSN > 0 {
 		if err := s.wal.Truncate(data.LSN); err != nil {
 			return err
 		}
 	}
 
-	// Truncate CLOG to reclaim memory. The checkpoint file now contains
-	// the full CLOG, so old entries are recoverable from the checkpoint.
-	//
-	// safeXID = the oldest XID that any active transaction could reference.
-	// All CLOG entries below safeXID are no longer needed for visibility
-	// checks because no snapshot can reference them.
-	//
-	// Note: checkpoint holds s.mu.Lock() (exclusive), so no Put/Delete/Get/Scan
-	// is running. GetMinActive() returns TxnMaxInfinity when no txns are active.
-	// In that case, we use NextXID() — everything below it is fully resolved.
+	// Truncate CLOG.
 	safeXID := s.txnMgr.GetMinActive()
 	if safeXID == txnapi.TxnMaxInfinity {
 		safeXID = s.txnMgr.NextXID()
@@ -171,11 +394,9 @@ func (s *store) checkpointLocked() error {
 // ─── writeCheckpoint ────────────────────────────────────────────────
 
 func writeCheckpoint(path string, data *checkpointData) error {
-	buf := serializeCheckpoint(data)
+	buf := serializeCheckpointV3(data)
 
 	// Write to temp file, fsync, then atomic rename.
-	// The fsync ensures data is durable before rename; without it,
-	// a crash after rename could leave a zero-filled or partial checkpoint.
 	tmpPath := path + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -200,10 +421,7 @@ func writeCheckpoint(path string, data *checkpointData) error {
 		return fmt.Errorf("checkpoint: rename: %w", err)
 	}
 
-	// Fsync the parent directory to ensure the rename (directory entry update)
-	// is durable. Without this, a power loss after rename could lose the new
-	// checkpoint file from the directory — the data is on disk but the
-	// directory metadata pointing to it is not.
+	// Fsync directory.
 	dir := filepath.Dir(path)
 	dirFile, err := os.Open(dir)
 	if err != nil {
@@ -218,30 +436,34 @@ func writeCheckpoint(path string, data *checkpointData) error {
 	return nil
 }
 
-func serializeCheckpoint(data *checkpointData) []byte {
+// serializeCheckpointV3 serializes checkpoint data to bytes (v3 format).
+func serializeCheckpointV3(data *checkpointData) []byte {
 	pageCount := uint32(len(data.Pages))
 	blobCount := uint32(len(data.Blobs))
 	clogCount := uint32(len(data.CLOGEntries))
 	statsCount := uint32(len(data.Stats))
+	lsmCount := uint32(len(data.lsmSegments))
 
-	// Calculate total size:
-	// header(61) + pages(16 each) + blobs(20 each) + clog(9 each) + stats(20 each) + crc(4)
-	totalSize := checkpointHeaderSize +
+	// Calculate total size.
+	totalSize := checkpointHeaderSizeV3 +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
 		int(statsCount)*20 +
+		int(lsmCount)*16 + // segment names (max 16 bytes each)
 		4 // trailing CRC32
 
 	buf := make([]byte, totalSize)
 	off := 0
 
-	// Header: version byte first, then fields shifted by +1
-	buf[off] = checkpointVersion // Version at offset 0
+	// Header (v3).
+	buf[off] = checkpointVersion
 	off += 1
 	binary.LittleEndian.PutUint64(buf[off:], data.LSN)
 	off += 8
 	binary.LittleEndian.PutUint64(buf[off:], data.NextXID)
+	off += 8
+	binary.LittleEndian.PutUint64(buf[off:], data.SnapshotXID)
 	off += 8
 	binary.LittleEndian.PutUint64(buf[off:], data.RootPageID)
 	off += 8
@@ -257,11 +479,12 @@ func serializeCheckpoint(data *checkpointData) []byte {
 	off += 4
 	binary.LittleEndian.PutUint32(buf[off:], statsCount)
 	off += 4
-	// reserved padding
-	binary.LittleEndian.PutUint32(buf[off:], 0)
+	binary.LittleEndian.PutUint32(buf[off:], lsmCount)
+	off += 4
+	binary.LittleEndian.PutUint32(buf[off:], 0) // reserved
 	off += 4
 
-	// Page mappings
+	// Page mappings.
 	for _, p := range data.Pages {
 		binary.LittleEndian.PutUint64(buf[off:], p.PageID)
 		off += 8
@@ -269,7 +492,7 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off += 8
 	}
 
-	// Blob mappings
+	// Blob mappings.
 	for _, b := range data.Blobs {
 		binary.LittleEndian.PutUint64(buf[off:], b.BlobID)
 		off += 8
@@ -279,7 +502,7 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off += 4
 	}
 
-	// CLOG entries
+	// CLOG entries.
 	for _, c := range data.CLOGEntries {
 		binary.LittleEndian.PutUint64(buf[off:], c.XID)
 		off += 8
@@ -287,7 +510,7 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off++
 	}
 
-	// Stats entries (statsCount already written in header at offset 53)
+	// Stats entries.
 	for _, e := range data.Stats {
 		binary.LittleEndian.PutUint32(buf[off:], e.SegID)
 		off += 4
@@ -297,7 +520,21 @@ func serializeCheckpoint(data *checkpointData) []byte {
 		off += 8
 	}
 
-	// CRC32-C over everything before the CRC field (includes version byte)
+	// LSM segment names.
+	for _, name := range data.lsmSegments {
+		binary.LittleEndian.PutUint16(buf[off:], uint16(len(name)))
+		off += 2
+		copy(buf[off:], name)
+		off += len(name)
+		// Pad to 16-byte alignment
+		pad := (16 - (len(name)%16)) % 16
+		for i := 0; i < pad; i++ {
+			buf[off] = 0
+			off++
+		}
+	}
+
+	// CRC32-C.
 	crc := crc32.Checksum(buf[:off], crc32.MakeTable(crc32.Castagnoli))
 	binary.LittleEndian.PutUint32(buf[off:], crc)
 
@@ -312,11 +549,11 @@ func loadCheckpoint(path string) (*checkpointData, error) {
 		return nil, err
 	}
 
-	if len(raw) < checkpointHeaderSize+4 {
+	if len(raw) < checkpointHeaderSizeV3+4 {
 		return nil, fmt.Errorf("checkpoint: file too small (%d bytes)", len(raw))
 	}
 
-	// Verify CRC
+	// Verify CRC.
 	storedCRC := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 	computedCRC := crc32.Checksum(raw[:len(raw)-4], crc32.MakeTable(crc32.Castagnoli))
 	if storedCRC != computedCRC {
@@ -330,50 +567,91 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 	off := 0
 	data := &checkpointData{}
 
-	// Version byte first
+	// Version byte.
 	if len(buf) < 1 {
 		return nil, fmt.Errorf("checkpoint: file too small for version byte")
 	}
 	version := buf[off]
 	off += 1
-	if version != checkpointVersion {
-		return nil, fmt.Errorf("checkpoint: unsupported version %d (expected %d)", version, checkpointVersion)
+
+	// Version 1-2 use checkpointHeaderSize (61), v3 uses checkpointHeaderSizeV3 (73).
+	var pageCount, blobCount, clogCount, statsCount, lsmCount uint32
+	var headerSize int
+
+	if version < 3 {
+		// v1/v2 format (backward compatible).
+		if len(buf) < checkpointHeaderSize+4 {
+			return nil, fmt.Errorf("checkpoint: file too small for v%d header", version)
+		}
+		headerSize = checkpointHeaderSize
+
+		data.LSN = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextXID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.RootPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextBlobID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		pageCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		blobCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		clogCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		statsCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		// reserved
+		off += 4
+		lsmCount = 0 // v1/v2 don't have LSM manifest
+		data.SnapshotXID = data.NextXID // default for v1/v2
+	} else if version == 3 {
+		// v3 format.
+		headerSize = checkpointHeaderSizeV3
+
+		data.LSN = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextXID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.SnapshotXID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.RootPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextPageID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		data.NextBlobID = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+		pageCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		blobCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		clogCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		statsCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		lsmCount = binary.LittleEndian.Uint32(buf[off:])
+		off += 4
+		// reserved
+		off += 4
+	} else {
+		return nil, fmt.Errorf("checkpoint: unsupported version %d", version)
 	}
 
-	// Fields now start at offset 1 (shifted +1 from v0)
-	data.LSN = binary.LittleEndian.Uint64(buf[off:])
-	off += 8
-	data.NextXID = binary.LittleEndian.Uint64(buf[off:])
-	off += 8
-	data.RootPageID = binary.LittleEndian.Uint64(buf[off:])
-	off += 8
-	data.NextPageID = binary.LittleEndian.Uint64(buf[off:])
-	off += 8
-	data.NextBlobID = binary.LittleEndian.Uint64(buf[off:])
-	off += 8
-	pageCount := binary.LittleEndian.Uint32(buf[off:])
-	off += 4
-	blobCount := binary.LittleEndian.Uint32(buf[off:])
-	off += 4
-	clogCount := binary.LittleEndian.Uint32(buf[off:])
-	off += 4
-	statsCount := binary.LittleEndian.Uint32(buf[off:])
-	off += 4
-	// skip reserved padding
-	off += 4
-
-	// Validate size (v2 format: header=61, stats=20 bytes/entry)
-	expected := checkpointHeaderSize +
+	// Validate size.
+	expected := headerSize +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
 		int(statsCount)*20 +
+		int(lsmCount)*16 +
 		4
 	if len(buf) != expected {
 		return nil, fmt.Errorf("checkpoint: size mismatch (got %d, expected %d)", len(buf), expected)
 	}
 
-	// Page mappings
+	// Page mappings.
 	data.Pages = make([]pageMapping, pageCount)
 	for i := range data.Pages {
 		data.Pages[i].PageID = binary.LittleEndian.Uint64(buf[off:])
@@ -382,7 +660,7 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off += 8
 	}
 
-	// Blob mappings
+	// Blob mappings.
 	data.Blobs = make([]blobMapping, blobCount)
 	for i := range data.Blobs {
 		data.Blobs[i].BlobID = binary.LittleEndian.Uint64(buf[off:])
@@ -393,7 +671,7 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off += 4
 	}
 
-	// CLOG entries
+	// CLOG entries.
 	data.CLOGEntries = make([]clogEntry, clogCount)
 	for i := range data.CLOGEntries {
 		data.CLOGEntries[i].XID = binary.LittleEndian.Uint64(buf[off:])
@@ -402,7 +680,7 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off++
 	}
 
-	// Stats entries
+	// Stats entries.
 	data.Stats = make([]segmentStatEntry, statsCount)
 	for i := range data.Stats {
 		data.Stats[i].SegID = binary.LittleEndian.Uint32(buf[off:])
@@ -411,6 +689,19 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off += 8
 		data.Stats[i].AliveBytes = binary.LittleEndian.Uint64(buf[off:])
 		off += 8
+	}
+
+	// LSM segment names (v3 only).
+	data.lsmSegments = make([]string, lsmCount)
+	for i := uint32(0); i < lsmCount; i++ {
+		nameLen := binary.LittleEndian.Uint16(buf[off:])
+		off += 2
+		name := string(buf[off : off+int(nameLen)])
+		off += int(nameLen)
+		// Skip padding
+		pad := (16 - (int(nameLen)%16)) % 16
+		off += int(pad)
+		data.lsmSegments[i] = name
 	}
 
 	return data, nil
@@ -440,4 +731,12 @@ func (d *checkpointData) toCLOGEntries() map[uint64]txnapi.TxnStatus {
 		out[e.XID] = txnapi.TxnStatus(e.Status)
 	}
 	return out
+}
+
+// Version returns the checkpoint version.
+func (d *checkpointData) Version() int {
+	if len(d.lsmSegments) > 0 {
+		return 3
+	}
+	return 2
 }

@@ -868,6 +868,10 @@ func (s *store) Close() error {
 	// the tree and page store below.
 	s.vacuumWg.Wait()
 
+	// Stop any in-flight background checkpoint goroutine.
+	// This signals abort and waits for cleanup (with 2s timeout).
+	s.stopCheckpoint()
+
 	// Checkpoint before closing to persist all in-memory state.
 	// This ensures the next Open can recover quickly from the checkpoint
 	// rather than replaying the entire WAL. Even if Checkpoint fails,

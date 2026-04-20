@@ -111,3 +111,21 @@ type RecoveryStore interface {
 	// Build rebuilds the in-memory structures from the applied records.
 	Build() error
 }
+
+// Manifest provides access to SSTable segment management for checkpoint.
+// Checkpoint pins segments during state capture to prevent GC from deleting them.
+type Manifest interface {
+	// PinAll atomically increments refcount for all current segments.
+	// Returns the list of pinned segment names.
+	PinAll() []string
+
+	// UnpinAll atomically decrements refcount for the given segments.
+	UnpinAll(names []string)
+
+	// CanDelete returns true if a segment's refcount is 0.
+	CanDelete(name string) bool
+
+	// GetSegmentName returns the filename for a given segment ID.
+	// Used by GC to construct the segment name before checking CanDelete.
+	GetSegmentName(segID uint64) string
+}

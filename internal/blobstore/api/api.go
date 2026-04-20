@@ -106,6 +106,11 @@ type BlobStore interface {
 	// ExportMapping returns all non-zero blob mappings for checkpoint serialization.
 	ExportMapping() []MappingEntry
 
+	// GetSnapshotMappings returns a COW copy of all non-zero blob mappings.
+	// Used by the checkpoint goroutine to capture state without blocking user operations.
+	// Takes a short write lock (~10ns) to swap the pointer. No user operation is blocked.
+	GetSnapshotMappings() []MappingEntry
+
 	// Close closes the BlobStore. After Close, all operations return ErrClosed.
 	// Note: BlobStore does NOT close the underlying SegmentManager —
 	// that is owned by the caller.

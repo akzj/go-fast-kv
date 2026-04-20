@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"time"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -224,8 +225,14 @@ func TestCheckpointMetadataExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Check checkpoint file exists
+	// Wait for async checkpoint to complete
 	cpPath := filepath.Join(dir, "checkpoint")
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(cpPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err := os.Stat(cpPath); err != nil {
 		t.Fatalf("Checkpoint file should exist: %v", err)
 	}

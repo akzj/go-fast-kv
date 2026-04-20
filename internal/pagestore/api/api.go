@@ -11,6 +11,7 @@ package pagestoreapi
 import (
 	"errors"
 
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
 
@@ -169,6 +170,11 @@ type PageStoreRecovery interface {
 	// LSMLifecycle returns the LSM store for WAL replay routing.
 	// Returns the underlying LSM so recovery.go can delegate ModuleLSM records.
 	LSMLifecycle() LSMLifecycle
+
+	// SetLSMSegments sets the LSM segment list from checkpoint (v3+).
+	// This initializes the LSM manifest with checkpoint-pinned segments,
+	// skipping rebuild from WAL for pre-checkpoint entries.
+	SetLSMSegments(segments []string)
 }
 
 // LSMLifecycle represents the LSM store's recovery surface.
@@ -198,6 +204,11 @@ type LSMLifecycle interface {
 	// value equals expectedVAddr and expectedSize. Returns true if the update was applied.
 	// Used by GC for race-free mapping updates.
 	CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool
+
+	// Manifest returns the LSM manifest for GC to check CanDelete before removing segments.
+	// Only pre-snapshot SSTables have refcount > 0 and are blocked from deletion.
+	// New SSTables created after checkpoint snapshot have refcount == 0 and can be deleted.
+	Manifest() lsmapi.Manifest
 }
 
 // ─── Config ─────────────────────────────────────────────────────────

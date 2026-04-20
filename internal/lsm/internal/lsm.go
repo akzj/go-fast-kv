@@ -10,8 +10,12 @@ import (
 	"time"
 
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
 )
+
+// Compile-time check: lsm implements LSMLifecycle interface used by GC.
+var _ pagestoreapi.LSMLifecycle = (*lsm)(nil)
 
 // ─── LSM Store ─────────────────────────────────────────────────────
 
@@ -745,6 +749,19 @@ func (s *lsm) SetCheckpointLSN(lsn uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.checkpointLSN = lsn
+}
+
+// Manifest returns the LSM manifest for checkpoint pinning.
+// Caller can call PinAll/UnpinAll to manage segment refcounts.
+func (s *lsm) Manifest() lsmapi.Manifest {
+	return s.manifest
+}
+
+// SetSegments sets the segment list from checkpoint (v3+).
+// This initializes the LSM manifest with checkpoint-pinned segments,
+// skipping rebuild from WAL for pre-checkpoint entries.
+func (s *lsm) SetSegments(names []string) {
+	s.manifest.SetSegments(names)
 }
 
 // DrainCollector retrieves and clears the current goroutine's WAL collector.

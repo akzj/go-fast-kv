@@ -323,6 +323,20 @@ func (ps *pageStore) SetNextPageID(nextID pagestoreapi.PageID) {
 	ps.nextPageID = nextID
 }
 
+// SetLSMSegments sets the LSM segment list from checkpoint (v3+).
+// This initializes the LSM manifest with checkpoint-pinned segments,
+// skipping rebuild from WAL for pre-checkpoint entries.
+// The segments are stored in the underlying *lsm's manifest.
+func (ps *pageStore) SetLSMSegments(segments []string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Get the LSM's manifest and populate it with checkpoint segments.
+	if lsm, ok := ps.lsm.(interface{ SetSegments([]string) }); ok {
+		lsm.SetSegments(segments)
+	}
+}
+
 // InvalidatePage invalidates any cached entry for the given PageID.
 // Used by GC after CAS update to evict the old VAddr from the LRU cache.
 func (ps *pageStore) InvalidatePage(pageID pagestoreapi.PageID) {

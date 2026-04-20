@@ -14,6 +14,8 @@ import (
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
+	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
+	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -219,8 +221,14 @@ func TestCheckpoint(t *testing.T) {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 
-	// Verify checkpoint file exists
+	// Verify checkpoint file exists (background checkpoint may need a moment)
 	cpPath := filepath.Join(dir, "checkpoint")
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(cpPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err := os.Stat(cpPath); os.IsNotExist(err) {
 		t.Fatal("checkpoint file does not exist")
 	}
@@ -330,8 +338,8 @@ func TestCheckpointFormatVersion(t *testing.T) {
 	if len(raw) < 1 {
 		t.Fatal("checkpoint file is empty")
 	}
-	if raw[0] != 2 {
-		t.Fatalf("version byte: got %d, want 2", raw[0])
+	if raw[0] != 3 {
+		t.Fatalf("version byte: got %d, want 3", raw[0])
 	}
 
 	// Verify that deserialization reads and validates the version.
@@ -350,11 +358,11 @@ func TestCheckpointFormatVersion(t *testing.T) {
 func TestCheckpointUnknownVersionRejected(t *testing.T) {
 	// Manually construct a v3 checkpoint buffer (version byte = 3)
 	// to simulate a future unsupported format.
-	// V2/v3 header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
+	// v4/future header layout: version(1) + LSN(8) + NextXID(8) + RootPageID(8) + NextPageID(8)
 	// + NextBlobID(8) + PageCount(4) + BlobCount(4) + CLOGCount(4) + StatsCount(4) + reserved(4)
 	// = 61 bytes, then CRC32(4) = 65 bytes total for zero-data checkpoint.
 	buf := make([]byte, 61+4)
-	buf[0] = 3                           // version = 3 (unsupported)
+	buf[0] = 4                           // version = 4 (unsupported/future)
 	binary.LittleEndian.PutUint64(buf[1:], 100)   // LSN
 	binary.LittleEndian.PutUint64(buf[9:], 10)    // NextXID
 	binary.LittleEndian.PutUint64(buf[17:], 1)    // RootPageID
@@ -777,6 +785,151 @@ func TestKVStoreBulkLoadMVCC(t *testing.T) {
 	}
 	val, _ := store.Get([]byte("b"))
 	if string(val) != "2" {
-		t.Errorf("got %s, want 2", val)
+		t.Errorf("got %s, want 3", val)
+	}
+}
+
+// TestCloseDuringCheckpoint verifies that Close() aborts a background
+// checkpoint cleanly, leaving no temp files and no pinned segments.
+func TestCloseDuringCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStoreAt(t, dir)
+
+	// Write enough data to ensure segments are created.
+	for i := 0; i < 20; i++ {
+		if err := s.Put(testKey(i), testValue(i)); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Start a background checkpoint.
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// Close immediately while checkpoint goroutine may still be running.
+	// Close() calls stopCheckpoint() which sends stop signal and waits.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Verify no .tmp files remain (abortCheckpoint cleans these up).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+
+	// Verify no pinned segments by accessing the manifest through
+	// the internal store type (unexported pageStore field).
+	// We type-assert through layers to reach the concrete *manifest type
+	// which exposes Segments() and Refcount().
+	internalStore := s.(*store)
+	psRecovery := internalStore.pageStore.(pagestoreapi.PageStoreRecovery)
+	lsmLifecycle := psRecovery.LSMLifecycle()
+
+	// Extended interface to get the Manifest interface.
+	type lsmWithManifest interface {
+		Manifest() lsmapi.Manifest
+	}
+	// Extended interface on Manifest to get concrete manifest methods.
+	type concreteManifest interface {
+		Segments() []string
+		Refcount(name string) int64
+	}
+	if ma, ok := lsmLifecycle.(lsmWithManifest); ok {
+		if m, ok := ma.Manifest().(concreteManifest); ok {
+			segs := m.Segments()
+			for _, name := range segs {
+				rc := m.Refcount(name)
+				if rc != 0 {
+					t.Errorf("segment %s refcount=%d, want 0 after close", name, rc)
+				}
+			}
+			t.Logf("manifest segments after close: %d, all refcounts=0", len(segs))
+		}
+	}
+}
+
+// TestV3CheckpointRecovery verifies that v3 checkpoints load LSM segments
+// from the checkpoint file during recovery, and that no panic occurs.
+func TestV3CheckpointRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	// Phase 1: create store, write data, checkpoint.
+	s := openTestStoreAt(t, dir)
+	for i := 0; i < 20; i++ {
+		if err := s.Put(testKey(i), testValue(i)); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// Wait for background checkpoint to complete.
+	cpPath := filepath.Join(dir, "checkpoint")
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(cpPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(cpPath); os.IsNotExist(err) {
+		t.Fatal("checkpoint file not created")
+	}
+
+	// Read version byte to verify v3 format.
+	raw, err := os.ReadFile(cpPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if raw[0] != 3 {
+		t.Fatalf("checkpoint version: got %d, want 3", raw[0])
+	}
+	t.Logf("checkpoint version: v3")
+
+	s.Close()
+
+	// Phase 2: reopen store — recovery path.
+	s2 := openTestStoreAt(t, dir)
+	defer s2.Close()
+
+	// Verify data survived recovery.
+	for i := 0; i < 20; i++ {
+		val, err := s2.Get(testKey(i))
+		if err != nil {
+			t.Fatalf("Get(%d) after recovery: %v", i, err)
+		}
+		if !bytes.Equal(val, testValue(i)) {
+			t.Fatalf("Get(%d) after recovery: got %q, want %q", i, val, testValue(i))
+		}
+	}
+
+	// Verify LSM segments were loaded from checkpoint (v3 feature).
+	// Access manifest via internal store type.
+	internalStore := s2.(*store)
+	psRecovery := internalStore.pageStore.(pagestoreapi.PageStoreRecovery)
+	lsmLifecycle := psRecovery.LSMLifecycle()
+
+	type lsmWithManifest interface {
+		Manifest() lsmapi.Manifest
+	}
+	type concreteManifest interface {
+		Segments() []string
+	}
+	if ma, ok := lsmLifecycle.(lsmWithManifest); ok {
+		if m, ok := ma.Manifest().(concreteManifest); ok {
+			segs := m.Segments()
+			if len(segs) == 0 {
+				t.Error("manifest.Segments() returned empty — v3 segments not loaded from checkpoint")
+			} else {
+				t.Logf("manifest.Segments() after recovery: %d segments: %v", len(segs), segs)
+			}
+		}
 	}
 }

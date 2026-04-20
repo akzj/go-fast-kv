@@ -132,6 +132,10 @@ type CLOG interface {
 	// Entries returns all CLOG entries (for checkpoint serialization).
 	Entries() map[uint64]TxnStatus
 
+	// EntriesUpTo returns all CLOG entries with XID < xmax.
+	// Used by checkpoint goroutine for consistent snapshot.
+	EntriesUpTo(xmax uint64) map[uint64]TxnStatus
+
 	// LoadEntries bulk-loads CLOG entries (for recovery from checkpoint).
 	LoadEntries(entries map[uint64]TxnStatus)
 }
