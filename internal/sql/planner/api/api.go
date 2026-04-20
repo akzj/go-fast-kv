@@ -8,40 +8,38 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
+	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
 
-var (
-	// ErrTableNotFound is returned when the referenced table does not exist.
-	ErrTableNotFound = errors.New("planner: table not found")
+// ErrTableNotFound is returned when the referenced table does not exist.
+var ErrTableNotFound = sqlerrors.ErrTableNotFound("")
 
-	// ErrColumnNotFound is returned when a referenced column does not exist.
-	ErrColumnNotFound = errors.New("planner: column not found")
+// ErrColumnNotFound is returned when a referenced column does not exist.
+var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
-	// ErrTypeMismatch is returned when a value's type doesn't match the column type.
-	ErrTypeMismatch = errors.New("planner: type mismatch")
+// ErrTypeMismatch is returned when a value's type doesn't match the column type.
+var ErrTypeMismatch = sqlerrors.ErrTypeMismatch("", nil)
 
-	// ErrColumnCountMismatch is returned when INSERT value count doesn't match column count.
-	ErrColumnCountMismatch = errors.New("planner: column count mismatch")
+// ErrColumnCountMismatch is returned when INSERT value count doesn't match column count.
+var ErrColumnCountMismatch = sqlerrors.ErrColumnCountMismatch(0, 0)
 
-	// ErrUnsupportedExpr is returned for expressions not supported in Phase 1.
-	// For example, SET col = other_col in UPDATE (only literals allowed).
-	ErrUnsupportedExpr = errors.New("planner: unsupported expression (Phase 1: literals only)")
+// ErrUnsupportedExpr is returned for expressions not supported in Phase 1.
+// For example, SET col = other_col in UPDATE (only literals allowed).
+var ErrUnsupportedExpr = sqlerrors.ErrUnsupportedExpr("Phase 1: literals only")
 
-	// ErrEmptyTable is returned when CREATE TABLE has no columns.
-	ErrEmptyTable = errors.New("planner: table must have at least one column")
+// ErrEmptyTable is returned when CREATE TABLE has no columns.
+var ErrEmptyTable = sqlerrors.ErrEmptyTable()
 
-	// ErrInvalidPlan is returned when a valid plan cannot be created.
-	ErrInvalidPlan = errors.New("planner: cannot create valid plan")
-)
+// ErrInvalidPlan is returned when a valid plan cannot be created.
+var ErrInvalidPlan = sqlerrors.ErrInvalidPlan("")
 
 // ─── Plan Interface ─────────────────────────────────────────────────
 

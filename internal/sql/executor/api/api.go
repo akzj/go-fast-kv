@@ -8,19 +8,16 @@
 package api
 
 import (
-	"errors"
-
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
+	sqlerrors "github.com/akzj/go-fast-kv/internal/sql/errors"
 	txnapi "github.com/akzj/go-fast-kv/internal/txn/api"
 )
 
 // ─── Errors ─────────────────────────────────────────────────────────
 
-var (
-	// ErrExecFailed is returned when plan execution fails.
-	ErrExecFailed = errors.New("executor: execution failed")
-)
+// ErrExecFailed is returned when plan execution fails.
+var ErrExecFailed = sqlerrors.ErrExecFailed(nil)
 
 // ─── Result ─────────────────────────────────────────────────────────
 
