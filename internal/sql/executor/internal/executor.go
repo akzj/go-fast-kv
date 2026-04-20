@@ -2135,12 +2135,13 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
 	// LIMIT/OFFSET pushdown: only push down if there's no ORDER BY (ORDER BY requires all rows first)
-	var limit, offset int
-	if plan.OrderBy == nil && plan.GroupByExprs == nil {
-		limit = plan.Limit
-		offset = plan.Offset
+	pushedDown := plan.OrderBy == nil && plan.GroupByExprs == nil
+	// Limit/offset to push down to storage. When pushedDown=false, pass 0 (no pushdown)
+	storageLimit, storageOffset := plan.Limit, plan.Offset
+	if !pushedDown {
+		storageLimit, storageOffset = 0, 0
 	}
-	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults, limit, offset)
+	rows, err := e.scanRows(plan.Table, scanPlan, subqueryResults, storageLimit, storageOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -2203,14 +2204,18 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		sortRawRows(rows, plan.OrderBy)
 	}
 
-	// OFFSET (skip first N rows first)
-	if plan.Offset >= 0 && plan.Offset < len(rows) {
-		rows = rows[plan.Offset:]
-	}
-
-	// LIMIT (take N from remaining)
-	if plan.Limit >= 0 && plan.Limit < len(rows) {
-		rows = rows[:plan.Limit]
+	// OFFSET and LIMIT: apply in executor if NOT pushed down to storage layer.
+	// When pushedDown=true, storage already applied them; executor should not apply again.
+	// When pushedDown=false, executor must apply them.
+	if !pushedDown {
+		// OFFSET (skip first N rows first)
+		if plan.Offset > 0 && plan.Offset < len(rows) {
+			rows = rows[plan.Offset:]
+		}
+		// LIMIT (take N from remaining)
+		if plan.Limit > 0 && plan.Limit < len(rows) {
+			rows = rows[:plan.Limit]
+		}
 	}
 
 	// Scalar aggregate in SELECT (no GROUP BY): compute across all rows.

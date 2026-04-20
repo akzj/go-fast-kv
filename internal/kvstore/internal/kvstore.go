@@ -872,12 +872,13 @@ func (s *store) ScanWithParams(start, end []byte, params kvstoreapi.ScanParams) 
 	btreeIter := s.tree.Scan(start, end, readXID)
 
 	return &limitIterator{
-		inner:   btreeIter,
-		store:   s,
-		readXID: readXID,
-		limit:   params.Limit,
-		offset:  params.Offset,
-		count:   0,
+		inner:    btreeIter,
+		store:    s,
+		readXID:  readXID,
+		limit:    params.Limit,
+		offset:   params.Offset,
+		skipDone: false,
+		returned: 0,
 	}
 }
 
@@ -1374,33 +1375,42 @@ func (it *snapshotIterator) Close() {
 // This enables push-down optimization: the storage layer stops scanning early
 // after returning the requested number of rows, avoiding unnecessary I/O.
 type limitIterator struct {
-	inner   btreeapi.Iterator
-	store   *store
-	readXID uint64
-	limit   int // maximum rows to return; 0 = no limit
-	offset  int // rows to skip; 0 = no offset
-	count   int // rows seen so far
+	inner    btreeapi.Iterator
+	store    *store
+	readXID  uint64
+	limit    int // maximum rows to return; 0 = no limit
+	offset   int // rows to skip; 0 = no offset
+	skipDone bool // true once we've skipped the offset rows
+	returned int // rows returned so far
 }
 
 func (it *limitIterator) Next() bool {
-	// Fast path: no limit
+	// Fast path: no limit - delegate to inner iterator
 	if it.limit <= 0 {
 		return it.inner.Next()
 	}
 
-	// Skip until we reach the offset
-	for it.count < it.offset {
-		if !it.inner.Next() {
-			return false
-		}
-		it.count++
+	// Check if we've returned enough rows
+	if it.returned >= it.limit {
+		return false
 	}
 
-	// Return up to limit rows
+	// Skip offset rows on first calls
+	for !it.skipDone {
+		for i := 0; i < it.offset; i++ {
+			if !it.inner.Next() {
+				it.skipDone = true
+				return false
+			}
+		}
+		it.skipDone = true
+	}
+
+	// Return next row
 	if !it.inner.Next() {
 		return false
 	}
-	it.count++
+	it.returned++
 	return true
 }
 
