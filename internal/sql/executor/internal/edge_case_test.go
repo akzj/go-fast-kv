@@ -582,6 +582,46 @@ func TestEdgeCase_AllAggregates(t *testing.T) {
 	}
 }
 
+// TestEdgeCase_SumAllNull verifies SUM returns NULL for all-NULL columns (SQL standard).
+// Before fix: SUM returned 0 for all-NULL columns.
+// After fix: SUM returns NULL per SQL standard.
+func TestEdgeCase_SumAllNull(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE t (a INT, b INT)")
+
+	// Test 1: All NULL column → SUM should be NULL, not 0
+	env.execSQL(t, "INSERT INTO t VALUES (NULL, 1), (NULL, 2)")
+	r := env.execSQL(t, "SELECT SUM(a) FROM t")
+	if !r.Rows[0][0].IsNull {
+		t.Errorf("SUM(all NULL) should be NULL, got %v", r.Rows[0][0])
+	}
+
+	// Test 2: Mix of NULL and non-NULL → SUM should skip NULLs
+	env.execSQL(t, "DELETE FROM t")
+	env.execSQL(t, "INSERT INTO t VALUES (NULL, 1), (5, 2), (NULL, 3)")
+	r = env.execSQL(t, "SELECT SUM(a) FROM t")
+	if r.Rows[0][0].IsNull {
+		t.Errorf("SUM with some non-NULL values should not be NULL, got %v", r.Rows[0][0])
+	}
+	if r.Rows[0][0].Int != 5 {
+		t.Errorf("SUM with some non-NULL values should be 5, got %d", r.Rows[0][0].Int)
+	}
+
+	// Test 3: Empty table → SUM should be NULL
+	env.execSQL(t, "DELETE FROM t")
+	r = env.execSQL(t, "SELECT SUM(a) FROM t")
+	if !r.Rows[0][0].IsNull {
+		t.Errorf("SUM on empty table should be NULL, got %v", r.Rows[0][0])
+	}
+
+	// Test 4: Single NULL value → SUM should be NULL
+	env.execSQL(t, "INSERT INTO t VALUES (NULL, 1)")
+	r = env.execSQL(t, "SELECT SUM(a) FROM t")
+	if !r.Rows[0][0].IsNull {
+		t.Errorf("SUM(single NULL) should be NULL, got %v", r.Rows[0][0])
+	}
+}
+
 func TestEdgeCase_GroupByWithNull(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE t (a INT, b INT)")

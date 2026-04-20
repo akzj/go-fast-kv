@@ -2965,13 +2965,18 @@ func computeAggregate(agg *parserapi.AggregateCallExpr, rows []*engineapi.Row, c
 		}
 		idx := findColumnIndexByName(columns, colRef.Column)
 		var sum int64
+		var count int64
 		for _, row := range rows {
 			if idx >= 0 && idx < len(row.Values) {
 				val := row.Values[idx]
 				if !val.IsNull && val.Type == catalogapi.TypeInt {
 					sum += val.Int
+					count++
 				}
 			}
+		}
+		if count == 0 {
+			return catalogapi.Value{Type: catalogapi.TypeInt, IsNull: true}, nil
 		}
 		return catalogapi.Value{Type: catalogapi.TypeInt, Int: sum}, nil
 
