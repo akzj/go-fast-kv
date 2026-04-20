@@ -327,10 +327,13 @@ func (s *lsm) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
 	return s.getPageFromSSTables(pageID)
 }
 
-// pageResult holds the result of a parallel SSTable page lookup.
-type pageResult struct {
-	value   uint64
-	found   bool
+// sstReadJob represents a pending SSTable read job for the worker pool.
+type sstReadJob struct {
+	segIdx    int
+	segPath   string
+	pageID    uint64
+	value     uint64
+	found     bool
 }
 
 // getPageFromSSTables looks up a page mapping in SSTables using parallel reads.
@@ -370,54 +373,27 @@ func (s *lsm) getPageFromSSTables(pageID uint64) (uint64, bool) {
 	}
 
 	// Phase 2: Fan out SSTable reads in parallel using worker pool
-	type result struct {
-		segIdx int
-		value  uint64
-		found  bool
-	}
-	results := newResultCollector[result](len(candidates))
-
-	for idx, cand := range candidates {
-		segIdx := idx
-		s.readPool.Submit(func() {
-			pages, _, err := readSSTable(cand.path)
-			if err != nil {
-				return
-			}
-			pos := searchPages(pages, pageID)
-			if pos < len(pages) && pages[pos].key == pageID {
-				results.Add(result{segIdx: segIdx, value: pages[pos].value, found: true})
-			}
-		})
-	}
-
-	// Wait for all parallel reads to complete
-	// We need to wait for pool completion - this requires synchronization
-	// The pool's Wait() closes the task channel, but we need a way to know when done
-	// Solution: track in-flight reads with a waitgroup
-	type pendingResult struct {
-		result result
-		ready  chan struct{}
-	}
-	pending := make([]pendingResult, len(candidates))
+	results := newResultCollector[*sstReadJob](len(candidates))
 	var readWG sync.WaitGroup
 
 	for idx, cand := range candidates {
 		segIdx := idx
-		pending[idx].ready = make(chan struct{}, 1)
+		segPath := cand.path // capture by value
 		readWG.Add(1)
 		s.readPool.Submit(func() {
 			defer readWG.Done()
-			pages, _, err := readSSTable(cand.path)
+			job := &sstReadJob{segIdx: segIdx}
+			pages, _, err := readSSTable(segPath)
 			if err != nil {
-				close(pending[segIdx].ready)
+				results.Add(job)
 				return
 			}
 			pos := searchPages(pages, pageID)
 			if pos < len(pages) && pages[pos].key == pageID {
-				pending[segIdx].result = result{segIdx: segIdx, value: pages[pos].value, found: true}
+				job.value = pages[pos].value
+				job.found = true
 			}
-			close(pending[segIdx].ready)
+			results.Add(job)
 		})
 	}
 
@@ -426,9 +402,10 @@ func (s *lsm) getPageFromSSTables(pageID uint64) (uint64, bool) {
 
 	// Phase 3: Find the newest (lowest index) matching segment
 	// Candidates are newest-to-oldest, so lower index = newer
-	for i := 0; i < len(pending); i++ {
-		if pending[i].result.found {
-			return pending[i].result.value, true
+	allResults := results.Results()
+	for _, r := range allResults {
+		if r.found {
+			return r.value, true
 		}
 	}
 
@@ -539,16 +516,33 @@ func (s *lsm) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok bool)
 
 // getBlobFromSSTables looks up a blob mapping in SSTables.
 // Uses bloom filters to skip SSTables that definitely don't contain the key.
+// blobReadJob represents a pending SSTable read job for blob lookup.
+type blobReadJob struct {
+	segIdx int
+	value  uint64
+	size   uint32
+	found  bool
+}
+
+// getBlobFromSSTables looks up a blob mapping in SSTables using parallel reads.
+// Uses bloom filters to skip SSTables that definitely don't contain the key.
+// Releases lock during SSTable file I/O for better concurrency.
 func (s *lsm) getBlobFromSSTables(blobID uint64) (uint64, uint32, bool) {
-	segments := s.manifest.Segments()
+	segments := s.manifest.SegmentNames()
+
+	// Phase 1: Check bloom filters to find candidate SSTables (lock-free, read-only)
+	type candidate struct {
+		name string
+		path string
+	}
+	candidates := make([]candidate, 0, len(segments))
 	for i := len(segments) - 1; i >= 0; i-- {
 		segName := segments[i]
 		segPath := filepath.Join(s.dir, segName)
 
-		// Check bloom filter first to skip SSTable if key is definitely not present
 		bloom := s.manifest.GetBloomFilter(segName)
 		if bloom == nil {
-			// No bloom filter available, try to read it lazily from disk
+			// No bloom filter cached, try to read it lazily from disk
 			bloom = readBloomFilter(segPath)
 			if bloom != nil {
 				s.manifest.SetBloomFilter(segName, bloom)
@@ -558,17 +552,52 @@ func (s *lsm) getBlobFromSSTables(blobID uint64) (uint64, uint32, bool) {
 			// Bloom filter says key definitely not in this SSTable, skip it
 			continue
 		}
+		candidates = append(candidates, candidate{name: segName, path: segPath})
+	}
 
-		_, blobs, err := readSSTable(segPath)
-		if err != nil {
-			continue
-		}
+	// No candidates after bloom filter check
+	if len(candidates) == 0 {
+		return 0, 0, false
+	}
 
-		idx := searchBlobs(blobs, blobID)
-		if idx < len(blobs) && blobs[idx].key == blobID {
-			return blobs[idx].value, blobs[idx].size, true
+	// Phase 2: Fan out SSTable reads in parallel using worker pool
+	results := newResultCollector[*blobReadJob](len(candidates))
+	var readWG sync.WaitGroup
+
+	for idx, cand := range candidates {
+		segIdx := idx
+		segPath := cand.path // capture by value
+		readWG.Add(1)
+		s.readPool.Submit(func() {
+			defer readWG.Done()
+			job := &blobReadJob{segIdx: segIdx}
+			_, blobs, err := readSSTable(segPath)
+			if err != nil {
+				results.Add(job)
+				return
+			}
+			pos := searchBlobs(blobs, blobID)
+			if pos < len(blobs) && blobs[pos].key == blobID {
+				job.value = blobs[pos].value
+				job.size = blobs[pos].size
+				job.found = true
+			}
+			results.Add(job)
+		})
+	}
+
+	// Wait for all reads to complete
+	readWG.Wait()
+
+	// Phase 3: Find the newest (lowest index) matching segment
+	// Candidates are newest-to-oldest, so lower index = newer
+	allResults := results.Results()
+	for _, r := range allResults {
+		if r.found {
+			return r.value, r.size, true
 		}
 	}
+
 	return 0, 0, false
 }
 
