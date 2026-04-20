@@ -12,7 +12,7 @@ type memtable struct {
 	pageMappings sync.Map // key=uint64, value=uint64 (packed vaddr)
 	blobMappings sync.Map // key=uint64, value=uint64 (packed blob meta)
 	size         int64
-	mu           sync.Mutex
+	mu           sync.RWMutex
 }
 
 // packedBlobMeta packs (vaddr, size) into a single uint64.
@@ -77,6 +77,8 @@ func (m *memtable) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64,
 
 // GetPageMapping gets a page mapping.
 func (m *memtable) GetPageMapping(pageID uint64) (vaddr uint64, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	val, ok := m.pageMappings.Load(pageID)
 	if !ok {
 		return 0, false
@@ -101,6 +103,8 @@ func (m *memtable) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
 
 // GetBlobMapping gets a blob mapping.
 func (m *memtable) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	val, ok := m.blobMappings.Load(blobID)
 	if !ok {
 		return 0, 0, false
