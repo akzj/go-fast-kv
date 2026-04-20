@@ -38,11 +38,23 @@ type manifestData struct {
 // decremented when checkpoint completes or is aborted.
 // GC checks refcount==0 before deleting any SSTable.
 // bloomFilter stores the deserialized bloom filter for this SSTable.
+// level tracks which LSM tree level this SSTable belongs to (0=L0, 1=L1, 2=L2).
+// minKey/maxKey track the key range for overlap detection during compaction.
 type segmentEntry struct {
 	name        string
+	level       int
 	refcount    atomic.Int64
 	bloomFilter *BloomFilter // cached bloom filter, nil if not yet loaded
+	minKey      uint64       // minimum key in this SSTable (0 if empty)
+	maxKey      uint64       // maximum key in this SSTable (0 if empty)
 }
+
+// Level configuration (10x growth per level)
+const (
+	Level0Capacity = 4  // Max 4 SSTables at L0
+	Level1Capacity = 10 // Max 10 SSTables at L1
+	Level2Capacity = 100
+)
 
 // Pin increments the reference count for a segment.
 // Returns true if the segment exists and was pinned.
@@ -238,16 +250,21 @@ func newManifest(dir string) (*manifest, error) {
 	return m, nil
 }
 
-// AddSegment adds a segment to the manifest synchronously.
+// AddSegment adds a segment to the manifest synchronously with level and key range.
 // Unlike NextID (which saves async), this waits for the file system
 // to acknowledge the update before returning. Called during LSM close
 // when data durability is critical.
-func (m *manifest) AddSegment(name string) error {
+func (m *manifest) AddSegmentWithLevel(name string, level int, minKey, maxKey uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Add as segmentEntry with refcount=0
-	m.segments = append(m.segments, segmentEntry{name: name})
+	// Add as segmentEntry with refcount=0, level=0, key range
+	m.segments = append(m.segments, segmentEntry{
+		name:     name,
+		level:    level,
+		minKey:   minKey,
+		maxKey:   maxKey,
+	})
 	m.data.Segments = append(m.data.Segments, name)
 	return m.saveLocked()
 }
@@ -300,6 +317,107 @@ func (m *manifest) Segments() []string {
 		result = append(result, seg.name)
 	}
 	return result
+}
+
+// SetLevel sets the level for a segment.
+func (m *manifest) SetLevel(name string, level int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			m.segments[i].level = level
+			return
+		}
+	}
+}
+
+// GetLevel returns the level for a segment, or 0 if not found.
+func (m *manifest) GetLevel(name string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, seg := range m.segments {
+		if seg.name == name {
+			return seg.level
+		}
+	}
+	return 0
+}
+
+// SetKeyRange sets the min/max key range for a segment.
+func (m *manifest) SetKeyRange(name string, minKey, maxKey uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			m.segments[i].minKey = minKey
+			m.segments[i].maxKey = maxKey
+			return
+		}
+	}
+}
+
+// GetKeyRange returns the min/max key range for a segment.
+// Returns 0,0 if segment not found.
+func (m *manifest) GetKeyRange(name string) (minKey, maxKey uint64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, seg := range m.segments {
+		if seg.name == name {
+			return seg.minKey, seg.maxKey
+		}
+	}
+	return 0, 0
+}
+
+// GetSegmentsByLevel returns all segments at the given level.
+func (m *manifest) GetSegmentsByLevel(level int) []segmentEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]segmentEntry, 0)
+	for _, seg := range m.segments {
+		if seg.level == level {
+			result = append(result, seg)
+		}
+	}
+	return result
+}
+
+// GetOverlappingSegments returns all segments at the given level whose
+// key ranges overlap with [minKey, maxKey].
+func (m *manifest) GetOverlappingSegments(level int, minKey, maxKey uint64) []segmentEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]segmentEntry, 0)
+	for _, seg := range m.segments {
+		if seg.level != level {
+			continue
+		}
+		// Two ranges [a,b] and [c,d] overlap if a <= d AND c <= b
+		if seg.minKey <= maxKey && minKey <= seg.maxKey {
+			result = append(result, seg)
+		}
+	}
+	return result
+}
+
+// CountLevel returns the number of segments at the given level.
+func (m *manifest) CountLevel(level int) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count := 0
+	for _, seg := range m.segments {
+		if seg.level == level {
+			count++
+		}
+	}
+	return count
 }
 
 // saveLocked saves the manifest to disk. Caller must hold m.mu.

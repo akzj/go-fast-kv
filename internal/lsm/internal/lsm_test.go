@@ -184,9 +184,9 @@ func TestManifest(t *testing.T) {
 		t.Fatalf("newManifest: %v", err)
 	}
 
-	// Test AddSegment
-	if err := m.AddSegment("segment-001.sst"); err != nil {
-		t.Fatalf("AddSegment: %v", err)
+	// Test AddSegmentWithLevel
+	if err := m.AddSegmentWithLevel("segment-001.sst", 0, 0, 0); err != nil {
+		t.Fatalf("AddSegmentWithLevel: %v", err)
 	}
 
 	segs := m.Segments()
@@ -659,4 +659,126 @@ func BenchmarkLSMBloomFilter(b *testing.B) {
 			l.GetPageMapping(pageID)
 		}
 	})
+}
+
+// ─── Level Compaction Tests ─────────────────────────────────────────
+
+func TestLevelCompactionIntegration(t *testing.T) {
+	Dir := t.TempDir()
+	cfg := lsmapi.Config{Dir: Dir, MemtableSize: 64}
+	l, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	// Insert data to create multiple SSTables at L0
+	// Small memtable size (64 bytes) forces frequent flushes
+	for i := uint64(1); i <= 10; i++ {
+		l.SetPageMapping(i, i*100)
+	}
+
+	// Trigger compaction to create SSTables
+	if err := l.MaybeCompact(); err != nil {
+		t.Fatalf("MaybeCompact: %v", err)
+	}
+	// Wait for background flush
+	time.Sleep(200 * time.Millisecond)
+	l.WaitForCompaction()
+
+	// Verify we have L0 segments
+	l0Count := l.manifest.CountLevel(0)
+	t.Logf("L0 segments after first compaction: %d", l0Count)
+
+	// Verify data is accessible after compaction
+	vaddr, ok := l.GetPageMapping(1)
+	if !ok || vaddr != 100 {
+		t.Errorf("GetPageMapping(1) after compaction: got (%d, %v), want (100, true)", vaddr, ok)
+	}
+
+	// Insert more data to exceed L0 capacity
+	for i := uint64(100); i <= 300; i++ {
+		l.SetPageMapping(i, i*100)
+	}
+
+	// Trigger more compactions to create more L0 segments
+	for i := 0; i < 3; i++ {
+		if err := l.MaybeCompact(); err != nil {
+			t.Fatalf("MaybeCompact %d: %v", i, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	l.WaitForCompaction()
+
+	// Check segment counts
+	l0Count = l.manifest.CountLevel(0)
+	l1Count := l.manifest.CountLevel(1)
+	t.Logf("After compactions - L0: %d, L1: %d", l0Count, l1Count)
+
+	// Verify all data still accessible from memtables
+	for i := uint64(1); i <= 10; i++ {
+		vaddr, ok := l.GetPageMapping(i)
+		if !ok || vaddr != i*100 {
+			t.Errorf("GetPageMapping(%d): got (%d, %v), want (%d, true)", i, vaddr, ok, i*100)
+		}
+	}
+}
+
+func TestManifestLevelTracking(t *testing.T) {
+	Dir := t.TempDir()
+	m, err := newManifest(Dir)
+	if err != nil {
+		t.Fatalf("newManifest: %v", err)
+	}
+
+	// Add segments at different levels with key ranges
+	m.AddSegmentWithLevel("seg-l0-1.sst", 0, 1, 100)
+	m.AddSegmentWithLevel("seg-l0-2.sst", 0, 50, 150)
+	m.AddSegmentWithLevel("seg-l1-1.sst", 1, 1, 100)
+	m.AddSegmentWithLevel("seg-l1-2.sst", 1, 200, 300)
+
+	// Test GetSegmentsByLevel
+	l0Segs := m.GetSegmentsByLevel(0)
+	if len(l0Segs) != 2 {
+		t.Errorf("GetSegmentsByLevel(0): got %d, want 2", len(l0Segs))
+	}
+
+	l1Segs := m.GetSegmentsByLevel(1)
+	if len(l1Segs) != 2 {
+		t.Errorf("GetSegmentsByLevel(1): got %d, want 2", len(l1Segs))
+	}
+
+	// Test GetOverlappingSegments - seg-l0-1 has range [1,100]
+	// Should overlap with seg-l1-1 [1,100] but not seg-l1-2 [200,300]
+	overlapping := m.GetOverlappingSegments(1, 1, 100)
+	if len(overlapping) != 1 || overlapping[0].name != "seg-l1-1.sst" {
+		t.Errorf("GetOverlappingSegments(1, [1,100]): got %v, want [seg-l1-1.sst]", overlapping)
+	}
+
+	// Test CountLevel
+	if m.CountLevel(0) != 2 {
+		t.Errorf("CountLevel(0): got %d, want 2", m.CountLevel(0))
+	}
+	if m.CountLevel(1) != 2 {
+		t.Errorf("CountLevel(1): got %d, want 2", m.CountLevel(1))
+	}
+
+	// Test GetLevel/SetLevel
+	if m.GetLevel("seg-l0-1.sst") != 0 {
+		t.Errorf("GetLevel(seg-l0-1.sst): got %d, want 0", m.GetLevel("seg-l0-1.sst"))
+	}
+
+	m.SetLevel("seg-l0-1.sst", 1)
+	if m.GetLevel("seg-l0-1.sst") != 1 {
+		t.Errorf("GetLevel after SetLevel: got %d, want 1", m.GetLevel("seg-l0-1.sst"))
+	}
+
+	// Test GetKeyRange
+	minKey, maxKey := m.GetKeyRange("seg-l0-2.sst")
+	if minKey != 50 || maxKey != 150 {
+		t.Errorf("GetKeyRange(seg-l0-2.sst): got (%d, %d), want (50, 150)", minKey, maxKey)
+	}
+
+	// Flush async saves before temp dir cleanup
+	m.Flush()
 }
