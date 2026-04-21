@@ -1591,3 +1591,35 @@ func TestParse_ForUpdate(t *testing.T) {
 		}
 	})
 }
+
+func TestColumnAliasWithoutAS(t *testing.T) {
+	p := New()
+	
+	tests := []struct {
+		sql     string
+		wantErr bool
+		alias   string
+	}{
+		{"SELECT id AS alias FROM t", false, "ALIAS"},
+		{"SELECT id alias FROM t", false, "ALIAS"},
+		{"SELECT id AS a, val AS b FROM t", false, "A"},
+		{"SELECT id a, val b FROM t", false, "A"},
+		{"SELECT id name FROM t WHERE name = 'x'", false, "NAME"},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			stmt, err := p.Parse(tt.sql)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Parse() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				sel := stmt.(*api.SelectStmt)
+				if sel.Columns[0].Alias != tt.alias {
+					t.Errorf("Parse() alias = %v, want %v", sel.Columns[0].Alias, tt.alias)
+				}
+			}
+		})
+	}
+}
