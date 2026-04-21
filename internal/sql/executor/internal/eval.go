@@ -86,6 +86,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalInExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CoalesceExpr:
 		return evalCoalesceExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.NullIfExpr:
+		return evalNullIfExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
 		return evalCaseExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.ExistsExpr:
@@ -696,6 +698,38 @@ func evalCoalesceExpr(expr *parserapi.CoalesceExpr, row *engineapi.Row, columns 
 	}
 	// All values were NULL
 	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalNullIfExpr evaluates NULLIF(a, b).
+// Returns a if a != b, returns NULL if a == b.
+// NULLIF is equivalent to CASE WHEN a = b THEN NULL ELSE a END.
+func evalNullIfExpr(expr *parserapi.NullIfExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Evaluate left operand
+	left, err := evalExpr(expr.Left, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL result
+	if left.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	// Evaluate right operand
+	right, err := evalExpr(expr.Right, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL result
+	if right.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	// Compare for equality (returns -1, 0, 1)
+	eq := compareValues(left, right)
+	// If equal → return NULL; if not equal → return left
+	if eq == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	return left, nil
 }
 
 // evalCaseExpr evaluates a CASE expression.

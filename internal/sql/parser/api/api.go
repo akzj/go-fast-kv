@@ -117,6 +117,7 @@ const (
 	TokTo       TokenType = 91 // TO
 	TokType     TokenType = 92 // TYPE
 	TokDefault  TokenType = 93 // DEFAULT
+	TokNullIf   TokenType = 94 // NULLIF
 )
 
 // Token represents a single lexical token.
@@ -418,6 +419,14 @@ type CoalesceExpr struct {
 }
 
 func (*CoalesceExpr) exprNode() {}
+
+// NullIfExpr: NULLIF(a, b) returns a if a != b, NULL if a == b.
+type NullIfExpr struct {
+	Left  Expr
+	Right Expr
+}
+
+func (*NullIfExpr) exprNode() {}
 
 // StarExpr: SELECT *
 type StarExpr struct{}

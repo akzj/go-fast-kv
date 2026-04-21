@@ -1675,6 +1675,31 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance() // consume ')'
 		return &api.CoalesceExpr{Args: args}, nil
 
+	case api.TokNullIf:
+		// NULLIF(expr, expr)
+		p.advance() // consume NULLIF
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after NULLIF")
+		}
+		p.advance() // consume '('
+		left, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokComma {
+			return nil, p.errorf("expected , between NULLIF arguments")
+		}
+		p.advance() // consume ','
+		right, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after NULLIF arguments")
+		}
+		p.advance() // consume ')'
+		return &api.NullIfExpr{Left: left, Right: right}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()

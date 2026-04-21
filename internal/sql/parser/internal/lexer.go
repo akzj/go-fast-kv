@@ -34,6 +34,7 @@ var keywords = map[string]api.TokenType{
 	"CROSS":    api.TokCross,
 	"INNER":    api.TokJoin,
 	"NOT":     api.TokNot,
+	"NULLIF":  api.TokNullIf,
 	"NULL":    api.TokNull,
 	"IS":      api.TokIs,
 	"LIKE":    api.TokLike,
