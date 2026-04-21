@@ -343,6 +343,191 @@ func TestParse_DropIndex(t *testing.T) {
 	})
 }
 
+func TestParse_AlterTable(t *testing.T) {
+	t.Run("add_column_basic", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col INT")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at, ok := stmt.(*api.AlterTableStmt)
+		if !ok {
+			t.Fatalf("expected AlterTableStmt, got %T", stmt)
+		}
+		if at.Table != "T" {
+			t.Errorf("table: expected T, got %s", at.Table)
+		}
+		if at.Operation != api.AlterAddColumn {
+			t.Errorf("operation: expected AlterAddColumn, got %v", at.Operation)
+		}
+		if at.Column != "COL" {
+			t.Errorf("column: expected COL, got %s", at.Column)
+		}
+		if at.TypeName != "INT" {
+			t.Errorf("type: expected INT, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("add_column_text", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE users ADD COLUMN name TEXT")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if at.TypeName != "TEXT" {
+			t.Errorf("type: expected TEXT, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("add_column_not_null", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col TEXT NOT NULL")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if !at.NotNull {
+			t.Error("expected NotNull=true")
+		}
+	})
+
+	t.Run("add_column_unique", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col TEXT UNIQUE")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if !at.Unique {
+			t.Error("expected Unique=true")
+		}
+	})
+
+	t.Run("add_column_not_null_unique", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col TEXT NOT NULL UNIQUE")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if !at.NotNull || !at.Unique {
+			t.Errorf("expected NotNull=true and Unique=true, got NotNull=%v Unique=%v", at.NotNull, at.Unique)
+		}
+	})
+
+	t.Run("add_column_integer", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col INTEGER")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if at.TypeName != "INTEGER" {
+			t.Errorf("type: expected INTEGER, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("add_column_float", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col FLOAT")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if at.TypeName != "FLOAT" {
+			t.Errorf("type: expected FLOAT, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("add_column_blob", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE t ADD COLUMN col BLOB")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if at.TypeName != "BLOB" {
+			t.Errorf("type: expected BLOB, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("drop_column", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE users DROP COLUMN age")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at, ok := stmt.(*api.AlterTableStmt)
+		if !ok {
+			t.Fatalf("expected AlterTableStmt, got %T", stmt)
+		}
+		if at.Operation != api.AlterDropColumn {
+			t.Errorf("operation: expected AlterDropColumn, got %v", at.Operation)
+		}
+		if at.Column != "AGE" {
+			t.Errorf("column: expected AGE, got %s", at.Column)
+		}
+	})
+
+	t.Run("rename_column", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE users RENAME COLUMN old_name TO new_name")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at, ok := stmt.(*api.AlterTableStmt)
+		if !ok {
+			t.Fatalf("expected AlterTableStmt, got %T", stmt)
+		}
+		if at.Operation != api.AlterRenameColumn {
+			t.Errorf("operation: expected AlterRenameColumn, got %v", at.Operation)
+		}
+		if at.Column != "OLD_NAME" {
+			t.Errorf("column: expected OLD_NAME, got %s", at.Column)
+		}
+		if at.ColumnNew != "NEW_NAME" {
+			t.Errorf("columnNew: expected NEW_NAME, got %s", at.ColumnNew)
+		}
+	})
+
+	t.Run("case_insensitive", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("alter table t add column col int")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at := stmt.(*api.AlterTableStmt)
+		if at.Table != "T" || at.Column != "COL" {
+			t.Errorf("expected T and COL (uppercased), got %s and %s", at.Table, at.Column)
+		}
+	})
+
+	t.Run("error_missing_table", func(t *testing.T) {
+		p := newParser()
+		_, err := p.Parse("ALTER TABLE ADD COLUMN col INT")
+		if err == nil {
+			t.Error("expected parse error for missing table name")
+		}
+	})
+
+	t.Run("error_missing_column", func(t *testing.T) {
+		p := newParser()
+		_, err := p.Parse("ALTER TABLE t ADD INT")
+		if err == nil {
+			t.Error("expected parse error for missing COLUMN keyword")
+		}
+	})
+
+	t.Run("error_missing_type", func(t *testing.T) {
+		p := newParser()
+		_, err := p.Parse("ALTER TABLE t ADD COLUMN col")
+		if err == nil {
+			t.Error("expected parse error for missing type")
+		}
+	})
+}
+
 // ─── Parser Tests: DML ────────────────────────────────────────────
 
 func TestParse_Insert(t *testing.T) {

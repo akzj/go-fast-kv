@@ -105,6 +105,19 @@ type DropIndexPlan struct {
 
 func (*DropIndexPlan) planNode() {}
 
+// AlterTablePlan represents ALTER TABLE operations.
+type AlterTablePlan struct {
+	TableName    string
+	Operation    parserapi.AlterOp
+	ColumnName   string
+	ColumnNew    string // new column name for RENAME
+	TypeName     string // column type for ADD
+	NotNull      bool
+	Unique       bool
+}
+
+func (*AlterTablePlan) planNode() {}
+
 // ─── DML Plans ──────────────────────────────────────────────────────
 
 // InsertPlan inserts rows into a table.

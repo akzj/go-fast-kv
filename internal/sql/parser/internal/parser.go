@@ -70,8 +70,10 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseCommit()
 	case api.TokRollback:
 		return p.parseRollback()
+	case api.TokAlter:
+		return p.parseAlterTable()
 	default:
-		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, ROLLBACK)")
+		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, BEGIN, COMMIT, ROLLBACK)")
 	}
 }
 
@@ -88,6 +90,132 @@ func (p *parser) parseCommit() (api.Statement, error) {
 func (p *parser) parseRollback() (api.Statement, error) {
 	p.advance() // consume ROLLBACK
 	return &api.RollbackStmt{}, nil
+}
+
+// ─── ALTER TABLE ──────────────────────────────────────────────────
+
+func (p *parser) parseAlterTable() (api.Statement, error) {
+	p.advance() // consume ALTER
+	if err := p.expect(api.TokTable); err != nil {
+		return nil, err
+	}
+
+	// Table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name")
+	}
+	stmt := &api.AlterTableStmt{
+		Table: p.cur.Literal,
+	}
+	p.advance()
+
+	// Operation: ADD COLUMN, DROP COLUMN, RENAME COLUMN
+	switch p.cur.Type {
+	case api.TokAdd:
+		return p.parseAlterAddColumn(stmt)
+	case api.TokDrop:
+		return p.parseAlterDropColumn(stmt)
+	case api.TokRename:
+		return p.parseAlterRenameColumn(stmt)
+	default:
+		return nil, p.errorf("expected ADD, DROP, or RENAME after ALTER TABLE table_name")
+	}
+}
+
+func (p *parser) parseAlterAddColumn(stmt *api.AlterTableStmt) (api.Statement, error) {
+	p.advance() // consume ADD
+	if err := p.expect(api.TokColumn); err != nil {
+		return nil, err
+	}
+
+	// Column name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected column name")
+	}
+	stmt.Column = p.cur.Literal
+	p.advance()
+
+	// Column type
+	switch p.cur.Type {
+	case api.TokIntKw:
+		stmt.TypeName = "INT"
+	case api.TokInteger2:
+		stmt.TypeName = "INTEGER"
+	case api.TokTextKw:
+		stmt.TypeName = "TEXT"
+	case api.TokFloatKw:
+		stmt.TypeName = "FLOAT"
+	case api.TokBlobKw:
+		stmt.TypeName = "BLOB"
+	default:
+		return nil, p.errorf("expected column type (INT, TEXT, FLOAT, BLOB)")
+	}
+	p.advance()
+
+	// Optional constraints: [NOT NULL] [UNIQUE]
+	for {
+		switch p.cur.Type {
+		case api.TokNot:
+			p.advance()
+			if err := p.expect(api.TokNull); err != nil {
+				return nil, err
+			}
+			stmt.NotNull = true
+		case api.TokUnique:
+			p.advance()
+			stmt.Unique = true
+		default:
+			goto done
+		}
+	}
+done:
+	stmt.Operation = api.AlterAddColumn
+	return stmt, nil
+}
+
+func (p *parser) parseAlterDropColumn(stmt *api.AlterTableStmt) (api.Statement, error) {
+	p.advance() // consume DROP
+	if err := p.expect(api.TokColumn); err != nil {
+		return nil, err
+	}
+
+	// Column name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected column name")
+	}
+	stmt.Column = p.cur.Literal
+	p.advance()
+
+	stmt.Operation = api.AlterDropColumn
+	return stmt, nil
+}
+
+func (p *parser) parseAlterRenameColumn(stmt *api.AlterTableStmt) (api.Statement, error) {
+	p.advance() // consume RENAME
+	if err := p.expect(api.TokColumn); err != nil {
+		return nil, err
+	}
+
+	// Old column name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected column name")
+	}
+	stmt.Column = p.cur.Literal
+	p.advance()
+
+	if err := p.expect(api.TokTo); err != nil {
+		return nil, err
+	}
+
+	// New column name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected new column name")
+	}
+	stmt.ColumnNew = p.cur.Literal
+	p.advance()
+
+	stmt.Operation = api.AlterRenameColumn
+	return stmt, nil
 }
 
 // ─── CREATE ───────────────────────────────────────────────────────

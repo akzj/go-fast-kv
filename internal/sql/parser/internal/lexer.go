@@ -78,6 +78,12 @@ var keywords = map[string]api.TokenType{
 	"SKIP":      api.TokSkip,
 	"LOCKED":    api.TokLocked,
 	"FOR":       api.TokIdent, // FOR UPDATE, handled specially in parser
+	"ALTER":     api.TokAlter,
+	"ADD":       api.TokAdd,
+	"COLUMN":    api.TokColumn,
+	"RENAME":    api.TokRename,
+	"TO":        api.TokTo,
+	"TYPE":      api.TokType,
 }
 
 // lexer tokenizes SQL input.

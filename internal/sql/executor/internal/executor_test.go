@@ -215,6 +215,150 @@ func TestExec_DropTableWithIndexes(t *testing.T) {
 	}
 }
 
+func TestExec_AlterTable(t *testing.T) {
+	env := newTestEnv(t)
+
+	t.Run("AddColumn_Int", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)")
+		env.execSQL(t, "ALTER TABLE t1 ADD COLUMN age INT")
+
+		schema, err := env.cat.GetTable("t1")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		if len(schema.Columns) != 3 {
+			t.Fatalf("expected 3 columns, got %d", len(schema.Columns))
+		}
+		if schema.Columns[2].Name != "AGE" {
+			t.Errorf("column name: expected AGE, got %s", schema.Columns[2].Name)
+		}
+		if schema.Columns[2].Type != catalogapi.TypeInt {
+			t.Errorf("column type: expected TypeInt, got %v", schema.Columns[2].Type)
+		}
+
+		// Verify INSERT/SELECT works with new column
+		env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice', 30)")
+		sel := env.execSQL(t, "SELECT * FROM t1")
+		if len(sel.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(sel.Rows))
+		}
+		if sel.Rows[0][2].Int != 30 {
+			t.Errorf("age = %d, want 30", sel.Rows[0][2].Int)
+		}
+	})
+
+	t.Run("AddColumn_Text", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t2 (id INT PRIMARY KEY)")
+		env.execSQL(t, "ALTER TABLE t2 ADD COLUMN email TEXT")
+
+		schema, err := env.cat.GetTable("t2")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		if schema.Columns[len(schema.Columns)-1].Name != "EMAIL" {
+			t.Errorf("column name: expected EMAIL, got %s", schema.Columns[len(schema.Columns)-1].Name)
+		}
+		if schema.Columns[len(schema.Columns)-1].Type != catalogapi.TypeText {
+			t.Errorf("column type: expected TypeText, got %v", schema.Columns[len(schema.Columns)-1].Type)
+		}
+	})
+
+	t.Run("AddColumn_Float", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t3 (id INT PRIMARY KEY)")
+		env.execSQL(t, "ALTER TABLE t3 ADD COLUMN score FLOAT")
+
+		schema, err := env.cat.GetTable("t3")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		if schema.Columns[len(schema.Columns)-1].Type != catalogapi.TypeFloat {
+			t.Errorf("column type: expected TypeFloat, got %v", schema.Columns[len(schema.Columns)-1].Type)
+		}
+	})
+
+	t.Run("AddColumn_BLOB", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t4 (id INT PRIMARY KEY)")
+		env.execSQL(t, "ALTER TABLE t4 ADD COLUMN data BLOB")
+
+		schema, err := env.cat.GetTable("t4")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		if schema.Columns[len(schema.Columns)-1].Type != catalogapi.TypeBlob {
+			t.Errorf("column type: expected TypeBlob, got %v", schema.Columns[len(schema.Columns)-1].Type)
+		}
+	})
+
+	t.Run("AddColumn_NotNull", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t5 (id INT PRIMARY KEY)")
+		env.execSQL(t, "ALTER TABLE t5 ADD COLUMN nick TEXT NOT NULL")
+
+		schema, err := env.cat.GetTable("t5")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		col := schema.Columns[len(schema.Columns)-1]
+		if col.Name != "NICK" {
+			t.Errorf("column name: expected NICK, got %s", col.Name)
+		}
+		if !col.NotNull {
+			t.Error("expected NotNull=true")
+		}
+	})
+
+	t.Run("DropColumn", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t6 (id INT PRIMARY KEY, name TEXT, age INT)")
+		env.execSQL(t, "ALTER TABLE t6 DROP COLUMN age")
+
+		schema, err := env.cat.GetTable("t6")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		if len(schema.Columns) != 2 {
+			t.Fatalf("expected 2 columns after DROP, got %d", len(schema.Columns))
+		}
+		for _, col := range schema.Columns {
+			if col.Name == "AGE" {
+				t.Error("AGE column should have been dropped")
+			}
+		}
+	})
+
+	t.Run("RenameColumn", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE t7 (id INT PRIMARY KEY, name TEXT)")
+		env.execSQL(t, "ALTER TABLE t7 RENAME COLUMN name TO full_name")
+
+		schema, err := env.cat.GetTable("t7")
+		if err != nil {
+			t.Fatalf("GetTable failed: %v", err)
+		}
+		found := false
+		for _, col := range schema.Columns {
+			if col.Name == "FULL_NAME" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Error("NAME should have been renamed to FULL_NAME")
+		}
+	})
+
+	t.Run("NonExistentTable", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "ALTER TABLE nope ADD COLUMN col INT")
+		if err == nil {
+			t.Error("expected error for non-existent table")
+		}
+	})
+
+	t.Run("DuplicateColumn", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "ALTER TABLE users ADD COLUMN id INT")
+		if err == nil {
+			t.Error("expected error for duplicate column")
+		}
+	})
+}
+
 func TestExec_Insert(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")

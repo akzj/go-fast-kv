@@ -168,6 +168,129 @@ func TestPlan_DropTable(t *testing.T) {
 	})
 }
 
+func TestPlan_AlterTable(t *testing.T) {
+	p := setupPlanner(t)
+
+	t.Run("AddColumn_Int", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:     "USERS",
+			Operation: parserapi.AlterAddColumn,
+			Column:    "AGE",
+			TypeName:  "INT",
+		}
+		plan, err := p.Plan(stmt)
+		if err != nil {
+			t.Fatalf("Plan failed: %v", err)
+		}
+		at, ok := plan.(*plannerapi.AlterTablePlan)
+		if !ok {
+			t.Fatalf("expected AlterTablePlan, got %T", plan)
+		}
+		if at.TableName != "USERS" {
+			t.Errorf("table: expected USERS, got %s", at.TableName)
+		}
+		if at.Operation != parserapi.AlterAddColumn {
+			t.Errorf("operation: expected AlterAddColumn, got %v", at.Operation)
+		}
+		if at.ColumnName != "AGE" {
+			t.Errorf("column: expected AGE, got %s", at.ColumnName)
+		}
+		if at.TypeName != "INT" {
+			t.Errorf("type: expected INT, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("AddColumn_Text", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:     "USERS",
+			Operation: parserapi.AlterAddColumn,
+			Column:    "EMAIL",
+			TypeName:  "TEXT",
+		}
+		plan, err := p.Plan(stmt)
+		if err != nil {
+			t.Fatalf("Plan failed: %v", err)
+		}
+		at := plan.(*plannerapi.AlterTablePlan)
+		if at.TypeName != "TEXT" {
+			t.Errorf("type: expected TEXT, got %s", at.TypeName)
+		}
+	})
+
+	t.Run("AddColumn_NotNull", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:     "USERS",
+			Operation: parserapi.AlterAddColumn,
+			Column:    "NICK",
+			TypeName:  "TEXT",
+			NotNull:   true,
+		}
+		plan, err := p.Plan(stmt)
+		if err != nil {
+			t.Fatalf("Plan failed: %v", err)
+		}
+		at := plan.(*plannerapi.AlterTablePlan)
+		if !at.NotNull {
+			t.Error("expected NotNull=true")
+		}
+	})
+
+	t.Run("DropColumn", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:     "USERS",
+			Operation: parserapi.AlterDropColumn,
+			Column:    "AGE",
+		}
+		plan, err := p.Plan(stmt)
+		if err != nil {
+			t.Fatalf("Plan failed: %v", err)
+		}
+		at, ok := plan.(*plannerapi.AlterTablePlan)
+		if !ok {
+			t.Fatalf("expected AlterTablePlan, got %T", plan)
+		}
+		if at.Operation != parserapi.AlterDropColumn {
+			t.Errorf("operation: expected AlterDropColumn, got %v", at.Operation)
+		}
+	})
+
+	t.Run("RenameColumn", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:      "USERS",
+			Operation:  parserapi.AlterRenameColumn,
+			Column:     "OLD_NAME",
+			ColumnNew:  "NEW_NAME",
+		}
+		plan, err := p.Plan(stmt)
+		if err != nil {
+			t.Fatalf("Plan failed: %v", err)
+		}
+		at := plan.(*plannerapi.AlterTablePlan)
+		if at.Operation != parserapi.AlterRenameColumn {
+			t.Errorf("operation: expected AlterRenameColumn, got %v", at.Operation)
+		}
+		if at.ColumnNew != "NEW_NAME" {
+			t.Errorf("columnNew: expected NEW_NAME, got %s", at.ColumnNew)
+		}
+	})
+
+	t.Run("NonExistentTable", func(t *testing.T) {
+		stmt := &parserapi.AlterTableStmt{
+			Table:     "NOPE",
+			Operation: parserapi.AlterAddColumn,
+			Column:    "COL",
+			TypeName:  "INT",
+		}
+		_, err := p.Plan(stmt)
+		if err == nil {
+			t.Fatal("expected error for non-existent table")
+		}
+		if !errors.Is(err, plannerapi.ErrTableNotFound) {
+			t.Errorf("expected ErrTableNotFound, got: %v", err)
+		}
+	})
+}
+
 func TestPlan_Insert(t *testing.T) {
 	p := setupPlanner(t)
 

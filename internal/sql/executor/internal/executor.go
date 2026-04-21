@@ -155,6 +155,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execExcept(p)
 	case *plannerapi.ExplainPlan:
 		return e.execExplain(p)
+	case *plannerapi.AlterTablePlan:
+		return e.execAlterTable(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -344,6 +346,89 @@ func (e *executor) execDropTable(plan *plannerapi.DropTablePlan) (*executorapi.R
 
 	// Drop catalog entry (also drops index metadata)
 	if err := e.catalog.DropTable(plan.TableName); err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: 0}, nil
+}
+
+func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi.Result, error) {
+	// Get existing table schema
+	schema, err := e.catalog.GetTable(plan.TableName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	switch plan.Operation {
+	case parserapi.AlterAddColumn:
+		// Check column doesn't already exist
+		for _, col := range schema.Columns {
+			if col.Name == plan.ColumnName {
+				return nil, fmt.Errorf("%w: column %s already exists", executorapi.ErrExecFailed, plan.ColumnName)
+			}
+		}
+
+		// Convert type string to catalogapi.Type
+		colType := catalogapi.TypeNull
+		switch plan.TypeName {
+		case "INT":
+			colType = catalogapi.TypeInt
+		case "FLOAT":
+			colType = catalogapi.TypeFloat
+		case "TEXT":
+			colType = catalogapi.TypeText
+		case "BLOB":
+			colType = catalogapi.TypeBlob
+		}
+
+		// Add new column
+		schema.Columns = append(schema.Columns, catalogapi.ColumnDef{
+			Table:    plan.TableName,
+			Name:     plan.ColumnName,
+			Type:     colType,
+			NotNull:  plan.NotNull,
+		})
+
+	case parserapi.AlterDropColumn:
+		// Find and remove column
+		found := false
+		newColumns := make([]catalogapi.ColumnDef, 0, len(schema.Columns))
+		for _, col := range schema.Columns {
+			if col.Name == plan.ColumnName {
+				found = true
+				continue
+			}
+			newColumns = append(newColumns, col)
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: column %s not found", executorapi.ErrExecFailed, plan.ColumnName)
+		}
+		schema.Columns = newColumns
+
+	case parserapi.AlterRenameColumn:
+		// Find and rename column
+		found := false
+		for i := range schema.Columns {
+			if schema.Columns[i].Name == plan.ColumnName {
+				schema.Columns[i].Name = plan.ColumnNew
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: column %s not found", executorapi.ErrExecFailed, plan.ColumnName)
+		}
+		// Update primary key reference if needed
+		if schema.PrimaryKey == plan.ColumnName {
+			schema.PrimaryKey = plan.ColumnNew
+		}
+
+	default:
+		return nil, fmt.Errorf("%w: unsupported alter operation %v", executorapi.ErrExecFailed, plan.Operation)
+	}
+
+	// Save updated schema
+	if err := e.catalog.AlterTable(*schema); err != nil {
 		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
 	}
 

@@ -118,4 +118,8 @@ type CatalogManager interface {
 	// ListIndexes returns all index schemas for a given table.
 	// Returns an empty slice (not error) if the table has no indexes.
 	ListIndexes(tableName string) ([]*IndexSchema, error)
+
+	// AlterTable modifies a table's schema.
+	// Returns ErrTableNotFound if the table does not exist.
+	AlterTable(schema TableSchema) error
 }

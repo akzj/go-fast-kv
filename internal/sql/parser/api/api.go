@@ -110,6 +110,12 @@ const (
 	TokBegin    TokenType = 84 // BEGIN
 	TokCommit   TokenType = 85 // COMMIT
 	TokRollback TokenType = 86 // ROLLBACK
+	TokAlter    TokenType = 87 // ALTER
+	TokAdd      TokenType = 88 // ADD
+	TokColumn   TokenType = 89 // COLUMN
+	TokRename   TokenType = 90 // RENAME
+	TokTo       TokenType = 91 // TO
+	TokType     TokenType = 92 // TYPE
 )
 
 // Token represents a single lexical token.
@@ -170,6 +176,30 @@ type DropIndexStmt struct {
 }
 
 func (*DropIndexStmt) stmtNode() {}
+
+// AlterTableStmt: ALTER TABLE t ADD COLUMN col TYPE [NOT NULL] [UNIQUE]
+//                 ALTER TABLE t DROP COLUMN col
+//                 ALTER TABLE t RENAME COLUMN old TO new
+type AlterTableStmt struct {
+	Table       string
+	Operation   AlterOp
+	Column      string       // column name (for ADD, DROP, RENAME)
+	ColumnNew   string       // new column name (for RENAME)
+	TypeName    string       // column type (for ADD)
+	NotNull     bool         // NOT NULL constraint (for ADD)
+	Unique      bool         // UNIQUE constraint (for ADD)
+}
+
+// AlterOp represents the type of ALTER TABLE operation.
+type AlterOp int
+
+const (
+	AlterAddColumn    AlterOp = 0 // ADD COLUMN
+	AlterDropColumn   AlterOp = 1 // DROP COLUMN
+	AlterRenameColumn AlterOp = 2 // RENAME COLUMN
+)
+
+func (*AlterTableStmt) stmtNode() {}
 
 // ─── DML Statements ───────────────────────────────────────────────
 

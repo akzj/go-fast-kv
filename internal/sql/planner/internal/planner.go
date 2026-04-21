@@ -63,6 +63,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return nil, nil
 	case *parserapi.RollbackStmt:
 		return nil, nil
+	case *parserapi.AlterTableStmt:
+		return p.planAlterTable(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -201,6 +203,50 @@ func (p *planner) planDropIndex(stmt *parserapi.DropIndexStmt) (*plannerapi.Drop
 		TableName: stmt.Table,
 		IfExists:  stmt.IfExists,
 	}, nil
+}
+
+func (p *planner) planAlterTable(stmt *parserapi.AlterTableStmt) (*plannerapi.AlterTablePlan, error) {
+	// Validate table exists
+	_, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		if err == catalogapi.ErrTableNotFound {
+			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+		}
+		return nil, err
+	}
+
+	plan := &plannerapi.AlterTablePlan{
+		TableName:  stmt.Table,
+		Operation:  stmt.Operation,
+		ColumnName: stmt.Column,
+		ColumnNew:  stmt.ColumnNew,
+		TypeName:   stmt.TypeName,
+		NotNull:    stmt.NotNull,
+		Unique:     stmt.Unique,
+	}
+
+	// For ADD COLUMN, resolve type
+	if stmt.Operation == parserapi.AlterAddColumn {
+		t, err := resolveTypeName(stmt.TypeName)
+		if err != nil {
+			return nil, err
+		}
+		// Convert catalogapi.Type back to string for plan
+		switch t {
+		case catalogapi.TypeInt:
+			plan.TypeName = "INT"
+		case catalogapi.TypeFloat:
+			plan.TypeName = "FLOAT"
+		case catalogapi.TypeText:
+			plan.TypeName = "TEXT"
+		case catalogapi.TypeBlob:
+			plan.TypeName = "BLOB"
+		default:
+			plan.TypeName = "NULL"
+		}
+	}
+
+	return plan, nil
 }
 
 // ─── DML Planning ───────────────────────────────────────────────────

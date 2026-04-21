@@ -311,3 +311,30 @@ func (c *Catalog) listIndexesImpl(tableName string) ([]*api.IndexSchema, error) 
 	}
 	return indexes, nil
 }
+
+func (c *Catalog) AlterTable(schema api.TableSchema) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.alterTableImpl(schema)
+}
+
+func (c *Catalog) alterTableImpl(schema api.TableSchema) error {
+	upperName := strings.ToUpper(schema.Name)
+	key := tableKey(upperName)
+
+	// Verify table exists
+	_, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrTableNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	// Store updated schema
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return c.kv.Put(key, data)
+}
