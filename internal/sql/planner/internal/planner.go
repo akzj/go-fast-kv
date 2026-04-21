@@ -77,9 +77,18 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		return nil, plannerapi.ErrEmptyTable
 	}
 
-	cols := make([]catalogapi.ColumnDef, len(stmt.Columns))
+	cols := make([]catalogapi.ColumnDef, 0, len(stmt.Columns))
 	var tableChecks []catalogapi.CheckConstraint
-	for i, c := range stmt.Columns {
+	for _, c := range stmt.Columns {
+		// Table-level CHECK: column name is empty (added by parser as placeholder).
+		// Don't create a real column for it. Use table name for error messages.
+		if c.Name == "" && c.CheckExpr != nil {
+			tableChecks = append(tableChecks, catalogapi.CheckConstraint{
+				Name:   stmt.Table, // Use table name for error messages
+				RawSQL: serializeExpr(c.CheckExpr),
+			})
+			continue
+		}
 		t, err := resolveTypeName(c.TypeName)
 		if err != nil {
 			return nil, err
@@ -99,13 +108,7 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 			}
 			col.Check = &check
 		}
-		// Table-level CHECK constraint: column name is empty (added in parser).
-		if c.Name == "" && c.CheckExpr != nil {
-			tableChecks = append(tableChecks, catalogapi.CheckConstraint{
-				RawSQL: serializeExpr(c.CheckExpr),
-			})
-		}
-		cols[i] = col
+		cols = append(cols, col)
 	}
 
 	pk := stmt.PrimaryKey

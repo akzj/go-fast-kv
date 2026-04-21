@@ -556,7 +556,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 			}
 
 			// Check CHECK constraints before inserting.
-			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row); err != nil {
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
 				return nil, err
 			}
 
@@ -621,7 +621,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		}
 
 		// Check CHECK constraints before inserting.
-		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row); err != nil {
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -2797,7 +2797,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				return nil, err
 
 			// Check CHECK constraints before updating.
-			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
 				return nil, err
 			}
 			}
@@ -2867,7 +2867,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		}
 
 		// Check CHECK constraints before updating.
-		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -3534,8 +3534,9 @@ func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.
 
 // checkCheckConstraints validates that row values satisfy all CHECK constraints.
 // It evaluates both column-level CHECKs (on each column) and table-level CHECKs.
-// Returns nil if all constraints are satisfied, or ErrCheckViolation on failure.
-func (e *executor) checkCheckConstraints(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value) error {
+// The tableName parameter is the table name for error messages.
+// The tableChecks parameter contains table-level CHECK constraints from the schema.
+func (e *executor) checkCheckConstraints(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value, tableChecks []catalogapi.CheckConstraint) error {
 	// Collect all CHECK constraints (column-level + table-level).
 	var checks []catalogapi.CheckConstraint
 
@@ -3546,11 +3547,10 @@ func (e *executor) checkCheckConstraints(tableName string, columns []catalogapi.
 		}
 	}
 
-	// Table-level checks: need to fetch from catalog since plan.Table may not have them.
-	// Only fetch if we don't already have table-level checks in the schema.
-	// The plan passes table-level checks via TableSchema.CheckConstraints.
-	// For INSERT/UPDATE, the plan includes the full TableSchema.
-	// This method is called with the plan's table schema directly.
+	// Table-level checks from the schema.
+	for _, check := range tableChecks {
+		checks = append(checks, check)
+	}
 
 	// Evaluate each CHECK constraint by re-parsing and evaluating the expression.
 	for _, check := range checks {
