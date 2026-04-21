@@ -85,7 +85,13 @@ var keywords = map[string]api.TokenType{
 	"RENAME":    api.TokRename,
 	"TO":        api.TokTo,
 	"TYPE":      api.TokType,
-	"DEFAULT":   api.TokDefault,
+	"DEFAULT":    api.TokDefault,
+	"SUBSTRING":  api.TokSubstring,
+	"CONCAT":     api.TokConcat,
+	"TRIM":       api.TokTrim,
+	"UPPER":      api.TokUpper,
+	"LOWER":      api.TokLower,
+	"LENGTH":     api.TokLength,
 }
 
 // lexer tokenizes SQL input.

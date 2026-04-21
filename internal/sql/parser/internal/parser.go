@@ -1444,6 +1444,16 @@ func isAggregateFunc(name string) bool {
 	}
 }
 
+// isStringFunc returns true for built-in string function names (case-insensitive).
+func isStringFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "SUBSTRING", "CONCAT", "TRIM", "UPPER", "LOWER", "LENGTH":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseFunctionArgs parses a comma-separated list of expressions inside parentheses.
 // For COUNT(*), the '*' is represented as a nil Expr (AggregateCallExpr.Arg == nil).
 // The opening '(' has already been consumed by the caller.
@@ -1700,6 +1710,89 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance() // consume ')'
 		return &api.NullIfExpr{Left: left, Right: right}, nil
 
+	case api.TokSubstring:
+		// SUBSTRING(str FROM start FOR len) or SUBSTRING(str, start, len)
+		p.advance() // consume SUBSTRING
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after SUBSTRING")
+		}
+		p.advance() // consume '('
+		str, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		var start, length api.Expr
+		// Check for FROM syntax: SUBSTRING(str FROM start [FOR len])
+		if p.cur.Type == api.TokFrom {
+			p.advance() // consume FROM
+			start, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			// Optional FOR length
+			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR" {
+				p.advance()
+				length, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else if p.cur.Type == api.TokComma {
+			// Comma syntax: SUBSTRING(str, start, len)
+			p.advance() // consume ','
+			start, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			// Optional length
+			if p.cur.Type == api.TokComma {
+				p.advance() // consume ','
+				length, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after SUBSTRING arguments")
+		}
+		p.advance() // consume ')'
+		return &api.StringFuncExpr{Func: "SUBSTRING", Args: []api.Expr{str}, Start: start, Len: length}, nil
+
+	case api.TokConcat:
+		// CONCAT(str1, str2, ...)
+		p.advance() // consume CONCAT
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after CONCAT")
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		if len(args) == 0 {
+			return nil, p.errorf("CONCAT requires at least one argument")
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		return &api.StringFuncExpr{Func: "CONCAT", Args: args}, nil
+
+	case api.TokTrim, api.TokUpper, api.TokLower, api.TokLength:
+		// TRIM(str), UPPER(str), LOWER(str), LENGTH(str)
+		funcName := p.cur.Literal
+		p.advance() // consume keyword
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		return &api.StringFuncExpr{Func: strings.ToUpper(funcName), Args: args}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
@@ -1719,16 +1812,25 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			// Exactly one argument, or COUNT(*) with nil
-			var arg api.Expr
-			if len(args) == 1 {
-				arg = args[0]
-			} else if len(args) > 1 {
-				return nil, p.errorf("aggregate functions require at most one argument")
-			}
 			// COUNT(*) — arg is nil, already set
 			if isAggregateFunc(name) {
+				var arg api.Expr
+				if len(args) == 1 {
+					arg = args[0]
+				} else if len(args) > 1 {
+					return nil, p.errorf("aggregate functions require at most one argument")
+				}
 				return &api.AggregateCallExpr{Func: strings.ToUpper(name), Arg: arg}, nil
+			}
+			// String functions: SUBSTRING, CONCAT, TRIM, UPPER, LOWER, LENGTH
+			if isStringFunc(name) {
+				upperName := strings.ToUpper(name)
+				// SUBSTRING needs special handling for FROM/FOR syntax
+				if upperName == "SUBSTRING" {
+					return nil, p.errorf("expected SUBSTRING keyword, not identifier")
+				}
+				// Other string functions: all use standard (arg1, arg2, ...) syntax
+				return &api.StringFuncExpr{Func: upperName, Args: args}, nil
 			}
 			// Unknown function — treat as column reference for backward compatibility
 			return &api.ColumnRef{Column: name}, nil

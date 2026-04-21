@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -47,6 +48,12 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		for _, arg := range e.Args {
 			walkExpr(arg, fn)
 		}
+	case *parserapi.StringFuncExpr:
+		for _, arg := range e.Args {
+			walkExpr(arg, fn)
+		}
+		walkExpr(e.Start, fn)
+		walkExpr(e.Len, fn)
 	case *parserapi.CaseExpr:
 		for _, w := range e.Whens {
 			walkExpr(w.Cond, fn)
@@ -88,6 +95,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalCoalesceExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.NullIfExpr:
 		return evalNullIfExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.StringFuncExpr:
+		return evalStringFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
 		return evalCaseExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.ExistsExpr:
@@ -730,6 +739,205 @@ func evalNullIfExpr(expr *parserapi.NullIfExpr, row *engineapi.Row, columns []ca
 		return catalogapi.Value{IsNull: true}, nil
 	}
 	return left, nil
+}
+
+// evalStringFuncExpr evaluates string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM.
+func evalStringFuncExpr(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch expr.Func {
+	case "SUBSTRING":
+		return evalSubstring(expr, row, columns, subqueryResults, ex)
+	case "CONCAT":
+		return evalConcat(expr, row, columns, subqueryResults, ex)
+	case "UPPER":
+		return evalUpper(expr, row, columns, subqueryResults, ex)
+	case "LOWER":
+		return evalLower(expr, row, columns, subqueryResults, ex)
+	case "LENGTH":
+		return evalLength(expr, row, columns, subqueryResults, ex)
+	case "TRIM":
+		return evalTrim(expr, row, columns, subqueryResults, ex)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown string function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// evalSubstring evaluates SUBSTRING(str FROM start [FOR len]) or SUBSTRING(str, start [, len]).
+// SQL positions are 1-indexed. Substring is: str[start-1 : start-1+len]
+func evalSubstring(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: SUBSTRING requires at least one argument", executorapi.ErrExecFailed)
+	}
+	// Evaluate the string argument
+	strVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if strVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if strVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: SUBSTRING requires text argument, got %v", executorapi.ErrExecFailed, strVal.Type)
+	}
+	str := strVal.Text
+
+	// Evaluate start position
+	if expr.Start == nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: SUBSTRING requires start position", executorapi.ErrExecFailed)
+	}
+	startVal, err := evalExpr(expr.Start, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if startVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if startVal.Type != catalogapi.TypeInt {
+		return catalogapi.Value{}, fmt.Errorf("%w: SUBSTRING start position must be integer, got %v", executorapi.ErrExecFailed, startVal.Type)
+	}
+	start := int(startVal.Int)
+	// Convert 1-indexed to 0-indexed
+	startIdx := start - 1
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if startIdx > len(str) {
+		startIdx = len(str)
+	}
+
+	// Optional length
+	if expr.Len != nil {
+		lenVal, err := evalExpr(expr.Len, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if lenVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		if lenVal.Type != catalogapi.TypeInt {
+			return catalogapi.Value{}, fmt.Errorf("%w: SUBSTRING length must be integer, got %v", executorapi.ErrExecFailed, lenVal.Type)
+		}
+		length := int(lenVal.Int)
+		if length < 0 {
+			length = 0
+		}
+		endIdx := startIdx + length
+		if endIdx > len(str) {
+			endIdx = len(str)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: str[startIdx:endIdx]}, nil
+	}
+
+	// No length: return from start to end
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: str[startIdx:]}, nil
+}
+
+// evalConcat evaluates CONCAT(str1, str2, ...). Concatenates all arguments.
+func evalConcat(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	var sb strings.Builder
+	for _, arg := range expr.Args {
+		val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			// If any argument is NULL, CONCAT returns NULL
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		switch val.Type {
+		case catalogapi.TypeText:
+			sb.WriteString(val.Text)
+		case catalogapi.TypeInt:
+			sb.WriteString(strconv.FormatInt(val.Int, 10))
+		case catalogapi.TypeFloat:
+			sb.WriteString(strconv.FormatFloat(val.Float, 'f', -1, 64))
+		case catalogapi.TypeBlob:
+			sb.Write(val.Blob)
+		}
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: sb.String()}, nil
+}
+
+// evalUpper evaluates UPPER(str). Converts string to uppercase.
+func evalUpper(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: UPPER requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: UPPER requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.ToUpper(val.Text)}, nil
+}
+
+// evalLower evaluates LOWER(str). Converts string to lowercase.
+func evalLower(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: LOWER requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: LOWER requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.ToLower(val.Text)}, nil
+}
+
+// evalLength evaluates LENGTH(str). Returns the length of the string.
+func evalLength(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: LENGTH requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	switch val.Type {
+	case catalogapi.TypeText:
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(val.Text))}, nil
+	case catalogapi.TypeBlob:
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(val.Blob))}, nil
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: LENGTH requires text or blob argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+}
+
+// evalTrim evaluates TRIM(str). Removes leading and trailing whitespace.
+func evalTrim(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: TRIM requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: TRIM requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.TrimSpace(val.Text)}, nil
 }
 
 // evalCaseExpr evaluates a CASE expression.

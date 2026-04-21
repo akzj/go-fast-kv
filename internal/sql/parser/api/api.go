@@ -118,6 +118,12 @@ const (
 	TokType     TokenType = 92 // TYPE
 	TokDefault  TokenType = 93 // DEFAULT
 	TokNullIf   TokenType = 94 // NULLIF
+	TokSubstring TokenType = 95 // SUBSTRING
+	TokConcat   TokenType = 96 // CONCAT
+	TokTrim     TokenType = 97 // TRIM
+	TokUpper    TokenType = 98 // UPPER
+	TokLower    TokenType = 99 // LOWER
+	TokLength   TokenType = 100 // LENGTH
 )
 
 // Token represents a single lexical token.
@@ -427,6 +433,16 @@ type NullIfExpr struct {
 }
 
 func (*NullIfExpr) exprNode() {}
+
+// StringFuncExpr represents string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM
+type StringFuncExpr struct {
+	Func  string   // "SUBSTRING", "CONCAT", "UPPER", "LOWER", "LENGTH", "TRIM"
+	Args  []Expr   // arguments for the function
+	Start Expr     // start position for SUBSTRING (1-indexed)
+	Len   Expr     // length for SUBSTRING (optional)
+}
+
+func (*StringFuncExpr) exprNode() {}
 
 // StarExpr: SELECT *
 type StarExpr struct{}
