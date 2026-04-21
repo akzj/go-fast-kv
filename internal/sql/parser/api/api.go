@@ -116,6 +116,7 @@ const (
 	TokRename   TokenType = 90 // RENAME
 	TokTo       TokenType = 91 // TO
 	TokType     TokenType = 92 // TYPE
+	TokDefault  TokenType = 93 // DEFAULT
 )
 
 // Token represents a single lexical token.
@@ -431,6 +432,11 @@ type AggregateCallExpr struct {
 
 func (*AggregateCallExpr) exprNode() {}
 
+// DefaultExpr: DEFAULT keyword in INSERT VALUES (resolves to column's default value)
+type DefaultExpr struct{}
+
+func (*DefaultExpr) exprNode() {}
+
 // LikeExpr: col LIKE 'pattern'
 type LikeExpr struct {
 	Expr    Expr  // the column expression
@@ -502,11 +508,12 @@ func (*ExplainStmt) stmtNode() {}
 
 // ColumnDef represents a column definition in CREATE TABLE (parser's own type).
 type ColumnDef struct {
-	Name       string
-	TypeName   string // "INT", "INTEGER", "TEXT", "FLOAT", "BLOB"
-	PrimaryKey bool
-	NotNull    bool
-	Unique     bool
+	Name        string
+	TypeName    string // "INT", "INTEGER", "TEXT", "FLOAT", "BLOB"
+	PrimaryKey  bool
+	NotNull     bool
+	Unique      bool
+	DefaultValue catalogapi.Value // DEFAULT value; zero Value means not specified
 }
 
 // ─── Parser Interface ─────────────────────────────────────────────

@@ -21,6 +21,14 @@ type parser struct {
 	depth int       // recursion depth for stack overflow prevention
 }
 
+// valToValue converts a parser Literal expression to a catalog Value.
+func valToValue(expr api.Expr) catalogapi.Value {
+	if lit, ok := expr.(*api.Literal); ok {
+		return lit.Value
+	}
+	return catalogapi.Value{}
+}
+
 // New creates a new Parser.
 func New() api.Parser {
 	return &parser{}
@@ -356,6 +364,32 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		col.NotNull = true
 	}
 
+	// Optional DEFAULT value
+	if p.cur.Type == api.TokDefault {
+		p.advance()
+		// Parse the default value expression
+		if p.cur.Type == api.TokLParen {
+			// Parenthesized expression: DEFAULT (expr)
+			p.advance()
+			val, err := p.parseExpr()
+			if err != nil {
+				return col, err
+			}
+			if p.cur.Type != api.TokRParen {
+				return col, p.errorf("expected ) after default value expression")
+			}
+			p.advance()
+			col.DefaultValue = valToValue(val)
+		} else {
+			// Simple literal: DEFAULT 0, DEFAULT 'hello', DEFAULT NULL
+			val, err := p.parseExpr()
+			if err != nil {
+				return col, err
+			}
+			col.DefaultValue = valToValue(val)
+		}
+	}
+
 	return col, nil
 }
 
@@ -526,11 +560,18 @@ func (p *parser) parseInsert() (api.Statement, error) {
 			if err := p.expect(api.TokEQ); err != nil {
 				return nil, err
 			}
-			val, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+			var expr api.Expr
+			if p.cur.Type == api.TokDefault {
+				p.advance()
+				expr = &api.DefaultExpr{}
+			} else {
+				val, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				expr = val
 			}
-			row = append(row, val)
+			row = append(row, expr)
 			if p.cur.Type != api.TokComma {
 				break
 			}
@@ -561,11 +602,17 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		}
 		var row []api.Expr
 		for {
-			expr, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+			// Check for DEFAULT keyword
+			if p.cur.Type == api.TokDefault {
+				p.advance()
+				row = append(row, &api.DefaultExpr{})
+			} else {
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				row = append(row, expr)
 			}
-			row = append(row, expr)
 			if p.cur.Type != api.TokComma {
 				break
 			}

@@ -83,7 +83,14 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		if err != nil {
 			return nil, err
 		}
-		cols[i] = catalogapi.ColumnDef{Name: c.Name, Type: t, NotNull: c.NotNull}
+		col := catalogapi.ColumnDef{Name: c.Name, Type: t, NotNull: c.NotNull}
+		// Copy default value if explicitly specified.
+		// Zero value (TypeNull, not IsNull) means no DEFAULT clause.
+		if c.DefaultValue.Type != catalogapi.TypeNull || c.DefaultValue.IsNull {
+			dv := c.DefaultValue
+			col.DefaultValue = &dv
+		}
+		cols[i] = col
 	}
 
 	pk := stmt.PrimaryKey
@@ -316,6 +323,13 @@ func (p *planner) resolveInsertRow(tbl *catalogapi.TableSchema, columns []string
 			if err != nil {
 				return nil, err
 			}
+			// Resolve DEFAULT: use the column's default value if specified
+			if _, ok := exprs[i].(*parserapi.DefaultExpr); ok {
+				if tbl.Columns[idx].DefaultValue != nil {
+					val = *tbl.Columns[idx].DefaultValue
+				}
+				// If no default, val stays as IsNull (no explicit default)
+			}
 			if !val.IsNull {
 				if err := checkType(val, tbl.Columns[idx].Type); err != nil {
 					return nil, fmt.Errorf("column %s: %w", colName, err)
@@ -334,6 +348,12 @@ func (p *planner) resolveInsertRow(tbl *catalogapi.TableSchema, columns []string
 		val, err := resolveExprToValue(expr)
 		if err != nil {
 			return nil, err
+		}
+		if _, ok := expr.(*parserapi.DefaultExpr); ok {
+			if tbl.Columns[i].DefaultValue != nil {
+				val = *tbl.Columns[i].DefaultValue
+			}
+			// If no default, val stays as IsNull (no explicit default)
 		}
 		if !val.IsNull {
 			if err := checkType(val, tbl.Columns[i].Type); err != nil {
