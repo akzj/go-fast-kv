@@ -83,6 +83,119 @@ Drops a table only if it exists (no error if it doesn't).
 DROP TABLE IF EXISTS table_name
 ```
 
+### Constraints
+
+Constraints enforce data integrity rules on tables.
+
+#### PRIMARY KEY
+
+Declares a column (or combination of columns) as the primary key.
+
+```sql
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT
+)
+```
+
+#### UNIQUE
+
+Ensures all values in a column are distinct.
+
+```sql
+CREATE TABLE users (
+    email TEXT UNIQUE,
+    name TEXT
+)
+```
+
+#### NOT NULL
+
+Ensures a column cannot contain NULL values.
+
+```sql
+CREATE TABLE users (
+    name TEXT NOT NULL,
+    age INT
+)
+```
+
+#### CHECK
+
+Validates a condition when inserting or updating rows.
+
+```sql
+CREATE TABLE products (
+    price INT CHECK (price > 0),
+    quantity INT CHECK (quantity >= 0)
+)
+```
+
+#### FOREIGN KEY
+
+Establishes a referential constraint between tables. When a row is inserted or updated in the referencing table, the referenced table is checked to ensure the referenced value exists.
+
+**Syntax:**
+```sql
+FOREIGN KEY (column_name) REFERENCES referenced_table(referenced_column)
+```
+
+**Supported actions for ON DELETE and ON UPDATE:**
+- `CASCADE` — Delete/update matching rows in child table
+- `SET NULL` — Set referencing columns to NULL
+- `RESTRICT` — Reject delete/update if matching rows exist
+- `NO ACTION` — Same as RESTRICT (deferred check)
+
+**Example:**
+```sql
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)
+```
+
+**Known Limitations:**
+- FK validation uses table scan (no PRIMARY KEY index required)
+- ON DELETE/UPDATE actions (CASCADE, SET NULL, RESTRICT, NO ACTION) are parsed and stored but not yet executed
+
+---
+
+### Transaction Support
+
+The database supports two isolation levels:
+
+| Isolation Level | Description |
+|-----------------|-------------|
+| **SI** (Serializable Isolation) | Default isolation level. Provides serializable transactions. |
+| **SSI** (Snapshot Isolation) | Serializable Snapshot Isolation. Prevents write-write conflicts. |
+
+Transactions are started with `BEGIN` and committed with `COMMIT` (or rolled back with `ROLLBACK`).
+
+---
+
+### Index Support
+
+Indexes improve query performance on column lookups.
+
+| Index Type | Description |
+|------------|-------------|
+| **UNIQUE** | Ensures distinct values and creates an index for fast lookups |
+| **PRIMARY KEY** | Auto-creates a unique index on the primary key column(s) |
+
+```sql
+-- Primary Key automatically creates an index
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT)
+
+-- Unique constraint creates an index
+CREATE TABLE users (email TEXT UNIQUE, name TEXT)
+
+-- Explicit index creation
+CREATE INDEX idx_name ON table_name (column_name)
+```
+
+---
+
 ### CREATE INDEX
 
 Creates an index on a column for faster lookups.
