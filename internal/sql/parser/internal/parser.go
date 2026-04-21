@@ -1710,6 +1710,44 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance() // consume ')'
 		return &api.NullIfExpr{Left: left, Right: right}, nil
 
+	case api.TokCast:
+		// CAST(expr AS type)
+		p.advance() // consume CAST
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after CAST")
+		}
+		p.advance() // consume '('
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+			return nil, p.errorf("expected AS after CAST expression")
+		}
+		p.advance() // consume AS
+		// Parse target type name
+		var typeName string
+		switch p.cur.Type {
+		case api.TokIntKw:
+			typeName = "INT"
+		case api.TokInteger2:
+			typeName = "INTEGER"
+		case api.TokTextKw:
+			typeName = "TEXT"
+		case api.TokFloatKw:
+			typeName = "FLOAT"
+		case api.TokBlobKw:
+			typeName = "BLOB"
+		default:
+			return nil, p.errorf("expected type name (INT, TEXT, FLOAT, BLOB) after CAST AS")
+		}
+		p.advance()
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after CAST type")
+		}
+		p.advance() // consume ')'
+		return &api.CastExpr{Expr: expr, TypeName: typeName}, nil
+
 	case api.TokSubstring:
 		// SUBSTRING(str FROM start FOR len) or SUBSTRING(str, start, len)
 		p.advance() // consume SUBSTRING

@@ -64,6 +64,8 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		}
 	case *parserapi.ExistsExpr:
 		// Subquery body not walked here (would need Statement visitor)
+	case *parserapi.CastExpr:
+		walkExpr(e.Expr, fn)
 	}
 }
 
@@ -97,6 +99,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalNullIfExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.StringFuncExpr:
 		return evalStringFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.CastExpr:
+		return evalCastExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
 		return evalCaseExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.ExistsExpr:
@@ -938,6 +942,106 @@ func evalTrim(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []cata
 		return catalogapi.Value{}, fmt.Errorf("%w: TRIM requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
 	}
 	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.TrimSpace(val.Text)}, nil
+}
+
+// evalCastExpr evaluates CAST(expr AS type).
+// Converts a value from one type to another.
+func evalCastExpr(expr *parserapi.CastExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Evaluate the expression first
+	val, err := evalExpr(expr.Expr, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL output
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+
+	switch expr.TypeName {
+	case "INT", "INTEGER":
+		return castToInt(val)
+	case "TEXT":
+		return castToText(val)
+	case "FLOAT":
+		return castToFloat(val)
+	case "BLOB":
+		return castToBlob(val)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unsupported cast type %s", executorapi.ErrExecFailed, expr.TypeName)
+	}
+}
+
+// castToInt converts a value to INT.
+func castToInt(val catalogapi.Value) (catalogapi.Value, error) {
+	switch val.Type {
+	case catalogapi.TypeInt:
+		return val, nil
+	case catalogapi.TypeText:
+		i, err := strconv.ParseInt(val.Text, 10, 64)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %q to INT", executorapi.ErrExecFailed, val.Text)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: i}, nil
+	case catalogapi.TypeFloat:
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(val.Float)}, nil
+	case catalogapi.TypeBlob:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast BLOB to INT", executorapi.ErrExecFailed)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to INT", executorapi.ErrExecFailed, val.Type)
+	}
+}
+
+// castToText converts a value to TEXT.
+func castToText(val catalogapi.Value) (catalogapi.Value, error) {
+	switch val.Type {
+	case catalogapi.TypeText:
+		return val, nil
+	case catalogapi.TypeInt:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: strconv.FormatInt(val.Int, 10)}, nil
+	case catalogapi.TypeFloat:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: strconv.FormatFloat(val.Float, 'f', -1, 64)}, nil
+	case catalogapi.TypeBlob:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: string(val.Blob)}, nil
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to TEXT", executorapi.ErrExecFailed, val.Type)
+	}
+}
+
+// castToFloat converts a value to FLOAT.
+func castToFloat(val catalogapi.Value) (catalogapi.Value, error) {
+	switch val.Type {
+	case catalogapi.TypeFloat:
+		return val, nil
+	case catalogapi.TypeInt:
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(val.Int)}, nil
+	case catalogapi.TypeText:
+		f, err := strconv.ParseFloat(val.Text, 64)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %q to FLOAT", executorapi.ErrExecFailed, val.Text)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: f}, nil
+	case catalogapi.TypeBlob:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast BLOB to FLOAT", executorapi.ErrExecFailed)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to FLOAT", executorapi.ErrExecFailed, val.Type)
+	}
+}
+
+// castToBlob converts a value to BLOB.
+func castToBlob(val catalogapi.Value) (catalogapi.Value, error) {
+	switch val.Type {
+	case catalogapi.TypeBlob:
+		return val, nil
+	case catalogapi.TypeText:
+		return catalogapi.Value{Type: catalogapi.TypeBlob, Blob: []byte(val.Text)}, nil
+	case catalogapi.TypeInt:
+		return catalogapi.Value{Type: catalogapi.TypeBlob, Blob: []byte(strconv.FormatInt(val.Int, 10))}, nil
+	case catalogapi.TypeFloat:
+		return catalogapi.Value{Type: catalogapi.TypeBlob, Blob: []byte(strconv.FormatFloat(val.Float, 'f', -1, 64))}, nil
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to BLOB", executorapi.ErrExecFailed, val.Type)
+	}
 }
 
 // evalCaseExpr evaluates a CASE expression.

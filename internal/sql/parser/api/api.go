@@ -124,6 +124,7 @@ const (
 	TokUpper    TokenType = 98 // UPPER
 	TokLower    TokenType = 99 // LOWER
 	TokLength   TokenType = 100 // LENGTH
+	TokCast     TokenType = 101 // CAST
 )
 
 // Token represents a single lexical token.
@@ -443,6 +444,14 @@ type StringFuncExpr struct {
 }
 
 func (*StringFuncExpr) exprNode() {}
+
+// CastExpr: CAST(expr AS type) performs type conversion.
+type CastExpr struct {
+	Expr     Expr  // the expression to cast
+	TypeName string // target type: "INT", "TEXT", "FLOAT", "BLOB"
+}
+
+func (*CastExpr) exprNode() {}
 
 // StarExpr: SELECT *
 type StarExpr struct{}

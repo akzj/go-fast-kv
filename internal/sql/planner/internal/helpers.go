@@ -48,6 +48,54 @@ func resolveExprToValue(expr parserapi.Expr) (catalogapi.Value, error) {
 			}
 		}
 		return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+	case *parserapi.CastExpr:
+		// CastExpr: evaluate the inner expression and apply the cast
+		inner, err := resolveExprToValue(e.Expr)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if inner.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		switch strings.ToUpper(e.TypeName) {
+		case "INT", "INTEGER":
+			switch inner.Type {
+			case catalogapi.TypeInt:
+				return inner, nil
+			case catalogapi.TypeText:
+				return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+			case catalogapi.TypeFloat:
+				return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(inner.Float)}, nil
+			default:
+				return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+			}
+		case "TEXT":
+			switch inner.Type {
+			case catalogapi.TypeText:
+				return inner, nil
+			case catalogapi.TypeInt:
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: fmt.Sprintf("%d", inner.Int)}, nil
+			case catalogapi.TypeFloat:
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: fmt.Sprintf("%v", inner.Float)}, nil
+			default:
+				return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+			}
+		case "FLOAT":
+			switch inner.Type {
+			case catalogapi.TypeFloat:
+				return inner, nil
+			case catalogapi.TypeInt:
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: float64(inner.Int)}, nil
+			case catalogapi.TypeText:
+				return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+			default:
+				return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+			}
+		case "BLOB":
+			return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+		default:
+			return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
+		}
 	default:
 		return catalogapi.Value{}, plannerapi.ErrUnsupportedExpr
 	}
