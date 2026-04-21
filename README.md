@@ -32,13 +32,6 @@ go-fast-kv includes a full SQL query engine for relational queries over your key
 | Category | Features |
 |----------|----------|
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX` |
-| **DML** | `INSERT`, `UPDATE`, `DELETE` |
-| **Queries** | `SELECT` with `WHERE`, `JOIN` (INNER), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET` |
-| **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
-| **Set Operations** | `UNION`, `INTERSECT`, `EXCEPT` |
-| **Expressions** | Subqueries, scalar expressions, `IN`, `BETWEEN`, `LIKE`, `DISTINCT` |
-| **Query Analysis** | `EXPLAIN`, `EXPLAIN ANALYZE` |
-
 ### Quick Example
 
 ```sql
@@ -49,6 +42,104 @@ SELECT name FROM users WHERE id > 1
 
 SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1
 ```
+
+### Supported SQL Features
+
+#### Data Definition (DDL)
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `CREATE TABLE` | ✅ | PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT |
+| `DROP TABLE` | ✅ | IF EXISTS |
+| `ALTER TABLE` | ✅ | ADD COLUMN, DROP COLUMN, RENAME COLUMN |
+| `CREATE INDEX` | ✅ | UNIQUE, IF NOT EXISTS |
+| `DROP INDEX` | ✅ | IF EXISTS |
+
+#### Data Manipulation (DML)
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `INSERT` | ✅ | Multi-row, INSERT ... SELECT |
+| `UPDATE` | ✅ | Multi-column SET |
+| `DELETE` | ✅ | WHERE clause |
+
+#### Queries
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `SELECT` | ✅ | *, expressions, DISTINCT |
+| `WHERE` | ✅ | =, <>, <, >, <=, >=, AND, OR, NOT |
+| `IN`, `NOT IN` | ✅ | With literals |
+| `BETWEEN` | ✅ | Inclusive range |
+| `LIKE` | ✅ | %, _ wildcards |
+| `IS NULL`, `IS NOT NULL` | ✅ | |
+| `JOIN` | ✅ | INNER, LEFT, RIGHT, CROSS |
+| `GROUP BY` | ✅ | |
+| `HAVING` | ✅ | |
+| `ORDER BY` | ✅ | ASC, DESC, multi-column |
+| `LIMIT`, `OFFSET` | ✅ | |
+| Subqueries | ✅ | Scalar, IN, EXISTS, correlated |
+| Derived tables | ✅ | (SELECT ...) AS alias |
+
+#### Aggregates
+| Function | Status |
+|----------|--------|
+| `COUNT(*)` | ✅ |
+| `SUM` | ✅ |
+| `AVG` | ✅ |
+| `MIN` | ✅ |
+| `MAX` | ✅ |
+
+#### Set Operations
+| Operation | Status |
+|-----------|--------|
+| `UNION` | ✅ |
+| `UNION ALL` | ✅ |
+| `INTERSECT` | ✅ |
+| `EXCEPT` | ✅ |
+
+#### Expressions
+| Feature | Status |
+|---------|--------|
+| `CASE`/`WHEN`/`ELSE`/`END` | ✅ |
+| `COALESCE` | ✅ |
+| `NULLIF` | ✅ |
+| `CAST` | ✅ |
+| `SUBSTRING`, `CONCAT` | ✅ |
+| `UPPER`, `LOWER` | ✅ |
+| `LENGTH`, `TRIM` | ✅ |
+
+#### Transaction Control
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `BEGIN` | ✅ | Starts transaction |
+| `COMMIT` | ✅ | Flushes WAL, updates CLOG |
+| `ROLLBACK` | ✅ | Rollback pending writes |
+| `SELECT ... FOR UPDATE` | ✅ | NOWAIT, SKIP LOCKED |
+| Isolation Level | ✅ | SSI (Serializable Snapshot Isolation) |
+
+#### Query Analysis
+| Feature | Status |
+|---------|--------|
+| `EXPLAIN` | ✅ |
+| `EXPLAIN ANALYZE` | ✅ |
+
+#### Data Types
+| Type | Status |
+|------|--------|
+| `INT` / `INTEGER` | ✅ |
+| `TEXT` | ✅ |
+| `FLOAT` | ✅ |
+| `BLOB` | ✅ |
+
+### Known Limitations
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `FOREIGN KEY` | ❌ | Not supported |
+| `AUTOINCREMENT` | ❌ | Not supported |
+| `SAVEPOINT` | ❌ | Not supported |
+| Named parameters | ❌ | Only `$1`, `$2`, ... positional |
+| `CHECK` constraints | ❌ | Not supported |
+| Isolation level configuration | ❌ | Only SERIALIZABLE (SSI) |
+| `LastInsertId()` | ⚠️ | Always returns 0 (KV stores don't support this) |
 
 See [docs/sql.md](docs/sql.md) for complete SQL language documentation.
 

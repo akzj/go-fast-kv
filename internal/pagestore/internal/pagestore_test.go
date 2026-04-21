@@ -84,6 +84,7 @@ func (m *mockLSMForTests) CompareAndSetBlobMapping(blobID uint64, expectedVAddr 
 	}
 	return false
 }
+func (m *mockLSMForTests) GetAllPageMappings() []walapi.Record { return nil }
 
 func TestAllocIncrementing(t *testing.T) {
 	ps := newTestPageStore(t)

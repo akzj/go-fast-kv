@@ -551,6 +551,7 @@ func (m *mockLSMForTests) CompareAndSetBlobMapping(blobID uint64, expectedVAddr 
 	}
 	return false
 }
+func (m *mockLSMForTests) GetAllPageMappings() []walapi.Record { return nil }
 
 // LSMLifecycle methods required by pagestoreapi.LSMLifecycle.
 func (m *mockLSMForTests) ApplyPageMapping(pageID uint64, vaddr uint64) {

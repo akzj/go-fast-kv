@@ -339,6 +339,7 @@ func (m *mockLSMForTests) CompareAndSetBlobMapping(blobID uint64, expectedVAddr 
 	}
 	return false
 }
+func (m *mockLSMForTests) GetAllPageMappings() []walapi.Record { return nil }
 
 func TestVacuum_EmptyTree(t *testing.T) {
 	env := setupTestEnv(t)

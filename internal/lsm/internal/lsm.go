@@ -730,7 +730,7 @@ func (s *lsm) MaybeCompact() error {
 			// Pick the oldest L0 SSTable (first in list).
 			// NOTE: L0 segments are ordered newest-first in the manifest,
 			// so index 0 is the oldest (most eligible for compaction).
-			s.runLevelCompaction(l0Segments[0])
+			s.runLevelCompaction(&l0Segments[0])
 		}
 	}
 
@@ -845,28 +845,15 @@ func (s *lsm) runCompaction(frozen *memtable) {
 // runLevelCompaction compacts a level 0 SSTable down to level 1.
 // It picks the L0 SSTable and all L1 SSTables with overlapping key ranges,
 // merges all entries (newer wins for duplicate keys), and writes a new L1 SSTable.
-func (s *lsm) runLevelCompaction(l0seg segmentEntry) {
-	// Get all L0 segments and find our target
-	l0Segments := s.manifest.GetSegmentsByLevel(0)
-	var targetL0 *segmentEntry
-	for i := range l0Segments {
-		if l0Segments[i].name == l0seg.name {
-			targetL0 = &l0Segments[i]
-			break
-		}
-	}
-	if targetL0 == nil {
-		return // Segment already removed
-	}
-
-	// Find overlapping L1 segments
-	overlapping := s.manifest.GetOverlappingSegments(1, targetL0.minKey, targetL0.maxKey)
+func (s *lsm) runLevelCompaction(l0seg *segmentEntry) {
+	// Find overlapping L1 segments using the provided L0 segment's key range
+	overlapping := s.manifest.GetOverlappingSegments(1, l0seg.minKey, l0seg.maxKey)
 
 	// Collect all segments to merge (L0 + overlapping L1s)
 	segmentsToMerge := make([]string, 0, 1+len(overlapping))
-	segmentsToMerge = append(segmentsToMerge, targetL0.name)
-	for _, seg := range overlapping {
-		segmentsToMerge = append(segmentsToMerge, seg.name)
+	segmentsToMerge = append(segmentsToMerge, l0seg.name)
+	for i := range overlapping {
+		segmentsToMerge = append(segmentsToMerge, overlapping[i].name)
 	}
 
 	// Read and merge entries from all segments

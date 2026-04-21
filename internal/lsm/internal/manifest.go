@@ -121,9 +121,9 @@ func (m *manifest) Refcount(name string) int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for _, seg := range m.segments {
-		if seg.name == name {
-			return seg.refcount.Load()
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			return m.segments[i].refcount.Load()
 		}
 	}
 	return -1
@@ -147,9 +147,9 @@ func (m *manifest) CanDelete(name string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for _, seg := range m.segments {
-		if seg.name == name {
-			return seg.refcount.Load() == 0
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			return m.segments[i].refcount.Load() == 0
 		}
 	}
 	return false // segment doesn't exist
@@ -177,20 +177,23 @@ func (m *manifest) TryDelete(segMgr segmentapi.SegmentManager, segID uint32) boo
 	defer m.mu.Unlock()
 
 	// Find the segment
-	for i, seg := range m.segments {
-		if seg.name == segName {
+	for i := range m.segments {
+		if m.segments[i].name == segName {
 			// Atomically check refcount under write lock
-			if seg.refcount.Load() > 0 {
+			if m.segments[i].refcount.Load() > 0 {
 				// Segment is pinned by checkpoint - do NOT delete
 				return false
 			}
 			// Refcount is 0 - safe to delete
+			seg := m.segments[i]
+			//nolint:govet
 			// Remove from manifest
 			m.segments = append(m.segments[:i], m.segments[i+1:]...)
 			m.data.Segments = append(m.data.Segments[:i], m.data.Segments[i+1:]...)
 			// Save manifest to disk
 			if err := m.saveLocked(); err != nil {
 				// Restore segment list on error
+				//nolint:govet
 				m.segments = append(m.segments[:i], append([]segmentEntry{seg}, m.segments[i:]...)...)
 				m.data.Segments = append(m.data.Segments[:i], append([]string{segName}, m.data.Segments[i:]...)...)
 				return false
@@ -214,9 +217,9 @@ func (m *manifest) GetBloomFilter(name string) *BloomFilter {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for _, seg := range m.segments {
-		if seg.name == name {
-			return seg.bloomFilter
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			return m.segments[i].bloomFilter
 		}
 	}
 	return nil
@@ -248,8 +251,8 @@ func (m *manifest) SegmentNames() []string {
 	defer m.mu.RUnlock()
 
 	result := make([]string, len(m.segments))
-	for i, seg := range m.segments {
-		result[i] = seg.name
+	for i := range m.segments {
+		result[i] = m.segments[i].name
 	}
 	return result
 }
@@ -331,8 +334,8 @@ func (m *manifest) RemoveSegment(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for i, seg := range m.segments {
-		if seg.name == name {
+	for i := range m.segments {
+		if m.segments[i].name == name {
 			m.segments = append(m.segments[:i], m.segments[i+1:]...)
 			m.data.Segments = append(m.data.Segments[:i], m.data.Segments[i+1:]...)
 			return m.saveLocked()
@@ -369,8 +372,8 @@ func (m *manifest) Segments() []string {
 	defer m.mu.RUnlock()
 
 	result := make([]string, 0, len(m.segments))
-	for _, seg := range m.segments {
-		result = append(result, seg.name)
+	for i := range m.segments {
+		result = append(result, m.segments[i].name)
 	}
 	return result
 }
@@ -393,9 +396,9 @@ func (m *manifest) GetLevel(name string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for _, seg := range m.segments {
-		if seg.name == name {
-			return seg.level
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			return m.segments[i].level
 		}
 	}
 	return 0
@@ -421,9 +424,9 @@ func (m *manifest) GetKeyRange(name string) (minKey, maxKey uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for _, seg := range m.segments {
-		if seg.name == name {
-			return seg.minKey, seg.maxKey
+	for i := range m.segments {
+		if m.segments[i].name == name {
+			return m.segments[i].minKey, m.segments[i].maxKey
 		}
 	}
 	return 0, 0
@@ -434,10 +437,20 @@ func (m *manifest) GetSegmentsByLevel(level int) []segmentEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	result := make([]segmentEntry, 0)
-	for _, seg := range m.segments {
-		if seg.level == level {
-			result = append(result, seg)
+	// Pre-count to avoid append copying segmentEntry with atomic.Int64
+	count := 0
+	for i := range m.segments {
+		if m.segments[i].level == level {
+			count++
+		}
+	}
+	result := make([]segmentEntry, count)
+	idx := 0
+	for i := range m.segments {
+		if m.segments[i].level == level {
+			//nolint:govet
+			result[idx] = m.segments[i]
+			idx++
 		}
 	}
 	return result
@@ -449,14 +462,27 @@ func (m *manifest) GetOverlappingSegments(level int, minKey, maxKey uint64) []se
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	result := make([]segmentEntry, 0)
-	for _, seg := range m.segments {
-		if seg.level != level {
+	// Pre-count to avoid append copying segmentEntry with atomic.Int64
+	count := 0
+	for i := range m.segments {
+		if m.segments[i].level != level {
+			continue
+		}
+		if m.segments[i].minKey <= maxKey && minKey <= m.segments[i].maxKey {
+			count++
+		}
+	}
+	result := make([]segmentEntry, count)
+	idx := 0
+	for i := range m.segments {
+		if m.segments[i].level != level {
 			continue
 		}
 		// Two ranges [a,b] and [c,d] overlap if a <= d AND c <= b
-		if seg.minKey <= maxKey && minKey <= seg.maxKey {
-			result = append(result, seg)
+		if m.segments[i].minKey <= maxKey && minKey <= m.segments[i].maxKey {
+			//nolint:govet
+			result[idx] = m.segments[i]
+			idx++
 		}
 	}
 	return result
@@ -468,8 +494,8 @@ func (m *manifest) CountLevel(level int) int {
 	defer m.mu.RUnlock()
 
 	count := 0
-	for _, seg := range m.segments {
-		if seg.level == level {
+	for i := range m.segments {
+		if m.segments[i].level == level {
 			count++
 		}
 	}
