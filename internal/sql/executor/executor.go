@@ -7,6 +7,7 @@ import (
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
 	"github.com/akzj/go-fast-kv/internal/sql/executor/api"
 	"github.com/akzj/go-fast-kv/internal/sql/executor/internal"
+	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
 )
 
@@ -21,6 +22,6 @@ var (
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
-	planner plannerapi.Planner) api.Executor {
-	return internal.New(store, catalog, tableEngine, indexEngine, planner)
+	planner plannerapi.Planner, parser parserapi.Parser) api.Executor {
+	return internal.New(store, catalog, tableEngine, indexEngine, planner, parser)
 }

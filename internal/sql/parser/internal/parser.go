@@ -292,6 +292,31 @@ func (p *parser) parseCreateTable() (api.Statement, error) {
 			break
 		}
 
+		// Check for table-level CHECK constraint: CHECK (expr)
+		if p.cur.Type == api.TokCheck {
+			p.advance()
+			if p.cur.Type != api.TokLParen {
+				return nil, p.errorf("expected ( after CHECK")
+			}
+			p.advance()
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur.Type != api.TokRParen {
+				return nil, p.errorf("expected ) after CHECK expression")
+			}
+			p.advance()
+			// Add a column def with only the check expression for table-level constraint
+			col := api.ColumnDef{Name: "", CheckExpr: expr}
+			stmt.Columns = append(stmt.Columns, col)
+			if p.cur.Type == api.TokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
@@ -400,6 +425,24 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 			}
 			col.DefaultValue = valToValue(val)
 		}
+	}
+
+	// Optional CHECK constraint
+	if p.cur.Type == api.TokCheck {
+		p.advance()
+		if p.cur.Type != api.TokLParen {
+			return col, p.errorf("expected ( after CHECK")
+		}
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return col, err
+		}
+		if p.cur.Type != api.TokRParen {
+			return col, p.errorf("expected ) after CHECK expression")
+		}
+		p.advance()
+		col.CheckExpr = expr
 	}
 
 	return col, nil

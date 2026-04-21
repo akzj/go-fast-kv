@@ -28,6 +28,7 @@ const (
 	// Class 23 — Integrity Constraint Violation
 	SQLStateUniqueViolation          = "23505"
 	SQLStateNotNullViolation         = "23502"
+	SQLStateCheckViolation           = "23522" // CHECK constraint violation
 	SQLStateForeignKeyViolation      = "23503"
 	SQLStateCheckConstraintViolation = "23514"
 	SQLStateExclusionViolation       = "23P01"
@@ -205,6 +206,14 @@ func ErrNotNullViolation(tableName, columnName string) *SQLError {
 	return &SQLError{
 		SQLState: SQLStateNotNullViolation,
 		Message:  fmt.Sprintf("null value in column %q violates NOT NULL constraint on table %q", columnName, tableName),
+	}
+}
+
+// ErrCheckViolation returns an error for a CHECK constraint violation.
+func ErrCheckViolation(tableName, expr string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateCheckViolation,
+		Message:  fmt.Sprintf("new row for table %q violates CHECK constraint %q", tableName, expr),
 	}
 }
 

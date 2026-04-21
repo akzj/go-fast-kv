@@ -31,7 +31,7 @@ func setupExplainTest(t *testing.T) (parserapi.Parser, plannerapi.Planner, execu
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	exec := executor.New(store, cat, tbl, idx, pl)
+	exec := executor.New(store, cat, tbl, idx, pl, p)
 	return p, pl, exec, cat
 }
 

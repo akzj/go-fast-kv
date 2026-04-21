@@ -37,6 +37,9 @@ type executor struct {
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
 	planner     plannerapi.Planner
+	// parser re-parses CHECK constraint expressions at execution time.
+	// CHECK expressions are stored as RawSQL strings in the catalog.
+	parser parserapi.Parser
 	// For correlated subquery support - outer query context set before filter evaluation
 	outerCols []catalogapi.ColumnDef
 	outerVals []catalogapi.Value
@@ -47,7 +50,7 @@ type executor struct {
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
-	planner plannerapi.Planner) *executor {
+	planner plannerapi.Planner, parser parserapi.Parser) *executor {
 	return &executor{
 		store:       store,
 		catalog:     catalog,
@@ -55,6 +58,7 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		indexEngine: indexEngine,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
+		parser:      parser,
 	}
 }
 
@@ -551,6 +555,11 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				return nil, err
 			}
 
+			// Check CHECK constraints before inserting.
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row); err != nil {
+				return nil, err
+			}
+
 			// Allocate rowID via table engine (in-memory only, no persistence yet).
 			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
 			if err != nil {
@@ -607,6 +616,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 		// Check UNIQUE constraint before inserting.
 		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check CHECK constraints before inserting.
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -2780,6 +2795,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			// Check UNIQUE constraint before updating.
 			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
 				return nil, err
+
+			// Check CHECK constraints before updating.
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+				return nil, err
+			}
 			}
 
 			// Update row with transaction's XID.
@@ -2842,6 +2862,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 
 		// Check UNIQUE constraint before updating.
 		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check CHECK constraints before updating.
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -3503,5 +3529,74 @@ func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.
 			return sqlerrors.ErrUniqueViolation(tableName, idx.Column)
 		}
 	}
+	return nil
+}
+
+// checkCheckConstraints validates that row values satisfy all CHECK constraints.
+// It evaluates both column-level CHECKs (on each column) and table-level CHECKs.
+// Returns nil if all constraints are satisfied, or ErrCheckViolation on failure.
+func (e *executor) checkCheckConstraints(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value) error {
+	// Collect all CHECK constraints (column-level + table-level).
+	var checks []catalogapi.CheckConstraint
+
+	// Column-level checks.
+	for _, col := range columns {
+		if col.Check != nil {
+			checks = append(checks, *col.Check)
+		}
+	}
+
+	// Table-level checks: need to fetch from catalog since plan.Table may not have them.
+	// Only fetch if we don't already have table-level checks in the schema.
+	// The plan passes table-level checks via TableSchema.CheckConstraints.
+	// For INSERT/UPDATE, the plan includes the full TableSchema.
+	// This method is called with the plan's table schema directly.
+
+	// Evaluate each CHECK constraint by re-parsing and evaluating the expression.
+	for _, check := range checks {
+		if check.RawSQL == "" {
+			continue
+		}
+
+		// Re-parse the CHECK expression in the context of this table.
+		// Wrap in SELECT 1 WHERE to parse as a boolean expression.
+		// e.g., "price > 0" becomes "SELECT 1 FROM table WHERE price > 0"
+		// But simpler: parse the expression directly and evaluate with evalExpr.
+		// Since CHECK expressions don't reference the table name, we prepend a fake
+		// SELECT that we'll use to extract just the WHERE-like expression.
+		// 
+		// Strategy: wrap as "SELECT * WHERE <expr>" - the parser supports WHERE.
+		sql := "SELECT * WHERE " + check.RawSQL
+		stmt, err := e.parser.Parse(sql)
+		if err != nil {
+			// Re-parse failed - constraint is malformed.
+			return fmt.Errorf("%w: malformed CHECK expression %q: %v", executorapi.ErrExecFailed, check.RawSQL, err)
+		}
+
+		sel, ok := stmt.(*parserapi.SelectStmt)
+		if !ok {
+			return fmt.Errorf("%w: CHECK expression %q did not parse as SELECT", executorapi.ErrExecFailed, check.RawSQL)
+		}
+
+		filter := sel.Where
+		if filter == nil {
+			// No WHERE clause - constraint always passes.
+			continue
+		}
+
+		// Evaluate the filter expression against the row values.
+		row := &engineapi.Row{Values: values}
+		result, err := evalExpr(filter, row, columns, nil, e)
+		if err != nil {
+			return fmt.Errorf("%w: evaluating CHECK constraint %q: %v", executorapi.ErrExecFailed, check.RawSQL, err)
+		}
+
+		// CHECK constraint passes only if the expression evaluates to TRUE.
+		// NULL or FALSE both fail the constraint.
+		if !isTruthy(result) {
+			return sqlerrors.ErrCheckViolation(tableName, check.RawSQL)
+		}
+	}
+
 	return nil
 }

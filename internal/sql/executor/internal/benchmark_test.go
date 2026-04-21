@@ -31,7 +31,7 @@ func newBenchEnv(b *testing.B) *benchEnv {
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	ex := New(store, cat, tbl, idx, pl)
+	ex := New(store, cat, tbl, idx, pl, p)
 
 	return &benchEnv{
 		store:   store,

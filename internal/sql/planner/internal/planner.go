@@ -78,6 +78,7 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 	}
 
 	cols := make([]catalogapi.ColumnDef, len(stmt.Columns))
+	var tableChecks []catalogapi.CheckConstraint
 	for i, c := range stmt.Columns {
 		t, err := resolveTypeName(c.TypeName)
 		if err != nil {
@@ -89,6 +90,20 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		if c.DefaultValue.Type != catalogapi.TypeNull || c.DefaultValue.IsNull {
 			dv := c.DefaultValue
 			col.DefaultValue = &dv
+		}
+		// Column-level CHECK constraint: store as RawSQL string for later evaluation.
+		// Cannot store parserapi.Expr here (would create circular dependency).
+		if c.CheckExpr != nil {
+			check := catalogapi.CheckConstraint{
+				RawSQL: serializeExpr(c.CheckExpr),
+			}
+			col.Check = &check
+		}
+		// Table-level CHECK constraint: column name is empty (added in parser).
+		if c.Name == "" && c.CheckExpr != nil {
+			tableChecks = append(tableChecks, catalogapi.CheckConstraint{
+				RawSQL: serializeExpr(c.CheckExpr),
+			})
 		}
 		cols[i] = col
 	}
@@ -133,9 +148,10 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 
 	return &plannerapi.CreateTablePlan{
 		Schema: catalogapi.TableSchema{
-			Name:       stmt.Table,
-			Columns:    cols,
-			PrimaryKey: pk,
+			Name:             stmt.Table,
+			Columns:          cols,
+			PrimaryKey:       pk,
+			CheckConstraints: tableChecks,
 		},
 		IfNotExists:  stmt.IfNotExists,
 		UniqueIndexes: uniqueIndexes,
@@ -1689,4 +1705,148 @@ func hasStarExpr(cols []parserapi.SelectColumn) bool {
 		}
 	}
 	return false
+}
+
+// serializeExpr converts a parser expression AST to a SQL string for RawSQL storage.
+// The executor will re-parse this string at runtime.
+func serializeExpr(expr parserapi.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *parserapi.Literal:
+		if e.Value.IsNull {
+			return "NULL"
+		}
+		switch e.Value.Type {
+		case catalogapi.TypeInt:
+			return fmt.Sprintf("%d", e.Value.Int)
+		case catalogapi.TypeFloat:
+			return fmt.Sprintf("%g", e.Value.Float)
+		case catalogapi.TypeText:
+			return fmt.Sprintf("'%s'", e.Value.Text)
+		}
+		return ""
+	case *parserapi.ColumnRef:
+		if e.Table != "" {
+			return e.Table + "." + e.Column
+		}
+		return e.Column
+	case *parserapi.BinaryExpr:
+		return "(" + serializeExpr(e.Left) + " " + binaryOpString(e.Op) + " " + serializeExpr(e.Right) + ")"
+	case *parserapi.UnaryExpr:
+		return unaryOpString(e.Op) + serializeExpr(e.Operand)
+	case *parserapi.IsNullExpr:
+		s := serializeExpr(e.Expr)
+		if e.Not {
+			return s + " IS NOT NULL"
+		}
+		return s + " IS NULL"
+	case *parserapi.LikeExpr:
+		return serializeExpr(e.Expr) + " LIKE '" + e.Pattern + "'"
+	case *parserapi.InExpr:
+		s := serializeExpr(e.Expr)
+		if e.Not {
+			s = s + " NOT IN ("
+		} else {
+			s = s + " IN ("
+		}
+		for i, v := range e.Values {
+			if i > 0 {
+				s += ", "
+			}
+			s += serializeExpr(v)
+		}
+		return s + ")"
+	case *parserapi.BetweenExpr:
+		s := serializeExpr(e.Expr)
+		if e.Not {
+			s = s + " NOT BETWEEN "
+		} else {
+			s = s + " BETWEEN "
+		}
+		return s + serializeExpr(e.Low) + " AND " + serializeExpr(e.High)
+	case *parserapi.CoalesceExpr:
+		s := "COALESCE("
+		for i, arg := range e.Args {
+			if i > 0 {
+				s += ", "
+			}
+			s += serializeExpr(arg)
+		}
+		return s + ")"
+	case *parserapi.NullIfExpr:
+		return "NULLIF(" + serializeExpr(e.Left) + ", " + serializeExpr(e.Right) + ")"
+	case *parserapi.CastExpr:
+		return "CAST(" + serializeExpr(e.Expr) + " AS " + e.TypeName + ")"
+	case *parserapi.StringFuncExpr:
+		s := e.Func + "("
+		for i, arg := range e.Args {
+			if i > 0 {
+				s += ", "
+			}
+			s += serializeExpr(arg)
+		}
+		return s + ")"
+	case *parserapi.AggregateCallExpr:
+		if e.Arg == nil {
+			return e.Func + "(*)"
+		}
+		return e.Func + "(" + serializeExpr(e.Arg) + ")"
+	case *parserapi.CaseExpr:
+		s := "CASE "
+		for _, w := range e.Whens {
+			s += "WHEN " + serializeExpr(w.Cond) + " THEN " + serializeExpr(w.Val) + " "
+		}
+		if e.Else != nil {
+			s += "ELSE " + serializeExpr(e.Else) + " "
+		}
+		return s + "END"
+	case *parserapi.SubqueryExpr:
+		// Subqueries in CHECK constraints are unusual but possible.
+		// Store as a placeholder - the executor will handle re-parsing.
+		return "(SELECT ...)"
+	default:
+		return ""
+	}
+}
+
+func binaryOpString(op parserapi.BinaryOp) string {
+	switch op {
+	case parserapi.BinEQ:
+		return "="
+	case parserapi.BinNE:
+		return "!="
+	case parserapi.BinLT:
+		return "<"
+	case parserapi.BinLE:
+		return "<="
+	case parserapi.BinGT:
+		return ">"
+	case parserapi.BinGE:
+		return ">="
+	case parserapi.BinAnd:
+		return "AND"
+	case parserapi.BinOr:
+		return "OR"
+	case parserapi.BinAdd:
+		return "+"
+	case parserapi.BinSub:
+		return "-"
+	case parserapi.BinMul:
+		return "*"
+	case parserapi.BinDiv:
+		return "/"
+	}
+	return ""
+}
+
+func unaryOpString(op parserapi.UnaryOp) string {
+	switch op {
+	case parserapi.UnaryNot:
+		return "NOT "
+	case parserapi.UnaryMinus:
+		return "-"
+	}
+	return ""
 }

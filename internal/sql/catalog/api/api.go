@@ -52,10 +52,11 @@ var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
 // TableSchema describes a table's structure.
 type TableSchema struct {
-	Name       string
-	Columns    []ColumnDef
-	PrimaryKey string // column name, optional
-	TableID    uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
+	Name              string
+	Columns           []ColumnDef
+	PrimaryKey        string // column name, optional
+	TableID           uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
+	CheckConstraints  []CheckConstraint // table-level CHECK constraints
 }
 
 // ColumnDef describes a single column in a table.
@@ -66,6 +67,14 @@ type ColumnDef struct {
 	NotNull      bool          // NOT NULL constraint
 	DefaultValue *Value        // DEFAULT value, nil if not specified
 	AutoInc      bool          // AUTOINCREMENT flag — column gets auto-generated integer IDs
+	Check        *CheckConstraint // column-level CHECK constraint; nil if not specified
+}
+
+// CheckConstraint represents a CHECK constraint (column-level or table-level).
+// RawSQL stores the original expression text for the executor to evaluate.
+type CheckConstraint struct {
+	Name   string // optional name, currently unused but reserved for future
+	RawSQL string // the expression text, e.g. "price > 0"
 }
 
 // IndexSchema describes an index on a table.

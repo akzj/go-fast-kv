@@ -128,6 +128,7 @@ const (
 	TokQuestion       TokenType = 102 // ? placeholder (ODBC style)
 	TokAutoIncrement  TokenType = 103 // AUTOINCREMENT
 	TokSerial         TokenType = 104 // SERIAL (PostgreSQL alias)
+	TokCheck          TokenType = 105 // CHECK constraint
 )
 
 // Token represents a single lexical token.
@@ -551,7 +552,8 @@ type ColumnDef struct {
 	NotNull      bool
 	Unique       bool
 	DefaultValue catalogapi.Value // DEFAULT value; zero Value means not specified
-	AutoInc      bool              // AUTOINCREMENT flag
+	AutoInc      bool             // AUTOINCREMENT flag
+	CheckExpr    Expr              // CHECK constraint expression; nil if not specified
 }
 
 // ─── Parser Interface ─────────────────────────────────────────────
