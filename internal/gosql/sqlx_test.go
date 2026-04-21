@@ -60,35 +60,41 @@ func TestSqlxNamedExec(t *testing.T) {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 
-	// Note: sqlx rebinds named params to ? before passing to driver.
-	// Our internal parser only supports $N placeholders.
-	// So we test with positional params to verify basic functionality,
-	// then document that named params are handled at driver level.
-
-	// Insert with positional params (our internal parser understands this).
-	_, err = db.Exec("INSERT INTO users VALUES ($1, $2, $3)", 1, "Alice", 30)
+	// Test ? placeholders (sqlx rebinds :name to ? before passing to driver).
+	// With the fix, our driver should now handle ? placeholders correctly.
+	_, err = db.Exec("INSERT INTO users VALUES (?, ?, ?)", 1, "Alice", 30)
 	if err != nil {
-		t.Fatalf("INSERT: %v", err)
+		t.Fatalf("INSERT with ? placeholders: %v", err)
 	}
 
-	// Verify positional params work.
+	// Verify ? placeholders work in SELECT.
 	var name string
-	err = db.Get(&name, "SELECT name FROM users WHERE id = $1", 1)
+	err = db.Get(&name, "SELECT name FROM users WHERE id = ?", 1)
 	if err != nil {
-		t.Fatalf("Get: %v", err)
+		t.Fatalf("Get with ? placeholder: %v", err)
 	}
 	if name != "Alice" {
 		t.Errorf("expected name=Alice, got %s", name)
 	}
 
-	// Test Query with multiple positional params.
+	// Test with multiple ? placeholders.
 	var age int
-	err = db.Get(&age, "SELECT age FROM users WHERE id = $1 AND name = $2", 1, "Alice")
+	err = db.Get(&age, "SELECT age FROM users WHERE id = ? AND name = ?", 1, "Alice")
 	if err != nil {
-		t.Fatalf("Get with multiple params: %v", err)
+		t.Fatalf("Get with multiple ? placeholders: %v", err)
 	}
 	if age != 30 {
 		t.Errorf("expected age=30, got %d", age)
+	}
+
+	// Verify backward compatibility: $N placeholders still work.
+	var id int
+	err = db.Get(&id, "SELECT id FROM users WHERE name = $1", "Alice")
+	if err != nil {
+		t.Fatalf("$N placeholder should still work: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("expected id=1, got %d", id)
 	}
 }
 

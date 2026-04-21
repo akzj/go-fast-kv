@@ -137,6 +137,9 @@ func (l *lexer) nextToken() api.Token {
 	case '.':
 		l.pos++
 		return api.Token{Type: api.TokDot, Literal: ".", Pos: startPos}
+	case '?':
+		l.pos++
+		return api.Token{Type: api.TokQuestion, Literal: "?", Pos: startPos}
 	case '+':
 		l.pos++
 		return api.Token{Type: api.TokPlus, Literal: "+", Pos: startPos}

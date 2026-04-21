@@ -34,7 +34,26 @@ func substitutePlaceholders(query string, args []interface{}) (string, error) {
 	var result strings.Builder
 	i := 0
 
+	// Keep track of ? position count for sequential substitution
+	questionMarkCount := 0
+
 	for i < len(query) {
+		// Check for question mark placeholder (sqlx rebinds :name to ?)
+		if query[i] == '?' {
+			i++
+			questionMarkCount++
+			if questionMarkCount > len(orderedParams) {
+				return "", fmt.Errorf("gosql: too many placeholders (have %d args)", len(orderedParams))
+			}
+			val := orderedParams[questionMarkCount-1]
+			argStr, err := valueToSQLLiteral(val)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(argStr)
+			continue
+		}
+
 		// Check for named parameter (:name or @name)
 		if (query[i] == ':' || query[i] == '@') && i+1 < len(query) {
 			start := i

@@ -125,6 +125,7 @@ const (
 	TokLower    TokenType = 99 // LOWER
 	TokLength   TokenType = 100 // LENGTH
 	TokCast     TokenType = 101 // CAST
+	TokQuestion TokenType = 102 // ? placeholder (ODBC style)
 )
 
 // Token represents a single lexical token.
