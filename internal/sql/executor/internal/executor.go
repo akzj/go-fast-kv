@@ -551,12 +551,17 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 			}
 
 			// Check UNIQUE constraint before inserting.
-			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row); err != nil {
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row, 0); err != nil {
 				return nil, err
 			}
 
 			// Check CHECK constraints before inserting.
 			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
+				return nil, err
+			}
+
+			// Check FOREIGN KEY constraints before inserting.
+			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.ForeignKeys); err != nil {
 				return nil, err
 			}
 
@@ -615,13 +620,19 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		}
 
 		// Check UNIQUE constraint before inserting.
-		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row); err != nil {
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row, 0); err != nil {
 			batch.Discard()
 			return nil, err
 		}
 
 		// Check CHECK constraints before inserting.
 		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check FOREIGN KEY constraints before inserting.
+		if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.ForeignKeys); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -2801,13 +2812,19 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			}
 
 			// Check UNIQUE constraint before updating.
-			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+			// Pass row.RowID to exclude it — allows UPDATE to same value (idempotent).
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues, row.RowID); err != nil {
 				return nil, err
+			}
 
 			// Check CHECK constraints before updating.
 			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
 				return nil, err
 			}
+
+			// Check FOREIGN KEY constraints for changed columns.
+			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
+				return nil, err
 			}
 
 			// Update row with transaction's XID.
@@ -2869,13 +2886,20 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		}
 
 		// Check UNIQUE constraint before updating.
-		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues); err != nil {
+		// Pass row.RowID to exclude it — allows UPDATE to same value (idempotent).
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues, row.RowID); err != nil {
 			batch.Discard()
 			return nil, err
 		}
 
 		// Check CHECK constraints before updating.
 		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
+		// Check FOREIGN KEY constraints for changed columns.
+		if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
 			batch.Discard()
 			return nil, err
 		}
@@ -3487,9 +3511,10 @@ func checkNotNullConstraint(columns []catalogapi.ColumnDef, values []catalogapi.
 
 // checkUniqueConstraint validates that values don't violate UNIQUE constraints.
 // For each UNIQUE index, checks if the value already exists in the index.
+// For UPDATE operations: pass the current row's rowID as excludeRowID to skip it.
 // Returns nil if all UNIQUE constraints are satisfied, or ErrUniqueViolation
 // if any UNIQUE column has a duplicate value.
-func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value) error {
+func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value, excludeRowID uint64) error {
 	indexes, err := e.catalog.ListIndexes(tableName)
 	if err != nil {
 		return err
@@ -3524,17 +3549,19 @@ func (e *executor) checkUniqueConstraint(tableName string, columns []catalogapi.
 			return err
 		}
 
-		found := iter.Next()
+		// Check each entry — skip excludeRowID for UPDATE (allows same value in same row)
+		for iter.Next() {
+			if iter.RowID() == excludeRowID {
+				continue
+			}
+			iter.Close()
+			return sqlerrors.ErrUniqueViolation(tableName, idx.Column)
+		}
 		err = iter.Err()
 		iter.Close()
 
 		if err != nil {
 			return err
-		}
-
-		if found {
-			// Found a duplicate
-			return sqlerrors.ErrUniqueViolation(tableName, idx.Column)
 		}
 	}
 	return nil
@@ -3607,4 +3634,119 @@ func (e *executor) checkCheckConstraints(tableName string, columns []catalogapi.
 	}
 
 	return nil
+}
+
+// checkForeignKeyConstraints validates that row values satisfy all foreign key constraints.
+// For INSERT: checks that FK column values reference existing rows in parent tables.
+// For UPDATE: checks that new FK column values (if changed) reference existing rows.
+// For any FK column that is NULL, the constraint is satisfied (SQL standard).
+func (e *executor) checkForeignKeyConstraints(tableName string, columns []catalogapi.ColumnDef, values []catalogapi.Value, fks []catalogapi.ForeignKeySchema) error {
+	if len(fks) == 0 {
+		return nil
+	}
+
+	// Build a column name -> index map for efficient lookup
+	colIdxMap := make(map[string]int, len(columns))
+	for i, col := range columns {
+		colIdxMap[strings.ToLower(col.Name)] = i
+	}
+
+	for _, fk := range fks {
+		// Check each FK column (skip if value is NULL — NULL satisfies FK constraint)
+		for i, colName := range fk.Columns {
+			// Look up the column index
+			idx, ok := colIdxMap[strings.ToLower(colName)]
+			if !ok || idx < 0 || idx >= len(values) {
+				continue
+			}
+			fkVal := values[idx]
+			if fkVal.IsNull {
+				continue // NULL FK always passes
+			}
+
+			// Get the parent table schema
+			parentTable, err := e.catalog.GetTable(fk.ReferencedTable)
+			if err != nil {
+				if err == catalogapi.ErrTableNotFound {
+					return sqlerrors.ErrForeignKeyViolation(
+						fmt.Sprintf("references table %q which does not exist", fk.ReferencedTable))
+				}
+				return err
+			}
+
+			// Determine which column to look up in the parent table
+			var parentColName string
+			if i < len(fk.ReferencedColumns) {
+				parentColName = fk.ReferencedColumns[i]
+			}
+
+			// Find the parent column index by name
+			lookupColIdx := -1
+			for j, col := range parentTable.Columns {
+				if strings.EqualFold(col.Name, parentColName) {
+					lookupColIdx = j
+					break
+				}
+			}
+			if lookupColIdx < 0 {
+				return sqlerrors.ErrForeignKeyViolation(
+					fmt.Sprintf("referenced column %q not found in table %q", parentColName, fk.ReferencedTable))
+			}
+
+			// Look up the FK value in the parent table.
+			// First try to use index on the referenced column (indexID 0 = primary key).
+			found := false
+			if lookupColIdx >= 0 {
+				// Try index scan first (indexID 0 = primary key index)
+				iter, err := e.indexEngine.Scan(parentTable.TableID, 0, encodingapi.OpEQ, fkVal)
+				if err == nil {
+					found = iter.Next()
+					iter.Close()
+				} else {
+					// Fall back to full table scan
+					found, err = e.scanFKParentTable(parentTable, lookupColIdx, fkVal)
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			if !found {
+				return sqlerrors.ErrForeignKeyViolation(
+					fmt.Sprintf("foreign key constraint violated: %s.%s references %s.%s, but %v does not exist",
+						tableName, colName, fk.ReferencedTable, parentColName, fkVal))
+			}
+		}
+	}
+
+	return nil
+}
+
+// scanFKParentTable performs a full scan of the parent table to find a matching row.
+// This is a fallback when index scan is not available or returns an error.
+func (e *executor) scanFKParentTable(parentTable *catalogapi.TableSchema, lookupColIdx int, fkVal catalogapi.Value) (bool, error) {
+	// Use the table engine's Scan to iterate all rows
+	iter, err := e.tableEngine.Scan(parentTable)
+	if err != nil {
+		return false, fmt.Errorf("%w: scan parent table for FK check: %v", executorapi.ErrExecFailed, err)
+	}
+	defer iter.Close()
+
+	for iter.Next() {
+		// Get the row to check the column value
+		row := iter.Row()
+		if row == nil {
+			continue
+		}
+		if lookupColIdx < len(row.Values) {
+			cmp := compareValues(row.Values[lookupColIdx], fkVal)
+			if cmp == 0 {
+				return true, nil // found matching row in parent table
+			}
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return false, fmt.Errorf("%w: scan parent table: %v", executorapi.ErrExecFailed, err)
+	}
+	return false, nil // no matching row found
 }

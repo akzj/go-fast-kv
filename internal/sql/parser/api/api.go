@@ -131,6 +131,12 @@ const (
 	TokCheck          TokenType = 105 // CHECK constraint
 	TokSavepoint      TokenType = 106 // SAVEPOINT
 	TokRelease        TokenType = 107 // RELEASE
+	TokForeign        TokenType = 108 // FOREIGN
+	TokReferences     TokenType = 109 // REFERENCES
+	TokCascade        TokenType = 110 // CASCADE
+	TokSetNull        TokenType = 111 // SET NULL
+	TokNoAction       TokenType = 112 // NO ACTION
+	TokRestrict       TokenType = 113 // RESTRICT
 )
 
 // Token represents a single lexical token.
@@ -160,6 +166,16 @@ type CreateTableStmt struct {
 	Columns     []ColumnDef
 	PrimaryKey  string // optional: column name
 	IfNotExists bool
+	ForeignKeys []ForeignKey
+}
+
+// ForeignKey represents a parsed FOREIGN KEY constraint (table-level or column-level).
+type ForeignKey struct {
+	Columns           []string // column names in this table
+	ReferencedTable   string   // referenced table name
+	ReferencedColumns []string // column names in referenced table (optional)
+	OnDelete          string   // ON DELETE action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
+	OnUpdate          string   // ON UPDATE action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
 }
 
 func (*CreateTableStmt) stmtNode() {}

@@ -161,10 +161,26 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 			Columns:          cols,
 			PrimaryKey:       pk,
 			CheckConstraints: tableChecks,
+			ForeignKeys:      convertForeignKeys(stmt.ForeignKeys, cols),
 		},
 		IfNotExists:  stmt.IfNotExists,
 		UniqueIndexes: uniqueIndexes,
 	}, nil
+}
+
+// convertForeignKeys converts parser.ForeignKey to catalogapi.ForeignKeySchema.
+func convertForeignKeys(fks []parserapi.ForeignKey, tableCols []catalogapi.ColumnDef) []catalogapi.ForeignKeySchema {
+	result := make([]catalogapi.ForeignKeySchema, 0, len(fks))
+	for _, fk := range fks {
+		result = append(result, catalogapi.ForeignKeySchema{
+			Columns:           fk.Columns,
+			ReferencedTable:   fk.ReferencedTable,
+			ReferencedColumns: fk.ReferencedColumns,
+			OnDelete:          fk.OnDelete,
+			OnUpdate:          fk.OnUpdate,
+		})
+	}
+	return result
 }
 
 func (p *planner) planDropTable(stmt *parserapi.DropTableStmt) (*plannerapi.DropTablePlan, error) {

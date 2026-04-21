@@ -376,6 +376,20 @@ func (p *parser) parseCreateTable() (api.Statement, error) {
 			break
 		}
 
+		// Check for table-level FOREIGN KEY constraint: FOREIGN KEY (col, ...) REFERENCES table (col, ...)
+		if p.cur.Type == api.TokForeign {
+			fk, err := p.parseTableLevelForeignKey()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ForeignKeys = append(stmt.ForeignKeys, *fk)
+			if p.cur.Type == api.TokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
@@ -505,6 +519,168 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 	}
 
 	return col, nil
+}
+
+// parseTableLevelForeignKey parses: FOREIGN KEY (col, ...) REFERENCES table (col, ...) [ON DELETE action] [ON UPDATE action]
+func (p *parser) parseTableLevelForeignKey() (*api.ForeignKey, error) {
+	p.advance() // consume FOREIGN
+	if err := p.expect(api.TokKey); err != nil {
+		return nil, err
+	}
+	if err := p.expect(api.TokLParen); err != nil {
+		return nil, err
+	}
+
+	// Parse column list
+	var columns []string
+	for {
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name in FOREIGN KEY")
+		}
+		columns = append(columns, p.cur.Literal)
+		p.advance()
+		if p.cur.Type != api.TokComma {
+			break
+		}
+		p.advance()
+	}
+	if err := p.expect(api.TokRParen); err != nil {
+		return nil, err
+	}
+
+	// REFERENCES
+	if err := p.expect(api.TokReferences); err != nil {
+		return nil, err
+	}
+
+	// Referenced table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected referenced table name")
+	}
+	refTable := p.cur.Literal
+	p.advance()
+
+	// Optional (column list)
+	var refColumns []string
+	if p.cur.Type == api.TokLParen {
+		p.advance()
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected referenced column name")
+			}
+			refColumns = append(refColumns, p.cur.Literal)
+			p.advance()
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(api.TokRParen); err != nil {
+			return nil, err
+		}
+	}
+
+	fk := &api.ForeignKey{
+		Columns:           columns,
+		ReferencedTable:   refTable,
+		ReferencedColumns: refColumns,
+		OnDelete:          "NO ACTION",
+		OnUpdate:          "NO ACTION",
+	}
+
+	// Optional ON DELETE / ON UPDATE
+	p.parseReferentialActions(fk)
+
+	return fk, nil
+}
+
+// parseReferentialActions parses ON DELETE/UPDATE actions for foreign keys.
+func (p *parser) parseReferentialActions(fk *api.ForeignKey) {
+	for {
+		if p.cur.Type == api.TokOn {
+			p.advance()
+			var action *string
+			if p.cur.Type == api.TokDelete || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "DELETE") {
+				if p.cur.Type == api.TokIdent {
+					p.advance() // consume DELETE identifier
+				} else {
+					p.advance() // consume DELETE token
+				}
+				action = &fk.OnDelete
+			} else if p.cur.Type == api.TokUpdate || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "UPDATE") {
+				if p.cur.Type == api.TokIdent {
+					p.advance() // consume UPDATE identifier
+				} else {
+					p.advance() // consume UPDATE token
+				}
+				action = &fk.OnUpdate
+			} else {
+				break
+			}
+
+			// Parse action: CASCADE, SET NULL, RESTRICT, NO ACTION
+			var act string
+			switch p.cur.Type {
+			case api.TokCascade:
+				act = "CASCADE"
+				p.advance()
+			case api.TokSetNull:
+				act = "SET NULL"
+				p.advance()
+			case api.TokRestrict:
+				act = "RESTRICT"
+				p.advance()
+			case api.TokNoAction:
+				act = "NO ACTION"
+				p.advance()
+			case api.TokSet:
+				// SET NULL
+				if p.peek.Type == api.TokNull {
+					act = "SET NULL"
+					p.advance()
+					p.advance()
+				} else {
+					break
+				}
+			case api.TokIdent:
+				upper := strings.ToUpper(p.cur.Literal)
+				if upper == "CASCADE" {
+					act = "CASCADE"
+					p.advance()
+				} else if upper == "SET" {
+					// SET NULL
+					if p.peek.Type == api.TokNull {
+						act = "SET NULL"
+						p.advance()
+						p.advance()
+					} else {
+						break
+					}
+				} else if upper == "NO" {
+					// NO ACTION
+					if p.peek.Type == api.TokIdent && strings.ToUpper(p.peek.Literal) == "ACTION" {
+						act = "NO ACTION"
+						p.advance()
+						p.advance()
+					} else {
+						break
+					}
+				} else if upper == "RESTRICT" {
+					act = "RESTRICT"
+					p.advance()
+				} else {
+					break
+				}
+			default:
+				break
+			}
+			if action != nil && act != "" {
+				*action = act
+			}
+		} else {
+			break
+		}
+	}
 }
 
 func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {

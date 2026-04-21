@@ -56,7 +56,8 @@ type TableSchema struct {
 	Columns           []ColumnDef
 	PrimaryKey        string // column name, optional
 	TableID           uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
-	CheckConstraints  []CheckConstraint // table-level CHECK constraints
+	CheckConstraints  []CheckConstraint  // table-level CHECK constraints
+	ForeignKeys       []ForeignKeySchema // foreign key constraints
 }
 
 // ColumnDef describes a single column in a table.
@@ -75,6 +76,16 @@ type ColumnDef struct {
 type CheckConstraint struct {
 	Name   string // optional name, currently unused but reserved for future
 	RawSQL string // the expression text, e.g. "price > 0"
+}
+
+// ForeignKeySchema describes a FOREIGN KEY constraint.
+type ForeignKeySchema struct {
+	Name              string
+	Columns           []string // column names in this table
+	ReferencedTable   string   // referenced table name
+	ReferencedColumns []string // column names in referenced table
+	OnDelete          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
+	OnUpdate          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
 }
 
 // IndexSchema describes an index on a table.
