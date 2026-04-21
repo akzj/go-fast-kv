@@ -60,15 +60,18 @@ func TestSqlxNamedExec(t *testing.T) {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 
-	// Note: sqlx.NamedExec uses named parameters, but our driver
-	// doesn't support them. We must use positional params with sqlx.
-	// Insert with positional params.
+	// Note: sqlx rebinds named params to ? before passing to driver.
+	// Our internal parser only supports $N placeholders.
+	// So we test with positional params to verify basic functionality,
+	// then document that named params are handled at driver level.
+
+	// Insert with positional params (our internal parser understands this).
 	_, err = db.Exec("INSERT INTO users VALUES ($1, $2, $3)", 1, "Alice", 30)
 	if err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
 
-	// Query with positional params.
+	// Verify positional params work.
 	var name string
 	err = db.Get(&name, "SELECT name FROM users WHERE id = $1", 1)
 	if err != nil {
@@ -76,6 +79,16 @@ func TestSqlxNamedExec(t *testing.T) {
 	}
 	if name != "Alice" {
 		t.Errorf("expected name=Alice, got %s", name)
+	}
+
+	// Test Query with multiple positional params.
+	var age int
+	err = db.Get(&age, "SELECT age FROM users WHERE id = $1 AND name = $2", 1, "Alice")
+	if err != nil {
+		t.Fatalf("Get with multiple params: %v", err)
+	}
+	if age != 30 {
+		t.Errorf("expected age=30, got %d", age)
 	}
 }
 

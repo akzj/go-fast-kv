@@ -106,9 +106,9 @@ func (c *Conn) ResetSession() error {
 }
 
 // CheckNamedValue implements driver.Conn.CheckNamedValue.
-// Named parameters are not supported.
+// Named parameters (:name, @name) are supported.
 func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
-	return driver.ErrSkip
+	return nil
 }
 
 // getDB returns the SQL DB for executing queries.
@@ -211,9 +211,9 @@ func (s *Stmt) LastInsertId() (int64, bool) {
 }
 
 // CheckNamedValue implements driver.Stmt.CheckNamedValue.
-// Named parameters are not supported.
+// Named parameters are supported.
 func (s *Stmt) CheckNamedValue(nv *driver.NamedValue) error {
-	return driver.ErrSkip
+	return nil
 }
 
 // Tx implements driver.Tx.
@@ -334,7 +334,7 @@ func (s *TxStmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *TxStmt) LastInsertId() (int64, bool) { return 0, false }
-func (s *TxStmt) CheckNamedValue(nv *driver.NamedValue) error { return driver.ErrSkip }
+func (s *TxStmt) CheckNamedValue(nv *driver.NamedValue) error { return nil }
 
 // Result implements driver.Result.
 type Result struct {

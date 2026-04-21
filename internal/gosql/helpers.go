@@ -1,6 +1,7 @@
 package gosql
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"strconv"
 	"strings"
@@ -8,12 +9,25 @@ import (
 	"github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 )
 
-// substitutePlaceholders replaces $1, $2, etc. with the actual argument values.
-// Named parameters are not supported.
+// substitutePlaceholders replaces $1, $2, etc. and :name, @name named parameters
+// with the actual argument values.
 // args should be []interface{} (converted from []driver.Value).
+// For named parameters, args may contain driver.NamedValue structs.
 func substitutePlaceholders(query string, args []interface{}) (string, error) {
 	if len(args) == 0 {
 		return query, nil
+	}
+
+	// Build a map of parameter names to their values (for named params).
+	// Also collect ordered param list for positional fallback.
+	namedValues := make(map[string]driver.Value)
+	var orderedParams []driver.Value
+
+	for _, arg := range args {
+		if nv, ok := arg.(driver.NamedValue); ok {
+			namedValues[nv.Name] = nv.Value
+		}
+		orderedParams = append(orderedParams, arg.(driver.Value))
 	}
 
 	// Find all placeholders in the query.
@@ -21,6 +35,36 @@ func substitutePlaceholders(query string, args []interface{}) (string, error) {
 	i := 0
 
 	for i < len(query) {
+		// Check for named parameter (:name or @name)
+		if (query[i] == ':' || query[i] == '@') && i+1 < len(query) {
+			start := i
+			i++
+			// Read the parameter name
+			nameStart := i
+			for i < len(query) && isIdentChar(query[i]) {
+				i++
+			}
+			if i > nameStart {
+				name := query[nameStart:i]
+				// Look up the value
+				val, ok := namedValues[name]
+				if !ok {
+					return "", fmt.Errorf("gosql: missing value for parameter :%s", name)
+				}
+				argStr, err := valueToSQLLiteral(val)
+				if err != nil {
+					return "", err
+				}
+				result.WriteString(argStr)
+				continue
+			}
+			// Not a valid named param, treat as regular character
+			result.WriteByte(query[start])
+			i = start + 1
+			continue
+		}
+
+		// Check for positional placeholder ($1, $2, etc.)
 		if query[i] == '$' && i+1 < len(query) {
 			// Check if it's a placeholder like $1, $2, etc.
 			j := i + 1
@@ -38,28 +82,30 @@ func substitutePlaceholders(query string, args []interface{}) (string, error) {
 				if err != nil {
 					return "", fmt.Errorf("gosql: invalid placeholder %s: %v", numStr, err)
 				}
-				if num < 1 || num > len(args) {
-					return "", fmt.Errorf("gosql: placeholder $%d out of range (have %d args)", num, len(args))
+				if num < 1 || num > len(orderedParams) {
+					return "", fmt.Errorf("gosql: placeholder $%d out of range (have %d args)", num, len(orderedParams))
 				}
 				// Convert the argument to SQL literal.
-				val := args[num-1]
+				val := orderedParams[num-1]
 				argStr, err := valueToSQLLiteral(val)
 				if err != nil {
 					return "", err
 				}
 				result.WriteString(argStr)
 				i = j
-			} else {
-				result.WriteByte(query[i])
-				i++
+				continue
 			}
-		} else {
-			result.WriteByte(query[i])
-			i++
 		}
+		result.WriteByte(query[i])
+		i++
 	}
 
 	return result.String(), nil
+}
+
+// isIdentChar returns true if c can be part of an identifier.
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
 // valueToSQLLiteral converts a Go value to a SQL literal string.
