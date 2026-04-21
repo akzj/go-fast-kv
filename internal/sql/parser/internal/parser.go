@@ -496,12 +496,16 @@ func (p *parser) parseSelect() (api.Statement, error) {
 				return nil, err
 			}
 			col := api.SelectColumn{Expr: expr}
-			// Optional AS alias
+			// Optional AS [alias] — supports both "SELECT id AS alias" and "SELECT id alias"
 			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
 				p.advance()
 				if p.cur.Type != api.TokIdent {
 					return nil, p.errorf("expected alias name after AS")
 				}
+				col.Alias = p.cur.Literal
+				p.advance()
+			} else if p.cur.Type == api.TokIdent && isAliasTerminator(p.peek.Type) {
+				// Implicit alias without AS: "SELECT id alias FROM t" or "SELECT id alias, ..."
 				col.Alias = p.cur.Literal
 				p.advance()
 			}
@@ -1716,5 +1720,21 @@ func tokenName(typ api.TokenType) string {
 		return "end of input"
 	default:
 		return "token"
+	}
+}
+
+// isAliasTerminator returns true if token type terminates a column alias without AS.
+func isAliasTerminator(t api.TokenType) bool {
+	switch t {
+	case api.TokFrom, api.TokWhere, api.TokGroup, api.TokHaving,
+		api.TokOrder, api.TokLimit, api.TokOffset, api.TokComma,
+		api.TokRParen, api.TokSemicolon, api.TokEOF, api.TokOn,
+		api.TokJoin, api.TokCross, api.TokLeft, api.TokRight,
+		api.TokUnion, api.TokIntersect, api.TokExcept, api.TokDistinct,
+		api.TokIn, api.TokBetween, api.TokLike, api.TokIs, api.TokNot,
+		api.TokAnd, api.TokOr:
+		return true
+	default:
+		return false
 	}
 }
