@@ -2369,7 +2369,9 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			var key strings.Builder
 			for _, v := range row {
 				if v.IsNull {
-					key.WriteString("NULL")
+					// Use type-aware NULL key to follow SQL standard semantics.
+					// Different NULL types (INT vs TEXT) are not equivalent in comparisons.
+					key.WriteString(fmt.Sprintf("NULL:%d", v.Type))
 				} else {
 					key.WriteString(fmt.Sprintf("%v", v))
 				}
@@ -2408,7 +2410,9 @@ func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, e
 			var key strings.Builder
 			for _, v := range row {
 				if v.IsNull {
-					key.WriteString("NULL")
+					// Use type-aware NULL key to follow SQL standard semantics.
+					// Different NULL types (INT vs TEXT) are not equivalent in comparisons.
+					key.WriteString(fmt.Sprintf("NULL:%d", v.Type))
 				} else {
 					key.WriteString(fmt.Sprintf("%v", v))
 				}

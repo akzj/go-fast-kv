@@ -38,9 +38,14 @@ func (e *executor) scanRows(table *catalogapi.TableSchema, scan plannerapi.ScanP
 
 // scanRowsForDML delegates to scanRows (consolidation: S1).
 // For DML operations, limit/offset are not pushed down (DML affects all matching rows).
+// Batched scan: limit is set to DMLBatchSize so each call returns at most DMLBatchSize rows.
+// Caller must call repeatedly to process all rows. This prevents unbounded memory growth
+// for large table DML operations (e.g., DELETE on a table with millions of rows).
+const DMLBatchSize = 1000
+
 func (e *executor) scanRowsForDML(table *catalogapi.TableSchema, scan plannerapi.ScanPlan,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}) ([]*engineapi.Row, error) {
-	return e.scanRows(table, scan, subqueryResults, 0, 0)
+	return e.scanRows(table, scan, subqueryResults, DMLBatchSize, 0)
 }
 
 // filterRows applies a residual filter to already-scanned rows (used by execSelect for SelectPlan.Filter).
