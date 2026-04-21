@@ -339,6 +339,12 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 	}
 	p.advance()
 
+	// Optional AUTOINCREMENT / SERIAL — can appear before or after PRIMARY KEY
+	if p.cur.Type == api.TokAutoIncrement || p.cur.Type == api.TokSerial {
+		p.advance()
+		col.AutoInc = true
+	}
+
 	// Optional PRIMARY KEY
 	if p.cur.Type == api.TokPrimary {
 		p.advance()
@@ -362,6 +368,12 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		}
 		p.advance()
 		col.NotNull = true
+	}
+
+	// Optional AUTOINCREMENT / SERIAL — marks the column for auto-generated IDs
+	if p.cur.Type == api.TokAutoIncrement || p.cur.Type == api.TokSerial {
+		p.advance()
+		col.AutoInc = true
 	}
 
 	// Optional DEFAULT value

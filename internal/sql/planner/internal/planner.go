@@ -83,7 +83,7 @@ func (p *planner) planCreateTable(stmt *parserapi.CreateTableStmt) (*plannerapi.
 		if err != nil {
 			return nil, err
 		}
-		col := catalogapi.ColumnDef{Name: c.Name, Type: t, NotNull: c.NotNull}
+		col := catalogapi.ColumnDef{Name: c.Name, Type: t, NotNull: c.NotNull, AutoInc: c.AutoInc}
 		// Copy default value if explicitly specified.
 		// Zero value (TypeNull, not IsNull) means no DEFAULT clause.
 		if c.DefaultValue.Type != catalogapi.TypeNull || c.DefaultValue.IsNull {

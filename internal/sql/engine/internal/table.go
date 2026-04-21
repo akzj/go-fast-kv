@@ -213,6 +213,10 @@ func (te *tableEngine) Insert(table *catalogapi.TableSchema, values []catalogapi
 		}
 		rowID = next
 		te.rowCounters[tableID] = next + 1
+		// Update the values slice so the caller gets the auto-generated ID.
+		if pkColIdx >= 0 && pkColIdx < len(values) {
+			values[pkColIdx] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(rowID)}
+		}
 	}
 
 	// Encode and write atomically. Persist the current (possibly updated) counter.
@@ -262,6 +266,16 @@ func (te *tableEngine) InsertInto(table *catalogapi.TableSchema, batch kvstoreap
 			}
 		}
 	}
+	// Also detect AUTOINCREMENT columns that may not have PRIMARY KEY set explicitly.
+	// An AUTOINCREMENT column is always INT and always auto-generates IDs.
+	if pkColIdx < 0 {
+		for i, col := range table.Columns {
+			if col.AutoInc && col.Type == catalogapi.TypeInt {
+				pkColIdx = i
+				break
+			}
+		}
+	}
 
 	if pkColIdx >= 0 && pkColIdx < len(values) && !values[pkColIdx].IsNull {
 		if values[pkColIdx].Int < 0 {
@@ -291,6 +305,10 @@ func (te *tableEngine) InsertInto(table *catalogapi.TableSchema, batch kvstoreap
 		}
 		rowID = next
 		te.rowCounters[tableID] = next + 1
+		// Update the values slice so the caller gets the auto-generated ID.
+		if pkColIdx >= 0 && pkColIdx < len(values) {
+			values[pkColIdx] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(rowID)}
+		}
 	}
 
 	rowKey := te.encoder.EncodeRowKey(tableID, rowID)

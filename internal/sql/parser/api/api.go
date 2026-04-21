@@ -124,8 +124,10 @@ const (
 	TokUpper    TokenType = 98 // UPPER
 	TokLower    TokenType = 99 // LOWER
 	TokLength   TokenType = 100 // LENGTH
-	TokCast     TokenType = 101 // CAST
-	TokQuestion TokenType = 102 // ? placeholder (ODBC style)
+	TokCast           TokenType = 101 // CAST
+	TokQuestion       TokenType = 102 // ? placeholder (ODBC style)
+	TokAutoIncrement  TokenType = 103 // AUTOINCREMENT
+	TokSerial         TokenType = 104 // SERIAL (PostgreSQL alias)
 )
 
 // Token represents a single lexical token.
@@ -543,12 +545,13 @@ func (*ExplainStmt) stmtNode() {}
 
 // ColumnDef represents a column definition in CREATE TABLE (parser's own type).
 type ColumnDef struct {
-	Name        string
-	TypeName    string // "INT", "INTEGER", "TEXT", "FLOAT", "BLOB"
-	PrimaryKey  bool
-	NotNull     bool
-	Unique      bool
+	Name         string
+	TypeName     string // "INT", "INTEGER", "TEXT", "FLOAT", "BLOB"
+	PrimaryKey   bool
+	NotNull      bool
+	Unique       bool
 	DefaultValue catalogapi.Value // DEFAULT value; zero Value means not specified
+	AutoInc      bool              // AUTOINCREMENT flag
 }
 
 // ─── Parser Interface ─────────────────────────────────────────────

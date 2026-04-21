@@ -60,11 +60,12 @@ type TableSchema struct {
 
 // ColumnDef describes a single column in a table.
 type ColumnDef struct {
-	Table       string // table name for qualified column lookups
-	Name        string
-	Type        Type
-	NotNull     bool         // NOT NULL constraint
-	DefaultValue *Value       // DEFAULT value, nil if not specified
+	Table        string // table name for qualified column lookups
+	Name         string
+	Type         Type
+	NotNull      bool          // NOT NULL constraint
+	DefaultValue *Value        // DEFAULT value, nil if not specified
+	AutoInc      bool          // AUTOINCREMENT flag — column gets auto-generated integer IDs
 }
 
 // IndexSchema describes an index on a table.
