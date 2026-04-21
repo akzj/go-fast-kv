@@ -19,6 +19,9 @@ import (
 // ErrExecFailed is returned when plan execution fails.
 var ErrExecFailed = sqlerrors.ErrExecFailed(nil)
 
+// ErrTypeMismatch is returned when a value's type doesn't match the expected type.
+var ErrTypeMismatch = sqlerrors.ErrTypeMismatch("", nil)
+
 // ─── Result ─────────────────────────────────────────────────────────
 
 // Result holds the output of executing a SQL plan.
@@ -46,4 +49,11 @@ type Executor interface {
 	// If txnCtx is nil, behaves identically to Execute.
 	// Use for executing statements inside BEGIN...COMMIT blocks.
 	ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*Result, error)
+
+	// ExecuteWithParams runs a plan with positional parameters ($1, $2, ...).
+	// Params are provided in order (1-indexed mapping).
+	ExecuteWithParams(plan plannerapi.Plan, params []catalogapi.Value) (*Result, error)
+
+	// ExecuteWithTxnAndParams runs a plan with transaction context and positional parameters.
+	ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.TxnContext, params []catalogapi.Value) (*Result, error)
 }

@@ -79,6 +79,15 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalColumnRef(node, row, columns, ex)
 	case *parserapi.Literal:
 		return node.Value, nil
+	case *parserapi.ParamRef:
+		// Resolve positional parameter: $1 → params[0], $2 → params[1], etc.
+		if ex.params == nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: no parameters provided for $%d", executorapi.ErrExecFailed, node.Index)
+		}
+		if node.Index < 1 || node.Index > len(ex.params) {
+			return catalogapi.Value{}, fmt.Errorf("%w: parameter index %d out of range (have %d parameters)", executorapi.ErrExecFailed, node.Index, len(ex.params))
+		}
+		return ex.params[node.Index-1], nil
 	case *parserapi.BinaryExpr:
 		return evalBinaryExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.UnaryExpr:

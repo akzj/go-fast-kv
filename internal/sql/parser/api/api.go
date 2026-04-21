@@ -137,6 +137,7 @@ const (
 	TokSetNull        TokenType = 111 // SET NULL
 	TokNoAction       TokenType = 112 // NO ACTION
 	TokRestrict       TokenType = 113 // RESTRICT
+	TokParam          TokenType = 114 // $1, $2, ... positional parameter
 )
 
 // Token represents a single lexical token.
@@ -513,6 +514,14 @@ func (*AggregateCallExpr) exprNode() {}
 type DefaultExpr struct{}
 
 func (*DefaultExpr) exprNode() {}
+
+// ParamRef: positional parameter reference ($1, $2, ...)
+// Used in prepared statements to bind values at execution time.
+type ParamRef struct {
+	Index int // 1-based index of the parameter
+}
+
+func (*ParamRef) exprNode() {}
 
 // LikeExpr: col LIKE 'pattern'
 type LikeExpr struct {

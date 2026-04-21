@@ -152,6 +152,8 @@ func (l *lexer) nextToken() api.Token {
 	case '?':
 		l.pos++
 		return api.Token{Type: api.TokQuestion, Literal: "?", Pos: startPos}
+	case '$':
+		return l.readParam()
 	case '+':
 		l.pos++
 		return api.Token{Type: api.TokPlus, Literal: "+", Pos: startPos}
@@ -278,6 +280,28 @@ func (l *lexer) readNumber() api.Token {
 		return api.Token{Type: api.TokFloat, Literal: literal, Pos: startPos}
 	}
 	return api.Token{Type: api.TokInteger, Literal: literal, Pos: startPos}
+}
+
+// readParam reads a positional parameter ($1, $2, ...).
+// Returns TokParam with the literal string (e.g., "$1") and the parsed index.
+func (l *lexer) readParam() api.Token {
+	startPos := l.pos
+	l.pos++ // skip '$'
+
+	// Must have at least one digit
+	if l.pos >= len(l.input) || !isDigit(l.input[l.pos]) {
+		// Invalid param (just $ followed by non-digit)
+		return api.Token{Type: api.TokIllegal, Literal: string(l.input[startPos:l.pos]), Pos: startPos}
+	}
+
+	var sb strings.Builder
+	sb.WriteByte('$')
+	for l.pos < len(l.input) && isDigit(l.input[l.pos]) {
+		sb.WriteByte(l.input[l.pos])
+		l.pos++
+	}
+
+	return api.Token{Type: api.TokParam, Literal: sb.String(), Pos: startPos}
 }
 
 // readIdentOrKeyword reads an identifier or keyword.

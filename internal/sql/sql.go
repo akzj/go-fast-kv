@@ -140,6 +140,35 @@ func (db *DB) Query(sql string) (*Result, error) {
 	return db.exec(sql)
 }
 
+// ExecParams executes a SQL statement with positional parameters ($1, $2, ...).
+// Params are provided in order: params[0] = $1, params[1] = $2, etc.
+//
+// Use for: INSERT, UPDATE, DELETE with parameter placeholders.
+//
+// Example:
+//
+//	result, err := db.ExecParams("INSERT INTO users VALUES ($1, $2)", []sql.Value{
+//	    {Type: catalogapi.TypeInt, Int: 1},
+//	    {Type: catalogapi.TypeText, Text: "Alice"},
+//	})
+func (db *DB) ExecParams(sql string, params []catalogapi.Value) (*Result, error) {
+	return db.execParams(sql, params)
+}
+
+// QueryParams executes a SQL query with positional parameters ($1, $2, ...).
+// Params are provided in order: params[0] = $1, params[1] = $2, etc.
+//
+// Use for: SELECT with parameter placeholders.
+//
+// Example:
+//
+//	result, err := db.QueryParams("SELECT * FROM users WHERE age > $1", []sql.Value{
+//	    {Type: catalogapi.TypeInt, Int: 25},
+//	})
+func (db *DB) QueryParams(sql string, params []catalogapi.Value) (*Result, error) {
+	return db.execParams(sql, params)
+}
+
 // Close releases SQL layer resources.
 // Close does NOT close the underlying KV store — the caller
 // is responsible for calling store.Close() separately.
@@ -275,6 +304,49 @@ func (db *DB) exec(sql string) (*Result, error) {
 		return db.executor.ExecuteWithTxn(plan, txnCtx)
 	}
 	return db.executor.Execute(plan)
+}
+
+// execParams executes a SQL statement with positional parameters ($1, $2, ...).
+func (db *DB) execParams(sql string, params []catalogapi.Value) (*Result, error) {
+	if db.closed {
+		return nil, fmt.Errorf("sql: database is closed")
+	}
+	goroutineID := goroutineID()
+	// Get per-goroutine transaction context (if any)
+	var txnCtx txnapi.TxnContext
+	if val, ok := db.txnCtxMap.Load(goroutineID); ok {
+		txnCtx = val.(txnapi.TxnContext)
+	}
+
+	// Parse SQL → AST
+	stmt, err := db.parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+
+	// Plan AST → execution plan
+	plan, err := db.planner.Plan(stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle EXPLAIN: delegate to exec
+	if plan == nil && stmt != nil {
+		if _, ok := stmt.(*parserapi.ExplainStmt); ok {
+			return nil, fmt.Errorf("sql: EXPLAIN not supported with parameters")
+		}
+	}
+
+	// Handle transaction-control statements (no params allowed)
+	if plan == nil && stmt != nil {
+		return nil, fmt.Errorf("sql: transaction control statements not allowed with parameters")
+	}
+
+	// Execute with params
+	if txnCtx != nil {
+		return db.executor.ExecuteWithTxnAndParams(plan, txnCtx, params)
+	}
+	return db.executor.ExecuteWithParams(plan, params)
 }
 
 // SetTxnContext sets the active transaction context for SQL execution.

@@ -123,7 +123,8 @@ func (*AlterTablePlan) planNode() {}
 // InsertPlan inserts rows into a table.
 type InsertPlan struct {
 	Table *catalogapi.TableSchema
-	Rows  [][]catalogapi.Value // resolved values, aligned with table columns
+	Rows  [][]catalogapi.Value   // resolved values, aligned with table columns (for non-parameterized inserts)
+	Exprs [][]parserapi.Expr     // raw expressions for parameterized inserts (nil if Rows is used)
 }
 
 func (*InsertPlan) planNode() {}
@@ -176,7 +177,8 @@ func (*DeletePlan) planNode() {}
 // UpdatePlan updates rows in a table.
 type UpdatePlan struct {
 	Table       *catalogapi.TableSchema
-	Assignments map[int]catalogapi.Value // columnIndex → new literal value
+	Assignments map[int]catalogapi.Value     // columnIndex → resolved literal (for non-parameterized updates)
+	ParamAssignments map[int]parserapi.Expr  // columnIndex → raw expression with ParamRef (for parameterized updates)
 	Scan        ScanPlan
 }
 

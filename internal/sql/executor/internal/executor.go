@@ -45,6 +45,8 @@ type executor struct {
 	outerVals []catalogapi.Value
 	// TxnContext provides row-level locking for SELECT FOR UPDATE
 	txnCtx txnapi.TxnContext
+	// params holds positional parameter values ($1, $2, ...) for prepared statements
+	params []catalogapi.Value
 }
 
 // New creates a new Executor.
@@ -119,6 +121,84 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
 	// within this transaction use the same snapshot. This provides true snapshot
 	// isolation: two SELECTs within the same BEGIN...COMMIT see the same state.
+	if txnCtx != nil {
+		snap := txnCtx.Snapshot()
+		if snap != nil {
+			e.store.RegisterSnapshot(txnCtx.XID(), snap)
+			defer e.store.UnregisterSnapshot(txnCtx.XID())
+		}
+	}
+
+	switch p := plan.(type) {
+	case *plannerapi.CreateTablePlan:
+		return e.execCreateTable(p)
+	case *plannerapi.DropTablePlan:
+		return e.execDropTable(p)
+	case *plannerapi.CreateIndexPlan:
+		return e.execCreateIndex(p)
+	case *plannerapi.DropIndexPlan:
+		return e.execDropIndex(p)
+	case *plannerapi.InsertPlan:
+		return e.execInsert(p)
+	case *plannerapi.InsertSelectPlan:
+		return e.execInsertSelect(p)
+	case *plannerapi.SelectPlan:
+		if p.Join != nil {
+			return e.execJoinSelect(p)
+		}
+		return e.execSelect(p)
+	case *plannerapi.JoinPlan:
+		return e.execJoin(p)
+	case *plannerapi.DeletePlan:
+		return e.execDelete(p)
+	case *plannerapi.UpdatePlan:
+		return e.execUpdate(p)
+	case *plannerapi.UnionPlan:
+		return e.execUnion(p)
+	case *plannerapi.IntersectPlan:
+		return e.execIntersect(p)
+	case *plannerapi.ExceptPlan:
+		return e.execExcept(p)
+	case *plannerapi.ExplainPlan:
+		return e.execExplain(p)
+	case *plannerapi.AlterTablePlan:
+		return e.execAlterTable(p)
+	default:
+		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
+	}
+}
+
+// ExecuteWithParams executes a plan with positional parameters ($1, $2, ...).
+// Params are provided in order (1-indexed mapping: params[0] = $1).
+func (e *executor) ExecuteWithParams(plan plannerapi.Plan, params []catalogapi.Value) (*executorapi.Result, error) {
+	return e.ExecuteWithTxnAndParams(plan, nil, params)
+}
+
+// ExecuteWithTxnAndParams executes a plan with transaction context and positional parameters.
+func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.TxnContext, params []catalogapi.Value) (*executorapi.Result, error) {
+	// Set params for this execution
+	e.params = params
+	// Panic recovery: rollback transaction and re-panic so caller knows.
+	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
+	defer func() {
+		if r := recover(); r != nil {
+			if txnCtx != nil {
+				txnCtx.Rollback()
+			}
+			panic(r)
+		}
+	}()
+	// Ensure cleanup on any exit path — runs after panic recovery.
+	defer func() {
+		e.txnCtx = nil
+		e.params = nil
+	}()
+
+	// Set transaction context for row locking
+	e.txnCtx = txnCtx
+
+	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
+	// within this transaction use the same snapshot.
 	if txnCtx != nil {
 		snap := txnCtx.Snapshot()
 		if snap != nil {
@@ -533,6 +613,11 @@ func (e *executor) execDropIndex(plan *plannerapi.DropIndexPlan) (*executorapi.R
 // ─── DML Execution ──────────────────────────────────────────────────
 
 func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result, error) {
+	// Handle parameterized INSERT (when Exprs is set)
+	if len(plan.Exprs) > 0 {
+		return e.execInsertParameterized(plan, nil)
+	}
+
 	// Get indexes for this table (to maintain index entries)
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
 	if err != nil {
@@ -679,6 +764,199 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	}
 
 	return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
+}
+
+// execInsertParameterized handles INSERT with ParamRef expressions (resolved at execution time).
+func (e *executor) execInsertParameterized(plan *plannerapi.InsertPlan, columns []string) (*executorapi.Result, error) {
+	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if e.txnCtx != nil {
+		// Transactional path
+		xid := e.txnCtx.XID()
+		for i, exprRow := range plan.Exprs {
+			resolved, err := e.resolveInsertRowParameterized(plan.Table, columns, exprRow)
+			if err != nil {
+				return nil, fmt.Errorf("row %d: %w", i+1, err)
+			}
+
+			// Check constraints
+			if err := checkNotNullConstraint(plan.Table.Columns, resolved); err != nil {
+				return nil, err
+			}
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, resolved, 0); err != nil {
+				return nil, err
+			}
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, resolved, plan.Table.CheckConstraints); err != nil {
+				return nil, err
+			}
+			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, resolved, plan.Table.ForeignKeys); err != nil {
+				return nil, err
+			}
+
+			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
+			if err != nil {
+				return nil, fmt.Errorf("%w: alloc rowid: %v", executorapi.ErrExecFailed, err)
+			}
+
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, rowID)
+			rowVal := e.tableEngine.EncodeRow(resolved)
+			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+				return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+			}
+			e.txnCtx.AddPendingWrite(rowKey, nil)
+
+			// Write index entries
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 {
+					continue
+				}
+				val := resolved[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey, nil)
+			}
+		}
+
+		// Persist counter
+		e.tableEngine.IncrementCounter(plan.Table.TableID)
+		metaKey := encodeMetaKeyLocal(plan.Table.TableID)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(plan.Table.TableID))
+		if err := e.store.PutWithXID(metaKey, buf, xid); err != nil {
+			return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+		}
+		e.txnCtx.AddPendingWrite(metaKey, nil)
+
+		return &executorapi.Result{RowsAffected: int64(len(plan.Exprs))}, nil
+	}
+
+	// Non-transactional path
+	batch := e.store.NewWriteBatch()
+	for i, exprRow := range plan.Exprs {
+		resolved, err := e.resolveInsertRowParameterized(plan.Table, columns, exprRow)
+		if err != nil {
+			return nil, fmt.Errorf("row %d: %w", i+1, err)
+		}
+
+		// Check constraints
+		if err := checkNotNullConstraint(plan.Table.Columns, resolved); err != nil {
+			return nil, err
+		}
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, resolved, 0); err != nil {
+			return nil, err
+		}
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, resolved, plan.Table.CheckConstraints); err != nil {
+			return nil, err
+		}
+		if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, resolved, plan.Table.ForeignKeys); err != nil {
+			return nil, err
+		}
+
+		rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
+		if err != nil {
+			batch.Discard()
+			return nil, fmt.Errorf("%w: alloc rowid: %v", executorapi.ErrExecFailed, err)
+		}
+
+		rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, rowID)
+		rowVal := e.tableEngine.EncodeRow(resolved)
+		if err := batch.Put(rowKey, rowVal); err != nil {
+			batch.Discard()
+			return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Write index entries
+		for _, idx := range indexes {
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+			if colIdx < 0 {
+				continue
+			}
+			val := resolved[colIdx]
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+	}
+
+	if err := e.tableEngine.PersistCounter(batch, plan.Table.TableID); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: int64(len(plan.Exprs))}, nil
+}
+
+// resolveInsertRowParameterized resolves INSERT VALUES expressions with ParamRefs.
+func (e *executor) resolveInsertRowParameterized(tbl *catalogapi.TableSchema, columns []string, exprs []parserapi.Expr) ([]catalogapi.Value, error) {
+	numCols := len(tbl.Columns)
+
+	if len(columns) > 0 {
+		if len(columns) != len(exprs) {
+			return nil, plannerapi.ErrColumnCountMismatch
+		}
+		values := make([]catalogapi.Value, numCols)
+		for i := range values {
+			values[i] = catalogapi.Value{IsNull: true}
+		}
+		for i, colName := range columns {
+			idx := findColumnIndex(tbl, colName)
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, colName)
+			}
+			val, err := evalExpr(exprs[i], nil, tbl.Columns, nil, e)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := exprs[i].(*parserapi.DefaultExpr); ok {
+				if tbl.Columns[idx].DefaultValue != nil {
+					val = *tbl.Columns[idx].DefaultValue
+				}
+			}
+			if !val.IsNull {
+				if err := checkType(val, tbl.Columns[idx].Type); err != nil {
+					return nil, fmt.Errorf("column %s: %w", colName, err)
+				}
+			}
+			values[idx] = val
+		}
+		return values, nil
+	}
+
+	if len(exprs) != numCols {
+		return nil, plannerapi.ErrColumnCountMismatch
+	}
+	values := make([]catalogapi.Value, numCols)
+	for i, expr := range exprs {
+		val, err := evalExpr(expr, nil, tbl.Columns, nil, e)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := expr.(*parserapi.DefaultExpr); ok {
+			if tbl.Columns[i].DefaultValue != nil {
+				val = *tbl.Columns[i].DefaultValue
+			}
+		}
+		if !val.IsNull {
+			if err := checkType(val, tbl.Columns[i].Type); err != nil {
+				return nil, fmt.Errorf("column %d: %w", i+1, err)
+			}
+		}
+		values[i] = val
+	}
+	return values, nil
 }
 
 func (e *executor) execInsertSelect(plan *plannerapi.InsertSelectPlan) (*executorapi.Result, error) {
@@ -2645,6 +2923,179 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 	}, nil
 }
 
+// execUpdateParameterized handles UPDATE with ParamRef expressions (resolved at execution time).
+func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*executorapi.Result, error) {
+	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Build set of changed column indices for index maintenance
+	changedCols := make(map[int]bool, len(plan.ParamAssignments))
+	for colIdx := range plan.ParamAssignments {
+		changedCols[colIdx] = true
+	}
+
+	rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var count int64
+
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for _, row := range rows {
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+			oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
+			// Delete old index entries
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 || !changedCols[colIdx] {
+					continue
+				}
+				oldVal := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
+				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey, nil)
+			}
+
+			// Resolve parameter expressions
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			for colIdx, expr := range plan.ParamAssignments {
+				val, err := evalExpr(expr, row, plan.Table.Columns, nil, e)
+				if err != nil {
+					return nil, fmt.Errorf("SET: %w", err)
+				}
+				if !val.IsNull {
+					if err := checkType(val, plan.Table.Columns[colIdx].Type); err != nil {
+						return nil, fmt.Errorf("SET %s: %w", plan.Table.Columns[colIdx].Name, err)
+					}
+				}
+				newValues[colIdx] = val
+			}
+
+			// Check constraints
+			if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+				return nil, err
+			}
+			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues, row.RowID); err != nil {
+				return nil, err
+			}
+			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
+				return nil, err
+			}
+			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
+				return nil, err
+			}
+
+			// Update row
+			rowVal := e.tableEngine.EncodeRow(newValues)
+			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+				return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+			}
+			e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
+
+			// Insert new index entries
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+				if colIdx < 0 || !changedCols[colIdx] {
+					continue
+				}
+				newVal := newValues[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
+				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(idxKey, nil)
+			}
+			count++
+		}
+		return &executorapi.Result{RowsAffected: count}, nil
+	}
+
+	// Non-transactional path
+	batch := e.store.NewWriteBatch()
+	for _, row := range rows {
+		rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+
+		// Delete old index entries
+		for _, idx := range indexes {
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+			if colIdx < 0 || !changedCols[colIdx] {
+				continue
+			}
+			oldVal := row.Values[colIdx]
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
+			if err := batch.Delete(idxKey); err != nil && err != kvstoreapi.ErrKeyNotFound {
+				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+
+		// Resolve parameter expressions
+		newValues := make([]catalogapi.Value, len(row.Values))
+		copy(newValues, row.Values)
+		for colIdx, expr := range plan.ParamAssignments {
+			val, err := evalExpr(expr, row, plan.Table.Columns, nil, e)
+			if err != nil {
+				return nil, fmt.Errorf("SET: %w", err)
+			}
+			if !val.IsNull {
+				if err := checkType(val, plan.Table.Columns[colIdx].Type); err != nil {
+					return nil, fmt.Errorf("SET %s: %w", plan.Table.Columns[colIdx].Name, err)
+				}
+			}
+			newValues[colIdx] = val
+		}
+
+		// Check constraints
+		if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+			return nil, err
+		}
+		if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues, row.RowID); err != nil {
+			return nil, err
+		}
+		if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
+			return nil, err
+		}
+		if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
+			return nil, err
+		}
+
+		// Update row
+		rowVal := e.tableEngine.EncodeRow(newValues)
+		if err := batch.Put(rowKey, rowVal); err != nil {
+			return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Insert new index entries
+		for _, idx := range indexes {
+			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+			if colIdx < 0 || !changedCols[colIdx] {
+				continue
+			}
+			newVal := newValues[colIdx]
+			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+		count++
+	}
+
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: count}, nil
+}
+
 // execDelete deletes rows from a table. It iterates until all rows are deleted,
 // scanning in batches to handle tables with more rows than any single scan can return.
 // This ensures DELETE without WHERE deletes ALL rows, not just the first batch.
@@ -2746,6 +3197,11 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 }
 
 func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result, error) {
+	// Handle parameterized UPDATE (when ParamAssignments is set)
+	if len(plan.ParamAssignments) > 0 {
+		return e.execUpdateParameterized(plan)
+	}
+
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
 	if err != nil {
@@ -3495,6 +3951,18 @@ func explainPlanDescription(plan plannerapi.Plan, analyze bool) string {
 		inner = fmt.Sprintf("%T", plan)
 	}
 	return prefix + "\n└─ " + inner
+}
+
+// checkType validates that a value's type matches the expected column type.
+// NULL values always pass (they're valid for any column type in Phase 1).
+func checkType(val catalogapi.Value, expected catalogapi.Type) error {
+	if val.IsNull {
+		return nil
+	}
+	if val.Type != expected {
+		return fmt.Errorf("%w: expected %v, got %v", executorapi.ErrTypeMismatch, expected, val.Type)
+	}
+	return nil
 }
 
 // checkNotNullConstraint validates that all NOT NULL columns have non-NULL values.

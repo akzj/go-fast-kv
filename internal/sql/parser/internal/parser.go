@@ -19,6 +19,8 @@ type parser struct {
 	cur   api.Token // current token
 	peek  api.Token // lookahead token
 	depth int       // recursion depth for stack overflow prevention
+	// questionCount tracks ? placeholder position for sequential numbering
+	questionCount int
 }
 
 // valToValue converts a parser Literal expression to a catalog Value.
@@ -39,6 +41,7 @@ func (p *parser) Parse(sql string) (api.Statement, error) {
 	p.lex = newLexer(sql)
 	p.cur = p.lex.nextToken()
 	p.peek = p.lex.nextToken()
+	p.questionCount = 0 // reset ? placeholder counter
 
 	stmt, err := p.parseStatement()
 	if err != nil {
@@ -2273,6 +2276,28 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 
 	case api.TokCase:
 		return p.parseCaseExpr()
+
+	case api.TokParam:
+		// $1, $2, ... positional parameter
+		lit := p.cur.Literal
+		p.advance()
+		if len(lit) < 2 || lit[0] != '$' {
+			return nil, p.errorf("invalid parameter: %s", lit)
+		}
+		index, err := strconv.Atoi(lit[1:])
+		if err != nil {
+			return nil, p.errorf("invalid parameter index: %s", lit[1:])
+		}
+		if index < 1 {
+			return nil, p.errorf("parameter index must be >= 1: %d", index)
+		}
+		return &api.ParamRef{Index: index}, nil
+
+	case api.TokQuestion:
+		// ? placeholder (ODBC style) — sequential numbering based on occurrence
+		p.questionCount++
+		p.advance()
+		return &api.ParamRef{Index: p.questionCount}, nil
 
 	default:
 		return nil, p.errorf("expected expression")

@@ -332,6 +332,26 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 		}, nil
 	}
 
+	// Check if any expression contains a ParamRef (needs execution-time resolution)
+	hasParams := false
+	for _, exprRow := range stmt.Values {
+		for _, expr := range exprRow {
+			if _, ok := expr.(*parserapi.ParamRef); ok {
+				hasParams = true
+				break
+			}
+		}
+		if hasParams {
+			break
+		}
+	}
+
+	if hasParams {
+		// Store raw expressions for parameterized insert
+		return &plannerapi.InsertPlan{Table: tbl, Exprs: stmt.Values}, nil
+	}
+
+	// Non-parameterized: resolve literals at planning time
 	rows := make([][]catalogapi.Value, len(stmt.Values))
 	for i, exprRow := range stmt.Values {
 		resolved, err := p.resolveInsertRow(tbl, stmt.Columns, exprRow)
@@ -1289,6 +1309,33 @@ func (p *planner) planUpdate(stmt *parserapi.UpdateStmt) (*plannerapi.UpdatePlan
 		return nil, err
 	}
 
+	// Check if any assignment contains a ParamRef (needs execution-time resolution)
+	hasParams := false
+	for _, a := range stmt.Assignments {
+		if _, ok := a.Value.(*parserapi.ParamRef); ok {
+			hasParams = true
+			break
+		}
+	}
+
+	if hasParams {
+		// Store raw expressions for parameterized update
+		paramAssignments := make(map[int]parserapi.Expr, len(stmt.Assignments))
+		for _, a := range stmt.Assignments {
+			idx := findColumnIndex(tbl, a.Column)
+			if idx < 0 {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrColumnNotFound, a.Column)
+			}
+			paramAssignments[idx] = a.Value
+		}
+		scan, _, err := p.planScan(tbl, stmt.Where)
+		if err != nil {
+			return nil, err
+		}
+		return &plannerapi.UpdatePlan{Table: tbl, ParamAssignments: paramAssignments, Scan: scan}, nil
+	}
+
+	// Non-parameterized: resolve literals at planning time
 	assignments := make(map[int]catalogapi.Value, len(stmt.Assignments))
 	for _, a := range stmt.Assignments {
 		idx := findColumnIndex(tbl, a.Column)
