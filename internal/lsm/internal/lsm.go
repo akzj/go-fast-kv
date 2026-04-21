@@ -727,7 +727,9 @@ func (s *lsm) MaybeCompact() error {
 	if l0Count > Level0Capacity {
 		l0Segments := s.manifest.GetSegmentsByLevel(0)
 		if len(l0Segments) > 0 {
-			// Pick the oldest L0 SSTable (first in list)
+			// Pick the oldest L0 SSTable (first in list).
+			// NOTE: L0 segments are ordered newest-first in the manifest,
+			// so index 0 is the oldest (most eligible for compaction).
 			s.runLevelCompaction(l0Segments[0])
 		}
 	}

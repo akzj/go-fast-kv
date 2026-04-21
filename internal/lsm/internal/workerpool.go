@@ -33,8 +33,20 @@ func newWorkerPool(workers int) *workerPool {
 }
 
 // Submit adds a task to the pool. Blocks if the task queue is full.
+// For non-blocking submission, use TrySubmit.
 func (p *workerPool) Submit(task func()) {
 	p.tasks <- task
+}
+
+// TrySubmit attempts to submit a task without blocking.
+// Returns true if the task was submitted, false if the queue is full.
+func (p *workerPool) TrySubmit(task func()) bool {
+	select {
+	case p.tasks <- task:
+		return true
+	default:
+		return false
+	}
 }
 
 // Wait waits for all submitted tasks to complete.
