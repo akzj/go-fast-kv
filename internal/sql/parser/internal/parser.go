@@ -78,6 +78,10 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseCommit()
 	case api.TokRollback:
 		return p.parseRollback()
+	case api.TokSavepoint:
+		return p.parseSavepoint()
+	case api.TokRelease:
+		return p.parseRelease()
 	case api.TokAlter:
 		return p.parseAlterTable()
 	default:
@@ -97,7 +101,62 @@ func (p *parser) parseCommit() (api.Statement, error) {
 
 func (p *parser) parseRollback() (api.Statement, error) {
 	p.advance() // consume ROLLBACK
+	// Check for ROLLBACK TO SAVEPOINT name
+	if p.cur.Type == api.TokTo || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "TO") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume TO
+		} else {
+			p.advance() // consume TokTo
+		}
+		// Expect SAVEPOINT
+		if p.cur.Type != api.TokSavepoint && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "SAVEPOINT") {
+			return nil, p.errorf("expected SAVEPOINT after ROLLBACK TO")
+		}
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume SAVEPOINT
+		} else {
+			p.advance() // consume TokSavepoint
+		}
+		// Savepoint name
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected savepoint name")
+		}
+		name := p.cur.Literal
+		p.advance()
+		return &api.RollbackToSavepointStmt{Name: name}, nil
+	}
 	return &api.RollbackStmt{}, nil
+}
+
+func (p *parser) parseSavepoint() (api.Statement, error) {
+	p.advance() // consume SAVEPOINT
+	// Savepoint name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected savepoint name")
+	}
+	name := p.cur.Literal
+	p.advance()
+	return &api.SavepointStmt{Name: name}, nil
+}
+
+func (p *parser) parseRelease() (api.Statement, error) {
+	p.advance() // consume RELEASE
+	// Expect SAVEPOINT
+	if p.cur.Type != api.TokSavepoint && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "SAVEPOINT") {
+		return nil, p.errorf("expected SAVEPOINT after RELEASE")
+	}
+	if p.cur.Type == api.TokIdent {
+		p.advance() // consume SAVEPOINT
+	} else {
+		p.advance() // consume TokSavepoint
+	}
+	// Savepoint name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected savepoint name")
+	}
+	name := p.cur.Literal
+	p.advance()
+	return &api.ReleaseSavepointStmt{Name: name}, nil
 }
 
 // ─── ALTER TABLE ──────────────────────────────────────────────────

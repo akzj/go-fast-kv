@@ -129,6 +129,8 @@ const (
 	TokAutoIncrement  TokenType = 103 // AUTOINCREMENT
 	TokSerial         TokenType = 104 // SERIAL (PostgreSQL alias)
 	TokCheck          TokenType = 105 // CHECK constraint
+	TokSavepoint      TokenType = 106 // SAVEPOINT
+	TokRelease        TokenType = 107 // RELEASE
 )
 
 // Token represents a single lexical token.
@@ -319,6 +321,27 @@ func (*CommitStmt) stmtNode() {}
 type RollbackStmt struct{}
 
 func (*RollbackStmt) stmtNode() {}
+
+// SavepointStmt: SAVEPOINT name
+type SavepointStmt struct {
+	Name string
+}
+
+func (*SavepointStmt) stmtNode() {}
+
+// RollbackToSavepointStmt: ROLLBACK TO SAVEPOINT name
+type RollbackToSavepointStmt struct {
+	Name string
+}
+
+func (*RollbackToSavepointStmt) stmtNode() {}
+
+// ReleaseSavepointStmt: RELEASE SAVEPOINT name
+type ReleaseSavepointStmt struct {
+	Name string
+}
+
+func (*ReleaseSavepointStmt) stmtNode() {}
 
 // SelectColumn represents a single column in a SELECT list.
 type SelectColumn struct {

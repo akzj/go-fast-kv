@@ -265,6 +265,25 @@ func (tm *TxnManager) MarkInProgressAsAborted() {
 	}
 }
 
+// ─── Savepoint ─────────────────────────────────────────────────────
+
+// pendingWrite stores a key modified in this transaction, along with its
+// pre-write value for savepoint rollback.
+// preValue is non-nil for UPDATE/DELETE (the encoded row before modification).
+// nil for INSERT (nothing to restore — just delete on rollback).
+type pendingWrite struct {
+	key      []byte
+	preValue []byte // nil for INSERT, non-nil for UPDATE/DELETE
+}
+
+// savepoint stores the transaction state at a point in time.
+// It is used to implement nested transactions via SAVEPOINT/ROLLBACK TO.
+type savepoint struct {
+	Name          string
+	Snap          *api.Snapshot    // snapshot at savepoint creation
+	PendingWrites []pendingWrite   // keys written since this savepoint
+}
+
 // ─── TxnContext Implementation ──────────────────────────────────────
 
 // txnContext implements api.TxnContext for SQL-layer transactions.
@@ -275,7 +294,12 @@ type txnContext struct {
 	lockMgr       rowlock.LockManager
 	lockTimeoutMs int64
 	active        bool
-	pendingWrites [][]byte // keys modified within this transaction, for rollback
+	pendingWrites []pendingWrite // writes within this transaction, for rollback
+
+	// Savepoint stack for nested transactions.
+	// Savepoints are ordered: earlier savepoints are at lower indices.
+	// RollbackToSavepoint pops everything after the named savepoint.
+	savepoints []savepoint
 }
 
 func (tc *txnContext) XID() uint64 {
@@ -326,18 +350,140 @@ func (tc *txnContext) IsActive() bool {
 }
 
 // AddPendingWrite records a key that was modified within this transaction.
-// Used by the SQL executor to track writes for potential rollback.
+// preValue is nil for INSERT (nothing to restore on rollback).
+// preValue is non-nil for UPDATE/DELETE (the encoded old row to restore on rollback).
 // Keys are stored in insertion order (first write first).
-func (tc *txnContext) AddPendingWrite(key []byte) {
-	tc.pendingWrites = append(tc.pendingWrites, append([]byte(nil), key...))
+func (tc *txnContext) AddPendingWrite(key []byte, preValue []byte) {
+	pw := pendingWrite{
+		key: append([]byte(nil), key...),
+	}
+	if preValue != nil {
+		pw.preValue = append([]byte(nil), preValue...)
+	}
+	tc.pendingWrites = append(tc.pendingWrites, pw)
 }
 
 // GetPendingWrites returns a copy of all keys modified within this transaction.
 // Used by Tx.Rollback() to iterate pending keys and call store.DeleteWithXID.
 func (tc *txnContext) GetPendingWrites() [][]byte {
 	result := make([][]byte, len(tc.pendingWrites))
-	copy(result, tc.pendingWrites)
+	for i, pw := range tc.pendingWrites {
+		result[i] = pw.key
+	}
 	return result
+}
+
+// GetSavepoints returns the current savepoint stack (for testing/debugging).
+func (tc *txnContext) GetSavepoints() []string {
+	names := make([]string, len(tc.savepoints))
+	for i, sp := range tc.savepoints {
+		names[i] = sp.Name
+	}
+	return names
+}
+
+// CreateSavepoint creates a new named savepoint.
+// The snapshot and pending writes at this point are saved.
+func (tc *txnContext) CreateSavepoint(name string) error {
+	if !tc.active {
+		return fmt.Errorf("txn: cannot create savepoint on inactive transaction")
+	}
+	// Deep copy the snapshot
+	snapCopy := &api.Snapshot{
+		XID:        tc.snap.XID,
+		Xmin:       tc.snap.Xmin,
+		Xmax:       tc.snap.Xmax,
+		ActiveXIDs: make(map[uint64]struct{}, len(tc.snap.ActiveXIDs)),
+	}
+	for k, v := range tc.snap.ActiveXIDs {
+		snapCopy.ActiveXIDs[k] = v
+	}
+	// Deep copy pending writes at this point
+	pwCopy := make([]pendingWrite, len(tc.pendingWrites))
+	for i, w := range tc.pendingWrites {
+		pwCopy[i] = pendingWrite{
+			key:      append([]byte(nil), w.key...),
+			preValue: append([]byte(nil), w.preValue...),
+		}
+	}
+	tc.savepoints = append(tc.savepoints, savepoint{
+		Name:          name,
+		Snap:          snapCopy,
+		PendingWrites: pwCopy,
+	})
+	return nil
+}
+
+// RollbackToSavepoint rolls back to a named savepoint.
+// All writes made after the savepoint are undone:
+//   - For INSERT (preValue==nil): key is deleted with this XID (invisible).
+//   - For UPDATE/DELETE (preValue!=nil): key is restored to preValue.
+// The savepoint itself is NOT removed (can be rolled back to again).
+func (tc *txnContext) RollbackToSavepoint(name string, store interface {
+	DeleteWithXID(key []byte, xid uint64) error
+	PutWithXID(key, value []byte, xid uint64) error
+}) error {
+	if !tc.active {
+		return fmt.Errorf("tx: cannot rollback to savepoint on inactive transaction")
+	}
+	// Find the savepoint by name
+	idx := -1
+	for i, sp := range tc.savepoints {
+		if sp.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("tx: savepoint %q not found", name)
+	}
+	sp := tc.savepoints[idx]
+	// Undo writes made after this savepoint (in reverse order).
+	// Iterate from the end of pendingWrites down to sp.PendingWrites length.
+	for i := len(tc.pendingWrites) - 1; i >= len(sp.PendingWrites); i-- {
+		pw := tc.pendingWrites[i]
+		if pw.preValue == nil {
+			// INSERT: just delete the key (it shouldn't exist in the pre-savepoint state)
+			store.(interface {
+				DeleteWithXID(key []byte, xid uint64) error
+			}).DeleteWithXID(pw.key, tc.xid)
+		} else {
+			// UPDATE or DELETE: restore the pre-value (the old row/image)
+			// For DELETE: preValue==the pre-deleted value → restores the row.
+			// For UPDATE: preValue==the old row value → restores the previous version.
+			store.(interface {
+				PutWithXID(key, value []byte, xid uint64) error
+			}).PutWithXID(pw.key, pw.preValue, tc.xid)
+		}
+	}
+	// Restore pending writes to savepoint state
+	tc.pendingWrites = make([]pendingWrite, len(sp.PendingWrites))
+	copy(tc.pendingWrites, sp.PendingWrites)
+	return nil
+}
+
+// ReleaseSavepoint removes a named savepoint.
+// Writes made within the savepoint are kept (committed to the transaction).
+// An error is returned if the savepoint does not exist.
+func (tc *txnContext) ReleaseSavepoint(name string) error {
+	if !tc.active {
+		return fmt.Errorf("tx: cannot release savepoint on inactive transaction")
+	}
+	// Find and remove the savepoint
+	newList := make([]savepoint, 0, len(tc.savepoints))
+	found := false
+	for _, sp := range tc.savepoints {
+		if sp.Name == name {
+			found = true
+			continue // skip this one (remove it)
+		}
+		newList = append(newList, sp)
+	}
+	if !found {
+		return fmt.Errorf("tx: savepoint %q not found", name)
+	}
+	tc.savepoints = newList
+	return nil
 }
 
 // BeginTxnContext starts a new SQL transaction with row-level locking.

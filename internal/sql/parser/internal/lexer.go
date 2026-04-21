@@ -97,6 +97,8 @@ var keywords = map[string]api.TokenType{
 	"AUTO_INCREMENT": api.TokAutoIncrement,
 	"SERIAL":      api.TokSerial,
 	"CHECK":       api.TokCheck,
+	"SAVEPOINT":   api.TokSavepoint,
+	"RELEASE":     api.TokRelease,
 }
 
 // lexer tokenizes SQL input.

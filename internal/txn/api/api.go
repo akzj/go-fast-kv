@@ -335,11 +335,25 @@ type TxnContext interface {
 	Rollback()
 	IsActive() bool
 	// AddPendingWrite records a key modified within this transaction.
+	// preValue is nil for INSERT; non-nil for UPDATE/DELETE (old row data for restore).
 	// Used by SQL executor to track writes for rollback.
-	AddPendingWrite(key []byte)
+	AddPendingWrite(key []byte, preValue []byte)
 	// GetPendingWrites returns all keys modified within this transaction.
 	// Used by Tx.Rollback() to call store.DeleteWithXID for each.
 	GetPendingWrites() [][]byte
+	// Savepoint management:
+	// CreateSavepoint creates a named savepoint for partial rollback.
+	CreateSavepoint(name string) error
+	// RollbackToSavepoint rolls back to a named savepoint.
+	// For INSERT: deletes the key. For UPDATE/DELETE: restores preValue.
+	RollbackToSavepoint(name string, store interface {
+		DeleteWithXID(key []byte, xid uint64) error
+		PutWithXID(key, value []byte, xid uint64) error
+	}) error
+	// ReleaseSavepoint removes a named savepoint (writes become permanent).
+	ReleaseSavepoint(name string) error
+	// GetSavepoints returns the current savepoint stack (for debugging/testing).
+	GetSavepoints() []string
 }
 
 // TxnContextFactory creates TxnContext instances.

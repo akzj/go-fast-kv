@@ -243,6 +243,29 @@ func (db *DB) exec(sql string) (*Result, error) {
 			db.store.ClearActiveTxnContext()
 			db.txnCtxMap.Delete(goroutineID)
 			return &executorapi.Result{}, err
+
+		case *parserapi.SavepointStmt:
+			if txnCtx == nil {
+				return nil, fmt.Errorf("sql: no active transaction for SAVEPOINT")
+			}
+			err := txnCtx.CreateSavepoint(stmt.(*parserapi.SavepointStmt).Name)
+			return &executorapi.Result{}, err
+
+		case *parserapi.RollbackToSavepointStmt:
+			if txnCtx == nil {
+				return nil, fmt.Errorf("sql: no active transaction for ROLLBACK TO SAVEPOINT")
+			}
+			name := stmt.(*parserapi.RollbackToSavepointStmt).Name
+			err := txnCtx.RollbackToSavepoint(name, db.store)
+			return &executorapi.Result{}, err
+
+		case *parserapi.ReleaseSavepointStmt:
+			if txnCtx == nil {
+				return nil, fmt.Errorf("sql: no active transaction for RELEASE SAVEPOINT")
+			}
+			name := stmt.(*parserapi.ReleaseSavepointStmt).Name
+			err := txnCtx.ReleaseSavepoint(name)
+			return &executorapi.Result{}, err
 		}
 	}
 

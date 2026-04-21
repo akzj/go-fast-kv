@@ -572,7 +572,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
 				return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
 			}
-			e.txnCtx.AddPendingWrite(rowKey)
+			e.txnCtx.AddPendingWrite(rowKey, nil) // nil preValue: INSERT rollback = delete
 
 			// Write index entries with same XID.
 			for _, idx := range indexes {
@@ -585,7 +585,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 				}
-				e.txnCtx.AddPendingWrite(idxKey)
+				e.txnCtx.AddPendingWrite(idxKey, nil) // nil preValue: rollback = delete
 			}
 		}
 
@@ -599,7 +599,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		if err := e.store.PutWithXID(metaKey, buf, xid); err != nil {
 			return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
 		}
-		e.txnCtx.AddPendingWrite(metaKey)
+		e.txnCtx.AddPendingWrite(metaKey, nil) // nil preValue: rollback = delete
 
 		return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
 	}
@@ -2660,6 +2660,9 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				break // No more rows to delete
 			}
 			for _, row := range rows {
+				// Get old encoded row data for savepoint rollback.
+				oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
 				// Delete index entries with transaction's XID.
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
@@ -2671,7 +2674,7 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 					if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 						return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 					}
-					e.txnCtx.AddPendingWrite(idxKey)
+					e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
 				}
 
 				// Delete row with transaction's XID.
@@ -2679,7 +2682,7 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				if err := e.store.DeleteWithXID(rowKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
 				}
-				e.txnCtx.AddPendingWrite(rowKey)
+				e.txnCtx.AddPendingWrite(rowKey, oldRowVal) // store old row for rollback restore
 				count++
 			}
 		}
@@ -2766,6 +2769,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for _, row := range rows {
+			// Capture old row key and pre-value BEFORE any modifications.
+			// This is needed for savepoint rollback to restore the original row.
+			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
+			oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
 			// Delete old index entries for changed columns with transaction's XID.
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
@@ -2777,7 +2785,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 				}
-				e.txnCtx.AddPendingWrite(idxKey)
+				e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
 			}
 
 			// Merge old values with new assignments
@@ -2803,12 +2811,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			}
 
 			// Update row with transaction's XID.
-			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
 			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
 				return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
 			}
-			e.txnCtx.AddPendingWrite(rowKey)
+			// Store old row as preValue so savepoint rollback can restore it.
+			e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
 
 			// Insert new index entries for changed columns.
 			for _, idx := range indexes {
@@ -2821,7 +2829,7 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 				}
-				e.txnCtx.AddPendingWrite(idxKey)
+				e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
 			}
 
 			count++

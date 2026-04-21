@@ -361,3 +361,232 @@ func TestEndToEnd_Union(t *testing.T) {
 		t.Fatalf("table UNION ALL: expected 6 rows, got %d", len(res.Rows))
 	}
 }
+
+// ─── SAVEPOINT Tests ───────────────────────────────────────────────
+
+func TestEndToEnd_Savepoint(t *testing.T) {
+	db, store := openTestDB(t)
+	defer store.Close()
+
+	_, err := db.Exec("CREATE TABLE users (id INT, name TEXT)")
+	if err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	// Test 1: Basic SAVEPOINT and ROLLBACK TO
+	t.Run("basic savepoint rollback", func(t *testing.T) {
+		_, err = db.Exec("BEGIN")
+		if err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+
+		_, err = db.Exec("INSERT INTO users VALUES (1, 'Alice')")
+		if err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+
+		_, err = db.Exec("SAVEPOINT sp1")
+		if err != nil {
+			t.Fatalf("SAVEPOINT sp1: %v", err)
+		}
+
+		_, err = db.Exec("UPDATE users SET name = 'Bob' WHERE id = 1")
+		if err != nil {
+			t.Fatalf("UPDATE: %v", err)
+		}
+
+		// Verify update was applied
+		res, _ := db.Query("SELECT name FROM users WHERE id = 1")
+		if len(res.Rows) == 0 {
+			t.Fatalf("no row found")
+		}
+		if res.Rows[0][0].Text != "Bob" {
+			t.Errorf("expected 'Bob', got %q", res.Rows[0][0].Text)
+		}
+
+		// Rollback to savepoint (should revert UPDATE, keep INSERT)
+		_, err = db.Exec("ROLLBACK TO SAVEPOINT sp1")
+		if err != nil {
+			t.Fatalf("ROLLBACK TO SAVEPOINT sp1: %v", err)
+		}
+
+		// Verify name is back to 'Alice'
+		res, _ = db.Query("SELECT name FROM users WHERE id = 1")
+		if len(res.Rows) == 0 {
+			t.Fatalf("row should still exist after ROLLBACK TO SAVEPOINT")
+		}
+		if res.Rows[0][0].Text != "Alice" {
+			t.Errorf("expected 'Alice' after ROLLBACK TO SAVEPOINT, got %q", res.Rows[0][0].Text)
+		}
+
+		_, err = db.Exec("COMMIT")
+		if err != nil {
+			t.Fatalf("COMMIT: %v", err)
+		}
+	})
+
+	// Test 2: Multiple savepoints
+	t.Run("multiple savepoints", func(t *testing.T) {
+		_, err = db.Exec("BEGIN")
+		if err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+
+		_, err = db.Exec("INSERT INTO users VALUES (2, 'Charlie')")
+		if err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+
+		_, err = db.Exec("SAVEPOINT sp_first")
+		if err != nil {
+			t.Fatalf("SAVEPOINT sp_first: %v", err)
+		}
+
+		_, err = db.Exec("UPDATE users SET name = 'Delta' WHERE id = 2")
+		if err != nil {
+			t.Fatalf("UPDATE: %v", err)
+		}
+
+		_, err = db.Exec("SAVEPOINT sp_second")
+		if err != nil {
+			t.Fatalf("SAVEPOINT sp_second: %v", err)
+		}
+
+		_, err = db.Exec("UPDATE users SET name = 'Echo' WHERE id = 2")
+		if err != nil {
+			t.Fatalf("UPDATE: %v", err)
+		}
+
+		// Rollback to sp_second (reverts to Delta)
+		_, err = db.Exec("ROLLBACK TO SAVEPOINT sp_second")
+		if err != nil {
+			t.Fatalf("ROLLBACK TO sp_second: %v", err)
+		}
+
+		res, _ := db.Query("SELECT name FROM users WHERE id = 2")
+		if res.Rows[0][0].Text != "Delta" {
+			t.Errorf("expected 'Delta', got %q", res.Rows[0][0].Text)
+		}
+
+		// Rollback to sp_first (reverts to Charlie)
+		_, err = db.Exec("ROLLBACK TO SAVEPOINT sp_first")
+		if err != nil {
+			t.Fatalf("ROLLBACK TO sp_first: %v", err)
+		}
+
+		res, _ = db.Query("SELECT name FROM users WHERE id = 2")
+		if res.Rows[0][0].Text != "Charlie" {
+			t.Errorf("expected 'Charlie', got %q", res.Rows[0][0].Text)
+		}
+
+		_, err = db.Exec("COMMIT")
+		if err != nil {
+			t.Fatalf("COMMIT: %v", err)
+		}
+	})
+
+	// Test 3: RELEASE SAVEPOINT
+	t.Run("release savepoint", func(t *testing.T) {
+		_, err = db.Exec("BEGIN")
+		if err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+
+		_, err = db.Exec("INSERT INTO users VALUES (3, 'Frank')")
+		if err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+
+		_, err = db.Exec("SAVEPOINT sp_rel")
+		if err != nil {
+			t.Fatalf("SAVEPOINT sp_rel: %v", err)
+		}
+
+		_, err = db.Exec("UPDATE users SET name = 'George' WHERE id = 3")
+		if err != nil {
+			t.Fatalf("UPDATE: %v", err)
+		}
+
+		// Release the savepoint (writes become permanent)
+		_, err = db.Exec("RELEASE SAVEPOINT sp_rel")
+		if err != nil {
+			t.Fatalf("RELEASE SAVEPOINT sp_rel: %v", err)
+		}
+
+		// Rollback to the released savepoint should fail
+		_, err = db.Exec("ROLLBACK TO SAVEPOINT sp_rel")
+		if err == nil {
+			t.Errorf("expected error rolling back to released savepoint")
+		}
+
+		// But the transaction should still be active
+		res, _ := db.Query("SELECT name FROM users WHERE id = 3")
+		if res.Rows[0][0].Text != "George" {
+			t.Errorf("expected 'George' (update should persist after release), got %q", res.Rows[0][0].Text)
+		}
+
+		_, err = db.Exec("COMMIT")
+		if err != nil {
+			t.Fatalf("COMMIT: %v", err)
+		}
+	})
+
+	// Test 4: SAVEPOINT without transaction
+	t.Run("savepoint without transaction", func(t *testing.T) {
+		_, err = db.Exec("SAVEPOINT sp_no_txn")
+		if err == nil {
+			t.Errorf("expected error: no active transaction")
+		}
+	})
+
+	// Test 5: Non-existent savepoint
+	t.Run("non-existent savepoint", func(t *testing.T) {
+		_, err = db.Exec("BEGIN")
+		if err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+
+		_, err = db.Exec("ROLLBACK TO SAVEPOINT nonexistent")
+		if err == nil {
+			t.Errorf("expected error: savepoint not found")
+		}
+
+		_, err = db.Exec("COMMIT")
+		if err != nil {
+			t.Fatalf("COMMIT: %v", err)
+		}
+	})
+
+	// Test 6: ROLLBACK (transaction-level) clears savepoints
+	t.Run("rollback clears savepoints", func(t *testing.T) {
+		_, err = db.Exec("BEGIN")
+		if err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+
+		_, err = db.Exec("INSERT INTO users VALUES (99, 'Temp')")
+		if err != nil {
+			t.Fatalf("INSERT: %v", err)
+		}
+
+		_, err = db.Exec("SAVEPOINT sp_txn")
+		if err != nil {
+			t.Fatalf("SAVEPOINT: %v", err)
+		}
+
+		// Transaction-level rollback should discard everything
+		_, err = db.Exec("ROLLBACK")
+		if err != nil {
+			t.Fatalf("ROLLBACK: %v", err)
+		}
+
+		// Verify data was rolled back
+		res, err := db.Query("SELECT COUNT(*) FROM users WHERE id = 99")
+		if err != nil {
+			t.Fatalf("SELECT: %v", err)
+		}
+		if res.Rows[0][0].Int != 0 {
+			t.Errorf("expected 0 rows for id=99 after ROLLBACK, got %d", res.Rows[0][0].Int)
+		}
+	})
+}

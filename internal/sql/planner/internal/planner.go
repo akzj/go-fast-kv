@@ -63,6 +63,12 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return nil, nil
 	case *parserapi.RollbackStmt:
 		return nil, nil
+	case *parserapi.SavepointStmt:
+		return nil, nil
+	case *parserapi.RollbackToSavepointStmt:
+		return nil, nil
+	case *parserapi.ReleaseSavepointStmt:
+		return nil, nil
 	case *parserapi.AlterTableStmt:
 		return p.planAlterTable(s)
 	default:
