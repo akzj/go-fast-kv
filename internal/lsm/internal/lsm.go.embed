@@ -1,0 +1,4 @@
+//go:build ignore
+// +build ignore
+
+// This is a marker file - the actual package is in lsm.go

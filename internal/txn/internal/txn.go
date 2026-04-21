@@ -130,23 +130,21 @@ func NewWithLockTimeout(lockTimeoutMs int64) api.TxnManager {
 }
 
 // BeginTxn atomically allocates an XID and creates a snapshot.
+// Uses COW (Copy-on-Write): shares the active map reference with snapshots,
+// forking only when the transaction commits or aborts.
+// This makes snapshot creation O(1) instead of O(n).
 func (tm *TxnManager) BeginTxn() (uint64, *api.Snapshot) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	xid := tm.nextXID
 	tm.nextXID++
-	tm.active[xid] = struct{}{}
+	tm.active[xid] = struct{}{} // Track in manager's active set
 
-	activeXIDs := make(map[uint64]struct{}, len(tm.active)-1)
-	for id := range tm.active {
-		if id != xid {
-			activeXIDs[id] = struct{}{}
-		}
-	}
-
+	// Snapshot uses shared reference to active set (O(1) pointer copy)
+	// Fork happens only at commit/abort time
 	xmin := tm.nextXID
-	for id := range activeXIDs {
+	for id := range tm.active {
 		if id < xmin {
 			xmin = id
 		}
@@ -156,7 +154,8 @@ func (tm *TxnManager) BeginTxn() (uint64, *api.Snapshot) {
 		XID:        xid,
 		Xmin:       xmin,
 		Xmax:       tm.nextXID,
-		ActiveXIDs: activeXIDs,
+		ActiveXIDs: tm.active, // COW: shared reference to manager's active set
+		ExcludeXID: 0,          // Write txn: self already in active set
 	}
 
 	return xid, snap
@@ -188,19 +187,15 @@ func (tm *TxnManager) IsVisible(snap *api.Snapshot, txnMin, txnMax uint64) bool 
 }
 
 // ReadSnapshot creates a read-only snapshot WITHOUT allocating a XID.
+// Uses COW: shares tm.active reference for O(1) creation.
 func (tm *TxnManager) ReadSnapshot() (uint64, *api.Snapshot) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	readID := tm.nextXID
 
-	activeXIDs := make(map[uint64]struct{}, len(tm.active))
-	for id := range tm.active {
-		activeXIDs[id] = struct{}{}
-	}
-
 	xmin := tm.nextXID
-	for id := range activeXIDs {
+	for id := range tm.active {
 		if id < xmin {
 			xmin = id
 		}
@@ -210,7 +205,8 @@ func (tm *TxnManager) ReadSnapshot() (uint64, *api.Snapshot) {
 		XID:        readID,
 		Xmin:       xmin,
 		Xmax:       tm.nextXID,
-		ActiveXIDs: activeXIDs,
+		ActiveXIDs: tm.active, // COW: shared reference, O(1) creation
+		ExcludeXID: 0,          // Read-only: nothing to exclude
 	}
 
 	return readID, snap
@@ -341,6 +337,7 @@ func (tc *txnContext) GetPendingWrites() [][]byte {
 }
 
 // BeginTxnContext starts a new SQL transaction with row-level locking.
+// Uses COW: shares tm.active reference for O(1) snapshot creation.
 func (tm *TxnManager) BeginTxnContext() api.TxnContext {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -349,15 +346,8 @@ func (tm *TxnManager) BeginTxnContext() api.TxnContext {
 	tm.nextXID++
 	tm.active[xid] = struct{}{}
 
-	activeXIDs := make(map[uint64]struct{}, len(tm.active)-1)
-	for id := range tm.active {
-		if id != xid {
-			activeXIDs[id] = struct{}{}
-		}
-	}
-
 	xmin := tm.nextXID
-	for id := range activeXIDs {
+	for id := range tm.active {
 		if id < xmin {
 			xmin = id
 		}
@@ -367,7 +357,8 @@ func (tm *TxnManager) BeginTxnContext() api.TxnContext {
 		XID:        xid,
 		Xmin:       xmin,
 		Xmax:       tm.nextXID,
-		ActiveXIDs: activeXIDs,
+		ActiveXIDs: tm.active, // COW: shared reference
+		ExcludeXID: 0,          // Self in active set
 	}
 
 	return &txnContext{

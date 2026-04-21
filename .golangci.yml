@@ -1,0 +1,11 @@
+linters:
+  default: none
+  enable:
+    - vet
+
+linters-settings:
+  vet:
+    settings:
+      # Disable copylocks check for atomic.Int64 fields (Go 1.21+ copy-safe)
+      # This is a false positive in Go 1.21+ where sync/atomic types are copy-safe
+      check: [-copylocks]

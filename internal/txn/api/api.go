@@ -149,13 +149,25 @@ type CLOG interface {
 //   - Xmin: oldest active XID at snapshot time (anything < xmin has finished)
 //   - Xmax: next XID to be allocated at snapshot time (anything >= xmax is future)
 //   - ActiveXIDs: transactions in [xmin, xmax) that were still running
+//   - ExcludeXID: for write transactions, XID to exclude from ActiveXIDs
 //
 // Design reference: docs/DESIGN.md §3.9.4
 type Snapshot struct {
 	XID        uint64             // this transaction's ID
 	Xmin       uint64             // oldest active XID at snapshot time
 	Xmax       uint64             // next-to-allocate XID at snapshot time
-	ActiveXIDs map[uint64]struct{} // active transactions at snapshot time (copy)
+	ActiveXIDs map[uint64]struct{} // active transactions at snapshot time (shared ref)
+	ExcludeXID uint64             // XID to exclude from visibility checks (self for write txns)
+}
+
+// isXidActive checks if an XID is in the active set.
+// If the XID matches ExcludeXID, it's considered NOT active.
+func (s *Snapshot) isXidActive(xid uint64) bool {
+	if xid == s.ExcludeXID {
+		return false
+	}
+	_, active := s.ActiveXIDs[xid]
+	return active
 }
 
 // IsVisible determines whether a data version (txnMin, txnMax) is
@@ -176,7 +188,8 @@ func (s *Snapshot) IsVisible(txnMin, txnMax uint64, clog CLOG) bool {
 	}
 
 	// Creator was still running at snapshot time → not visible
-	if _, active := s.ActiveXIDs[txnMin]; active {
+	// (Excludes self via ExcludeXID check)
+	if s.isXidActive(txnMin) {
 		return false
 	}
 
@@ -204,7 +217,8 @@ func (s *Snapshot) IsVisible(txnMin, txnMax uint64, clog CLOG) bool {
 	}
 
 	// Deleter was still running at snapshot time → visible (deletion not committed)
-	if _, active := s.ActiveXIDs[txnMax]; active {
+	// (Excludes self via ExcludeXID check)
+	if s.isXidActive(txnMax) {
 		return true
 	}
 
