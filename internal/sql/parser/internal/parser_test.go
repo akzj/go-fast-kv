@@ -1863,3 +1863,350 @@ func TestColumnAliasWithoutAS(t *testing.T) {
 		})
 	}
 }
+
+// Referenced: parseReferentialActions - ON DELETE/UPDATE actions for foreign keys
+func TestParse_ReferentialActions(t *testing.T) {
+	p := newParser()
+
+	cases := []struct {
+		name     string
+		sql      string
+		onDelete string
+		onUpdate string
+	}{
+		{"on_delete_cascade", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON DELETE CASCADE)", "CASCADE", "NO ACTION"},
+		{"on_delete_set_null", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON DELETE SET NULL)", "SET NULL", "NO ACTION"},
+		{"on_delete_restrict", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON DELETE RESTRICT)", "RESTRICT", "NO ACTION"},
+		{"on_delete_no_action", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON DELETE NO ACTION)", "NO ACTION", "NO ACTION"},
+		{"on_update_cascade", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON UPDATE CASCADE)", "NO ACTION", "CASCADE"},
+		{"on_update_set_null", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON UPDATE SET NULL)", "NO ACTION", "SET NULL"},
+		{"on_update_restrict", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON UPDATE RESTRICT)", "NO ACTION", "RESTRICT"},
+		{"on_update_no_action", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON UPDATE NO ACTION)", "NO ACTION", "NO ACTION"},
+		{"both_delete_update", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON DELETE CASCADE ON UPDATE SET NULL)", "CASCADE", "SET NULL"},
+		{"both_update_delete", "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p (id) ON UPDATE CASCADE ON DELETE SET NULL)", "SET NULL", "CASCADE"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := p.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("parse error for %q: %v", tc.sql, err)
+			}
+			ct := stmt.(*api.CreateTableStmt)
+			if len(ct.ForeignKeys) == 0 {
+				t.Fatal("expected foreign key constraint")
+			}
+			fk := ct.ForeignKeys[0]
+			if fk.OnDelete != tc.onDelete {
+				t.Errorf("OnDelete: expected %q, got %q", tc.onDelete, fk.OnDelete)
+			}
+			if fk.OnUpdate != tc.onUpdate {
+				t.Errorf("OnUpdate: expected %q, got %q", tc.onUpdate, fk.OnUpdate)
+			}
+		})
+	}
+
+	t.Run("multi_column_fk", func(t *testing.T) {
+		stmt, err := p.Parse("CREATE TABLE t (a INT, b INT, FOREIGN KEY (a, b) REFERENCES p (x, y) ON DELETE CASCADE)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ct := stmt.(*api.CreateTableStmt)
+		fk := ct.ForeignKeys[0]
+		if len(fk.Columns) != 2 || fk.Columns[0] != "A" || fk.Columns[1] != "B" {
+			t.Errorf("expected columns [A B], got %v", fk.Columns)
+		}
+		if len(fk.ReferencedColumns) != 2 || fk.ReferencedColumns[0] != "X" || fk.ReferencedColumns[1] != "Y" {
+			t.Errorf("expected ref columns [X Y], got %v", fk.ReferencedColumns)
+		}
+	})
+}
+
+// Referenced: parseInsert - SET syntax
+func TestParse_InsertSET(t *testing.T) {
+	p := newParser()
+
+	t.Run("set_syntax", func(t *testing.T) {
+		stmt, err := p.Parse("INSERT INTO t SET col1 = 1, col2 = 'hello'")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ins, ok := stmt.(*api.InsertStmt)
+		if !ok {
+			t.Fatalf("expected InsertStmt, got %T", stmt)
+		}
+		if len(ins.Columns) != 2 {
+			t.Fatalf("expected 2 columns, got %d", len(ins.Columns))
+		}
+		if ins.Columns[0] != "COL1" || ins.Columns[1] != "COL2" {
+			t.Errorf("columns: expected [COL1 COL2], got %v", ins.Columns)
+		}
+		if len(ins.Values) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(ins.Values))
+		}
+	})
+
+	t.Run("set_with_default", func(t *testing.T) {
+		stmt, err := p.Parse("INSERT INTO t SET col1 = 1, col2 = DEFAULT")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ins := stmt.(*api.InsertStmt)
+		if _, ok := ins.Values[0][1].(*api.DefaultExpr); !ok {
+			t.Errorf("expected DefaultExpr for col2")
+		}
+	})
+}
+
+// Referenced: parseInsert - SELECT subquery syntax
+func TestParse_InsertSelect(t *testing.T) {
+	p := newParser()
+
+	t.Run("insert_select", func(t *testing.T) {
+		stmt, err := p.Parse("INSERT INTO t SELECT * FROM s")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ins, ok := stmt.(*api.InsertStmt)
+		if !ok {
+			t.Fatalf("expected InsertStmt, got %T", stmt)
+		}
+		if ins.SelectStmt == nil {
+			t.Fatal("expected SelectStmt to be set")
+		}
+		if ins.SelectStmt.Table != "S" {
+			t.Errorf("expected table S, got %s", ins.SelectStmt.Table)
+		}
+	})
+}
+
+// Referenced: parseInsert - DEFAULT value in VALUES
+func TestParse_InsertDefault(t *testing.T) {
+	p := newParser()
+
+	t.Run("default_value", func(t *testing.T) {
+		stmt, err := p.Parse("INSERT INTO t VALUES (1, DEFAULT, 'x')")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ins := stmt.(*api.InsertStmt)
+		if len(ins.Values) != 1 || len(ins.Values[0]) != 3 {
+			t.Fatalf("expected 1 row with 3 values, got %d rows x %d cols", len(ins.Values), len(ins.Values[0]))
+		}
+		if _, ok := ins.Values[0][1].(*api.DefaultExpr); !ok {
+			t.Errorf("expected DefaultExpr at position 1")
+		}
+	})
+}
+
+// Referenced: parseSelect - DISTINCT, UNION, INTERSECT, EXCEPT, GROUP BY, HAVING, OFFSET
+func TestParse_SelectExtensions(t *testing.T) {
+	p := newParser()
+
+	t.Run("distinct", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT DISTINCT name FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if !sel.Distinct {
+			t.Error("expected Distinct=true")
+		}
+	})
+
+	t.Run("union", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM a UNION SELECT * FROM b")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		u, ok := stmt.(*api.UnionStmt)
+		if !ok {
+			t.Fatalf("expected UnionStmt, got %T", stmt)
+		}
+		if u.UnionAll {
+			t.Error("expected UnionAll=false")
+		}
+		left, ok := u.Left.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt for union left, got %T", u.Left)
+		}
+		if left.Table != "A" {
+			t.Errorf("left table: expected A, got %s", left.Table)
+		}
+	})
+
+	t.Run("union_all", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM a UNION ALL SELECT * FROM b")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		u := stmt.(*api.UnionStmt)
+		if !u.UnionAll {
+			t.Error("expected UnionAll=true")
+		}
+	})
+
+	t.Run("intersect", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT id FROM t1 INTERSECT SELECT id FROM t2")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		i, ok := stmt.(*api.IntersectStmt)
+		if !ok {
+			t.Fatalf("expected IntersectStmt, got %T", stmt)
+		}
+		left, ok := i.Left.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt for intersect left, got %T", i.Left)
+		}
+		if left.Table != "T1" {
+			t.Errorf("left table: expected T1, got %s", left.Table)
+		}
+	})
+
+	t.Run("except", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT id FROM t1 EXCEPT SELECT id FROM t2")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		e, ok := stmt.(*api.ExceptStmt)
+		if !ok {
+			t.Fatalf("expected ExceptStmt, got %T", stmt)
+		}
+		left, ok := e.Left.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt for except left, got %T", e.Left)
+		}
+		if left.Table != "T1" {
+			t.Errorf("left table: expected T1, got %s", left.Table)
+		}
+	})
+
+	t.Run("group_by", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT status, COUNT(*) FROM orders GROUP BY status")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if len(sel.GroupBy) == 0 {
+			t.Fatal("expected GROUP BY clause")
+		}
+	})
+
+	t.Run("group_by_having", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if len(sel.GroupBy) == 0 {
+			t.Fatal("expected GROUP BY clause")
+		}
+		if sel.Having == nil {
+			t.Fatal("expected HAVING clause")
+		}
+	})
+
+	t.Run("offset", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM t LIMIT 10 OFFSET 5")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.Limit == nil {
+			t.Fatal("expected LIMIT")
+		}
+		if sel.Offset == nil {
+			t.Fatal("expected OFFSET")
+		}
+	})
+
+	t.Run("derived_table_subquery", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT id FROM inner_table) AS sq")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.DerivedTable == nil {
+			t.Fatal("expected DerivedTable")
+		}
+		if sel.DerivedTable.Alias != "SQ" {
+			t.Errorf("expected alias SQ, got %q", sel.DerivedTable.Alias)
+		}
+	})
+}
+
+// Referenced: parseSubquerySelect - subquery with WHERE, GROUP BY, ORDER BY, HAVING
+func TestParse_SubquerySelect(t *testing.T) {
+	p := newParser()
+
+	t.Run("subquery_in_from_with_where", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT id FROM users WHERE active = 1) AS active_users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		if sel.DerivedTable == nil {
+			t.Fatal("expected DerivedTable")
+		}
+		subq := sel.DerivedTable.Subquery.Stmt
+		subSel, ok := subq.(*api.SelectStmt)
+		if !ok {
+			t.Fatalf("expected SelectStmt in subquery, got %T", subq)
+		}
+		if subSel.Where == nil {
+			t.Error("expected WHERE clause in subquery")
+		}
+	})
+
+	t.Run("subquery_in_from_with_group_by", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status) AS summary")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		subSel := sel.DerivedTable.Subquery.Stmt.(*api.SelectStmt)
+		if len(subSel.GroupBy) == 0 {
+			t.Error("expected GROUP BY in subquery")
+		}
+	})
+
+	t.Run("subquery_in_from_with_order_by_limit", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 5) AS top_five")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		subSel := sel.DerivedTable.Subquery.Stmt.(*api.SelectStmt)
+		if len(subSel.OrderBy) == 0 {
+			t.Error("expected ORDER BY in subquery")
+		}
+		if subSel.Limit == nil {
+			t.Error("expected LIMIT in subquery")
+		}
+	})
+
+	t.Run("subquery_with_alias_column", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT id AS user_id FROM t) AS sub")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		subSel := sel.DerivedTable.Subquery.Stmt.(*api.SelectStmt)
+		if subSel.Columns[0].Alias != "USER_ID" {
+			t.Errorf("expected alias USER_ID, got %q", subSel.Columns[0].Alias)
+		}
+	})
+
+	t.Run("subquery_with_having", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT * FROM (SELECT status, COUNT(*) AS cnt FROM t GROUP BY status HAVING COUNT(*) > 1) AS filtered")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		subSel := sel.DerivedTable.Subquery.Stmt.(*api.SelectStmt)
+		if subSel.Having == nil {
+			t.Error("expected HAVING in subquery")
+		}
+	})
+}
