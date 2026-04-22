@@ -14,16 +14,29 @@ import (
 // Compile-time interface check
 var _ api.CatalogManager = (*Catalog)(nil)
 
+// DefaultSchemaCacheSize is the default maximum number of table schemas to cache.
+const DefaultSchemaCacheSize = 128
+
 // Catalog implements api.CatalogManager using kvstore for persistence.
 // All exported methods are protected by a mutex to prevent TOCTOU races.
 type Catalog struct {
 	kv  kvstoreapi.Store
 	mu sync.RWMutex
+
+	// Schema cache: table name → cached TableSchema
+	schemaCache    map[string]*api.TableSchema
+	schemaCacheOrder []string // insertion order for LRU eviction
+	schemaCacheSize int
 }
 
 // New creates a new Catalog that persists to kv.
 func New(kv kvstoreapi.Store) *Catalog {
-	return &Catalog{kv: kv}
+	return &Catalog{
+		kv: kv,
+		schemaCache:    make(map[string]*api.TableSchema),
+		schemaCacheOrder: make([]string, 0, DefaultSchemaCacheSize),
+		schemaCacheSize: DefaultSchemaCacheSize,
+	}
 }
 
 // ─── Key helpers ─────────────────────────────────────────────────
@@ -84,7 +97,22 @@ func (c *Catalog) createTableImpl(schema api.TableSchema) error {
 	if err != nil {
 		return err
 	}
-	return c.kv.Put(key, data)
+	if err := c.kv.Put(key, data); err != nil {
+		return err
+	}
+
+	// Pre-cache the new schema
+	if len(c.schemaCache) >= c.schemaCacheSize {
+		if len(c.schemaCacheOrder) > 0 {
+			oldest := c.schemaCacheOrder[0]
+			delete(c.schemaCache, oldest)
+			c.schemaCacheOrder = c.schemaCacheOrder[1:]
+		}
+	}
+	c.schemaCache[upperName] = &schema
+	c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
+
+	return nil
 }
 
 func (c *Catalog) GetTable(name string) (*api.TableSchema, error) {
@@ -94,7 +122,14 @@ func (c *Catalog) GetTable(name string) (*api.TableSchema, error) {
 }
 
 func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
-	key := tableKey(strings.ToUpper(name))
+	upperName := strings.ToUpper(name)
+
+	// Check cache first
+	if cached, ok := c.schemaCache[upperName]; ok {
+		return cached, nil
+	}
+
+	key := tableKey(upperName)
 	data, err := c.kv.Get(key)
 	if err == kvstoreapi.ErrKeyNotFound {
 		return nil, api.ErrTableNotFound
@@ -107,6 +142,19 @@ func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
 	if err := json.Unmarshal(data, &schema); err != nil {
 		return nil, err
 	}
+
+	// Cache the schema (LRU eviction if needed)
+	if len(c.schemaCache) >= c.schemaCacheSize {
+		// Evict oldest entry (FIFO)
+		if len(c.schemaCacheOrder) > 0 {
+			oldest := c.schemaCacheOrder[0]
+			delete(c.schemaCache, oldest)
+			c.schemaCacheOrder = c.schemaCacheOrder[1:]
+		}
+	}
+	c.schemaCache[upperName] = &schema
+	c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
+
 	return &schema, nil
 }
 
@@ -133,6 +181,9 @@ func (c *Catalog) dropTableImpl(name string) error {
 	if err := c.kv.Delete(key); err != nil {
 		return err
 	}
+
+	// Invalidate cache entry
+	delete(c.schemaCache, upperName)
 
 	// Delete all indexes on this table
 	prefix := tableIndexPrefix(upperName)
@@ -376,7 +427,14 @@ func (c *Catalog) alterTableImpl(schema api.TableSchema) error {
 	if err != nil {
 		return err
 	}
-	return c.kv.Put(key, data)
+	if err := c.kv.Put(key, data); err != nil {
+		return err
+	}
+
+	// Update cache with new schema
+	c.schemaCache[upperName] = &schema
+
+	return nil
 }
 
 func (c *Catalog) RenameTable(oldName, newName string) error {
@@ -428,7 +486,15 @@ func (c *Catalog) renameTableImpl(oldName, newName string) error {
 	}
 
 	// Delete old entry
-	return c.kv.Delete(oldKey)
+	if err := c.kv.Delete(oldKey); err != nil {
+		return err
+	}
+
+	// Update cache: remove old entry, add new entry
+	delete(c.schemaCache, upperOld)
+	c.schemaCache[upperNew] = &schema
+
+	return nil
 }
 
 // CreateTrigger creates a trigger.
