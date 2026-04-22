@@ -118,6 +118,41 @@ ALTER TABLE users RENAME COLUMN name TO full_name
 ALTER TABLE users RENAME TO customers
 ```
 
+### CREATE VIEW
+
+Creates a virtual table based on the result of a SELECT statement.
+
+**Syntax:**
+```sql
+CREATE VIEW view_name AS select_statement
+```
+
+**Example:**
+```sql
+CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1;
+
+-- Query the view like a table
+SELECT * FROM active_users WHERE id > 10;
+```
+
+### DROP VIEW
+
+Removes a view from the database.
+
+**Syntax:**
+```sql
+DROP VIEW view_name;
+DROP VIEW IF EXISTS view_name;
+```
+
+**Example:**
+```sql
+DROP VIEW active_users;
+```
+
+---
+
+
 ---
 
 ### Constraints
@@ -174,8 +209,14 @@ Establishes a referential constraint between tables. When a row is inserted or u
 
 **Syntax:**
 ```sql
+-- Single column
 FOREIGN KEY (column_name) REFERENCES referenced_table(referenced_column)
+
+-- Multiple columns
+FOREIGN KEY (col1, col2) REFERENCES referenced_table(pk1, pk2)
 ```
+
+**Multi-column support:** ✅ Both single and multi-column foreign keys are supported.
 
 **Supported actions for ON DELETE and ON UPDATE:**
 - `CASCADE` — Delete/update matching rows in child table
