@@ -45,6 +45,7 @@ const (
 	tablePrefix  = "_sql:table:"
 	indexPrefix  = "_sql:index:"
 	triggerPrefix = "_sql:trigger:"
+	viewPrefix    = "_sql:view:"
 )
 
 // tableKey returns the KV key for a table schema.
@@ -60,6 +61,11 @@ func indexKey(tableName, indexName string) []byte {
 // triggerKey returns the KV key for a trigger schema.
 func triggerKey(triggerName string) []byte {
 	return []byte(triggerPrefix + strings.ToUpper(triggerName))
+}
+
+// viewKey returns the KV key for a view schema.
+func viewKey(name string) []byte {
+	return []byte(viewPrefix + strings.ToUpper(name))
 }
 
 // tableTriggersPrefix returns the prefix for all triggers on a table.
@@ -593,4 +599,92 @@ func (c *Catalog) listTriggersImpl(tableName string) ([]api.TriggerSchema, error
 		}
 	}
 	return triggers, iter.Err()
+}
+
+// ─── View Management ──────────────────────────────────────────────
+
+func (c *Catalog) CreateView(schema api.ViewSchema) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.createViewImpl(schema)
+}
+
+func (c *Catalog) createViewImpl(schema api.ViewSchema) error {
+	upperName := strings.ToUpper(schema.Name)
+	key := viewKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == nil {
+		return api.ErrViewExists
+	}
+	if err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return c.kv.Put(key, data)
+}
+
+func (c *Catalog) GetView(name string) (*api.ViewSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getViewImpl(name)
+}
+
+func (c *Catalog) getViewImpl(name string) (*api.ViewSchema, error) {
+	upperName := strings.ToUpper(name)
+	key := viewKey(upperName)
+	data, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return nil, api.ErrViewNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var schema api.ViewSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil, err
+	}
+	return &schema, nil
+}
+
+func (c *Catalog) DropView(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropViewImpl(name)
+}
+
+func (c *Catalog) dropViewImpl(name string) error {
+	upperName := strings.ToUpper(name)
+	key := viewKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrViewNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return c.kv.Delete(key)
+}
+
+func (c *Catalog) ListViews() ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.listViewsImpl()
+}
+
+func (c *Catalog) listViewsImpl() ([]string, error) {
+	prefix := []byte(viewPrefix)
+	end := append(prefix, 0xFF)
+
+	var views []string
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		name := strings.TrimPrefix(string(iter.Key()), viewPrefix)
+		views = append(views, name)
+	}
+	return views, iter.Err()
 }

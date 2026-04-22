@@ -54,6 +54,12 @@ var ErrTriggerNotFound = sqlerrors.ErrTriggerNotFound("")
 // ErrTriggerExists is returned when trying to create a trigger that already exists.
 var ErrTriggerExists = sqlerrors.ErrTriggerExists("")
 
+// ErrViewNotFound is returned when a view does not exist.
+var ErrViewNotFound = sqlerrors.ErrViewNotFound("")
+
+// ErrViewExists is returned when trying to create a view that already exists.
+var ErrViewExists = sqlerrors.ErrViewExists("")
+
 // ─── Schema Types ─────────────────────────────────────────────────
 
 // TableSchema describes a table's structure.
@@ -117,6 +123,13 @@ type TriggerSchema struct {
 	Event    string `json:"E,omitempty"` // "INSERT", "UPDATE", "DELETE"
 	WhenCond string `json:"W,omitempty"` // WHEN condition expression (or "")
 	Body     string `json:"B,omitempty"` // trigger body SQL
+}
+
+// ViewSchema describes a view's definition.
+type ViewSchema struct {
+	Name      string `json:"N,omitempty"`
+	QuerySQL  string `json:"Q,omitempty"` // original SELECT SQL
+	CreatedAt int64  `json:"T,omitempty"` // creation timestamp
 }
 // ─── Interfaces ────────────────────────────────────────────────────
 
@@ -190,4 +203,19 @@ type CatalogManager interface {
 	// ListTriggers returns all triggers for a given table.
 	// Returns an empty slice (not error) if the table has no triggers.
 	ListTriggers(tableName string) ([]TriggerSchema, error)
+
+	// CreateView creates a view.
+	// Returns ErrViewExists if the view already exists.
+	CreateView(schema ViewSchema) error
+
+	// GetView returns a view by name (case-insensitive).
+	// Returns ErrViewNotFound if the view does not exist.
+	GetView(name string) (*ViewSchema, error)
+
+	// DropView removes a view.
+	// Returns ErrViewNotFound if the view does not exist.
+	DropView(name string) error
+
+	// ListViews returns all view names.
+	ListViews() ([]string, error)
 }

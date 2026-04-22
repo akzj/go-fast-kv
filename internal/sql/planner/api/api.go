@@ -138,6 +138,22 @@ type DropTriggerPlan struct {
 
 func (*DropTriggerPlan) planNode() {}
 
+// CreateViewPlan creates a view from a SELECT statement.
+type CreateViewPlan struct {
+	Name    string
+	QuerySQL string // serialized SELECT statement
+}
+
+func (*CreateViewPlan) planNode() {}
+
+// DropViewPlan drops a view.
+type DropViewPlan struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropViewPlan) planNode() {}
+
 // ─── FTS Plans ─────────────────────────────────────────────────────
 
 // FTSIndexSchema stores FTS table metadata.

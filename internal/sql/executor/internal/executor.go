@@ -580,6 +580,56 @@ func (e *executor) execDropTrigger(plan *plannerapi.DropTriggerPlan) (*executora
 	return &executorapi.Result{RowsAffected: 1}, nil
 }
 
+// execCreateView creates a view from a SELECT statement.
+func (e *executor) execCreateView(plan *plannerapi.CreateViewPlan) (*executorapi.Result, error) {
+	// Check if view already exists (if not IF NOT EXISTS)
+	_, err := e.catalog.GetView(plan.Name)
+	if err == nil {
+		return nil, fmt.Errorf("%w: view %q already exists", executorapi.ErrExecFailed, plan.Name)
+	}
+	if err != catalogapi.ErrViewNotFound {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Create the view schema
+	schema := catalogapi.ViewSchema{
+		Name:     plan.Name,
+		QuerySQL: plan.QuerySQL,
+	}
+
+	err = e.catalog.CreateView(schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create view: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execDropView drops a view.
+func (e *executor) execDropView(plan *plannerapi.DropViewPlan) (*executorapi.Result, error) {
+	// Check if view exists (unless IF EXISTS was specified)
+	if !plan.IfExists {
+		_, err := e.catalog.GetView(plan.Name)
+		if err != nil {
+			if err == catalogapi.ErrViewNotFound {
+				return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+			}
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	err := e.catalog.DropView(plan.Name)
+	if err != nil {
+		if err == catalogapi.ErrViewNotFound && plan.IfExists {
+			// IF EXISTS was specified and view doesn't exist — OK
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: drop view: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
 // execCreateFTS creates a FTS virtual table.
 // FTS tables are stored in the catalog as special tables with FTS metadata.
 func (e *executor) execCreateFTS(plan *plannerapi.CreateFTSPlan) (*executorapi.Result, error) {
