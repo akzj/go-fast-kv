@@ -19,6 +19,14 @@ type bTree struct {
 	pageLocks   *lock.PageRWLocks    // per-page RwLock manager (§3.8.1)
 	bootstrapMu sync.Mutex           // protects root creation when rootPageID == 0
 	visCheck    func(txnMin, txnMax, readTxnID uint64) bool // MVCC visibility via CLOG (nil = default range check)
+
+	// Search path statistics for bottleneck analysis.
+	searchDepthSum   atomic.Uint64 // Total search depth across all operations
+	searchCount      atomic.Uint64 // Number of search operations
+	rightSiblingNavs atomic.Uint64 // B-link correction traversals (high value = many splits during insert)
+
+	// Split statistics.
+	splitCount atomic.Uint64 // Total leaf node splits (high value = frequent splits = bottleneck)
 }
 
 // New creates a new BTree instance.
@@ -234,6 +242,8 @@ func (t *bTree) findInsertPos(leaf *btreeapi.Node, key []byte, txnMin uint64) in
 // Each node is read-locked, then unlocked before moving to the next.
 func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 	currentPID := t.rootPageID.Load()
+	depth := 0
+
 	for {
 		t.pageLocks.RLock(currentPID)
 		node, err := t.pages.ReadPage(currentPID)
@@ -242,18 +252,23 @@ func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 			return nil, err
 		}
 
-		// B-link right-link correction
+		depth++
+		path = append(path, currentPID)
+
+		// B-link right-link correction — traverse right sibling if key >= HighKey
 		if node.HighKey != nil && bytes.Compare(key, node.HighKey) >= 0 && node.Next != 0 {
 			nextPID := node.Next
 			t.pageLocks.RUnlock(currentPID)
+			t.rightSiblingNavs.Add(1)
 			currentPID = nextPID
 			continue
 		}
 
-		path = append(path, currentPID)
-
 		if node.IsLeaf {
 			t.pageLocks.RUnlock(currentPID)
+			// Record search depth
+			t.searchDepthSum.Add(uint64(depth))
+			t.searchCount.Add(1)
 			return path, nil
 		}
 
@@ -359,6 +374,7 @@ func (t *bTree) splitNode(node *btreeapi.Node) (splitKey []byte, right *btreeapi
 }
 
 func (t *bTree) splitLeafNode(node *btreeapi.Node) (splitKey []byte, right *btreeapi.Node) {
+	t.splitCount.Add(1)
 	entries := node.Entries
 	mid := len(entries) / 2
 
@@ -752,4 +768,33 @@ func cloneUint64Slice(s []uint64) []uint64 {
 	out := make([]uint64, len(s))
 	copy(out, s)
 	return out
+}
+
+// ─── BTree Metrics Accessors ─────────────────────────────────────────
+
+// GetStats returns B-tree operation statistics for metrics/bottleneck analysis.
+func (t *bTree) GetStats() btreeapi.BTreeStats {
+	return btreeapi.BTreeStats{
+		SearchDepthSum:   t.searchDepthSum.Load(),
+		SearchCount:      t.searchCount.Load(),
+		RightSiblingNavs: t.rightSiblingNavs.Load(),
+		SplitCount:       t.splitCount.Load(),
+	}
+}
+
+// GetAvgSearchDepth returns the average B-tree search depth.
+func (t *bTree) GetAvgSearchDepth() float64 {
+	count := t.searchCount.Load()
+	if count == 0 {
+		return 0
+	}
+	return float64(t.searchDepthSum.Load()) / float64(count)
+}
+
+// ResetStats clears all B-tree statistics.
+func (t *bTree) ResetStats() {
+	t.searchDepthSum.Store(0)
+	t.searchCount.Store(0)
+	t.rightSiblingNavs.Store(0)
+	t.splitCount.Store(0)
 }

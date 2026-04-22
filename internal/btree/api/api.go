@@ -251,6 +251,9 @@ type BTree interface {
 	// Close releases resources held by the BTree.
 	Close() error
 
+	// GetStats returns B-tree operation statistics for metrics/bottleneck analysis.
+	GetStats() BTreeStats
+
 	// NewBulkLoader creates a BulkLoader for efficient bulk loading.
 	// Entries should be sorted by key before calling Build(), or the loader
 	// will sort them automatically.
@@ -264,6 +267,14 @@ type BTree interface {
 	// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID
 	// for MVCC mode. All loaded entries will have the given TxnMin.
 	NewBulkLoaderWithTxn(mode BulkMode, txnID uint64) BulkLoader
+}
+
+// BTreeStats holds B-tree traversal statistics for bottleneck analysis.
+type BTreeStats struct {
+	SearchDepthSum       uint64 // Total search depth across all operations
+	SearchCount          uint64 // Number of search operations
+	RightSiblingNavs     uint64 // B-link correction traversals
+	SplitCount           uint64 // Total leaf node splits
 }
 
 // ─── BulkLoader ─────────────────────────────────────────────────────

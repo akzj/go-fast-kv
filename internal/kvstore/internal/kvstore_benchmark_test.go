@@ -52,6 +52,12 @@ func BenchmarkKVStore_Put_SeqWrite_1k(b *testing.B) {
 		for j := 0; j < 1000; j++ {
 			s.Put(keyFor(j), valueFor(j))
 		}
+		// Print metrics after benchmark
+		m := s.GetMetrics()
+		fmt.Printf("1k: PageReads=%d PageWrites=%d PageSplits=%d BTreeSearchDepth=%d\n",
+			m.PageReads, m.PageWrites, m.PageSplits, m.BTreeSearchDepth)
+		fmt.Printf("     PageReadsPerOp=%.1f SplitsPerOp=%.2f\n",
+			float64(m.PageReads)/1000.0, float64(m.PageSplits)/1000.0)
 	}
 }
 
@@ -61,6 +67,12 @@ func BenchmarkKVStore_Put_SeqWrite_10k(b *testing.B) {
 		for j := 0; j < 10000; j++ {
 			s.Put(keyFor(j), valueFor(j))
 		}
+		// Print metrics after benchmark
+		m := s.GetMetrics()
+		fmt.Printf("Metrics: PageReads=%d PageWrites=%d PageCacheHits=%d PageSplits=%d PageAlloc=%d BTreeSearchDepth=%d RightSiblingTraversals=%d\n",
+			m.PageReads, m.PageWrites, m.PageCacheHits, m.PageSplits, m.PageAlloc, m.BTreeSearchDepth, m.RightSiblingTraversals)
+		fmt.Printf("Latency: PutP50=%0.2fμs PutP90=%0.2fμs PutP99=%0.2fμs\n",
+			m.PutLatencyP50, m.PutLatencyP90, m.PutLatencyP99)
 	}
 }
 

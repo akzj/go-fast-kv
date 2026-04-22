@@ -1620,7 +1620,43 @@ func (wb *writeBatch) DeleteWithXID(key []byte, txnID uint64) error {
 // GetMetrics returns a snapshot of current operational metrics.
 // Zero blocking — all fields are populated atomically from lock-free data structures.
 func (s *store) GetMetrics() *kvstoreapi.Metrics {
-	// Update background status from vacuum goroutine flags.
+	// Wire page provider stats (RealPageProvider).
+	stats := s.provider.GetStats()
+	s.metrics.UpdatePageStats(struct {
+		PageReads     uint64
+		PageWrites    uint64
+		PageCacheHits uint64
+		PageAlloc     uint64
+		ReadLatNs     uint64
+		ReadCount     uint64
+		WriteLatNs    uint64
+		WriteCount    uint64
+	}{
+		PageReads:     stats.PageReads,
+		PageWrites:    stats.PageWrites,
+		PageCacheHits: stats.PageCacheHits,
+		PageAlloc:     stats.PageAlloc,
+		ReadLatNs:     stats.ReadLatencyNanos,
+		ReadCount:     stats.ReadLatencyCount,
+		WriteLatNs:    stats.WriteLatencyNanos,
+		WriteCount:    stats.WriteLatencyCount,
+	})
+
+	// Wire B-tree stats via interface method.
+	treeStats := s.tree.GetStats()
+	s.metrics.UpdateBTreeStats(struct {
+		SplitCount      uint64
+		SearchDepthSum  uint64
+		SearchCount     uint64
+		RightSiblingNav uint64
+	}{
+		SplitCount:      treeStats.SplitCount,
+		SearchDepthSum:  treeStats.SearchDepthSum,
+		SearchCount:     treeStats.SearchCount,
+		RightSiblingNav: treeStats.RightSiblingNavs,
+	})
+
+	// Collect metrics with updated stats.
 	m := s.metrics.collect()
 
 	// Update GC status from trigger flags.

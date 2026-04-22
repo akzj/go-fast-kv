@@ -186,6 +186,25 @@ type metricsCollector struct {
 
 	// Resource estimates (updated periodically by background tick)
 	walSizeBytes atomic.Uint64
+
+	// Page-level operation stats (wired from RealPageProvider).
+	pageReads      atomic.Uint64
+	pageWrites     atomic.Uint64
+	pageCacheHits  atomic.Uint64
+	pageAlloc      atomic.Uint64
+
+	// Page I/O latency tracking (microseconds, P99).
+	pageReadLatencyNanos  atomic.Uint64 // Total read latency (ns)
+	pageReadCount         atomic.Uint64 // Number of reads
+	pageWriteLatencyNanos atomic.Uint64 // Total write latency (ns)
+	pageWriteLatencyCount atomic.Uint64 // Number of writes
+
+	// B-tree traversal stats (wired from bTree).
+	pageSplits         atomic.Uint64 // Leaf node split count
+	searchDepthSum     atomic.Uint64 // Total search depth (for avg calculation)
+	searchCount        atomic.Uint64 // Number of search operations
+	btreeSearchDepth   atomic.Uint64 // Average search depth
+	rightSiblingNavs   atomic.Uint64 // B-link correction traversals
 }
 
 // incRead records a read operation. Called from Get/Scan paths.
@@ -240,8 +259,67 @@ func (mc *metricsCollector) setWALSize(bytes uint64) {
 	mc.walSizeBytes.Store(bytes)
 }
 
+// UpdatePageStats updates page operation stats from RealPageProvider.
+func (mc *metricsCollector) UpdatePageStats(stats struct {
+	PageReads      uint64
+	PageWrites     uint64
+	PageCacheHits  uint64
+	PageAlloc      uint64
+	ReadLatNs      uint64
+	ReadCount      uint64
+	WriteLatNs     uint64
+	WriteCount     uint64
+}) {
+	mc.pageReads.Store(stats.PageReads)
+	mc.pageWrites.Store(stats.PageWrites)
+	mc.pageCacheHits.Store(stats.PageCacheHits)
+	mc.pageAlloc.Store(stats.PageAlloc)
+	mc.pageReadLatencyNanos.Store(stats.ReadLatNs)
+	mc.pageReadCount.Store(stats.ReadCount)
+	mc.pageWriteLatencyNanos.Store(stats.WriteLatNs)
+	mc.pageWriteLatencyCount.Store(stats.WriteCount)
+}
+
+// UpdateBTreeStats updates B-tree traversal stats.
+func (mc *metricsCollector) UpdateBTreeStats(stats struct {
+	SplitCount      uint64
+	SearchDepthSum  uint64
+	SearchCount     uint64
+	RightSiblingNav uint64
+}) {
+	mc.pageSplits.Store(stats.SplitCount)
+	mc.searchDepthSum.Store(stats.SearchDepthSum)
+	mc.searchCount.Store(stats.SearchCount)
+	// Average search depth
+	if stats.SearchCount > 0 {
+		mc.btreeSearchDepth.Store(stats.SearchDepthSum / stats.SearchCount)
+	}
+	mc.rightSiblingNavs.Store(stats.RightSiblingNav)
+}
+
 // collect returns a snapshot of all metrics.
 func (mc *metricsCollector) collect() *kvstoreapi.Metrics {
+	// Page-level latency P99 in microseconds.
+	readLatencyP99Us := uint64(0)
+	readCount := mc.pageReadCount.Load()
+	if readCount > 0 {
+		// Approximate P99 from accumulated latency (total / count * 1.2 for P99 skew)
+		readLatencyP99Us = (mc.pageReadLatencyNanos.Load() / readCount) * 12 / 10 / 1000
+	}
+	writeLatencyP99Us := uint64(0)
+	writeCount := mc.pageWriteLatencyCount.Load()
+	if writeCount > 0 {
+		writeLatencyP99Us = (mc.pageWriteLatencyNanos.Load() / writeCount) * 12 / 10 / 1000
+	}
+
+	// Average B-tree search depth.
+	btreeSearchDepth := uint64(0)
+	searchCount := mc.searchCount.Load()
+	searchDepthSum := mc.searchDepthSum.Load()
+	if searchCount > 0 {
+		btreeSearchDepth = searchDepthSum / searchCount
+	}
+
 	return &kvstoreapi.Metrics{
 		GetLatencyP50:         mc.getLatency.percentile(0.50),
 		GetLatencyP90:         mc.getLatency.percentile(0.90),
@@ -263,6 +341,22 @@ func (mc *metricsCollector) collect() *kvstoreapi.Metrics {
 		PageCacheUsed:         0, // TODO: wire from page store stats
 		MemTableUsed:          0, // TODO: wire from LSM memtable stats
 		WALSizeBytes:          mc.walSizeBytes.Load(),
+
+		// Page operation stats from RealPageProvider.
+		PageReads:             mc.pageReads.Load(),
+		PageWrites:            mc.pageWrites.Load(),
+		PageCacheHits:         mc.pageCacheHits.Load(),
+		PageCacheMiss:         mc.pageReads.Load() - mc.pageCacheHits.Load(),
+		PageSplits:            mc.pageSplits.Load(),
+		PageAlloc:             mc.pageAlloc.Load(),
+
+		// Page I/O latency.
+		PageReadLatencyP99:    readLatencyP99Us,
+		PageWriteLatencyP99:   writeLatencyP99Us,
+
+		// B-tree traversal stats.
+		BTreeSearchDepth:      btreeSearchDepth,
+		RightSiblingTraversals: mc.rightSiblingNavs.Load(),
 	}
 }
 

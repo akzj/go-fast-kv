@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
@@ -127,6 +129,20 @@ type RealPageProvider struct {
 	// Legacy shared buffer (for tests that don't use collectors).
 	mu         sync.Mutex
 	walEntries []pagestoreapi.WALEntry
+
+	// Page operation counters for metrics/analysis.
+	// Used to detect query path issues (e.g., sequential scan vs hierarchical lookup).
+	pageReads      atomic.Uint64 // Total ReadPage calls
+	pageWrites     atomic.Uint64 // Total WritePage calls
+	pageCacheHits  atomic.Uint64 // Cache hits (no disk I/O)
+	pageAlloc      atomic.Uint64 // Total AllocPage calls
+
+	// Latency tracking for page I/O (microseconds).
+	// Uses atomic operations for thread safety.
+	readLatencyNanos  atomic.Uint64 // Accumulated read latency (ns)
+	readLatencyCount  atomic.Uint64 // Number of reads sampled
+	writeLatencyNanos atomic.Uint64 // Accumulated write latency (ns)
+	writeLatencyCount atomic.Uint64 // Number of writes sampled
 }
 
 // NewRealPageProvider creates a RealPageProvider backed by the given PageStore.
@@ -176,6 +192,7 @@ func (p *RealPageProvider) CollectAndClear() []pagestoreapi.WALEntry {
 
 // AllocPage allocates a new page via the underlying PageStore.
 func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
+	p.pageAlloc.Add(1)
 	return p.store.Alloc()
 }
 
@@ -183,8 +200,12 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 // The LRU cache is checked first; on miss the page is read from
 // the PageStore, deserialized, cached, and returned.
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
+	startNs := time.Now().UnixNano()
+	p.pageReads.Add(1)
+
 	// Fast path: cache hit — return a clone.
 	if node, ok := p.cache.Get(pageID); ok {
+		p.pageCacheHits.Add(1)
 		return node, nil
 	}
 
@@ -201,6 +222,11 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 	// Populate cache (stores a clone internally).
 	p.cache.Put(pageID, node)
 
+	// Track latency (cache miss includes disk I/O).
+	latencyNs := time.Now().UnixNano() - startNs
+	p.readLatencyNanos.Add(uint64(latencyNs))
+	p.readLatencyCount.Add(1)
+
 	// Return the original — the cache holds its own clone.
 	return node, nil
 }
@@ -213,6 +239,9 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 // the WAL entry is appended to that collector. Otherwise, it falls back to the
 // shared walEntries buffer (legacy mode for tests).
 func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.Node) error {
+	startNs := time.Now().UnixNano()
+	p.pageWrites.Add(1)
+
 	data, err := p.serializer.Serialize(node)
 	if err != nil {
 		return fmt.Errorf("realpage: serialize page %d: %w", pageID, err)
@@ -224,6 +253,11 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.
 
 	// Update cache with the new version (stores a clone internally).
 	p.cache.Put(pageID, node)
+
+	// Track write latency (includes serialization + disk I/O).
+	latencyNs := time.Now().UnixNano() - startNs
+	p.writeLatencyNanos.Add(uint64(latencyNs))
+	p.writeLatencyCount.Add(1)
 
 	// Route WAL entry to per-operation collector or shared buffer.
 	gid := goroutineID()
@@ -258,4 +292,46 @@ func (p *RealPageProvider) DrainWALEntries() []pagestoreapi.WALEntry {
 	out := p.walEntries
 	p.walEntries = nil
 	return out
+}
+
+// ─── Metrics Accessors ────────────────────────────────────────────────
+
+// PageStats holds page-level operation statistics for B-tree analysis.
+type PageStats struct {
+	PageReads           uint64
+	PageWrites          uint64
+	PageCacheHits       uint64
+	PageAlloc           uint64
+	ReadLatencyNanos    uint64 // Total read latency (ns)
+	ReadLatencyCount    uint64
+	WriteLatencyNanos   uint64 // Total write latency (ns)
+	WriteLatencyCount   uint64
+}
+
+// GetStats returns a snapshot of page operation statistics.
+// Used for metrics collection and bottleneck analysis.
+func (p *RealPageProvider) GetStats() PageStats {
+	return PageStats{
+		PageReads:         p.pageReads.Load(),
+		PageWrites:        p.pageWrites.Load(),
+		PageCacheHits:    p.pageCacheHits.Load(),
+		PageAlloc:        p.pageAlloc.Load(),
+		ReadLatencyNanos:  p.readLatencyNanos.Load(),
+		ReadLatencyCount:  p.readLatencyCount.Load(),
+		WriteLatencyNanos: p.writeLatencyNanos.Load(),
+		WriteLatencyCount: p.writeLatencyCount.Load(),
+	}
+}
+
+// ResetStats clears all page operation counters.
+// Used between benchmark runs to measure isolated workloads.
+func (p *RealPageProvider) ResetStats() {
+	p.pageReads.Store(0)
+	p.pageWrites.Store(0)
+	p.pageCacheHits.Store(0)
+	p.pageAlloc.Store(0)
+	p.readLatencyNanos.Store(0)
+	p.readLatencyCount.Store(0)
+	p.writeLatencyNanos.Store(0)
+	p.writeLatencyCount.Store(0)
 }
