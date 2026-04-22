@@ -172,6 +172,7 @@ const (
 	TokVirtual       TokenType = 156 // VIRTUAL (for CREATE VIRTUAL TABLE)
 	TokUsing         TokenType = 157 // USING
 	TokMatch         TokenType = 158 // MATCH (for FTS MATCH expression)
+	TokView          TokenType = 162 // VIEW (for CREATE VIEW, DROP VIEW)
 	TokFTS5          TokenType = 159 // FTS5
 	TokFTS4          TokenType = 160 // FTS4
 	TokFTS3          TokenType = 161 // FTS3
@@ -248,6 +249,23 @@ type DropIndexStmt struct {
 }
 
 func (*DropIndexStmt) stmtNode() {}
+
+// CreateViewStmt: CREATE VIEW view_name AS select_statement
+type CreateViewStmt struct {
+	Name      string // view name
+	QuerySQL  string // raw SQL text for re-parsing
+	Select    Statement // the parsed SELECT statement (for validation)
+}
+
+func (*CreateViewStmt) stmtNode() {}
+
+// DropViewStmt: DROP VIEW [IF EXISTS] view_name
+type DropViewStmt struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropViewStmt) stmtNode() {}
 
 // AlterTableStmt: ALTER TABLE t ADD COLUMN col TYPE [NOT NULL] [UNIQUE]
 //                 ALTER TABLE t DROP COLUMN col

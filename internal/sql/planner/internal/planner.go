@@ -16,13 +16,14 @@ var _ plannerapi.Planner = (*planner)(nil)
 
 type planner struct {
 	catalog catalogapi.CatalogManager
+	parser  parserapi.Parser
 	// cteSchemas holds CTE schemas indexed by name, populated during WithStmt planning
 	cteSchemas map[string]*catalogapi.TableSchema
 }
 
-// New creates a new Planner backed by the given catalog.
-func New(catalog catalogapi.CatalogManager) *planner {
-	return &planner{catalog: catalog}
+// New creates a new Planner backed by the given catalog and parser.
+func New(catalog catalogapi.CatalogManager, parser parserapi.Parser) *planner {
+	return &planner{catalog: catalog, parser: parser}
 }
 
 // Plan converts a parsed AST statement into an execution plan.
@@ -83,6 +84,10 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planCreateTrigger(s)
 	case *parserapi.DropTriggerStmt:
 		return p.planDropTrigger(s)
+	case *parserapi.CreateViewStmt:
+		return p.planCreateView(s)
+	case *parserapi.DropViewStmt:
+		return p.planDropView(s)
 	case *parserapi.CreateFTSStmt:
 		return p.planCreateFTS(s)
 	default:
@@ -787,6 +792,28 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		tbl, err = p.catalog.GetTable(stmt.Table)
 		if err != nil {
 			if err == catalogapi.ErrTableNotFound {
+				// Check if it's a VIEW
+				view, viewErr := p.catalog.GetView(stmt.Table)
+				if viewErr == nil {
+					// It's a view — re-parse the view's SELECT SQL
+					viewSelect, err := p.parser.Parse(view.QuerySQL)
+					if err != nil {
+						return nil, fmt.Errorf("invalid view %q: %v", stmt.Table, err)
+					}
+					viewSelectStmt, ok := viewSelect.(*parserapi.SelectStmt)
+					if !ok {
+						return nil, fmt.Errorf("view %q must define a SELECT statement", stmt.Table)
+					}
+					// Treat as a derived table: set DerivedTable and call planDerivedTableSelect
+					stmt.DerivedTable = &parserapi.DerivedTable{
+						Subquery: &parserapi.SubqueryExpr{
+							Stmt: viewSelectStmt,
+						},
+						Alias: stmt.Table,
+					}
+					stmt.Table = "" // clear table name
+					return p.planDerivedTableSelect(stmt)
+				}
 				return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
 			}
 			return nil, err
@@ -2328,6 +2355,23 @@ func (p *planner) planCreateTrigger(stmt *parserapi.TriggerStmt) (*plannerapi.Cr
 
 func (p *planner) planDropTrigger(stmt *parserapi.DropTriggerStmt) (*plannerapi.DropTriggerPlan, error) {
 	return &plannerapi.DropTriggerPlan{
+		Name:     stmt.Name,
+		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// ─── VIEW Planning ───────────────────────────────────────────────────
+
+func (p *planner) planCreateView(stmt *parserapi.CreateViewStmt) (*plannerapi.CreateViewPlan, error) {
+	// Use the raw SQL captured by the parser
+	return &plannerapi.CreateViewPlan{
+		Name:     stmt.Name,
+		QuerySQL: stmt.QuerySQL,
+	}, nil
+}
+
+func (p *planner) planDropView(stmt *parserapi.DropViewStmt) (*plannerapi.DropViewPlan, error) {
+	return &plannerapi.DropViewPlan{
 		Name:     stmt.Name,
 		IfExists: stmt.IfExists,
 	}, nil

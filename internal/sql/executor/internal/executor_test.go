@@ -44,7 +44,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
-	pl := planner.New(cat)
+	pl := planner.New(cat, p)
 	ex := New(store, cat, tbl, idx, nil, pl, p)
 
 	return &testEnv{
@@ -87,6 +87,65 @@ func (env *testEnv) execSQLErr(t *testing.T, sql string) (*executorapi.Result, e
 		return nil, err
 	}
 	return env.exec.Execute(plan)
+}
+
+// ─── View Tests ───────────────────────────────────────────────────
+
+func TestExec_CreateView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+
+	// Create view
+	result := env.execSQL(t, "CREATE VIEW active_users AS SELECT id, name FROM users WHERE id = 1")
+	if result.RowsAffected != 1 {
+		t.Errorf("expected 1 row affected, got %d", result.RowsAffected)
+	}
+}
+
+func TestExec_DropView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE t1 (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice')")
+
+	// Create view
+	env.execSQL(t, "CREATE VIEW v1 AS SELECT * FROM t1")
+
+	// Drop view
+	result := env.execSQL(t, "DROP VIEW v1")
+	if result.RowsAffected != 1 {
+		t.Errorf("expected 1 row affected, got %d", result.RowsAffected)
+	}
+}
+
+func TestExec_SelectFromView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE t1 (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')")
+
+	// Create view
+	env.execSQL(t, "CREATE VIEW v1 AS SELECT id, name FROM t1 WHERE id = 1")
+
+	// Query view
+	result := env.execSQL(t, "SELECT * FROM v1")
+	if len(result.Rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Int != 1 || result.Rows[0][1].Text != "Alice" {
+		t.Errorf("unexpected row: %v", result.Rows[0])
+	}
+}
+
+func TestExec_DropViewIfExists(t *testing.T) {
+	env := newTestEnv(t)
+	// Try to drop non-existent view with IF EXISTS
+	result := env.execSQL(t, "DROP VIEW IF EXISTS nonexistent")
+	if result.RowsAffected != 0 {
+		t.Errorf("expected 0 rows affected, got %d", result.RowsAffected)
+	}
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────

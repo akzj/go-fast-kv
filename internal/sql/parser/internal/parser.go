@@ -15,10 +15,11 @@ var _ api.Parser = (*parser)(nil)
 
 // parser is a recursive descent SQL parser.
 type parser struct {
-	lex   *lexer
-	cur   api.Token // current token
-	peek  api.Token // lookahead token
-	depth int       // recursion depth for stack overflow prevention
+	lex      *lexer
+	cur      api.Token // current token
+	peek     api.Token // lookahead token
+	depth    int       // recursion depth for stack overflow prevention
+	rawInput string    // original input SQL for capturing raw SQL text
 	// questionCount tracks ? placeholder position for sequential numbering
 	questionCount int
 }
@@ -39,6 +40,7 @@ func New() api.Parser {
 // Parse parses a single SQL statement.
 func (p *parser) Parse(sql string) (api.Statement, error) {
 	p.lex = newLexer(sql)
+	p.rawInput = sql
 	p.cur = p.lex.nextToken()
 	p.peek = p.lex.nextToken()
 	p.questionCount = 0 // reset ? placeholder counter
@@ -337,12 +339,78 @@ func (p *parser) parseCreate() (api.Statement, error) {
 		return p.parseCreateIndex(false)
 	case api.TokTrigger:
 		return p.parseCreateTrigger()
+	case api.TokView:
+		return p.parseCreateView()
 	case api.TokVirtual:
 		return p.parseCreateFTS()
 	default:
-		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, or VIRTUAL after CREATE")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, VIEW, or VIRTUAL after CREATE")
 	}
 }
+
+// ─── CREATE VIEW ─────────────────────────────────────────────────
+
+func (p *parser) parseCreateView() (api.Statement, error) {
+	p.advance() // consume VIEW
+
+	// View name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected view name")
+	}
+	viewName := p.cur.Literal
+	p.advance()
+
+	// AS keyword
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+		return nil, p.errorf("expected AS after view name")
+	}
+	p.advance()
+
+	// Capture raw SELECT SQL text BEFORE parsing
+	if p.cur.Type != api.TokSelect {
+		return nil, p.errorf("expected SELECT statement in view definition")
+	}
+	querySQL := p.rawSQLFromCurrentPos()
+
+	// Parse SELECT statement for validation
+	selectStmt, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.CreateViewStmt{
+		Name:     viewName,
+		QuerySQL: querySQL,
+		Select:   selectStmt,
+	}, nil
+}
+
+// ─── DROP VIEW ────────────────────────────────────────────────────
+
+func (p *parser) parseDropView() (api.Statement, error) {
+	p.advance() // consume VIEW
+	stmt := &api.DropViewStmt{}
+
+	// IF EXISTS
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	// View name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected view name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+
+	return stmt, nil
+}
+
+// ─── CREATE TABLE ─────────────────────────────────────────────────
 
 func (p *parser) parseCreateTable() (api.Statement, error) {
 	p.advance() // consume TABLE
@@ -1086,8 +1154,10 @@ func (p *parser) parseDrop() (api.Statement, error) {
 		return p.parseDropIndex()
 	case api.TokTrigger:
 		return p.parseDropTrigger()
+	case api.TokView:
+		return p.parseDropView()
 	default:
-		return nil, p.errorf("expected TABLE, INDEX, or TRIGGER after DROP")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, or VIEW after DROP")
 	}
 }
 
@@ -3006,6 +3076,21 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 func (p *parser) advance() {
 	p.cur = p.peek
 	p.peek = p.lex.nextToken()
+}
+
+// rawSQLFromCurrentPos returns the raw SQL text from current token position to end of input.
+// This is used to capture the raw SELECT text when creating a VIEW.
+func (p *parser) rawSQLFromCurrentPos() string {
+	if p.rawInput == "" {
+		return ""
+	}
+	// Find the token position in the raw input
+	startPos := p.cur.Pos
+	// Trim any leading whitespace
+	for startPos < len(p.rawInput) && (p.rawInput[startPos] == ' ' || p.rawInput[startPos] == '\t' || p.rawInput[startPos] == '\n' || p.rawInput[startPos] == '\r') {
+		startPos++
+	}
+	return strings.TrimSpace(p.rawInput[startPos:])
 }
 
 // expect consumes the current token if it matches the expected type.

@@ -44,7 +44,7 @@ func newForUpdateTestEnv(t *testing.T) *forUpdateTestEnv {
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
-	pl := planner.New(cat)
+	pl := planner.New(cat, p)
 	exec := New(store, cat, tbl, idx, nil, pl, p)
 	txnMgr := txn.New()
 
@@ -730,7 +730,7 @@ func BenchmarkForUpdate_LockAcquisition(b *testing.B) {
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
 	env.parser = parser.New()
-	env.planner = planner.New(env.cat)
+	env.planner = planner.New(env.cat, env.parser)
 	env.exec = New(store, env.cat, tbl, idx, nil, env.planner, env.parser)
 	env.txnMgr = txn.New()
 

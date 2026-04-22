@@ -259,7 +259,7 @@ func newTestEnvWithFTS(t *testing.T) *testEnv {
 	idx := engine.NewIndexEngine(store, enc)
 	fts := engine.NewFTSEngine(store)
 	p := parser.New()
-	pl := planner.New(cat)
+	pl := planner.New(cat, p)
 	exec := New(store, cat, tbl, idx, fts, pl, p)
 
 	return &testEnv{

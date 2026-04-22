@@ -191,6 +191,10 @@ func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error
 		return e.execCreateTrigger(p)
 	case *plannerapi.DropTriggerPlan:
 		return e.execDropTrigger(p)
+	case *plannerapi.CreateViewPlan:
+		return e.execCreateView(p)
+	case *plannerapi.DropViewPlan:
+		return e.execDropView(p)
 	case *plannerapi.CreateFTSPlan:
 		return e.execCreateFTS(p)
 	case *plannerapi.FTSSearchPlan:

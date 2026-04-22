@@ -139,6 +139,7 @@ var keywords = map[string]api.TokenType{
 	"FTS5":          api.TokFTS5,
 	"FTS4":          api.TokFTS4,
 	"FTS3":          api.TokFTS3,
+	"VIEW":          api.TokView,
 }
 
 // lexer tokenizes SQL input.

@@ -10,6 +10,7 @@ import (
 	"github.com/akzj/go-fast-kv/internal/sql/catalog"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
+	"github.com/akzj/go-fast-kv/internal/sql/parser"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
 )
@@ -39,7 +40,7 @@ func setupPlanner(t *testing.T) *planner {
 		t.Fatalf("create table: %v", err)
 	}
 
-	return New(cat)
+	return New(cat, parser.New())
 }
 
 // setupPlannerWithIndex creates a planner with USERS table + index on AGE.
@@ -75,7 +76,7 @@ func setupPlannerWithIndex(t *testing.T) *planner {
 		t.Fatalf("create index: %v", err)
 	}
 
-	return New(cat)
+	return New(cat, parser.New())
 }
 
 func TestPlan_CreateTable(t *testing.T) {
@@ -989,7 +990,7 @@ func setupPlannerWithJoinTables(t *testing.T) *planner {
 		t.Fatalf("create t2 table: %v", err)
 	}
 
-	return New(cat)
+	return New(cat, parser.New())
 }
 
 func TestPlan_IndexNestedLoopJoin(t *testing.T) {
