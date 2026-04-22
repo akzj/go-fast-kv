@@ -167,9 +167,13 @@ CREATE TABLE orders (
 
 ### Known Limitations
 
-| Issue | Description | Severity |
-|-------|-------------|----------|
-| TestSnapshotIsolation Intermittent | Snapshot Isolation test has ~5% failure rate due to race condition in test setup | Low (test only, not production code) |
+No known issues. All documented features are production-ready.
+
+### Resolved Issues
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| TestSnapshotIsolation intermittent failure | Schema stored as BLOB; vacuum deleted it prematurely | Schema compression (54B inline), vacuum skips `_sql:*` catalog keys |
 
 ---
 
