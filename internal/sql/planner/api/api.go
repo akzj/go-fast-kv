@@ -159,12 +159,14 @@ func (*CreateFTSPlan) planNode() {}
 
 // FTSSearchPlan represents a FTS MATCH search.
 type FTSSearchPlan struct {
-	Table    string // FTS table name
-	Query    string // FTS query string
-	ScanPlan *SelectPlan // underlying scan plan
+	Table          string       // FTS table name
+	TableID        uint32       // FTS table ID
+	Query          string       // FTS query string
+	ResidualFilter parserapi.Expr // other filter conditions (AND'd with MATCH)
 }
 
 func (*FTSSearchPlan) planNode() {}
+func (*FTSSearchPlan) scanNode() {}
 
 // DropFTSPlan drops a FTS table (same as DROP TABLE).
 type DropFTSPlan struct {

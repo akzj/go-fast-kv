@@ -193,6 +193,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execDropTrigger(p)
 	case *plannerapi.CreateFTSPlan:
 		return e.execCreateFTS(p)
+	case *plannerapi.FTSSearchPlan:
+		return e.execFTSSearch(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -285,6 +287,8 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execDropTrigger(p)
 	case *plannerapi.CreateFTSPlan:
 		return e.execCreateFTS(p)
+	case *plannerapi.FTSSearchPlan:
+		return e.execFTSSearch(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -720,6 +724,62 @@ func ftsColumnsToSchema(columns []string) []catalogapi.ColumnDef {
 		}
 	}
 	return cols
+}
+
+// execFTSSearch executes a FTS MATCH search.
+func (e *executor) execFTSSearch(plan *plannerapi.FTSSearchPlan) (*executorapi.Result, error) {
+	if e.ftsEngine == nil {
+		return nil, fmt.Errorf("%w: FTS engine not available", executorapi.ErrExecFailed)
+	}
+
+	// Perform FTS search
+	docIDs, err := e.ftsEngine.Search(plan.Table, plan.Query)
+	if err != nil {
+		return nil, fmt.Errorf("%w: FTS search: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Get FTS table schema
+	schema, err := e.catalog.GetTable(plan.Table)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Fetch rows by rowID and apply residual filter
+	var rows [][]catalogapi.Value
+	for _, docID := range docIDs {
+		row, err := e.tableEngine.Get(schema, docID)
+		if err != nil {
+			if err == engineapi.ErrRowNotFound {
+				continue // row was deleted
+			}
+			return nil, fmt.Errorf("%w: fetching FTS row: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Apply residual filter if present
+		if plan.ResidualFilter != nil {
+			engineRow := &engineapi.Row{RowID: docID, Values: row.Values}
+			match, err := matchFilter(plan.ResidualFilter, engineRow, schema.Columns, nil, e)
+			if err != nil {
+				return nil, fmt.Errorf("%w: evaluating FTS filter: %v", executorapi.ErrExecFailed, err)
+			}
+			if !match {
+				continue
+			}
+		}
+
+		rows = append(rows, row.Values)
+	}
+
+	// Build column names list
+	colNames := make([]string, len(schema.Columns))
+	for i, col := range schema.Columns {
+		colNames[i] = col.Name
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    rows,
+	}, nil
 }
 
 // pragmaTableInfo returns column information for a table.

@@ -1681,6 +1681,31 @@ func (p *planner) planScan(tbl *catalogapi.TableSchema, where parserapi.Expr) (p
 
 	conditions := flattenAnd(where)
 
+	// Check for FTS MATCH expression
+	for i, cond := range conditions {
+		if match, ok := cond.(*parserapi.MatchExpr); ok {
+			// FTS MATCH query — create FTSSearchPlan
+			var residualParts []parserapi.Expr
+			for j, c := range conditions {
+				if j != i {
+					residualParts = append(residualParts, c)
+				}
+			}
+			var residual parserapi.Expr
+			if len(residualParts) == 1 {
+				residual = residualParts[0]
+			} else if len(residualParts) > 1 {
+				residual = buildAndChain(residualParts)
+			}
+			return &plannerapi.FTSSearchPlan{
+				Table:         tbl.Name,
+				TableID:       tbl.TableID,
+				Query:         match.Query,
+				ResidualFilter: residual,
+			}, residual, nil
+		}
+	}
+
 	// First: check for LIKE prefix candidates (highest priority — more specific than EQ)
 	for i, cond := range conditions {
 		cand := p.extractLikeIndexCandidate(tbl, cond)
