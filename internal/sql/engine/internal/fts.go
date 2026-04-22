@@ -118,41 +118,7 @@ func (f *ftsEngine) RemoveDocument(tableName string, docID uint64, texts []strin
 	return batch.Commit()
 }
 
-// Search performs an FTS search and returns matching docIDs.
-func (f *ftsEngine) Search(tableName string, query string) ([]uint64, error) {
-	// Parse the query into terms and operators
-	terms := parseFTSQuery(query)
 
-	if len(terms) == 0 {
-		return nil, nil
-	}
-
-	// Get matching docIDs for each term
-	var termDocIDs []map[uint64]struct{}
-	for _, term := range terms {
-		docIDs, err := f.getDocIDsForToken(tableName, term)
-		if err != nil {
-			return nil, err
-		}
-		termDocIDs = append(termDocIDs, docIDs)
-	}
-
-	if len(termDocIDs) == 0 {
-		return nil, nil
-	}
-
-	// For AND: intersect all sets
-	result := intersectDocIDs(termDocIDs)
-
-	// Convert to sorted slice
-	docList := make([]uint64, 0, len(result))
-	for docID := range result {
-		docList = append(docList, docID)
-	}
-	sort.Slice(docList, func(i, j int) bool { return docList[i] < docList[j] })
-
-	return docList, nil
-}
 
 // getDocIDsForToken returns all docIDs that contain the given token.
 func (f *ftsEngine) getDocIDsForToken(tableName string, token string) (map[uint64]struct{}, error) {
@@ -251,56 +217,320 @@ func simpleTokenize(text string) []string {
 	return words
 }
 
-// parseFTSQuery parses a simple FTS query string.
-// Supports: term, "term1 AND term2", "term1 OR term2"
-// Simple terms are treated as AND (all must match).
-func parseFTSQuery(query string) []string {
+// queryToken represents a parsed FTS query token.
+// Type: "term" or "op" (AND, OR, NOT).
+type queryToken struct {
+	Type  string // "term", "op"
+	Value string // word or operator
+}
+
+// tokenizeQuery splits a query string into tokens preserving operators.
+func tokenizeQuery(query string) []queryToken {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil
 	}
 
-	// Check for explicit operators
-	upperQuery := strings.ToUpper(query)
-	if strings.Contains(upperQuery, " AND ") {
-		parts := strings.Split(strings.ToLower(query), " and ")
-		var result []string
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			// Remove NOT prefix if present
-			if strings.HasPrefix(part, "not ") {
-				part = strings.TrimPrefix(part, "not ")
+	var tokens []queryToken
+	// Use a simple state machine to extract terms and operators.
+	// Operators: AND, OR, NOT (case-insensitive).
+	// Terms: anything else, stripped of surrounding quotes.
+
+	// First, split by operators while preserving them.
+	// Match: word1 AND word2 OR word3 NOT word4
+	// Split the query around operators
+	inQuote := false
+	partStart := 0
+	for i := 0; i <= len(query); i++ {
+		c := rune(0)
+		if i < len(query) {
+			c = rune(query[i])
+		}
+
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+
+		if !inQuote && i < len(query) {
+			// Check if we're at an operator
+			remaining := strings.ToUpper(query[i:])
+			if strings.HasPrefix(remaining, "AND ") || strings.HasPrefix(remaining, "AND") {
+				// Extract the part before this operator
+				if i > partStart {
+					part := strings.TrimSpace(query[partStart:i])
+					part = strings.Trim(part, "\"")
+					if part != "" {
+						tokens = append(tokens, queryToken{Type: "term", Value: strings.ToLower(part)})
+					}
+				}
+				// Consume "AND" and any trailing space
+				tokens = append(tokens, queryToken{Type: "op", Value: "AND"})
+				i += 2
+				for i < len(query) && query[i] == ' ' {
+					i++
+				}
+				partStart = i
+				continue
 			}
-			// Remove quotes
-			part = strings.Trim(part, "\"")
-			if part != "" {
-				result = append(result, part)
+			if strings.HasPrefix(remaining, "OR ") || strings.HasPrefix(remaining, "OR") {
+				if i > partStart {
+					part := strings.TrimSpace(query[partStart:i])
+					part = strings.Trim(part, "\"")
+					if part != "" {
+						tokens = append(tokens, queryToken{Type: "term", Value: strings.ToLower(part)})
+					}
+				}
+				tokens = append(tokens, queryToken{Type: "op", Value: "OR"})
+				i += 1
+				for i < len(query) && query[i] == ' ' {
+					i++
+				}
+				partStart = i
+				continue
+			}
+			if strings.HasPrefix(remaining, "NOT ") || strings.HasPrefix(remaining, "NOT") {
+				if i > partStart {
+					part := strings.TrimSpace(query[partStart:i])
+					part = strings.Trim(part, "\"")
+					if part != "" {
+						tokens = append(tokens, queryToken{Type: "term", Value: strings.ToLower(part)})
+					}
+				}
+				tokens = append(tokens, queryToken{Type: "op", Value: "NOT"})
+				i += 2
+				for i < len(query) && query[i] == ' ' {
+					i++
+				}
+				partStart = i
+				continue
 			}
 		}
-		return result
 	}
 
-	if strings.Contains(upperQuery, " OR ") {
-		parts := strings.Split(strings.ToLower(query), " or ")
-		var result []string
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			// Remove NOT prefix if present
-			if strings.HasPrefix(part, "not ") {
-				part = strings.TrimPrefix(part, "not ")
-			}
-			// Remove quotes
-			part = strings.Trim(part, "\"")
-			if part != "" {
-				result = append(result, part)
+	// Handle remaining part after last operator
+	if partStart < len(query) {
+		part := strings.TrimSpace(query[partStart:])
+		part = strings.Trim(part, "\"")
+		if part != "" {
+			tokens = append(tokens, queryToken{Type: "term", Value: strings.ToLower(part)})
+		}
+	}
+
+	return tokens
+}
+
+// parseFTSQuery parses a simple FTS query string.
+// Supports: term, "term1 AND term2", "term1 OR term2", "term1 NOT term2"
+// Simple terms are treated as AND (all must match).
+func parseFTSQuery(query string) []string {
+	tokens := tokenizeQuery(query)
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// For backward compatibility: if no operators, just return terms.
+	hasOp := false
+	for _, t := range tokens {
+		if t.Type == "op" {
+			hasOp = true
+			break
+		}
+	}
+
+	if !hasOp {
+		// No operators - return all terms as simple list (AND semantics)
+		var terms []string
+		for _, t := range tokens {
+			if t.Type == "term" && t.Value != "" {
+				terms = append(terms, t.Value)
 			}
 		}
-		return result
+		return terms
 	}
 
-	// Simple single term - remove quotes
-	term := strings.Trim(query, "\"")
-	return []string{strings.ToLower(term)}
+	// Legacy: strip operators and return terms
+	var terms []string
+	for _, t := range tokens {
+		if t.Type == "term" {
+			terms = append(terms, t.Value)
+		}
+	}
+	return terms
+}
+
+// Search performs an FTS search and returns matching docIDs.
+// Supports AND (intersection), OR (union), NOT (difference).
+func (f *ftsEngine) Search(tableName string, query string) ([]uint64, error) {
+	tokens := tokenizeQuery(query)
+
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+
+	// Check if we have any operators
+	hasOp := false
+	for _, t := range tokens {
+		if t.Type == "op" {
+			hasOp = true
+			break
+		}
+	}
+
+	if !hasOp {
+		// No operators - simple single term search
+		term := ""
+		if tokens[0].Type == "term" {
+			term = tokens[0].Value
+		}
+		if term == "" {
+			return nil, nil
+		}
+		docIDs, err := f.getDocIDsForToken(tableName, term)
+		if err != nil {
+			return nil, err
+		}
+		return docIDsToList(docIDs), nil
+	}
+
+	// Execute query with operators
+	return f.executeQuery(tableName, tokens)
+}
+
+// executeQuery evaluates a tokenized query with AND/OR/NOT operators.
+// Operator precedence: NOT > AND > OR (left-to-right for same precedence).
+func (f *ftsEngine) executeQuery(tableName string, tokens []queryToken) ([]uint64, error) {
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+
+	// First pass: handle NOT (unary operator, highest precedence)
+	// "word1 NOT word2" means docs with word1 that don't have word2
+	// We process NOT by computing the set difference
+
+	// For simplicity, let's implement left-to-right evaluation with
+	// NOT having higher precedence than AND/OR.
+	// Algorithm: 
+	// 1. Group into groups separated by OR
+	// 2. For each group, compute AND/NOT
+	// 3. OR the groups together
+
+	// Alternative: simpler approach - compute all term sets first,
+	// then apply operators in order.
+
+	// Get all term sets
+	type termSet struct {
+		term  string
+		negate bool
+	}
+	var termSets []termSet
+	var ops []string // operators between terms
+
+	currentNegate := false
+	for i, token := range tokens {
+		if token.Type == "op" {
+			ops = append(ops, token.Value)
+			if token.Value == "NOT" {
+				// NOT is a unary operator - next term should be negated
+				currentNegate = true
+			}
+		} else {
+			termSets = append(termSets, termSet{
+				term:   token.Value,
+				negate: currentNegate,
+			})
+			currentNegate = false
+			_ = i // silence unused warning
+		}
+	}
+
+	// Evaluate left to right with AND/OR precedence:
+	// AND has higher precedence than OR
+	// "a OR b AND c" = "(a OR b) AND c" = left-to-right
+
+	// Group by OR first, then AND within groups
+	var orGroups [][]termSet
+	var currentGroup []termSet
+
+	for i, ts := range termSets {
+		currentGroup = append(currentGroup, ts)
+		if i < len(ops) && ops[i] == "OR" {
+			orGroups = append(orGroups, currentGroup)
+			currentGroup = nil
+		}
+	}
+	if len(currentGroup) > 0 {
+		orGroups = append(orGroups, currentGroup)
+	}
+
+	// Evaluate each OR group (AND within)
+	var groupResults []map[uint64]struct{}
+	for _, group := range orGroups {
+		// AND = intersection
+		if len(group) == 0 {
+			continue
+		}
+		// Get first term's docIDs
+		var result map[uint64]struct{}
+		for j, ts := range group {
+			docIDs, err := f.getDocIDsForToken(tableName, ts.term)
+			if err != nil {
+				return nil, err
+			}
+			if j == 0 {
+				result = docIDs
+			} else {
+				// AND: intersect
+				result = intersectDocIDs([]map[uint64]struct{}{result, docIDs})
+			}
+			// Apply NOT after AND
+			if ts.negate && len(docIDs) > 0 {
+				// Subtract these docIDs from result
+				for docID := range docIDs {
+					delete(result, docID)
+				}
+			}
+		}
+		if result != nil {
+			groupResults = append(groupResults, result)
+		}
+	}
+
+	if len(groupResults) == 0 {
+		return nil, nil
+	}
+
+	// OR = union of all groups
+	result := unionDocIDs(groupResults)
+	return docIDsToList(result), nil
+}
+
+// docIDsToList converts a map to sorted slice.
+func docIDsToList(docIDs map[uint64]struct{}) []uint64 {
+	list := make([]uint64, 0, len(docIDs))
+	for docID := range docIDs {
+		list = append(list, docID)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
+	return list
+}
+
+// unionDocIDs returns the union of multiple docID sets.
+func unionDocIDs(sets []map[uint64]struct{}) map[uint64]struct{} {
+	if len(sets) == 0 {
+		return make(map[uint64]struct{})
+	}
+	if len(sets) == 1 {
+		return sets[0]
+	}
+
+	result := make(map[uint64]struct{})
+	for _, set := range sets {
+		for docID := range set {
+			result[docID] = struct{}{}
+		}
+	}
+	return result
 }
 
 // intersectDocIDs returns the intersection of multiple docID sets.
