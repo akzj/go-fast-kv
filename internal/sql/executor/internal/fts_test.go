@@ -191,7 +191,7 @@ func TestFTS_QueryOperators(t *testing.T) {
 
 	// Test OR query - should return docs 1, 2, 3
 	t.Run("OR query", func(t *testing.T) {
-		docIDs, err := fts.Search("docs", "sql OR nosql")
+		docIDs, err := fts.Search("docs", "sql OR database")
 		if err != nil {
 			t.Fatalf("Search OR: %v", err)
 		}

@@ -266,11 +266,13 @@ func tokenizeQuery(query string) []queryToken {
 				}
 				// Consume "AND" and any trailing space
 				tokens = append(tokens, queryToken{Type: "op", Value: "AND"})
-				i += 2
+				i += 3 // skip "AND" (i now at space or end)
 				for i < len(query) && query[i] == ' ' {
 					i++
 				}
+				// Set partStart to first non-space char, compensate for for-loop's i++
 				partStart = i
+				i-- // compensate
 				continue
 			}
 			if strings.HasPrefix(remaining, "OR ") || strings.HasPrefix(remaining, "OR") {
@@ -282,11 +284,13 @@ func tokenizeQuery(query string) []queryToken {
 					}
 				}
 				tokens = append(tokens, queryToken{Type: "op", Value: "OR"})
-				i += 1
+				i += 2 // skip "OR" (i now at space or end)
 				for i < len(query) && query[i] == ' ' {
 					i++
 				}
+				// Set partStart to first non-space char, compensate for for-loop's i++
 				partStart = i
+				i-- // compensate
 				continue
 			}
 			if strings.HasPrefix(remaining, "NOT ") || strings.HasPrefix(remaining, "NOT") {
@@ -298,11 +302,13 @@ func tokenizeQuery(query string) []queryToken {
 					}
 				}
 				tokens = append(tokens, queryToken{Type: "op", Value: "NOT"})
-				i += 2
+				i += 3 // skip "NOT" (i now at space or end)
 				for i < len(query) && query[i] == ' ' {
 					i++
 				}
+				// Set partStart to first non-space char, compensate for for-loop's i++
 				partStart = i
+				i-- // compensate
 				continue
 			}
 		}
@@ -466,31 +472,79 @@ func (f *ftsEngine) executeQuery(tableName string, tokens []queryToken) ([]uint6
 	// Evaluate each OR group (AND within)
 	var groupResults []map[uint64]struct{}
 	for _, group := range orGroups {
-		// AND = intersection
 		if len(group) == 0 {
 			continue
 		}
-		// Get first term's docIDs
+
+		// Separate negated and non-negated terms
+		var posTerms []string      // terms that must match (AND)
+		var negTerms []string      // terms that must NOT match (NOT)
+
+		for _, ts := range group {
+			if ts.negate {
+				negTerms = append(negTerms, ts.term)
+			} else {
+				posTerms = append(posTerms, ts.term)
+			}
+		}
+
+		// Get docIDs for positive terms (intersection = AND)
 		var result map[uint64]struct{}
-		for j, ts := range group {
-			docIDs, err := f.getDocIDsForToken(tableName, ts.term)
+		for i, term := range posTerms {
+			docIDs, err := f.getDocIDsForToken(tableName, term)
 			if err != nil {
 				return nil, err
 			}
-			if j == 0 {
+			if i == 0 {
 				result = docIDs
 			} else {
-				// AND: intersect
 				result = intersectDocIDs([]map[uint64]struct{}{result, docIDs})
 			}
-			// Apply NOT after AND
-			if ts.negate && len(docIDs) > 0 {
-				// Subtract these docIDs from result
-				for docID := range docIDs {
+		}
+
+		// If no positive terms, start with all docs from negated term's table
+		// (This is a simplified approach - for "NOT word", start with word's docs as "all")
+		if len(posTerms) == 0 && len(negTerms) > 0 {
+			// For "NOT X", we need all docs minus X's docs
+			// But we don't know "all docs" - use negated term's docs as the exclusion set
+			// This works for "sql NOT database" where sql's docs = {1, 3}, database's docs = {2, 3}
+			// Result = sql docs minus database docs = {1}
+			for _, term := range negTerms {
+				docIDs, err := f.getDocIDsForToken(tableName, term)
+				if err != nil {
+					return nil, err
+				}
+				if result == nil {
+					result = docIDs
+				} else {
+					// For multiple NOT terms, union them first
+					result = unionDocIDs([]map[uint64]struct{}{result, docIDs})
+				}
+			}
+		}
+
+		// Get docIDs for negated terms (union = any of these excludes)
+		if len(negTerms) > 0 {
+			var negatedIDs map[uint64]struct{}
+			for i, term := range negTerms {
+				docIDs, err := f.getDocIDsForToken(tableName, term)
+				if err != nil {
+					return nil, err
+				}
+				if i == 0 {
+					negatedIDs = docIDs
+				} else {
+					negatedIDs = unionDocIDs([]map[uint64]struct{}{negatedIDs, docIDs})
+				}
+			}
+			// Subtract all negated docIDs from result
+			if result != nil && len(negatedIDs) > 0 {
+				for docID := range negatedIDs {
 					delete(result, docID)
 				}
 			}
 		}
+
 		if result != nil {
 			groupResults = append(groupResults, result)
 		}
