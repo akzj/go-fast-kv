@@ -4873,3 +4873,34 @@ func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, 
 	}
 	return rows, iter.Err()
 }
+
+// getIndexValue returns the value to index for a given index schema and row.
+// For simple column indexes, returns the column value.
+// For expression indexes (ExprSQL non-empty), re-parses and evaluates the expression.
+func getIndexValue(idx *catalogapi.IndexSchema, row *engineapi.Row, columns []catalogapi.ColumnDef, e *executor) (catalogapi.Value, error) {
+	if idx.ExprSQL == "" {
+		// Simple column index - use column value
+		colIdx := findColumnIndexByName(columns, idx.Column)
+		if colIdx < 0 {
+			return catalogapi.Value{}, fmt.Errorf("column %s not found", idx.Column)
+		}
+		return row.Values[colIdx], nil
+	}
+
+	// Expression index - re-parse and evaluate the expression
+	exprSQL := idx.ExprSQL
+	if len(exprSQL) >= 2 && exprSQL[0] == '(' && exprSQL[len(exprSQL)-1] == ')' {
+		exprSQL = exprSQL[1 : len(exprSQL)-1]
+	}
+
+	stmt, err := e.parser.Parse(exprSQL)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("re-parse index expression %q: %v", idx.ExprSQL, err)
+	}
+
+	if sel, ok := stmt.(*parserapi.SelectStmt); ok && len(sel.Columns) > 0 {
+		return evalExpr(sel.Columns[0].Expr, row, columns, nil, e)
+	}
+
+	return catalogapi.Value{}, fmt.Errorf("could not extract expression from %q", idx.ExprSQL)
+}

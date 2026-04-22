@@ -846,6 +846,38 @@ func TestExec_CreateIndex(t *testing.T) {
 	env.execSQL(t, "CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
 }
 
+func TestExec_CreateIndex_Expression(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+
+	// Create expression index with LOWER function
+	env.execSQL(t, "CREATE INDEX idx_lower_email ON users (LOWER(email))")
+
+	idx, err := env.cat.GetIndex("users", "idx_lower_email")
+	if err != nil {
+		t.Fatalf("GetIndex: %v", err)
+	}
+	if idx.Column != "EMAIL" {
+		t.Errorf("column = %q, want %q", idx.Column, "EMAIL")
+	}
+	if idx.ExprSQL == "" {
+		t.Error("ExprSQL should be set for expression index")
+	}
+	if idx.IndexID == 0 {
+		t.Error("IndexID should be assigned (non-zero)")
+	}
+
+	// Insert data - should populate the index
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Test@Example.COM')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Another@TEST.com')")
+
+	// Query that could use the expression index
+	result := env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(result.Rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(result.Rows))
+	}
+}
+
 func TestExec_DropIndex(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")

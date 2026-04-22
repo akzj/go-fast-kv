@@ -312,6 +312,40 @@ func TestParse_CreateIndex(t *testing.T) {
 			t.Error("expected IfNotExists=true")
 		}
 	})
+
+	t.Run("expression_function", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("CREATE INDEX idx_lower_email ON users (LOWER(email))")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ci, ok := stmt.(*api.CreateIndexStmt)
+		if !ok {
+			t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+		}
+		if ci.Expr == nil {
+			t.Fatal("expected Expr to be set for expression index")
+		}
+		// Column should also be set for simple column ref in expression
+		if ci.Column != "EMAIL" {
+			t.Errorf("column: expected EMAIL, got %s", ci.Column)
+		}
+	})
+
+	t.Run("expression_arithmetic", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("CREATE INDEX idx_total ON orders (price + quantity)")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ci, ok := stmt.(*api.CreateIndexStmt)
+		if !ok {
+			t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+		}
+		if ci.Expr == nil {
+			t.Fatal("expected Expr to be set for expression index")
+		}
+	})
 }
 
 func TestParse_DropIndex(t *testing.T) {

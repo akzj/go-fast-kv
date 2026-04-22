@@ -770,10 +770,8 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	expr, err := p.parseExpr()
 	if err == nil && expr != nil {
 		stmt.Expr = expr
-		// If it's a simple column reference, also set Column for backward compat
-		if colRef, ok := expr.(*api.ColumnRef); ok {
-			stmt.Column = colRef.Column
-		}
+		// Extract column for backward compat
+		stmt.Column = extractFirstColumn(expr)
 	} else {
 		// Fallback to simple column name
 		if p.cur.Type != api.TokIdent {
@@ -2457,4 +2455,27 @@ func isAliasTerminator(t api.TokenType) bool {
 	default:
 		return false
 	}
+}
+
+// extractFirstColumn extracts the first column reference from an expression.
+// Used to set Column field for backward compatibility with simple column indexes.
+func extractFirstColumn(expr api.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *api.ColumnRef:
+		return e.Column
+	case *api.StringFuncExpr:
+		if len(e.Args) > 0 {
+			return extractFirstColumn(e.Args[0])
+		}
+	case *api.BinaryExpr:
+		if e.Left != nil {
+			return extractFirstColumn(e.Left)
+		}
+	case *api.UnaryExpr:
+		return extractFirstColumn(e.Operand)
+	}
+	return ""
 }
