@@ -357,6 +357,52 @@ func TestExec_AlterTable(t *testing.T) {
 			t.Error("expected error for duplicate column")
 		}
 	})
+
+	t.Run("RenameTo", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE old_name (id INT PRIMARY KEY, name TEXT)")
+		env.execSQL(t, "ALTER TABLE old_name RENAME TO new_name")
+
+		// New table name should exist
+		schema, err := env.cat.GetTable("new_name")
+		if err != nil {
+			t.Fatalf("GetTable new_name failed: %v", err)
+		}
+		if schema.Name != "NEW_NAME" {
+			t.Errorf("table name: expected NEW_NAME, got %s", schema.Name)
+		}
+
+		// Old table name should not exist
+		_, err = env.cat.GetTable("old_name")
+		if err != catalogapi.ErrTableNotFound {
+			t.Errorf("old_name should not exist: got %v", err)
+		}
+
+		// INSERT/SELECT should work with new table name
+		env.execSQL(t, "INSERT INTO new_name VALUES (1, 'Alice')")
+		sel := env.execSQL(t, "SELECT * FROM new_name")
+		if len(sel.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(sel.Rows))
+		}
+		if sel.Rows[0][1].Text != "Alice" {
+			t.Errorf("name = %q, want %q", sel.Rows[0][1].Text, "Alice")
+		}
+	})
+
+	t.Run("RenameTo_Duplicate", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE dup1 (id INT PRIMARY KEY)")
+		env.execSQL(t, "CREATE TABLE dup2 (id INT PRIMARY KEY)")
+		_, err := env.execSQLErr(t, "ALTER TABLE dup1 RENAME TO dup2")
+		if err == nil {
+			t.Error("expected error for duplicate table name")
+		}
+	})
+
+	t.Run("RenameTo_NonExistent", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "ALTER TABLE nonexistent RENAME TO new_name")
+		if err == nil {
+			t.Error("expected error for non-existent table")
+		}
+	})
 }
 
 func TestExec_Insert(t *testing.T) {

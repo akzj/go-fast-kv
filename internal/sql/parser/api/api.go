@@ -212,11 +212,13 @@ func (*DropIndexStmt) stmtNode() {}
 // AlterTableStmt: ALTER TABLE t ADD COLUMN col TYPE [NOT NULL] [UNIQUE]
 //                 ALTER TABLE t DROP COLUMN col
 //                 ALTER TABLE t RENAME COLUMN old TO new
+//                 ALTER TABLE t RENAME TO new_name
 type AlterTableStmt struct {
 	Table       string
 	Operation   AlterOp
-	Column      string       // column name (for ADD, DROP, RENAME)
-	ColumnNew   string       // new column name (for RENAME)
+	Column      string       // column name (for ADD, DROP, RENAME COLUMN)
+	ColumnNew   string       // new column name (for RENAME COLUMN)
+	TableNew    string       // new table name (for RENAME TO)
 	TypeName    string       // column type (for ADD)
 	NotNull     bool         // NOT NULL constraint (for ADD)
 	Unique      bool         // UNIQUE constraint (for ADD)
@@ -229,6 +231,7 @@ const (
 	AlterAddColumn    AlterOp = 0 // ADD COLUMN
 	AlterDropColumn   AlterOp = 1 // DROP COLUMN
 	AlterRenameColumn AlterOp = 2 // RENAME COLUMN
+	AlterRenameTable  AlterOp = 3 // RENAME TO
 )
 
 func (*AlterTableStmt) stmtNode() {}

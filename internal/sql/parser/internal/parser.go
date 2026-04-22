@@ -179,16 +179,23 @@ func (p *parser) parseAlterTable() (api.Statement, error) {
 	}
 	p.advance()
 
-	// Operation: ADD COLUMN, DROP COLUMN, RENAME COLUMN
+	// Operation: ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO
 	switch p.cur.Type {
 	case api.TokAdd:
 		return p.parseAlterAddColumn(stmt)
 	case api.TokDrop:
 		return p.parseAlterDropColumn(stmt)
 	case api.TokRename:
-		return p.parseAlterRenameColumn(stmt)
+		// Could be RENAME COLUMN or RENAME TO — check what's after RENAME
+		// If COLUMN keyword follows, it's RENAME COLUMN old TO new
+		// If table name follows (no COLUMN), it's RENAME TO new_name
+		if p.peek.Type == api.TokColumn {
+			return p.parseAlterRenameColumn(stmt)
+		}
+		// RENAME TO new_name
+		return p.parseAlterRenameTo(stmt)
 	default:
-		return nil, p.errorf("expected ADD, DROP, or RENAME after ALTER TABLE table_name")
+		return nil, p.errorf("expected ADD, DROP, RENAME COLUMN, or RENAME TO after ALTER TABLE table_name")
 	}
 }
 
@@ -285,6 +292,28 @@ func (p *parser) parseAlterRenameColumn(stmt *api.AlterTableStmt) (api.Statement
 	p.advance()
 
 	stmt.Operation = api.AlterRenameColumn
+	return stmt, nil
+}
+
+// parseAlterRenameTo parses: ALTER TABLE t RENAME TO new_name
+func (p *parser) parseAlterRenameTo(stmt *api.AlterTableStmt) (api.Statement, error) {
+	// p.cur = TokRename, p.peek = TokTo
+	p.advance() // consume TokRename
+
+	// Expect "TO" keyword
+	if err := p.expect(api.TokTo); err != nil {
+		return nil, err
+	}
+	// cur = new table name
+
+	// New table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected new table name")
+	}
+	stmt.TableNew = p.cur.Literal
+	p.advance() // consume new table name
+
+	stmt.Operation = api.AlterRenameTable
 	return stmt, nil
 }
 

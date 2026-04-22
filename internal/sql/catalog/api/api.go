@@ -149,4 +149,9 @@ type CatalogManager interface {
 	// AlterTable modifies a table's schema.
 	// Returns ErrTableNotFound if the table does not exist.
 	AlterTable(schema TableSchema) error
+
+	// RenameTable renames a table.
+	// Returns ErrTableNotFound if the table does not exist.
+	// Returns ErrTableExists if the new name already exists.
+	RenameTable(oldName, newName string) error
 }

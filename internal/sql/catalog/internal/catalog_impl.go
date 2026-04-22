@@ -367,3 +367,55 @@ func (c *Catalog) alterTableImpl(schema api.TableSchema) error {
 	}
 	return c.kv.Put(key, data)
 }
+
+func (c *Catalog) RenameTable(oldName, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.renameTableImpl(oldName, newName)
+}
+
+func (c *Catalog) renameTableImpl(oldName, newName string) error {
+	upperOld := strings.ToUpper(oldName)
+	upperNew := strings.ToUpper(newName)
+
+	// Check if old table exists
+	oldKey := tableKey(upperOld)
+	data, err := c.kv.Get(oldKey)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrTableNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	// Check if new name already exists
+	newKey := tableKey(upperNew)
+	_, err = c.kv.Get(newKey)
+	if err == nil {
+		return api.ErrTableExists
+	}
+	if err != nil && err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+
+	// Parse existing schema
+	var schema api.TableSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return err
+	}
+
+	// Update the table name in the schema
+	schema.Name = upperNew
+
+	// Write new entry with updated name
+	newData, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	if err := c.kv.Put(newKey, newData); err != nil {
+		return err
+	}
+
+	// Delete old entry
+	return c.kv.Delete(oldKey)
+}

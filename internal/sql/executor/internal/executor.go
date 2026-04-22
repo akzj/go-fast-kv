@@ -507,6 +507,13 @@ func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi
 			schema.PrimaryKey = plan.ColumnNew
 		}
 
+	case parserapi.AlterRenameTable:
+		// Rename the table via catalog
+		if err := e.catalog.RenameTable(plan.TableName, plan.TableNew); err != nil {
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+		return &executorapi.Result{RowsAffected: 0}, nil
+
 	default:
 		return nil, fmt.Errorf("%w: unsupported alter operation %v", executorapi.ErrExecFailed, plan.Operation)
 	}

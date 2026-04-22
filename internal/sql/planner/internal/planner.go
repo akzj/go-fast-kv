@@ -295,6 +295,11 @@ func (p *planner) planAlterTable(stmt *parserapi.AlterTableStmt) (*plannerapi.Al
 		}
 	}
 
+	// For RENAME TO, store new table name
+	if stmt.Operation == parserapi.AlterRenameTable {
+		plan.TableNew = stmt.TableNew
+	}
+
 	return plan, nil
 }
 

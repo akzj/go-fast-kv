@@ -110,7 +110,8 @@ type AlterTablePlan struct {
 	TableName    string
 	Operation    parserapi.AlterOp
 	ColumnName   string
-	ColumnNew    string // new column name for RENAME
+	ColumnNew    string // new column name for RENAME COLUMN
+	TableNew     string // new table name for RENAME TO
 	TypeName     string // column type for ADD
 	NotNull      bool
 	Unique       bool

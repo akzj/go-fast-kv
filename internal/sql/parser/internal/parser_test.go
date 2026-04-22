@@ -491,6 +491,27 @@ func TestParse_AlterTable(t *testing.T) {
 		}
 	})
 
+	t.Run("rename_to", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("ALTER TABLE old_name RENAME TO new_name")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		at, ok := stmt.(*api.AlterTableStmt)
+		if !ok {
+			t.Fatalf("expected AlterTableStmt, got %T", stmt)
+		}
+		if at.Operation != api.AlterRenameTable {
+			t.Errorf("operation: expected AlterRenameTable, got %v", at.Operation)
+		}
+		if at.Table != "OLD_NAME" {
+			t.Errorf("table: expected OLD_NAME, got %s", at.Table)
+		}
+		if at.TableNew != "NEW_NAME" {
+			t.Errorf("tableNew: expected NEW_NAME, got %s", at.TableNew)
+		}
+	})
+
 	t.Run("case_insensitive", func(t *testing.T) {
 		p := newParser()
 		stmt, err := p.Parse("alter table t add column col int")
