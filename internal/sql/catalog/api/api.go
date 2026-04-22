@@ -52,50 +52,50 @@ var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
 // TableSchema describes a table's structure.
 type TableSchema struct {
-	Name              string
-	Columns           []ColumnDef
-	PrimaryKey        string // column name, optional
-	TableID           uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
-	CheckConstraints  []CheckConstraint  // table-level CHECK constraints
-	ForeignKeys       []ForeignKeySchema // foreign key constraints
+	Name             string            `json:"N,omitempty"`
+	Columns          []ColumnDef       `json:"C,omitempty"`
+	PrimaryKey      string            `json:"P,omitempty"`
+	TableID         uint32           `json:"I,omitempty"`
+	CheckConstraints []CheckConstraint `json:"CC,omitempty"`
+	ForeignKeys      []ForeignKeySchema `json:"FK,omitempty"`
 }
 
 // ColumnDef describes a single column in a table.
 type ColumnDef struct {
-	Table        string // table name for qualified column lookups
-	Name         string
-	Type         Type
-	NotNull      bool          // NOT NULL constraint
-	DefaultValue *Value        // DEFAULT value, nil if not specified
-	AutoInc      bool          // AUTOINCREMENT flag — column gets auto-generated integer IDs
-	Check        *CheckConstraint // column-level CHECK constraint; nil if not specified
+	Table        string           `json:"T,omitempty"`
+	Name         string           `json:"N,omitempty"`
+	Type         Type             `json:"Y,omitempty"`
+	NotNull      bool             `json:"NN,omitempty"`
+	DefaultValue *Value           `json:"D,omitempty"`
+	AutoInc      bool             `json:"AI,omitempty"`
+	Check        *CheckConstraint `json:"C,omitempty"`
 }
 
 // CheckConstraint represents a CHECK constraint (column-level or table-level).
 // RawSQL stores the original expression text for the executor to evaluate.
 type CheckConstraint struct {
-	Name   string // optional name, currently unused but reserved for future
-	RawSQL string // the expression text, e.g. "price > 0"
+	Name   string `json:"N,omitempty"`
+	RawSQL string `json:"R,omitempty"`
 }
 
 // ForeignKeySchema describes a FOREIGN KEY constraint.
 type ForeignKeySchema struct {
-	Name              string
-	TableName         string   // name of the table this FK belongs to (child table)
-	Columns           []string // column names in this table
-	ReferencedTable   string   // referenced table name
-	ReferencedColumns []string // column names in referenced table
-	OnDelete          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
-	OnUpdate          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
+	Name            string   `json:"N,omitempty"`
+	TableName       string   `json:"T,omitempty"`
+	Columns        []string `json:"C,omitempty"`
+	ReferencedTable string   `json:"RT,omitempty"`
+	ReferencedColumns []string `json:"RC,omitempty"`
+	OnDelete       string   `json:"OD,omitempty"`
+	OnUpdate       string   `json:"OU,omitempty"`
 }
 
 // IndexSchema describes an index on a table.
 type IndexSchema struct {
-	Name    string
-	Table   string
-	Column  string // indexed column
-	Unique  bool
-	IndexID uint32 // persistent ID for key encoding (assigned at CREATE INDEX)
+	Name    string `json:"N,omitempty"`
+	Table  string `json:"T,omitempty"`
+	Column string `json:"C,omitempty"`
+	Unique bool   `json:"U,omitempty"`
+	IndexID uint32 `json:"I,omitempty"`
 }
 
 // ─── Interfaces ────────────────────────────────────────────────────
