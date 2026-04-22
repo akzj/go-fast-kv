@@ -148,6 +148,8 @@ func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error
 	switch p := plan.(type) {
 	case *plannerapi.CreateTablePlan:
 		return e.execCreateTable(p)
+	case *plannerapi.CreateTableAsSelectPlan:
+		return e.execCreateTableAsSelect(p)
 	case *plannerapi.DropTablePlan:
 		return e.execDropTable(p)
 	case *plannerapi.CreateIndexPlan:
@@ -384,6 +386,111 @@ func (e *executor) execCreateTable(plan *plannerapi.CreateTablePlan) (*executora
 	}
 
 	return &executorapi.Result{RowsAffected: 0}, nil
+}
+
+// execCreateTableAsSelect executes: CREATE TABLE t AS SELECT ...
+// 1. Create the table with schema inferred from SELECT columns.
+// 2. Execute SELECT and insert rows.
+func (e *executor) execCreateTableAsSelect(plan *plannerapi.CreateTableAsSelectPlan) (*executorapi.Result, error) {
+	// I-C1: check existence BEFORE allocating ID.
+	_, err := e.catalog.GetTable(plan.Schema.Name)
+	if err == nil {
+		if plan.IfNotExists {
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, catalogapi.ErrTableExists)
+	}
+	if err != catalogapi.ErrTableNotFound {
+		return nil, fmt.Errorf("%w: checking table existence: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Allocate table ID.
+	tableID, err := e.nextID(metaNextTableID)
+	if err != nil {
+		return nil, err
+	}
+
+	schema := plan.Schema
+	schema.TableID = tableID
+
+	// Create the table.
+	if err := e.catalog.CreateTable(schema); err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Execute the SELECT subquery.
+	selPlan, ok := plan.SelectPlan.(*plannerapi.SelectPlan)
+	if !ok {
+		return nil, fmt.Errorf("%w: CTAS select plan must be SelectPlan, got %T", executorapi.ErrExecFailed, plan.SelectPlan)
+	}
+	subResult, err := e.execSelect(selPlan)
+	if err != nil {
+		// Drop the table on failure to keep catalog clean.
+		_ = e.catalog.DropTable(plan.Schema.Name)
+		return nil, fmt.Errorf("%w: execute select: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// If SELECT returned no rows, we're done.
+	if len(subResult.Rows) == 0 {
+		return &executorapi.Result{RowsAffected: 0}, nil
+	}
+
+	// Get indexes for the new table (likely none, but handle UNIQUE columns).
+	indexes, err := e.catalog.ListIndexes(plan.Schema.Name)
+	if err != nil {
+		_ = e.catalog.DropTable(plan.Schema.Name)
+		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	batch := e.store.NewWriteBatch()
+	rowsAffected := int64(0)
+
+	for i, row := range subResult.Rows {
+		if len(row) != len(schema.Columns) {
+			_ = e.catalog.DropTable(plan.Schema.Name)
+			batch.Discard()
+			return nil, fmt.Errorf("CTAS row %d: column count mismatch: got %d, expected %d", i+1, len(row), len(schema.Columns))
+		}
+
+		rowID, err := e.tableEngine.InsertInto(&schema, batch, row)
+		if err != nil {
+			_ = e.catalog.DropTable(plan.Schema.Name)
+			batch.Discard()
+			return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Insert index entries.
+		for _, idx := range indexes {
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+			val, err := getIndexValue(idx, rowForIdx, schema.Columns, e)
+			if err != nil {
+				_ = e.catalog.DropTable(plan.Schema.Name)
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
+			}
+			idxKey := e.indexEngine.EncodeIndexKey(schema.TableID, idx.IndexID, val, rowID)
+			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+				_ = e.catalog.DropTable(plan.Schema.Name)
+				batch.Discard()
+				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+		rowsAffected++
+	}
+
+	if err := e.tableEngine.PersistCounter(batch, schema.TableID); err != nil {
+		_ = e.catalog.DropTable(plan.Schema.Name)
+		batch.Discard()
+		return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if err := batch.Commit(); err != nil {
+		_ = e.catalog.DropTable(plan.Schema.Name)
+		batch.Discard()
+		return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: rowsAffected}, nil
 }
 
 func (e *executor) execDropTable(plan *plannerapi.DropTablePlan) (*executorapi.Result, error) {

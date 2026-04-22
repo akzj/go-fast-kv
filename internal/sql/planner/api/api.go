@@ -79,6 +79,16 @@ type CreateTablePlan struct {
 
 func (*CreateTablePlan) planNode() {}
 
+// CreateTableAsSelectPlan: CREATE TABLE t AS SELECT ... — creates table then populates via INSERT SELECT.
+type CreateTableAsSelectPlan struct {
+	Schema          catalogapi.TableSchema  // inferred from SELECT columns
+	IfNotExists     bool
+	SelectPlan      Plan                   // planned SELECT subquery
+	SelectStatement parserapi.Statement    // raw parsed SELECT for column inference
+}
+
+func (*CreateTableAsSelectPlan) planNode() {}
+
 // DropTablePlan drops a table and its data.
 type DropTablePlan struct {
 	TableName string
