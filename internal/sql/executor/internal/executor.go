@@ -3099,11 +3099,27 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 // execDelete deletes rows from a table. It iterates until all rows are deleted,
 // scanning in batches to handle tables with more rows than any single scan can return.
 // This ensures DELETE without WHERE deletes ALL rows, not just the first batch.
+// After each row deletion, FK ON DELETE actions are executed via executeFKDeleteActions.
 func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result, error) {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Get referencing FKs for ON DELETE actions (RESTRICT check + CASCADE/SET NULL execution)
+	var fks []catalogapi.ForeignKeySchema
+	if plan.Table.PrimaryKey != "" {
+		fks, err = e.catalog.GetReferencingFKs(plan.Table.Name)
+		if err != nil {
+			return nil, fmt.Errorf("%w: get referencing FKs: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	// Find the primary key column index for FK action key extraction
+	var pkColIdx int = -1
+	if plan.Table.PrimaryKey != "" {
+		pkColIdx = findColumnIndexByName(plan.Table.Columns, plan.Table.PrimaryKey)
 	}
 
 	var count int64
@@ -3137,6 +3153,15 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 						return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 					}
 					e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
+				}
+
+				// Execute FK ON DELETE RESTRICT check BEFORE delete completes
+				// This is deferred constraint checking - RESTRICT errors before the delete is visible
+				if pkColIdx >= 0 && len(fks) > 0 {
+					parentKeyValues := []catalogapi.Value{row.Values[pkColIdx]}
+					if err := e.executeFKDeleteActions(plan.Table.Name, parentKeyValues, fks); err != nil {
+						return nil, err
+					}
 				}
 
 				// Delete row with transaction's XID.
@@ -3187,9 +3212,31 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 			count++
 		}
 
+		// Execute RESTRICT checks BEFORE commit to prevent the delete.
+		// CASCADE and SET NULL actions run after commit (when it's safe).
+		if pkColIdx >= 0 && len(fks) > 0 {
+			for _, row := range rows {
+				parentKeyValues := []catalogapi.Value{row.Values[pkColIdx]}
+				if err := e.checkFKRestrictBeforeDelete(plan.Table.Name, parentKeyValues, fks); err != nil {
+					batch.Discard()
+					return nil, err
+				}
+			}
+		}
+
 		if err := batch.Commit(); err != nil {
 			batch.Discard()
 			return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Execute FK ON DELETE actions after batch commit (CASCADE/SET NULL)
+		if pkColIdx >= 0 && len(fks) > 0 {
+			for _, row := range rows {
+				parentKeyValues := []catalogapi.Value{row.Values[pkColIdx]}
+				if err := e.executeFKDeleteActions(plan.Table.Name, parentKeyValues, fks); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 
@@ -3208,6 +3255,17 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Get referencing FKs for ON UPDATE actions
+	var fks []catalogapi.ForeignKeySchema
+	var pkColIdx int = -1
+	if plan.Table.PrimaryKey != "" {
+		fks, err = e.catalog.GetReferencingFKs(plan.Table.Name)
+		if err != nil {
+			return nil, fmt.Errorf("%w: get referencing FKs: %v", executorapi.ErrExecFailed, err)
+		}
+		pkColIdx = findColumnIndexByName(plan.Table.Columns, plan.Table.PrimaryKey)
+	}
+
 	// Defensive: validate that all assignment column indices are within bounds.
 	// This guards against edge cases (e.g., planner bugs or concurrent schema changes).
 	for colIdx := range plan.Assignments {
@@ -3222,6 +3280,9 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	for colIdx := range plan.Assignments {
 		changedCols[colIdx] = true
 	}
+
+	// Check if primary key column is being updated
+	pkChanged := pkColIdx >= 0 && changedCols[pkColIdx]
 
 	rows, err := e.scanRowsForDML(plan.Table, plan.Scan, nil)
 	if err != nil {
@@ -3281,6 +3342,16 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			// Check FOREIGN KEY constraints for changed columns.
 			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
 				return nil, err
+			}
+
+			// Execute FK ON UPDATE actions BEFORE the update completes
+			// Only for RESTRICT: check before allowing update
+			if pkChanged && len(fks) > 0 {
+				oldKeyValues := []catalogapi.Value{row.Values[pkColIdx]}
+				newKeyValues := []catalogapi.Value{newValues[pkColIdx]}
+				if err := e.executeFKUpdateActions(plan.Table.Name, oldKeyValues, newKeyValues, fks); err != nil {
+					return nil, err
+				}
 			}
 
 			// Update row with transaction's XID.
@@ -3358,6 +3429,22 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
 			batch.Discard()
 			return nil, err
+		}
+
+		// Check RESTRICT/NO ACTION BEFORE allowing update to complete.
+		// This prevents the update if there are referencing child rows.
+		if pkChanged && len(fks) > 0 {
+			oldKeyValues := []catalogapi.Value{row.Values[pkColIdx]}
+			newKeyValues := []catalogapi.Value{newValues[pkColIdx]}
+			if err := e.checkFKRestrictBeforeUpdate(plan.Table.Name, oldKeyValues, fks); err != nil {
+				batch.Discard()
+				return nil, err
+			}
+			// Execute CASCADE/SET NULL actions
+			if err := e.executeFKUpdateActions(plan.Table.Name, oldKeyValues, newKeyValues, fks); err != nil {
+				batch.Discard()
+				return nil, err
+			}
 		}
 
 		// Update row via batch.
@@ -4162,16 +4249,39 @@ func (e *executor) checkForeignKeyConstraints(tableName string, columns []catalo
 			}
 
 			// Look up the FK value in the parent table.
-			// First try to use index on the referenced column (indexID 0 = primary key).
+			// First try to use index on the referenced column.
 			found := false
 			if lookupColIdx >= 0 {
-				// Try index scan first (indexID 0 = primary key index)
-				iter, err := e.indexEngine.Scan(parentTable.TableID, 0, encodingapi.OpEQ, fkVal)
+				// Find the index on the referenced column (could be primary key or secondary index)
+				indexes, err := e.catalog.ListIndexes(fk.ReferencedTable)
 				if err == nil {
-					found = iter.Next()
-					iter.Close()
-				} else {
-					// Fall back to full table scan
+					var pkIndex *catalogapi.IndexSchema
+					for _, idx := range indexes {
+						// Find index on the referenced column
+						colIdx := findColumnIndexByName(parentTable.Columns, parentColName)
+						if colIdx >= 0 && strings.EqualFold(idx.Column, parentColName) {
+							// Try to use primary key index first
+							if idx.Unique && parentTable.PrimaryKey != "" && strings.EqualFold(idx.Column, parentTable.PrimaryKey) {
+								pkIndex = idx
+								break
+							}
+							// Fall back to any unique index on this column
+							if idx.Unique && pkIndex == nil {
+								pkIndex = idx
+							}
+						}
+					}
+					// Use the found index or skip if none
+					if pkIndex != nil {
+						iter, err := e.indexEngine.Scan(parentTable.TableID, pkIndex.IndexID, encodingapi.OpEQ, fkVal)
+						if err == nil {
+							found = iter.Next()
+							iter.Close()
+						}
+					}
+				}
+				// Fall back to full table scan if not found via index
+				if !found {
 					found, err = e.scanFKParentTable(parentTable, lookupColIdx, fkVal)
 					if err != nil {
 						return err
@@ -4217,4 +4327,510 @@ func (e *executor) scanFKParentTable(parentTable *catalogapi.TableSchema, lookup
 		return false, fmt.Errorf("%w: scan parent table: %v", executorapi.ErrExecFailed, err)
 	}
 	return false, nil // no matching row found
+}
+
+// ─── FK Action Execution ───────────────────────────────────────────────────────
+
+// checkFKRestrictBeforeUpdate checks RESTRICT and NO ACTION constraints BEFORE update.
+// This prevents the update from succeeding if there are referencing rows.
+func (e *executor) checkFKRestrictBeforeUpdate(parentTableName string, parentKeyValues []catalogapi.Value, fks []catalogapi.ForeignKeySchema) error {
+	for _, fk := range fks {
+		action := strings.ToUpper(fk.OnUpdate)
+		// Check RESTRICT and NO ACTION (both block the update)
+		if action != "RESTRICT" && action != "NO ACTION" {
+			continue
+		}
+
+		// Get the child table
+		childTable, err := e.catalog.GetTable(fk.TableName)
+		if err != nil {
+			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
+		}
+
+		// Find the FK column index in the child table
+		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
+		if fkColIdx < 0 {
+			continue
+		}
+
+		// Check if any referencing rows exist
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		if err != nil {
+			return err
+		}
+		if hasRows {
+			return sqlerrors.ErrForeignKeyViolation(
+				fmt.Sprintf("foreign key constraint violated: cannot update parent row in %q - %s action prevents update with existing references from %q", parentTableName, action, fk.TableName))
+		}
+	}
+	return nil
+}
+
+// checkFKRestrictBeforeDelete checks RESTRICT and NO ACTION constraints BEFORE delete.
+// This prevents the delete from succeeding if there are referencing rows.
+// Used in non-transactional path where FK actions run after commit.
+func (e *executor) checkFKRestrictBeforeDelete(parentTableName string, parentKeyValues []catalogapi.Value, fks []catalogapi.ForeignKeySchema) error {
+	for _, fk := range fks {
+		action := strings.ToUpper(fk.OnDelete)
+		// Check RESTRICT and NO ACTION (both block the delete)
+		if action != "RESTRICT" && action != "NO ACTION" {
+			continue
+		}
+
+		// Get the child table
+		childTable, err := e.catalog.GetTable(fk.TableName)
+		if err != nil {
+			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
+		}
+
+		// Find the FK column index in the child table
+		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
+		if fkColIdx < 0 {
+			continue
+		}
+
+		// Check if any referencing rows exist
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		if err != nil {
+			return err
+		}
+		if hasRows {
+			return sqlerrors.ErrForeignKeyViolation(
+				fmt.Sprintf("foreign key constraint violated: cannot delete parent row in %q - %s action prevents deletion with existing references from %q", parentTableName, action, fk.TableName))
+		}
+	}
+	return nil
+}
+
+// executeFKDeleteActions handles ON DELETE actions for a deleted parent row.
+// parentKeyValues: the values of the parent's primary key (referenced columns).
+// fks: foreign keys from child tables that reference this parent table.
+func (e *executor) executeFKDeleteActions(parentTableName string, parentKeyValues []catalogapi.Value, fks []catalogapi.ForeignKeySchema) error {
+	for _, fk := range fks {
+		// Skip RESTRICT and NO ACTION (already checked by checkFKRestrictBeforeDelete)
+		action := strings.ToUpper(fk.OnDelete)
+		if action == "" || action == "RESTRICT" || action == "NO ACTION" {
+			continue
+		}
+
+		// Get the child table
+		childTable, err := e.catalog.GetTable(fk.TableName)
+		if err != nil {
+			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
+		}
+
+		// Find the FK column index in the child table
+		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
+		if fkColIdx < 0 {
+			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		}
+
+		switch action {
+		case "CASCADE":
+			if err := e.cascadeDeleteChildRows(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+				return err
+			}
+		case "SET NULL":
+			if err := e.setNullChildFKColumns(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// executeFKUpdateActions handles ON UPDATE actions for an updated parent row.
+// parentTableName: the parent table name (for error messages)
+// oldKeyValues: the old values of the parent's primary key
+// newKeyValues: the new values of the parent's primary key
+// fks: foreign keys from child tables that reference this parent table
+func (e *executor) executeFKUpdateActions(parentTableName string, oldKeyValues, newKeyValues []catalogapi.Value, fks []catalogapi.ForeignKeySchema) error {
+	for _, fk := range fks {
+		// Skip RESTRICT and NO ACTION (already checked by checkFKRestrictBeforeUpdate)
+		action := strings.ToUpper(fk.OnUpdate)
+		if action == "" || action == "RESTRICT" || action == "NO ACTION" {
+			continue
+		}
+
+		// Get the child table
+		childTable, err := e.catalog.GetTable(fk.TableName)
+		if err != nil {
+			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
+		}
+
+		// Find the FK column index in the child table
+		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
+		if fkColIdx < 0 {
+			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		}
+
+		switch action {
+		case "CASCADE":
+			if err := e.cascadeUpdateChildFKValues(childTable, fkColIdx, oldKeyValues[0], newKeyValues[0]); err != nil {
+				return err
+			}
+		case "SET NULL":
+			if err := e.setNullChildFKColumns(childTable, fkColIdx, oldKeyValues[0]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// hasReferencingRows checks if child table has any rows referencing the given parent key value.
+func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) (bool, error) {
+	iter, err := e.tableEngine.Scan(childTable)
+	if err != nil {
+		return false, fmt.Errorf("%w: scan child table for FK check: %v", executorapi.ErrExecFailed, err)
+	}
+	defer iter.Close()
+
+	for iter.Next() {
+		row := iter.Row()
+		if row == nil {
+			continue
+		}
+		if fkColIdx < len(row.Values) {
+			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
+			if cmp == 0 {
+				return true, nil
+			}
+		}
+	}
+	return false, iter.Err()
+}
+
+// cascadeDeleteChildRows deletes all rows in child table where FK column matches parent key.
+func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+	// Get indexes for cleanup
+	indexes, err := e.catalog.ListIndexes(childTable.Name)
+	if err != nil {
+		return fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for {
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				break
+			}
+			for _, row := range rows {
+				oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
+				// Delete index entries
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+					if colIdx < 0 {
+						continue
+					}
+					val := row.Values[colIdx]
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+					if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+						return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey, nil)
+				}
+
+				// Delete row
+				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
+				if err := e.store.DeleteWithXID(rowKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+					return fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
+			}
+		}
+		return nil
+	}
+
+	// Non-transactional path
+	for {
+		batch := e.store.NewWriteBatch()
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, row := range rows {
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+				if colIdx < 0 {
+					continue
+				}
+				val := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+				if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
+					batch.Discard()
+					return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+			}
+
+			if err := e.tableEngine.DeleteFrom(childTable, batch, row.RowID); err != nil {
+				batch.Discard()
+				return fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+
+		if err := batch.Commit(); err != nil {
+			batch.Discard()
+			return fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+	return nil
+}
+
+// setNullChildFKColumns sets the FK column to NULL for all child rows referencing the parent key.
+func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+	// Get indexes for cleanup
+	indexes, err := e.catalog.ListIndexes(childTable.Name)
+	if err != nil {
+		return fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	nullValue := catalogapi.Value{IsNull: true}
+
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for {
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				break
+			}
+			for _, row := range rows {
+				oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
+				// Delete old index entries for the FK column
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+					if colIdx < 0 || colIdx != fkColIdx {
+						continue
+					}
+					val := row.Values[colIdx]
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+					if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+						return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey, nil)
+				}
+
+				// Update row: set FK column to NULL
+				newValues := make([]catalogapi.Value, len(row.Values))
+				copy(newValues, row.Values)
+				newValues[fkColIdx] = nullValue
+
+				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
+				newRowVal := e.tableEngine.EncodeRow(newValues)
+				if err := e.store.PutWithXID(rowKey, newRowVal, xid); err != nil {
+					return fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
+
+				// Insert new index entries for the FK column (now NULL - skip if index doesn't handle NULLs)
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+					if colIdx < 0 || colIdx != fkColIdx {
+						continue
+					}
+					// Index on NULL value - encode and insert
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, nullValue, row.RowID)
+					if err := e.store.PutWithXID(idxKey, nil, xid); err != nil {
+						return fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey, nil)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Non-transactional path
+	for {
+		batch := e.store.NewWriteBatch()
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, row := range rows {
+			// Delete old index entries
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+				if colIdx < 0 || colIdx != fkColIdx {
+					continue
+				}
+				val := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+				if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
+					batch.Discard()
+					return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+			}
+
+			// Update row: set FK column to NULL
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			newValues[fkColIdx] = nullValue
+
+			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
+			rowVal := e.tableEngine.EncodeRow(newValues)
+			batch.Put(rowKey, rowVal)
+		}
+
+		if err := batch.Commit(); err != nil {
+			batch.Discard()
+			return fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+	return nil
+}
+
+// cascadeUpdateChildFKValues updates all child rows' FK column from old value to new value.
+func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema, fkColIdx int, oldKeyVal, newKeyVal catalogapi.Value) error {
+	// Get indexes for cleanup
+	indexes, err := e.catalog.ListIndexes(childTable.Name)
+	if err != nil {
+		return fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	if e.txnCtx != nil {
+		xid := e.txnCtx.XID()
+		for {
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				break
+			}
+			for _, row := range rows {
+				oldRowVal := e.tableEngine.EncodeRow(row.Values)
+
+				// Delete old index entries for the FK column
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+					if colIdx < 0 || colIdx != fkColIdx {
+						continue
+					}
+					val := row.Values[colIdx]
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+					if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+						return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey, nil)
+				}
+
+				// Update row: change FK column to new value
+				newValues := make([]catalogapi.Value, len(row.Values))
+				copy(newValues, row.Values)
+				newValues[fkColIdx] = newKeyVal
+
+				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
+				newRowVal := e.tableEngine.EncodeRow(newValues)
+				if err := e.store.PutWithXID(rowKey, newRowVal, xid); err != nil {
+					return fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+				}
+				e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
+
+				// Insert new index entries
+				for _, idx := range indexes {
+					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+					if colIdx < 0 || colIdx != fkColIdx {
+						continue
+					}
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, newKeyVal, row.RowID)
+					if err := e.store.PutWithXID(idxKey, nil, xid); err != nil {
+						return fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+					}
+					e.txnCtx.AddPendingWrite(idxKey, nil)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Non-transactional path
+	for {
+		batch := e.store.NewWriteBatch()
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, row := range rows {
+			// Delete old index entries
+			for _, idx := range indexes {
+				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
+				if colIdx < 0 || colIdx != fkColIdx {
+					continue
+				}
+				val := row.Values[colIdx]
+				idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, val, row.RowID)
+				if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
+					batch.Discard()
+					return fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+				}
+			}
+
+			// Update row: change FK column to new value
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			newValues[fkColIdx] = newKeyVal
+
+			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
+			rowVal := e.tableEngine.EncodeRow(newValues)
+			batch.Put(rowKey, rowVal)
+		}
+
+		if err := batch.Commit(); err != nil {
+			batch.Discard()
+			return fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+	return nil
+}
+
+// scanChildRowsForFKAction scans child table rows where FK column matches parent key value.
+// Returns a batch of matching rows (up to DMLBatchSize).
+func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) ([]*engineapi.Row, error) {
+	iter, err := e.tableEngine.ScanWithLimit(childTable, DMLBatchSize, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: scan child table: %v", executorapi.ErrExecFailed, err)
+	}
+	defer iter.Close()
+
+	var rows []*engineapi.Row
+	for iter.Next() {
+		row := iter.Row()
+		if row == nil {
+			continue
+		}
+		if fkColIdx < len(row.Values) {
+			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
+			if cmp == 0 {
+				rowCopy := &engineapi.Row{
+					RowID:  row.RowID,
+					Values: make([]catalogapi.Value, len(row.Values)),
+				}
+				copy(rowCopy.Values, row.Values)
+				rows = append(rows, rowCopy)
+			}
+		}
+	}
+	return rows, iter.Err()
 }

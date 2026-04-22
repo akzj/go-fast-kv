@@ -636,6 +636,10 @@ func (p *parser) parseReferentialActions(fk *api.ForeignKey) {
 			case api.TokNoAction:
 				act = "NO ACTION"
 				p.advance()
+				// Consume the following "ACTION" keyword if present
+				if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "ACTION" {
+					p.advance()
+				}
 			case api.TokSet:
 				// SET NULL
 				if p.peek.Type == api.TokNull {

@@ -81,6 +81,7 @@ type CheckConstraint struct {
 // ForeignKeySchema describes a FOREIGN KEY constraint.
 type ForeignKeySchema struct {
 	Name              string
+	TableName         string   // name of the table this FK belongs to (child table)
 	Columns           []string // column names in this table
 	ReferencedTable   string   // referenced table name
 	ReferencedColumns []string // column names in referenced table
@@ -136,6 +137,10 @@ type CatalogManager interface {
 
 	// ListTables returns all table names.
 	ListTables() ([]string, error)
+
+	// GetReferencingFKs returns all foreign key schemas that reference a given table.
+	// Used by FK action execution (ON DELETE/UPDATE) to find referencing tables.
+	GetReferencingFKs(tableName string) ([]ForeignKeySchema, error)
 
 	// ListIndexes returns all index schemas for a given table.
 	// Returns an empty slice (not error) if the table has no indexes.

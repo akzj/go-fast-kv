@@ -284,6 +284,35 @@ func (c *Catalog) listTablesImpl() ([]string, error) {
 	return tables, iter.Err()
 }
 
+func (c *Catalog) GetReferencingFKs(tableName string) ([]api.ForeignKeySchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getReferencingFKsImpl(tableName)
+}
+
+func (c *Catalog) getReferencingFKsImpl(tableName string) ([]api.ForeignKeySchema, error) {
+	upperTable := strings.ToUpper(tableName)
+	prefix := []byte(tablePrefix)
+	end := append(prefix, 0xFF)
+
+	var result []api.ForeignKeySchema
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		var schema api.TableSchema
+		if err := json.Unmarshal(iter.Value(), &schema); err != nil {
+			return nil, err
+		}
+		for _, fk := range schema.ForeignKeys {
+			if strings.ToUpper(fk.ReferencedTable) == upperTable {
+				result = append(result, fk)
+			}
+		}
+	}
+	return result, iter.Err()
+}
+
 func (c *Catalog) ListIndexes(tableName string) ([]*api.IndexSchema, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
