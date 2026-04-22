@@ -26,7 +26,6 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"time"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -201,33 +200,23 @@ func (db *DB) exec(sql string) (*Result, error) {
 		return nil, err
 	}
 
-	// Handle EXPLAIN: format plan text (optionally with stats)
-	if explainStmt, ok := stmt.(*parserapi.ExplainStmt); ok {
-		var planText string
-		if selectPlan, ok := plan.(*plannerapi.SelectPlan); ok {
-			planText = selectPlan.String()
+	// Handle EXPLAIN: delegate to executor for proper plan formatting + timing
+	if _, ok := stmt.(*parserapi.ExplainStmt); ok {
+		var result *executorapi.Result
+		var err error
+		if txnCtx != nil {
+			result, err = db.executor.ExecuteWithTxn(plan, txnCtx)
 		} else {
-			planText = fmt.Sprintf("%T", plan)
+			result, err = db.executor.Execute(plan)
 		}
-		if explainStmt.Analyze {
-			// Execute the plan to collect stats
-			start := time.Now()
-			var result *Result
-			var err error
-			if txnCtx != nil {
-				result, err = db.executor.ExecuteWithTxn(plan, txnCtx)
-			} else {
-				result, err = db.executor.Execute(plan)
-			}
-			if err != nil {
-				return nil, err
-			}
-			elapsed := time.Since(start)
-			planText += fmt.Sprintf("\n[rows=%d, time=%v]", len(result.Rows), elapsed)
+		if err != nil {
+			return nil, err
 		}
-		return &executorapi.Result{
-			Columns: []string{"QUERY PLAN"},
-			Rows:    [][]catalogapi.Value{{{Text: planText}}},
+		// Convert executorapi.Result to our Result type
+		return &Result{
+			Columns:     result.Columns,
+			Rows:        result.Rows,
+			RowsAffected: result.RowsAffected,
 		}, nil
 	}
 
