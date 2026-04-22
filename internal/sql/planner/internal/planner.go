@@ -2005,12 +2005,36 @@ func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
 // detectEquiJoin checks if the ON clause is an equi-join (t1.col = t2.col).
 // Returns left and right key column indices if it's an equi-join, or -1/-1 if not.
 // Handles both orderings: t1.col = t2.col AND t2.col = t1.col.
+// Also handles composite conditions: a = b AND extra_condition (extracts the equi-join).
 func detectEquiJoin(on parserapi.Expr, leftTable, rightTable string, leftTableSchema, rightTableSchema *catalogapi.TableSchema) (leftIdx, rightIdx int, isEqui bool) {
 	if on == nil {
 		return -1, -1, false
 	}
 
-	bin, ok := on.(*parserapi.BinaryExpr)
+	// Try direct equi-join first (simple a = b)
+	if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(on, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+		return leftIdx, rightIdx, true
+	}
+
+	// Try to extract equi-join from AND expression (a = b AND extra)
+	if bin, ok := on.(*parserapi.BinaryExpr); ok && bin.Op == parserapi.BinAnd {
+		// Try left side of AND
+		if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(bin.Left, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+			return leftIdx, rightIdx, true
+		}
+		// Try right side of AND
+		if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(bin.Right, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+			return leftIdx, rightIdx, true
+		}
+	}
+
+	return -1, -1, false
+}
+
+// tryDetectEquiJoinDirect tries to detect a direct equi-join condition.
+// Returns left/right column indices if it's a simple a = b pattern.
+func tryDetectEquiJoinDirect(expr parserapi.Expr, leftTable, rightTable string, leftTableSchema, rightTableSchema *catalogapi.TableSchema) (leftIdx, rightIdx int, isEqui bool) {
+	bin, ok := expr.(*parserapi.BinaryExpr)
 	if !ok || bin.Op != parserapi.BinEQ {
 		return -1, -1, false
 	}

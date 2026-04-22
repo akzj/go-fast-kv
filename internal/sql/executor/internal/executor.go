@@ -2095,6 +2095,9 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		matchedBuild = make(map[*engineapi.Row]bool, len(buildRows))
 	}
 
+	// Pre-allocate combinedVals once per probe row, reused for all build matches
+	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+
 	// Probe phase
 	for _, probe := range probeRows {
 		key := hashKey(probe.Values[probeKeyIdx])
@@ -2111,23 +2114,27 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 			continue
 		}
 
+		// Fill probe values into combinedVals (right portion)
+		if buildIsLeft {
+			// build=left, probe=right → probe in right portion
+			copy(combinedVals[leftLen:], probe.Values)
+		} else {
+			// build=right, probe=left → probe in left portion
+			copy(combinedVals, probe.Values)
+		}
+
 		// For each build match, check if there's an ON condition match
 		for _, build := range buildMatches {
 			if hplan.On != nil {
-				// Evaluate ON condition with combined row
-				var combinedVals []catalogapi.Value
+				// Evaluate ON condition with combined row - reuse pre-allocated slice
 				if buildIsLeft {
 					// build=left, probe=right
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, build.Values)
-					copy(combinedVals[leftLen:], probe.Values)
 				} else {
 					// build=right, probe=left
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
-					copy(combinedVals, probe.Values)
 					copy(combinedVals[leftLen:], build.Values)
 				}
-				combinedRow := &engineapi.Row{Values: combinedVals}
+				combinedRow := &engineapi.Row{Values: combinedVals[:leftLen+rightLen]}
 				result, err := evalExpr(hplan.On, combinedRow, combinedCols, subqueryResults, e)
 				if err != nil || !isTruthy(result) {
 					continue
