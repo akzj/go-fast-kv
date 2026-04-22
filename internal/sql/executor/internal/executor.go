@@ -5632,14 +5632,17 @@ func (e *executor) checkFKRestrictBeforeUpdate(parentTableName string, parentKey
 			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			continue
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		// Check if any referencing rows exist
-		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdxs, parentKeyValues)
 		if err != nil {
 			return err
 		}
@@ -5668,14 +5671,17 @@ func (e *executor) checkFKRestrictBeforeDelete(parentTableName string, parentKey
 			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			continue
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		// Check if any referencing rows exist
-		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdxs, parentKeyValues)
 		if err != nil {
 			return err
 		}
@@ -5704,19 +5710,22 @@ func (e *executor) executeFKDeleteActions(parentTableName string, parentKeyValue
 			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		switch action {
 		case "CASCADE":
-			if err := e.cascadeDeleteChildRows(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+			if err := e.cascadeDeleteChildRows(childTable, fkColIdxs, parentKeyValues); err != nil {
 				return err
 			}
 		case "SET NULL":
-			if err := e.setNullChildFKColumns(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+			if err := e.setNullChildFKColumns(childTable, fkColIdxs, parentKeyValues); err != nil {
 				return err
 			}
 		}
@@ -5743,19 +5752,22 @@ func (e *executor) executeFKUpdateActions(parentTableName string, oldKeyValues, 
 			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		switch action {
 		case "CASCADE":
-			if err := e.cascadeUpdateChildFKValues(childTable, fkColIdx, oldKeyValues[0], newKeyValues[0]); err != nil {
+			if err := e.cascadeUpdateChildFKValues(childTable, fkColIdxs, oldKeyValues, newKeyValues); err != nil {
 				return err
 			}
 		case "SET NULL":
-			if err := e.setNullChildFKColumns(childTable, fkColIdx, oldKeyValues[0]); err != nil {
+			if err := e.setNullChildFKColumns(childTable, fkColIdxs, oldKeyValues); err != nil {
 				return err
 			}
 		}
@@ -5763,8 +5775,9 @@ func (e *executor) executeFKUpdateActions(parentTableName string, oldKeyValues, 
 	return nil
 }
 
-// hasReferencingRows checks if child table has any rows referencing the given parent key value.
-func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) (bool, error) {
+// hasReferencingRows checks if child table has any rows referencing the given parent key values.
+// Supports multi-column foreign keys by comparing all columns.
+func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) (bool, error) {
 	iter, err := e.tableEngine.Scan(childTable)
 	if err != nil {
 		return false, fmt.Errorf("%w: scan child table for FK check: %v", executorapi.ErrExecFailed, err)
@@ -5776,18 +5789,31 @@ func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColI
 		if row == nil {
 			continue
 		}
-		if fkColIdx < len(row.Values) {
-			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
-			if cmp == 0 {
-				return true, nil
-			}
+		// Check if ALL FK columns match (multi-column FK support)
+		if matchesAllFKColumns(row.Values, fkColIdxs, parentKeyVals) {
+			return true, nil
 		}
 	}
 	return false, iter.Err()
 }
 
-// cascadeDeleteChildRows deletes all rows in child table where FK column matches parent key.
-func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+// matchesAllFKColumns checks if a row's FK columns all match the parent key values.
+// Used for multi-column foreign key matching.
+func matchesAllFKColumns(rowValues []catalogapi.Value, fkColIdxs []int, parentKeyVals []catalogapi.Value) bool {
+	for i, colIdx := range fkColIdxs {
+		if colIdx >= len(rowValues) {
+			return false
+		}
+		if compareValues(rowValues[colIdx], parentKeyVals[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// cascadeDeleteChildRows deletes all rows in child table where FK columns match parent key.
+// Supports multi-column foreign keys by comparing all columns.
+func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -5797,7 +5823,7 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 			if err != nil {
 				return err
 			}
@@ -5835,7 +5861,7 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 		if err != nil {
 			return err
 		}
@@ -5871,8 +5897,9 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	return nil
 }
 
-// setNullChildFKColumns sets the FK column to NULL for all child rows referencing the parent key.
-func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+// setNullChildFKColumns sets the FK columns to NULL for all child rows referencing the parent key.
+// Supports multi-column foreign keys by setting all FK columns to NULL.
+func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -5884,7 +5911,7 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 			if err != nil {
 				return err
 			}
@@ -5894,10 +5921,21 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 			for _, row := range rows {
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
-				// Delete old index entries for the FK column
+				// Delete old index entries for the FK columns
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					val := row.Values[colIdx]
@@ -5908,10 +5946,12 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 					e.txnCtx.AddPendingWrite(idxKey, nil)
 				}
 
-				// Update row: set FK column to NULL
+				// Update row: set all FK columns to NULL
 				newValues := make([]catalogapi.Value, len(row.Values))
 				copy(newValues, row.Values)
-				newValues[fkColIdx] = nullValue
+				for _, fkIdx := range fkColIdxs {
+					newValues[fkIdx] = nullValue
+				}
 
 				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 				newRowVal := e.tableEngine.EncodeRow(newValues)
@@ -5920,10 +5960,21 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 				}
 				e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
 
-				// Insert new index entries for the FK column (now NULL - skip if index doesn't handle NULLs)
+				// Insert new index entries for the FK columns (now NULL - skip if index doesn't handle NULLs)
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					// Index on NULL value - encode and insert
@@ -5941,7 +5992,7 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 		if err != nil {
 			return err
 		}
@@ -5953,7 +6004,18 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 			// Delete old index entries
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-				if colIdx < 0 || colIdx != fkColIdx {
+				if colIdx < 0 {
+					continue
+				}
+				// Check if this index column is one of the FK columns
+				isFKColumn := false
+				for _, fkIdx := range fkColIdxs {
+					if colIdx == fkIdx {
+						isFKColumn = true
+						break
+					}
+				}
+				if !isFKColumn {
 					continue
 				}
 				val := row.Values[colIdx]
@@ -5964,10 +6026,12 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 				}
 			}
 
-			// Update row: set FK column to NULL
+			// Update row: set all FK columns to NULL
 			newValues := make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
-			newValues[fkColIdx] = nullValue
+			for _, fkIdx := range fkColIdxs {
+				newValues[fkIdx] = nullValue
+			}
 
 			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -5982,8 +6046,9 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	return nil
 }
 
-// cascadeUpdateChildFKValues updates all child rows' FK column from old value to new value.
-func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema, fkColIdx int, oldKeyVal, newKeyVal catalogapi.Value) error {
+// cascadeUpdateChildFKValues updates all child rows' FK columns from old values to new values.
+// Supports multi-column foreign keys by updating all FK columns.
+func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema, fkColIdxs []int, oldKeyVals, newKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -5993,7 +6058,7 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, oldKeyVals)
 			if err != nil {
 				return err
 			}
@@ -6003,10 +6068,21 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 			for _, row := range rows {
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
-				// Delete old index entries for the FK column
+				// Delete old index entries for the FK columns
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					val := row.Values[colIdx]
@@ -6017,10 +6093,12 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 					e.txnCtx.AddPendingWrite(idxKey, nil)
 				}
 
-				// Update row: change FK column to new value
+				// Update row: change all FK columns to new values
 				newValues := make([]catalogapi.Value, len(row.Values))
 				copy(newValues, row.Values)
-				newValues[fkColIdx] = newKeyVal
+				for i, fkIdx := range fkColIdxs {
+					newValues[fkIdx] = newKeyVals[i]
+				}
 
 				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 				newRowVal := e.tableEngine.EncodeRow(newValues)
@@ -6032,10 +6110,29 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 				// Insert new index entries
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
 						continue
 					}
-					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, newKeyVal, row.RowID)
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
+						continue
+					}
+					// Find the corresponding new value for this FK column
+					var newVal catalogapi.Value
+					for i, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							newVal = newKeyVals[i]
+							break
+						}
+					}
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, newVal, row.RowID)
 					if err := e.store.PutWithXID(idxKey, nil, xid); err != nil {
 						return fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 					}
@@ -6049,7 +6146,7 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, oldKeyVals)
 		if err != nil {
 			return err
 		}
@@ -6061,7 +6158,18 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 			// Delete old index entries
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-				if colIdx < 0 || colIdx != fkColIdx {
+				if colIdx < 0 {
+					continue
+				}
+				// Check if this index column is one of the FK columns
+				isFKColumn := false
+				for _, fkIdx := range fkColIdxs {
+					if colIdx == fkIdx {
+						isFKColumn = true
+						break
+					}
+				}
+				if !isFKColumn {
 					continue
 				}
 				val := row.Values[colIdx]
@@ -6072,10 +6180,12 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 				}
 			}
 
-			// Update row: change FK column to new value
+			// Update row: change all FK columns to new values
 			newValues := make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
-			newValues[fkColIdx] = newKeyVal
+			for i, fkIdx := range fkColIdxs {
+				newValues[fkIdx] = newKeyVals[i]
+			}
 
 			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -6089,10 +6199,9 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	}
 	return nil
 }
-
-// scanChildRowsForFKAction scans child table rows where FK column matches parent key value.
+// Supports multi-column foreign keys by comparing all columns.
 // Returns a batch of matching rows (up to DMLBatchSize).
-func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) ([]*engineapi.Row, error) {
+func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) ([]*engineapi.Row, error) {
 	iter, err := e.tableEngine.ScanWithLimit(childTable, DMLBatchSize, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: scan child table: %v", executorapi.ErrExecFailed, err)
@@ -6105,16 +6214,14 @@ func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, 
 		if row == nil {
 			continue
 		}
-		if fkColIdx < len(row.Values) {
-			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
-			if cmp == 0 {
-				rowCopy := &engineapi.Row{
-					RowID:  row.RowID,
-					Values: make([]catalogapi.Value, len(row.Values)),
-				}
-				copy(rowCopy.Values, row.Values)
-				rows = append(rows, rowCopy)
+		// Check if ALL FK columns match (multi-column FK support)
+		if matchesAllFKColumns(row.Values, fkColIdxs, parentKeyVals) {
+			rowCopy := &engineapi.Row{
+				RowID:  row.RowID,
+				Values: make([]catalogapi.Value, len(row.Values)),
 			}
+			copy(rowCopy.Values, row.Values)
+			rows = append(rows, rowCopy)
 		}
 	}
 	return rows, iter.Err()
