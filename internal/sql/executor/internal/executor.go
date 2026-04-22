@@ -694,11 +694,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 			// Write index entries with same XID.
 			for _, idx := range indexes {
-				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-				if colIdx < 0 {
-					continue
+				// Get index value (column or expression)
+				rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+				val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 				}
-				val := row[colIdx]
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
@@ -2983,7 +2984,10 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				oldVal := row.Values[colIdx]
+				oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3034,7 +3038,11 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				newVal := newValues[colIdx]
+				newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+				newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
@@ -3057,7 +3065,11 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			oldVal := row.Values[colIdx]
+			oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 			if err := batch.Delete(idxKey); err != nil && err != kvstoreapi.ErrKeyNotFound {
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3106,7 +3118,12 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			newVal := newValues[colIdx]
+			newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+			newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -3343,11 +3360,16 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 
 			// Delete old index entries for changed columns with transaction's XID.
 			for _, idx := range indexes {
+				// Check if any indexed column changed
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				oldVal := row.Values[colIdx]
+				// Get index value (column or expression)
+				oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3407,7 +3429,13 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				newVal := newValues[colIdx]
+				// Build new row with updated values for expression evaluation
+				newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+				// Get index value (column or expression)
+				newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
@@ -3430,7 +3458,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			oldVal := row.Values[colIdx]
+			// Get index value (column or expression)
+			oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 			if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -3498,7 +3531,14 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			newVal := newValues[colIdx]
+			// Build new row with updated values for expression evaluation
+			newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+			// Get index value (column or expression)
+			newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -4888,10 +4928,8 @@ func getIndexValue(idx *catalogapi.IndexSchema, row *engineapi.Row, columns []ca
 	}
 
 	// Expression index - re-parse and evaluate the expression
-	exprSQL := idx.ExprSQL
-	if len(exprSQL) >= 2 && exprSQL[0] == '(' && exprSQL[len(exprSQL)-1] == ')' {
-		exprSQL = exprSQL[1 : len(exprSQL)-1]
-	}
+	// Wrap in SELECT statement so parser accepts it as a valid SQL statement
+	exprSQL := "SELECT " + idx.ExprSQL
 
 	stmt, err := e.parser.Parse(exprSQL)
 	if err != nil {

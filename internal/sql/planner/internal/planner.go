@@ -226,11 +226,17 @@ func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.
 	var exprSQL string
 
 	if stmt.Expr != nil {
-		// Expression index: serialize expression
-		exprSQL = serializeExprToSQL(stmt.Expr)
-		// For expression indexes, use first column reference as the "column"
-		// for backward compatibility (the actual expression is in ExprSQL)
-		column = extractColumnFromExpr(stmt.Expr)
+		// Check if this is just a simple column reference (not an expression index)
+		if _, isColRef := stmt.Expr.(*parserapi.ColumnRef); isColRef {
+			// Simple column index: use Column field
+			column = stmt.Column
+		} else {
+			// Expression index: serialize expression
+			exprSQL = serializeExprToSQL(stmt.Expr)
+			// For expression indexes, use first column reference as the "column"
+			// for backward compatibility (the actual expression is in ExprSQL)
+			column = extractColumnFromExpr(stmt.Expr)
+		}
 	} else {
 		// Simple column index
 		column = stmt.Column
