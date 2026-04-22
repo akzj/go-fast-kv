@@ -175,6 +175,14 @@ type DeletePlan struct {
 
 func (*DeletePlan) planNode() {}
 
+// TruncatePlan truncates a table (deletes all rows efficiently).
+type TruncatePlan struct {
+	Table    *catalogapi.TableSchema
+	TableID  uint32
+}
+
+func (*TruncatePlan) planNode() {}
+
 // UpdatePlan updates rows in a table.
 type UpdatePlan struct {
 	Table       *catalogapi.TableSchema
@@ -243,6 +251,8 @@ func planDescription(plan Plan) string {
 		return fmt.Sprintf("INSERT INTO %s", p.Table.Name)
 	case *DeletePlan:
 		return fmt.Sprintf("DELETE FROM %s", p.Table.Name)
+	case *TruncatePlan:
+		return fmt.Sprintf("TRUNCATE TABLE %s", p.Table.Name)
 	case *UpdatePlan:
 		return fmt.Sprintf("UPDATE %s", p.Table.Name)
 	case *CreateTablePlan:

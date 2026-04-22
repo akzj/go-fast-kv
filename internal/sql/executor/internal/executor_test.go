@@ -739,6 +739,73 @@ func TestExec_DeleteAll_LargeTable(t *testing.T) {
 	}
 }
 
+func TestExec_Truncate(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Charlie')")
+
+	// TRUNCATE the table
+	result := env.execSQL(t, "TRUNCATE TABLE users")
+	if result.RowsAffected != 0 {
+		t.Errorf("RowsAffected = %d, want 0", result.RowsAffected)
+	}
+
+	// Verify table is empty
+	sel := env.execSQL(t, "SELECT * FROM users")
+	if len(sel.Rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(sel.Rows))
+	}
+
+	// Verify table structure still exists (can re-insert)
+	env.execSQL(t, "INSERT INTO users VALUES (10, 'Dave')")
+	sel = env.execSQL(t, "SELECT * FROM users")
+	if len(sel.Rows) != 1 {
+		t.Errorf("rows = %d, want 1 after re-insert", len(sel.Rows))
+	}
+	if sel.Rows[0][0].Int != 10 {
+		t.Errorf("id = %d, want 10", sel.Rows[0][0].Int)
+	}
+}
+
+func TestExec_Truncate_LargeTable(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE big (id INT PRIMARY KEY, val TEXT)")
+
+	// Insert 1000 rows
+	for i := 1; i <= 1000; i++ {
+		env.execSQL(t, "INSERT INTO big VALUES ("+strconv.Itoa(i)+", 'row"+strconv.Itoa(i)+"')")
+	}
+
+	// TRUNCATE the table
+	result := env.execSQL(t, "TRUNCATE TABLE big")
+	if result.RowsAffected != 0 {
+		t.Errorf("RowsAffected = %d, want 0", result.RowsAffected)
+	}
+
+	// Verify no rows remain
+	sel := env.execSQL(t, "SELECT COUNT(*) FROM big")
+	if sel.Rows[0][0].Int != 0 {
+		t.Errorf("COUNT(*) = %d, want 0", sel.Rows[0][0].Int)
+	}
+
+	// Verify table structure still exists
+	env.execSQL(t, "INSERT INTO big VALUES (9999, 'new')")
+	sel = env.execSQL(t, "SELECT COUNT(*) FROM big")
+	if sel.Rows[0][0].Int != 1 {
+		t.Errorf("COUNT(*) = %d, want 1 after re-insert", sel.Rows[0][0].Int)
+	}
+}
+
+func TestExec_Truncate_NonExistentTable(t *testing.T) {
+	env := newTestEnv(t)
+	_, err := env.execSQLErr(t, "TRUNCATE TABLE nonexistent")
+	if err == nil {
+		t.Fatal("expected error for non-existent table")
+	}
+}
+
 func TestExec_Update(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")

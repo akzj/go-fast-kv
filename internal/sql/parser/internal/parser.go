@@ -87,8 +87,10 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseRelease()
 	case api.TokAlter:
 		return p.parseAlterTable()
+	case api.TokTruncate:
+		return p.parseTruncate()
 	default:
-		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, BEGIN, COMMIT, ROLLBACK)")
+		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, TRUNCATE, BEGIN, COMMIT, ROLLBACK)")
 	}
 }
 
@@ -1467,6 +1469,23 @@ func (p *parser) parseDelete() (api.Statement, error) {
 		}
 		stmt.Where = expr
 	}
+	return stmt, nil
+}
+
+// ─── TRUNCATE ─────────────────────────────────────────────────────
+
+func (p *parser) parseTruncate() (api.Statement, error) {
+	p.advance() // consume TRUNCATE
+	if err := p.expect(api.TokTable); err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after TABLE")
+	}
+	stmt := &api.TruncateStmt{
+		Table: p.cur.Literal,
+	}
+	p.advance()
 	return stmt, nil
 }
 

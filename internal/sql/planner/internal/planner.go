@@ -40,6 +40,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planSelect(s)
 	case *parserapi.DeleteStmt:
 		return p.planDelete(s)
+	case *parserapi.TruncateStmt:
+		return p.planTruncate(s)
 	case *parserapi.UpdateStmt:
 		return p.planUpdate(s)
 	case *parserapi.ExplainStmt:
@@ -1304,6 +1306,18 @@ func (p *planner) planDelete(stmt *parserapi.DeleteStmt) (*plannerapi.DeletePlan
 	}
 
 	return &plannerapi.DeletePlan{Table: tbl, Scan: scan}, nil
+}
+
+func (p *planner) planTruncate(stmt *parserapi.TruncateStmt) (*plannerapi.TruncatePlan, error) {
+	tbl, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		if err == catalogapi.ErrTableNotFound {
+			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+		}
+		return nil, err
+	}
+
+	return &plannerapi.TruncatePlan{Table: tbl, TableID: tbl.TableID}, nil
 }
 
 func (p *planner) planUpdate(stmt *parserapi.UpdateStmt) (*plannerapi.UpdatePlan, error) {

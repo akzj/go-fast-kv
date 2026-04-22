@@ -151,6 +151,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execJoin(p)
 	case *plannerapi.DeletePlan:
 		return e.execDelete(p)
+	case *plannerapi.TruncatePlan:
+		return e.execTruncate(p)
 	case *plannerapi.UpdatePlan:
 		return e.execUpdate(p)
 	case *plannerapi.UnionPlan:
@@ -229,6 +231,8 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execJoin(p)
 	case *plannerapi.DeletePlan:
 		return e.execDelete(p)
+	case *plannerapi.TruncatePlan:
+		return e.execTruncate(p)
 	case *plannerapi.UpdatePlan:
 		return e.execUpdate(p)
 	case *plannerapi.UnionPlan:
@@ -3248,6 +3252,17 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 	}
 
 	return &executorapi.Result{RowsAffected: count}, nil
+}
+
+// execTruncate deletes all rows from a table efficiently using DropTableData.
+// This is faster than DELETE without WHERE because it doesn't scan individual rows.
+// Truncate does NOT reset AUTOINCREMENT counter — that's SQLite behavior.
+func (e *executor) execTruncate(plan *plannerapi.TruncatePlan) (*executorapi.Result, error) {
+	// Use the efficient DropTableData to delete all rows at once
+	if err := e.tableEngine.DropTableData(plan.TableID); err != nil {
+		return nil, fmt.Errorf("%w: truncate %s: %v", executorapi.ErrExecFailed, plan.Table.Name, err)
+	}
+	return &executorapi.Result{RowsAffected: 0}, nil
 }
 
 func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result, error) {

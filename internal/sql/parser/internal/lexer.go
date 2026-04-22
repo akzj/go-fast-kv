@@ -80,6 +80,7 @@ var keywords = map[string]api.TokenType{
 	"LOCKED":    api.TokLocked,
 	"FOR":       api.TokIdent, // FOR UPDATE, handled specially in parser
 	"ALTER":     api.TokAlter,
+	"TRUNCATE":   api.TokTruncate,
 	"ADD":       api.TokAdd,
 	"COLUMN":    api.TokColumn,
 	"RENAME":    api.TokRename,

@@ -138,6 +138,7 @@ const (
 	TokNoAction       TokenType = 112 // NO ACTION
 	TokRestrict       TokenType = 113 // RESTRICT
 	TokParam          TokenType = 114 // $1, $2, ... positional parameter
+	TokTruncate       TokenType = 115 // TRUNCATE
 )
 
 // Token represents a single lexical token.
@@ -382,6 +383,13 @@ type DeleteStmt struct {
 }
 
 func (*DeleteStmt) stmtNode() {}
+
+// TruncateStmt: TRUNCATE TABLE t
+type TruncateStmt struct {
+	Table string
+}
+
+func (*TruncateStmt) stmtNode() {}
 
 // UpdateStmt: UPDATE table SET col1=val1, ... [WHERE expr]
 type UpdateStmt struct {
