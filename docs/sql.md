@@ -255,6 +255,7 @@ Creates an index on a column for faster lookups.
 
 ```sql
 CREATE INDEX idx_name ON table_name (column_name)
+CREATE UNIQUE INDEX idx_name ON table_name (column_name)  -- unique index
 ```
 
 ### DROP INDEX
@@ -262,7 +263,8 @@ CREATE INDEX idx_name ON table_name (column_name)
 Removes an index.
 
 ```sql
-DROP INDEX idx_name
+DROP INDEX idx_name ON table_name
+DROP INDEX IF EXISTS idx_name ON table_name  -- no error if not exists
 ```
 
 ---

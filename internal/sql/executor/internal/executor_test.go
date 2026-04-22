@@ -846,6 +846,73 @@ func TestExec_CreateIndex(t *testing.T) {
 	env.execSQL(t, "CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
 }
 
+func TestExec_DropIndex(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_age ON users (age)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+
+	// Verify index exists
+	_, err := env.cat.GetIndex("users", "idx_age")
+	if err != nil {
+		t.Fatalf("GetIndex before drop: %v", err)
+	}
+
+	// Drop the index
+	env.execSQL(t, "DROP INDEX idx_age ON users")
+
+	// Verify index is gone
+	_, err = env.cat.GetIndex("users", "idx_age")
+	if err != catalogapi.ErrIndexNotFound {
+		t.Errorf("GetIndex after drop: err = %v, want ErrIndexNotFound", err)
+	}
+
+	// Queries should still work (table scan)
+	result := env.execSQL(t, "SELECT * FROM users WHERE age = 30")
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows after index drop = %d, want 1", len(result.Rows))
+	}
+}
+
+func TestExec_DropIndex_IfExists(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+	// DROP INDEX IF EXISTS with non-existent index should succeed silently
+	env.execSQL(t, "DROP INDEX IF EXISTS idx_age ON users")
+
+	// No error means test passes
+}
+
+func TestExec_DropIndex_NotExists(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+	// DROP INDEX without IF EXISTS on non-existent index should fail
+	_, err := env.execSQLErr(t, "DROP INDEX idx_age ON users")
+	if err == nil {
+		t.Fatal("expected error for non-existent index")
+	}
+}
+
+func TestExec_DropIndex_CascadeToData(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_age ON users (age)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+
+	// Drop the index
+	env.execSQL(t, "DROP INDEX idx_age ON users")
+
+	// Table data should still exist
+	result := env.execSQL(t, "SELECT COUNT(*) FROM users")
+	if result.Rows[0][0].Int != 2 {
+		t.Errorf("count = %d, want 2", result.Rows[0][0].Int)
+	}
+}
+
 func TestExec_IndexScan(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
