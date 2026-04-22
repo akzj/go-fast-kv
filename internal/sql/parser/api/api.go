@@ -139,6 +139,8 @@ const (
 	TokRestrict       TokenType = 113 // RESTRICT
 	TokParam          TokenType = 114 // $1, $2, ... positional parameter
 	TokTruncate       TokenType = 115 // TRUNCATE
+	TokConflict       TokenType = 116 // CONFLICT (for ON CONFLICT)
+	TokNothing        TokenType = 117 // NOTHING (for DO NOTHING)
 )
 
 // Token represents a single lexical token.
@@ -243,12 +245,31 @@ func (*AlterTableStmt) stmtNode() {}
 // ─── DML Statements ───────────────────────────────────────────────
 
 // InsertStmt: INSERT INTO table [(col1, col2)] VALUES (v1, v2), ...
+//   INSERT ... ON CONFLICT (col) DO UPDATE SET col=val
+//   INSERT ... ON CONFLICT DO NOTHING
 type InsertStmt struct {
-	Table      string
-	Columns    []string   // optional column list
-	Values     [][]Expr   // multiple rows
-	SelectStmt *SelectStmt // SELECT subquery for INSERT ... SELECT
+	Table           string
+	Columns         []string       // optional column list
+	Values          [][]Expr      // multiple rows
+	SelectStmt      *SelectStmt    // SELECT subquery for INSERT ... SELECT
+	OnConflict      *OnConflictClause // ON CONFLICT clause for UPSERT
 }
+
+// OnConflictClause represents the ON CONFLICT (UPSERT) clause.
+type OnConflictClause struct {
+	ConflictColumns []string          // columns for conflict detection (e.g., id for PRIMARY KEY)
+	Action          ConflictAction     // DO NOTHING or DO UPDATE
+	// For DO UPDATE:
+	UpdateColumns  []string           // column names to update
+	UpdateValues   []Expr             // new values for UPDATE SET
+}
+
+type ConflictAction int
+
+const (
+	ConflictDoNothing ConflictAction = 0 // DO NOTHING
+	ConflictDoUpdate  ConflictAction = 1 // DO UPDATE SET col=val
+)
 
 func (*InsertStmt) stmtNode() {}
 

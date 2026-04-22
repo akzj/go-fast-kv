@@ -134,6 +134,27 @@ type InsertPlan struct {
 
 func (*InsertPlan) planNode() {}
 
+// UpsertPlan: INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
+type UpsertPlan struct {
+	Table       *catalogapi.TableSchema
+	Rows        [][]catalogapi.Value   // resolved values for INSERT
+	Exprs       [][]parserapi.Expr     // raw expressions for parameterized inserts
+	ConflictColumns []int            // column indices for conflict detection
+	Action      UpsertAction          // DO NOTHING or DO UPDATE
+	// For DO UPDATE:
+	UpdateAssignments map[int]catalogapi.Value // columnIndex → resolved value
+	ParamUpdateAssignments map[int]parserapi.Expr // columnIndex → raw expr (for parameterized)
+}
+
+type UpsertAction int
+
+const (
+	UpsertDoNothing UpsertAction = 0
+	UpsertDoUpdate  UpsertAction = 1
+)
+
+func (*UpsertPlan) planNode() {}
+
 // InsertSelectPlan inserts rows from a SELECT query into a table.
 type InsertSelectPlan struct {
 	Table      *catalogapi.TableSchema
@@ -253,6 +274,11 @@ func planDescription(plan Plan) string {
 		return p.String()
 	case *InsertPlan:
 		return fmt.Sprintf("INSERT INTO %s", p.Table.Name)
+	case *UpsertPlan:
+		if p.Action == UpsertDoNothing {
+			return fmt.Sprintf("UPSERT INTO %s (ON CONFLICT DO NOTHING)", p.Table.Name)
+		}
+		return fmt.Sprintf("UPSERT INTO %s (ON CONFLICT DO UPDATE)", p.Table.Name)
 	case *DeletePlan:
 		return fmt.Sprintf("DELETE FROM %s", p.Table.Name)
 	case *TruncatePlan:

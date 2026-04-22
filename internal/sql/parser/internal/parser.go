@@ -967,7 +967,110 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		}
 		p.advance()
 	}
+	// Optional ON CONFLICT clause
+	if p.cur.Type == api.TokOn {
+		p.advance() // consume ON
+		if p.cur.Type == api.TokConflict || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "CONFLICT") {
+			if p.cur.Type == api.TokIdent {
+				p.advance() // consume CONFLICT identifier
+			} else {
+				p.advance() // consume CONFLICT token
+			}
+			// ON CONFLICT (column, ...) or ON CONFLICT DO NOTHING
+			onConflict, err := p.parseOnConflictClause()
+			if err != nil {
+				return nil, err
+			}
+			stmt.OnConflict = onConflict
+		}
+	}
 	return stmt, nil
+}
+
+// parseOnConflictClause parses: ON CONFLICT (col, ...) DO [NOTHING | UPDATE SET col=val]
+func (p *parser) parseOnConflictClause() (*api.OnConflictClause, error) {
+	clause := &api.OnConflictClause{}
+
+	// Check if there's a conflict column list: ON CONFLICT (col, ...)
+	if p.cur.Type == api.TokLParen {
+		p.advance() // consume '('
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name in ON CONFLICT")
+			}
+			clause.ConflictColumns = append(clause.ConflictColumns, p.cur.Literal)
+			p.advance()
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(api.TokRParen); err != nil {
+			return nil, err
+		}
+	}
+
+	// DO NOTHING or DO UPDATE SET ...
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "DO" {
+		return nil, p.errorf("expected DO after ON CONFLICT")
+	}
+	p.advance() // consume DO
+
+	// Check for DO NOTHING
+	if p.cur.Type == api.TokNothing || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "NOTHING") {
+		clause.Action = api.ConflictDoNothing
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume NOTHING identifier
+		} else {
+			p.advance() // consume NOTHING token
+		}
+		return clause, nil
+	}
+
+	// DO UPDATE SET col=val, col=val, ...
+	// Accept both UPDATE keyword and UPDATE identifier
+	if p.cur.Type == api.TokUpdate || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "UPDATE") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume UPDATE identifier
+		} else {
+			p.advance() // consume UPDATE token
+		}
+	}
+	if err := p.expect(api.TokSet); err != nil {
+		return nil, err
+	}
+
+	clause.Action = api.ConflictDoUpdate
+	// Parse SET assignments
+	for {
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name in ON CONFLICT UPDATE SET")
+		}
+		clause.UpdateColumns = append(clause.UpdateColumns, p.cur.Literal)
+		p.advance()
+		if err := p.expect(api.TokEQ); err != nil {
+			return nil, err
+		}
+		// Parse value expression
+		var expr api.Expr
+		if p.cur.Type == api.TokDefault {
+			p.advance()
+			expr = &api.DefaultExpr{}
+		} else {
+			val, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			expr = val
+		}
+		clause.UpdateValues = append(clause.UpdateValues, expr)
+		if p.cur.Type != api.TokComma {
+			break
+		}
+		p.advance()
+	}
+
+	return clause, nil
 }
 
 // ─── EXPLAIN ──────────────────────────────────────────────────────

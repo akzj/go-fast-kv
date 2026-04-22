@@ -360,6 +360,11 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 		return nil, err
 	}
 
+	// INSERT ... ON CONFLICT → route to UpsertPlan
+	if stmt.OnConflict != nil {
+		return p.planUpsert(stmt, tbl)
+	}
+
 	// INSERT ... SELECT
 	if stmt.SelectStmt != nil {
 		subPlan, err := p.planSelect(stmt.SelectStmt)
@@ -414,6 +419,92 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 	}
 
 	return &plannerapi.InsertPlan{Table: tbl, Rows: rows}, nil
+}
+
+// planUpsert handles INSERT ... ON CONFLICT
+func (p *planner) planUpsert(stmt *parserapi.InsertStmt, tbl *catalogapi.TableSchema) (plannerapi.Plan, error) {
+	oc := stmt.OnConflict
+
+	// Resolve conflict columns to indices
+	conflictCols := make([]int, 0, len(oc.ConflictColumns))
+	for _, colName := range oc.ConflictColumns {
+		idx := findColumnIndex(tbl, colName)
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ON CONFLICT column %s", plannerapi.ErrColumnNotFound, colName)
+		}
+		conflictCols = append(conflictCols, idx)
+	}
+
+	plan := &plannerapi.UpsertPlan{
+		Table:           tbl,
+		ConflictColumns: conflictCols,
+	}
+
+	if oc.Action == parserapi.ConflictDoNothing {
+		plan.Action = plannerapi.UpsertDoNothing
+		// Still need to resolve INSERT values
+		return p.finishUpsertPlan(stmt, plan)
+	}
+
+	// DO UPDATE
+	plan.Action = plannerapi.UpsertDoUpdate
+
+	// Resolve UPDATE assignments
+	plan.UpdateAssignments = make(map[int]catalogapi.Value)
+	plan.ParamUpdateAssignments = make(map[int]parserapi.Expr)
+
+	for i, colName := range oc.UpdateColumns {
+		idx := findColumnIndex(tbl, colName)
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ON CONFLICT UPDATE SET column %s", plannerapi.ErrColumnNotFound, colName)
+		}
+		expr := oc.UpdateValues[i]
+		if _, ok := expr.(*parserapi.ParamRef); ok {
+			plan.ParamUpdateAssignments[idx] = expr
+		} else {
+			val, err := resolveExprToValue(expr)
+			if err != nil {
+				return nil, fmt.Errorf("ON CONFLICT UPDATE SET %s: %w", colName, err)
+			}
+			plan.UpdateAssignments[idx] = val
+		}
+	}
+
+	return p.finishUpsertPlan(stmt, plan)
+}
+
+// finishUpsertPlan resolves INSERT values and finalizes the upsert plan.
+func (p *planner) finishUpsertPlan(stmt *parserapi.InsertStmt, plan *plannerapi.UpsertPlan) (plannerapi.Plan, error) {
+	// Check if any INSERT value has parameters
+	hasParams := false
+	for _, exprRow := range stmt.Values {
+		for _, expr := range exprRow {
+			if _, ok := expr.(*parserapi.ParamRef); ok {
+				hasParams = true
+				break
+			}
+		}
+		if hasParams {
+			break
+		}
+	}
+
+	if hasParams {
+		plan.Exprs = stmt.Values
+		return plan, nil
+	}
+
+	// Resolve literals at planning time
+	rows := make([][]catalogapi.Value, len(stmt.Values))
+	for i, exprRow := range stmt.Values {
+		resolved, err := p.resolveInsertRow(plan.Table, stmt.Columns, exprRow)
+		if err != nil {
+			return nil, fmt.Errorf("row %d: %w", i+1, err)
+		}
+		rows[i] = resolved
+	}
+	plan.Rows = rows
+	return plan, nil
 }
 
 func (p *planner) resolveInsertRow(tbl *catalogapi.TableSchema, columns []string, exprs []parserapi.Expr) ([]catalogapi.Value, error) {
