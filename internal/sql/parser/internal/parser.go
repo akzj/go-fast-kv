@@ -530,7 +530,7 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 	col.Name = p.cur.Literal
 	p.advance()
 
-	// Type name
+	// Type name or SERIAL/SERIAL PRIMARY KEY shortcut
 	switch p.cur.Type {
 	case api.TokIntKw:
 		col.TypeName = "INT"
@@ -542,6 +542,9 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		col.TypeName = "FLOAT"
 	case api.TokBlobKw:
 		col.TypeName = "BLOB"
+	case api.TokSerial:
+		col.TypeName = "INT"
+		col.AutoInc = true
 	default:
 		return col, p.errorf("expected type name (INT, TEXT, FLOAT, BLOB)")
 	}
@@ -610,7 +613,7 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		}
 	}
 
-	// Optional CHECK constraint
+	// Optional CHECK constraint: CHECK (expr) or CHECK expr
 	if p.cur.Type == api.TokCheck {
 		p.advance()
 		if p.cur.Type != api.TokLParen {
@@ -3273,12 +3276,26 @@ func (p *parser) parseFrameBound() (*api.FrameBound, error) {
 	if p.cur.Type == api.TokUnbounded {
 		bound.Type = "UNBOUNDED PRECEDING"
 		p.advance()
-		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "PRECEDING" {
+		// Check for PRECEDING or FOLLOWING keyword
+		if p.cur.Type == api.TokFollowing {
+			bound.Type = "UNBOUNDED FOLLOWING"
 			p.advance()
+		} else if p.cur.Type == api.TokIdent {
+			upper := strings.ToUpper(p.cur.Literal)
+			if upper == "PRECEDING" {
+				p.advance()
+			} else if upper == "FOLLOWING" {
+				bound.Type = "UNBOUNDED FOLLOWING"
+				p.advance()
+			}
 		}
 	} else if p.cur.Type == api.TokCurrent {
 		bound.Type = "CURRENT ROW"
 		p.advance()
+		// Consume "ROW" if it follows CURRENT
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "ROW" {
+			p.advance()
+		}
 	} else {
 		// Could be <n> PRECEDING or <n> FOLLOWING
 		// Parse expression first
