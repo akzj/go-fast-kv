@@ -138,6 +138,43 @@ type DropTriggerPlan struct {
 
 func (*DropTriggerPlan) planNode() {}
 
+// ─── FTS Plans ─────────────────────────────────────────────────────
+
+// FTSIndexSchema stores FTS table metadata.
+type FTSIndexSchema struct {
+	Name       string
+	TableID    uint32
+	Columns    []string
+	Tokenizer  string // "simple", "porter", ""
+	FTSVersion string // "fts5", "fts4", "fts3"
+}
+
+// CreateFTSPlan creates a FTS virtual table.
+type CreateFTSPlan struct {
+	Schema     FTSIndexSchema
+	IfNotExists bool
+}
+
+func (*CreateFTSPlan) planNode() {}
+
+// FTSSearchPlan represents a FTS MATCH search.
+type FTSSearchPlan struct {
+	Table    string // FTS table name
+	Query    string // FTS query string
+	ScanPlan *SelectPlan // underlying scan plan
+}
+
+func (*FTSSearchPlan) planNode() {}
+
+// DropFTSPlan drops a FTS table (same as DROP TABLE).
+type DropFTSPlan struct {
+	TableName string
+	TableID   uint32
+	IfExists  bool
+}
+
+func (*DropFTSPlan) planNode() {}
+
 // ─── DML Plans ──────────────────────────────────────────────────────
 
 // InsertPlan inserts rows into a table.

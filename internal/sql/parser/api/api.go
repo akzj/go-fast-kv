@@ -169,6 +169,12 @@ const (
 	TokForEachRow    TokenType = 153 // FOR EACH ROW
 	TokBeginTrigger  TokenType = 154 // BEGIN (trigger body)
 	TokEndTrigger    TokenType = 155 // END (trigger body)
+	TokVirtual       TokenType = 156 // VIRTUAL (for CREATE VIRTUAL TABLE)
+	TokUsing         TokenType = 157 // USING
+	TokMatch         TokenType = 158 // MATCH (for FTS MATCH expression)
+	TokFTS5          TokenType = 159 // FTS5
+	TokFTS4          TokenType = 160 // FTS4
+	TokFTS3          TokenType = 161 // FTS3
 )
 
 // Token represents a single lexical token.
@@ -713,6 +719,36 @@ type PragmaStmt struct {
 }
 
 func (*PragmaStmt) stmtNode() {}
+
+// ─── FTS Statements ───────────────────────────────────────────────
+
+// CreateFTSStmt: CREATE VIRTUAL TABLE name USING fts5(col1, col2, ...) [tokenize='porter']
+type CreateFTSStmt struct {
+	Name           string   // table name
+	Columns        []string // column names
+	Tokenize       string   // tokenizer: "", "porter", "simple"
+	FTSVersion     string   // "fts5", "fts4", "fts3"
+	IfNotExists    bool
+}
+
+func (*CreateFTSStmt) stmtNode() {}
+
+// DropFTSStmt: DROP TABLE name (FTS tables use same DROP TABLE syntax)
+type DropFTSStmt struct {
+	Table    string
+	IfExists bool
+}
+
+func (*DropFTSStmt) stmtNode() {}
+
+// MatchExpr: expression for FTS MATCH operator
+// e.g., 'sql AND database' in: WHERE table MATCH 'sql AND database'
+type MatchExpr struct {
+	Table  string // optional table qualifier (e.g., "articles" in "articles.MATCH")
+	Query  string // FTS query string
+}
+
+func (*MatchExpr) exprNode() {}
 
 // TriggerStmt: CREATE TRIGGER name [BEFORE|AFTER] [INSERT|UPDATE|DELETE] ON table [WHEN condition] BEGIN ... END
 type TriggerStmt struct {

@@ -34,7 +34,7 @@ func TestExplainOutputCapture(t *testing.T) {
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	exec := executor.New(store, cat, tbl, idx, pl, p)
+	exec := executor.New(store, cat, tbl, idx, nil, pl, p)
 
 	// Create test tables
 	setupTables(t, p, pl, exec, cat)

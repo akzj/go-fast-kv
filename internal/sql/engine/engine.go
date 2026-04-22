@@ -29,3 +29,8 @@ func NewTableEngine(store kvstoreapi.Store, encoder encodingapi.KeyEncoder, code
 func NewIndexEngine(store kvstoreapi.Store, encoder encodingapi.KeyEncoder) api.IndexEngine {
 	return internal.NewIndexEngine(store, encoder)
 }
+
+// NewFTSEngine creates a new FTSEngine for full-text search.
+func NewFTSEngine(store kvstoreapi.Store) api.FTSEngine {
+	return internal.NewFTSEngine(store)
+}

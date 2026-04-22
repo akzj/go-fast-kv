@@ -83,6 +83,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planCreateTrigger(s)
 	case *parserapi.DropTriggerStmt:
 		return p.planDropTrigger(s)
+	case *parserapi.CreateFTSStmt:
+		return p.planCreateFTS(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -2303,6 +2305,21 @@ func (p *planner) planDropTrigger(stmt *parserapi.DropTriggerStmt) (*plannerapi.
 	return &plannerapi.DropTriggerPlan{
 		Name:     stmt.Name,
 		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// ─── FTS Planning ───────────────────────────────────────────────────
+
+func (p *planner) planCreateFTS(stmt *parserapi.CreateFTSStmt) (*plannerapi.CreateFTSPlan, error) {
+	schema := plannerapi.FTSIndexSchema{
+		Name:       stmt.Name,
+		Columns:    stmt.Columns,
+		Tokenizer:  stmt.Tokenize,
+		FTSVersion: stmt.FTSVersion,
+	}
+	return &plannerapi.CreateFTSPlan{
+		Schema:      schema,
+		IfNotExists: stmt.IfNotExists,
 	}, nil
 }
 

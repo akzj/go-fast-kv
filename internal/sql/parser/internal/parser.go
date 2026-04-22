@@ -337,8 +337,10 @@ func (p *parser) parseCreate() (api.Statement, error) {
 		return p.parseCreateIndex(false)
 	case api.TokTrigger:
 		return p.parseCreateTrigger()
+	case api.TokVirtual:
+		return p.parseCreateFTS()
 	default:
-		return nil, p.errorf("expected TABLE, INDEX, or TRIGGER after CREATE")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, or VIRTUAL after CREATE")
 	}
 }
 
@@ -790,6 +792,95 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	if err := p.expect(api.TokRParen); err != nil {
 		return nil, err
 	}
+	return stmt, nil
+}
+
+// ─── FTS (Full-Text Search) ───────────────────────────────────────
+
+// parseCreateFTS parses: CREATE VIRTUAL TABLE name USING fts5|fts4|fts3(col1, col2, ...) [tokenize='...']
+func (p *parser) parseCreateFTS() (api.Statement, error) {
+	p.advance() // consume VIRTUAL
+	if err := p.expect(api.TokTable); err != nil {
+		return nil, err
+	}
+
+	stmt := &api.CreateFTSStmt{}
+
+	// IF NOT EXISTS
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokNot); err != nil {
+			return nil, err
+		}
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+
+	// Table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+
+	// USING fts5|fts4|fts3
+	if err := p.expect(api.TokUsing); err != nil {
+		return nil, err
+	}
+
+	switch p.cur.Type {
+	case api.TokFTS5:
+		stmt.FTSVersion = "fts5"
+	case api.TokFTS4:
+		stmt.FTSVersion = "fts4"
+	case api.TokFTS3:
+		stmt.FTSVersion = "fts3"
+	default:
+		return nil, p.errorf("expected fts5, fts4, or fts3 after USING")
+	}
+	p.advance()
+
+	// Optional column list: (col1, col2, ...)
+	if p.cur.Type == api.TokLParen {
+		p.advance()
+		for {
+			if p.cur.Type == api.TokRParen {
+				p.advance()
+				break
+			}
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name")
+			}
+			stmt.Columns = append(stmt.Columns, p.cur.Literal)
+			p.advance()
+			if p.cur.Type == api.TokComma {
+				p.advance()
+				continue
+			}
+			if p.cur.Type == api.TokRParen {
+				p.advance()
+				break
+			}
+			return nil, p.errorf("expected , or ) after column name")
+		}
+	}
+
+	// Optional tokenize parameter: tokenize='porter' or tokenize='simple'
+	if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "TOKENIZE" {
+		p.advance()
+		if p.cur.Type != api.TokEQ {
+			return nil, p.errorf("expected = after TOKENIZE")
+		}
+		p.advance()
+		if p.cur.Type != api.TokString {
+			return nil, p.errorf("expected string literal for TOKENIZE value")
+		}
+		stmt.Tokenize = p.cur.Literal
+		p.advance()
+	}
+
 	return stmt, nil
 }
 
@@ -2098,6 +2189,24 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		pattern := p.cur.Literal
 		p.advance()
 		return &api.LikeExpr{Expr: left, Pattern: pattern}, nil
+	}
+
+	// MATCH — FTS full-text search
+	if p.cur.Type == api.TokMatch {
+		p.advance()
+		// Optional qualified name (table.column or just column)
+		var table string
+		if colRef, ok := left.(*api.ColumnRef); ok && colRef.Column != "" {
+			table = colRef.Table
+			// Check for table.column syntax (but for FTS we want just table)
+			// Actually, for FTS the left side should be table reference
+		}
+		if p.cur.Type != api.TokString {
+			return nil, p.errorf("expected query string after MATCH")
+		}
+		query := p.cur.Literal
+		p.advance()
+		return &api.MatchExpr{Table: table, Query: query}, nil
 	}
 
 	// BETWEEN ... AND ...

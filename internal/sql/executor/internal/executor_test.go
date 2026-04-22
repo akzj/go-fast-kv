@@ -45,7 +45,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	ex := New(store, cat, tbl, idx, pl, p)
+	ex := New(store, cat, tbl, idx, nil, pl, p)
 
 	return &testEnv{
 		store:   store,

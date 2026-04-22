@@ -106,6 +106,7 @@ func Open(store kvstoreapi.Store) *DB {
 	// Layer 2: engine (table/index CRUD)
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
+	fts := engine.NewFTSEngine(store)
 
 	// Layer 3: parser (standalone)
 	p := parser.New()
@@ -114,7 +115,7 @@ func Open(store kvstoreapi.Store) *DB {
 	pl := planner.New(cat)
 
 	// Layer 5: executor (plan → result)
-	ex := executor.New(store, cat, tbl, idx, pl, p)
+	ex := executor.New(store, cat, tbl, idx, fts, pl, p)
 
 	return &DB{
 		store:    store,

@@ -28,7 +28,7 @@ func TestJoinPlanType(t *testing.T) {
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
 	pl := planner.New(cat)
-	ex := New(store, cat, tbl, idx, pl, p)
+	ex := New(store, cat, tbl, idx, nil, pl, p)
 
 	// Create tables
 	stmt, _ := p.Parse("CREATE TABLE t1 (id INT, a INT)")

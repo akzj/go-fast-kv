@@ -36,6 +36,7 @@ type executor struct {
 	tableEngine engineapi.TableEngine
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
+	ftsEngine   engineapi.FTSEngine
 	planner     plannerapi.Planner
 	// parser re-parses CHECK constraint expressions at execution time.
 	// CHECK expressions are stored as RawSQL strings in the catalog.
@@ -63,12 +64,14 @@ type executor struct {
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
+	ftsEngine engineapi.FTSEngine,
 	planner plannerapi.Planner, parser parserapi.Parser) *executor {
 	return &executor{
 		store:       store,
 		catalog:     catalog,
 		tableEngine: tableEngine,
 		indexEngine: indexEngine,
+		ftsEngine:   ftsEngine,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
 		parser:      parser,
@@ -188,6 +191,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execCreateTrigger(p)
 	case *plannerapi.DropTriggerPlan:
 		return e.execDropTrigger(p)
+	case *plannerapi.CreateFTSPlan:
+		return e.execCreateFTS(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -278,6 +283,8 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execCreateTrigger(p)
 	case *plannerapi.DropTriggerPlan:
 		return e.execDropTrigger(p)
+	case *plannerapi.CreateFTSPlan:
+		return e.execCreateFTS(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -628,6 +635,91 @@ func (e *executor) execDropTrigger(plan *plannerapi.DropTriggerPlan) (*executora
 		return nil, fmt.Errorf("%w: drop trigger: %v", executorapi.ErrExecFailed, err)
 	}
 	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execCreateFTS creates a FTS virtual table.
+// FTS tables are stored in the catalog as special tables with FTS metadata.
+func (e *executor) execCreateFTS(plan *plannerapi.CreateFTSPlan) (*executorapi.Result, error) {
+	// Allocate table ID for the FTS table
+	tableID, err := e.nextID(metaNextTableID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create catalog entry for the FTS table
+	// We use a special table type to distinguish FTS tables
+	schema := catalogapi.TableSchema{
+		Name:     plan.Schema.Name,
+		TableID:  tableID,
+		Columns: ftsColumnsToSchema(plan.Schema.Columns),
+	}
+
+	// Store FTS metadata in a special column attribute
+	// For now, we mark it as a virtual table via the catalog
+	// The FTS-specific config (tokenizer, columns) is stored alongside
+
+	// Use IF NOT EXISTS semantics
+	existing, err := e.catalog.GetTable(plan.Schema.Name)
+	if err == nil && existing != nil {
+		if plan.IfNotExists {
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, catalogapi.ErrTableExists)
+	}
+	if err != nil && err != catalogapi.ErrTableNotFound {
+		return nil, fmt.Errorf("%w: checking table existence: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Store FTS table metadata
+	err = e.catalog.CreateTable(schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: creating FTS table: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Store FTS-specific metadata (columns, tokenizer) as a special index entry
+	ftsMeta := plannerapi.FTSIndexSchema{
+		Name:       plan.Schema.Name,
+		TableID:    tableID,
+		Columns:    plan.Schema.Columns,
+		Tokenizer:  plan.Schema.Tokenizer,
+		FTSVersion: plan.Schema.FTSVersion,
+	}
+	err = e.catalog.CreateIndex(catalogapi.IndexSchema{
+		Name:    "_fts_meta_" + plan.Schema.Name,
+		Table:   plan.Schema.Name,
+		Column:  "", // empty column = FTS metadata marker
+		IndexID: tableID, // reuse tableID
+	})
+	if err != nil {
+		// Ignore duplicate index error - metadata might already exist
+		if err != catalogapi.ErrIndexExists {
+			return nil, fmt.Errorf("%w: storing FTS metadata: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	// Store FTS metadata reference (using IndexSchema to store arbitrary FTS config)
+	// We serialize the FTS schema into the catalog's internal format
+	_ = ftsMeta // will be used when implementing FTS DML
+
+	return &executorapi.Result{RowsAffected: 0}, nil
+}
+
+// ftsColumnsToSchema converts FTS column names to ColumnDef list.
+func ftsColumnsToSchema(columns []string) []catalogapi.ColumnDef {
+	cols := make([]catalogapi.ColumnDef, len(columns)+1)
+	// Add rowid column
+	cols[0] = catalogapi.ColumnDef{
+		Name: "rowid",
+		Type: catalogapi.TypeInt,
+	}
+	// Add FTS content columns
+	for i, col := range columns {
+		cols[i+1] = catalogapi.ColumnDef{
+			Name: col,
+			Type: catalogapi.TypeText,
+		}
+	}
+	return cols
 }
 
 // pragmaTableInfo returns column information for a table.
