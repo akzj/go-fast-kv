@@ -143,6 +143,20 @@ const (
 	TokNothing        TokenType = 117 // NOTHING (for DO NOTHING)
 	TokWith           TokenType = 118 // WITH (for CTE)
 	TokRecursive      TokenType = 119 // RECURSIVE (for CTE)
+	TokOver           TokenType = 130 // OVER (window function)
+	TokRowNumber      TokenType = 131 // ROW_NUMBER
+	TokRank           TokenType = 132 // RANK
+	TokDenseRank      TokenType = 133 // DENSE_RANK
+	TokPartition      TokenType = 134 // PARTITION
+	TokFirstValue     TokenType = 135 // FIRST_VALUE
+	TokLastValue      TokenType = 136 // LAST_VALUE
+	TokLag            TokenType = 137 // LAG
+	TokLead           TokenType = 138 // LEAD
+	TokRows           TokenType = 139 // ROWS (window frame)
+	TokRange          TokenType = 140 // RANGE (window frame)
+	TokUnbounded      TokenType = 141 // UNBOUNDED (window frame)
+	TokCurrent        TokenType = 142 // CURRENT (window frame)
+	TokFollowing      TokenType = 143 // FOLLOWING (window frame)
 )
 
 // Token represents a single lexical token.
@@ -564,6 +578,31 @@ type AggregateCallExpr struct {
 }
 
 func (*AggregateCallExpr) exprNode() {}
+
+// WindowSpec: OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ...)
+type WindowSpec struct {
+	PartitionBy []Expr      // PARTITION BY expressions (nil = all rows)
+	OrderBy     []*OrderByClause // ORDER BY within window (nil = no ordering)
+	FrameStart  FrameBound // ROWS/RANGE start (UNBOUNDED PRECEDING, CURRENT ROW, etc.)
+	FrameEnd    FrameBound // ROWS/RANGE end
+	FrameMode   string     // "ROWS" or "RANGE" (empty = default)
+}
+
+// FrameBound: UNBOUNDED PRECEDING, CURRENT ROW, expr PRECEDING, expr FOLLOWING
+type FrameBound struct {
+	Type string // "UNBOUNDED PRECEDING", "CURRENT ROW", "PRECEDING", "FOLLOWING"
+	Expr Expr   // numeric expression for PRECEDING/FOLLOWING (nil for keywords)
+}
+
+// WindowFuncExpr: window function call with OVER clause
+// Examples: ROW_NUMBER() OVER (...), SUM(x) OVER (PARTITION BY y ORDER BY z)
+type WindowFuncExpr struct {
+	Func   string       // "ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", etc.
+	Args   []Expr       // Arguments (empty for ROW_NUMBER, RANK; 1 for SUM, LAG, etc.)
+	Window *WindowSpec  // nil means no OVER clause (shouldn't happen after parsing)
+}
+
+func (*WindowFuncExpr) exprNode() {}
 
 // DefaultExpr: DEFAULT keyword in INSERT VALUES (resolves to column's default value)
 type DefaultExpr struct{}

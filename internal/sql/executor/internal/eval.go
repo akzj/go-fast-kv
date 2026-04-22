@@ -98,6 +98,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalLikeExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.AggregateCallExpr:
 		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, node.Func)
+	case *parserapi.WindowFuncExpr:
+		return catalogapi.Value{}, fmt.Errorf("%w: window function %s() not yet implemented", executorapi.ErrExecFailed, node.Func)
 	case *parserapi.BetweenExpr:
 		return evalBetweenExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.InExpr:

@@ -2214,6 +2214,30 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		}
 		return &api.AggregateCallExpr{Func: strings.ToUpper(funcName), Arg: arg}, nil
 
+	case api.TokRowNumber, api.TokRank, api.TokDenseRank, api.TokFirstValue, api.TokLastValue, api.TokLag, api.TokLead:
+		// Window function: ROW_NUMBER() OVER (...), RANK() OVER (...), SUM(x) OVER (...), etc.
+		funcName := strings.ToUpper(p.cur.Literal)
+		p.advance() // consume function name
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		var window *api.WindowSpec
+		if p.cur.Type == api.TokOver {
+			p.advance() // consume OVER
+			window, err = p.parseWindowSpec()
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &api.WindowFuncExpr{Func: funcName, Args: args, Window: window}, nil
+
 	case api.TokCoalesce:
 		// COALESCE(expr1, expr2, ...)
 		p.advance() // consume COALESCE
@@ -2633,6 +2657,155 @@ func tokenName(typ api.TokenType) string {
 }
 
 // isAliasTerminator returns true if token type terminates a column alias without AS.
+// parseWindowSpec parses: OVER ( [PARTITION BY expr [, expr]*] [ORDER BY sortspec [, sortspec]*] [ROWS|RANGE BETWEEN bound AND bound] )
+func (p *parser) parseWindowSpec() (*api.WindowSpec, error) {
+	// Expect '(' after OVER
+	if p.cur.Type != api.TokLParen {
+		return nil, p.errorf("expected ( after OVER")
+	}
+	p.advance() // consume '('
+
+	spec := &api.WindowSpec{}
+
+	// Parse PARTITION BY clause (optional)
+	if p.cur.Type == api.TokPartition {
+		p.advance() // consume PARTITION
+		if p.cur.Type == api.TokBy {
+			p.advance() // consume BY
+		}
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			spec.PartitionBy = append(spec.PartitionBy, expr)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume ','
+		}
+	}
+
+	// Parse ORDER BY clause (optional)
+	if p.cur.Type == api.TokOrder {
+		p.advance() // consume ORDER
+		if p.cur.Type == api.TokBy {
+			p.advance() // consume BY
+		}
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			// Extract column from expression
+			var col string
+			if ref, ok := expr.(*api.ColumnRef); ok {
+				col = ref.Column
+				if ref.Table != "" {
+					col = ref.Table + "." + ref.Column
+				}
+			} else {
+				return nil, p.errorf("ORDER BY in window must be a column reference, got %T", expr)
+			}
+			ob := &api.OrderByClause{Column: col}
+			if p.cur.Type == api.TokDesc {
+				ob.Desc = true
+				p.advance()
+			} else if p.cur.Type == api.TokAsc {
+				p.advance()
+			}
+			spec.OrderBy = append(spec.OrderBy, ob)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume ','
+		}
+	}
+
+	// Parse ROWS/RANGE BETWEEN ... AND ... (optional)
+	if p.cur.Type == api.TokRows || p.cur.Type == api.TokRange {
+		spec.FrameMode = strings.ToUpper(p.cur.Literal)
+		p.advance() // consume ROWS or RANGE
+
+		// Expect BETWEEN
+		if p.cur.Type != api.TokBetween {
+			return nil, p.errorf("expected BETWEEN after %s", spec.FrameMode)
+		}
+		p.advance() // consume BETWEEN
+
+		// Parse frame start
+		startBound, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		spec.FrameStart = *startBound
+
+		// Expect AND
+		if p.cur.Type != api.TokAnd {
+			return nil, p.errorf("expected AND between frame bounds")
+		}
+		p.advance() // consume AND
+
+		// Parse frame end
+		endBound, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		spec.FrameEnd = *endBound
+	}
+
+	// Expect ')'
+	if p.cur.Type != api.TokRParen {
+		return nil, p.errorf("expected ) after window specification")
+	}
+	p.advance() // consume ')'
+
+	return spec, nil
+}
+
+// parseFrameBound parses a single frame bound: UNBOUNDED PRECEDING, CURRENT ROW, <expr> PRECEDING, <expr> FOLLOWING
+func (p *parser) parseFrameBound() (*api.FrameBound, error) {
+	bound := &api.FrameBound{}
+
+	if p.cur.Type == api.TokUnbounded {
+		bound.Type = "UNBOUNDED PRECEDING"
+		p.advance()
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "PRECEDING" {
+			p.advance()
+		}
+	} else if p.cur.Type == api.TokCurrent {
+		bound.Type = "CURRENT ROW"
+		p.advance()
+	} else {
+		// Could be <n> PRECEDING or <n> FOLLOWING
+		// Parse expression first
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		bound.Expr = expr
+
+		// Look ahead for PRECEDING or FOLLOWING
+		if p.cur.Type == api.TokIdent {
+			keyword := strings.ToUpper(p.cur.Literal)
+			if keyword == "PRECEDING" {
+				bound.Type = "PRECEDING"
+				p.advance()
+			} else if keyword == "FOLLOWING" {
+				bound.Type = "FOLLOWING"
+				p.advance()
+			} else {
+				return nil, p.errorf("expected PRECEDING or FOLLOWING after expression")
+			}
+		} else if p.cur.Type == api.TokFollowing {
+			bound.Type = "FOLLOWING"
+			p.advance()
+		}
+	}
+
+	return bound, nil
+}
+
 func isAliasTerminator(t api.TokenType) bool {
 	switch t {
 	case api.TokFrom, api.TokWhere, api.TokGroup, api.TokHaving,

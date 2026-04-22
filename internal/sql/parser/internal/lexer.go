@@ -110,6 +110,20 @@ var keywords = map[string]api.TokenType{
 	"DO":            api.TokIdent, // handled specially
 	"WITH":          api.TokWith,
 	"RECURSIVE":     api.TokRecursive,
+	"OVER":          api.TokOver,
+	"ROW_NUMBER":    api.TokRowNumber,
+	"RANK":          api.TokRank,
+	"DENSE_RANK":    api.TokDenseRank,
+	"PARTITION":     api.TokPartition,
+	"FIRST_VALUE":   api.TokFirstValue,
+	"LAST_VALUE":    api.TokLastValue,
+	"LAG":           api.TokLag,
+	"LEAD":          api.TokLead,
+	"ROWS":          api.TokRows,
+	"RANGE":         api.TokRange,
+	"UNBOUNDED":     api.TokUnbounded,
+	"CURRENT":       api.TokCurrent,
+	"FOLLOWING":     api.TokFollowing,
 }
 
 // lexer tokenizes SQL input.
