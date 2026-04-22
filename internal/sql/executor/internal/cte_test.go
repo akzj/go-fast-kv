@@ -145,3 +145,42 @@ func TestCTE_Referenced(t *testing.T) {
 		t.Fatalf("expected 2 rows, got %d", len(rows))
 	}
 }
+
+// TestCTE_OrderBy tests CTE with ORDER BY clause
+func TestCTE_OrderBy(t *testing.T) {
+	env := newTestEnvCTE(t)
+
+	execSQL(t, env, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	execSQL(t, env, "INSERT INTO users VALUES (3, 'Alice'), (1, 'Bob'), (2, 'Carol')")
+
+	// CTE with ORDER BY DESC - results should be in descending order by id
+	rows, _ := querySQL(t, env, `
+		WITH cte AS (
+			SELECT id, name FROM users ORDER BY id DESC
+		)
+		SELECT * FROM cte
+	`)
+
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+
+	// Expected order: Alice (3), Carol (2), Bob (1) - descending by id
+	expected := []struct {
+		id   int64
+		name string
+	}{
+		{3, "Alice"},
+		{2, "Carol"},
+		{1, "Bob"},
+	}
+
+	for i, row := range rows {
+		if row[0].Int != expected[i].id {
+			t.Errorf("row %d: expected id=%d, got %v", i, expected[i].id, row[0].Int)
+		}
+		if row[1].Text != expected[i].name {
+			t.Errorf("row %d: expected name=%s, got %s", i, expected[i].name, row[1].Text)
+		}
+	}
+}
