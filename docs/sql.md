@@ -155,15 +155,20 @@ CREATE TABLE orders (
 )
 ```
 
-**Known Limitations:**
-- FK validation uses table scan (no PRIMARY KEY index required)
-- ON DELETE/UPDATE actions (CASCADE, SET NULL, RESTRICT, NO ACTION) are parsed and stored but not yet executed
+**Supported Actions:**
+- ON DELETE CASCADE: Automatically delete child rows when parent is deleted ✅
+- ON DELETE SET NULL: Set child FK columns to NULL when parent is deleted ✅
+- ON DELETE RESTRICT: Block deletion if child rows exist ✅
+- ON DELETE NO ACTION: Same as RESTRICT (check before allowing change) ✅
+- ON UPDATE CASCADE: Automatically update child FK values when parent key changes ✅
+- ON UPDATE SET NULL: Set child FK columns to NULL when parent key changes ✅
+- ON UPDATE RESTRICT: Block update if would orphan child rows ✅
+- ON UPDATE NO ACTION: Same as RESTRICT (check before allowing change) ✅
 
 ### Known Limitations
 
 | Issue | Description | Severity |
 |-------|-------------|----------|
-| FK Actions Not Executed | FOREIGN KEY CASCADE/SET NULL/NO ACTION/RESTRICT are parsed and stored, but the cascading action is not performed on delete/update | Low (actions not commonly used) |
 | TestSnapshotIsolation Intermittent | Snapshot Isolation test has ~5% failure rate due to race condition in test setup | Low (test only, not production code) |
 
 ---
