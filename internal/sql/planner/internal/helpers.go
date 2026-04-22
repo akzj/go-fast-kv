@@ -101,6 +101,70 @@ func resolveExprToValue(expr parserapi.Expr) (catalogapi.Value, error) {
 	}
 }
 
+// serializeExprToSQL converts an expression to SQL string representation.
+// This is used to store expression indexes in the catalog.
+func serializeExprToSQL(expr parserapi.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *parserapi.Literal:
+		switch e.Value.Type {
+		case catalogapi.TypeText:
+			return fmt.Sprintf("%q", e.Value.Text)
+		case catalogapi.TypeInt:
+			return fmt.Sprintf("%d", e.Value.Int)
+		case catalogapi.TypeFloat:
+			return fmt.Sprintf("%v", e.Value.Float)
+		case catalogapi.TypeBlob:
+			return "NULL"
+		default:
+			return "NULL"
+		}
+	case *parserapi.StringFuncExpr:
+		args := make([]string, len(e.Args))
+		for i, arg := range e.Args {
+			args[i] = serializeExprToSQL(arg)
+		}
+		return fmt.Sprintf("%s(%s)", strings.ToUpper(e.Func), strings.Join(args, ", "))
+	case *parserapi.BinaryExpr:
+		return fmt.Sprintf("(%s %v %s)", serializeExprToSQL(e.Left), e.Op, serializeExprToSQL(e.Right))
+	case *parserapi.UnaryExpr:
+		return fmt.Sprintf("(%v%s)", e.Op, serializeExprToSQL(e.Operand))
+	case *parserapi.ColumnRef:
+		return e.Column
+	case *parserapi.ParamRef:
+		return "?"
+	default:
+		return "?"
+	}
+}
+
+// extractColumnFromExpr extracts the first column reference from an expression.
+// Used to determine which table column an expression index primarily refers to.
+func extractColumnFromExpr(expr parserapi.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *parserapi.ColumnRef:
+		return e.Column
+	case *parserapi.StringFuncExpr:
+		if len(e.Args) > 0 {
+			return extractColumnFromExpr(e.Args[0])
+		}
+	case *parserapi.BinaryExpr:
+		// Prefer left side
+		if e.Left != nil {
+			return extractColumnFromExpr(e.Left)
+		}
+	case *parserapi.UnaryExpr:
+		return extractColumnFromExpr(e.Operand)
+	default:
+	}
+	return ""
+}
+
 // ─── Type Resolution ────────────────────────────────────────────────
 
 // resolveTypeName converts a parser type name string to a catalog Type.

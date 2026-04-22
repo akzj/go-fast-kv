@@ -88,13 +88,7 @@ type DropTablePlan struct {
 
 func (*DropTablePlan) planNode() {}
 
-// CreateIndexPlan creates an index on a table column.
-type CreateIndexPlan struct {
-	Schema      catalogapi.IndexSchema
-	IfNotExists bool
-}
 
-func (*CreateIndexPlan) planNode() {}
 
 // DropIndexPlan drops an index.
 type DropIndexPlan struct {
@@ -102,6 +96,16 @@ type DropIndexPlan struct {
 	TableName string
 	IfExists  bool
 }
+// CreateIndexPlan creates an index on a table column or expression.
+type CreateIndexPlan struct {
+	Schema      catalogapi.IndexSchema
+	IfNotExists bool
+	// Expr is the parsed expression for expression indexes.
+	// nil for simple column indexes.
+	Expr parserapi.Expr
+}
+
+func (*CreateIndexPlan) planNode() {}
 
 func (*DropIndexPlan) planNode() {}
 

@@ -89,15 +89,19 @@ type ForeignKeySchema struct {
 	OnUpdate       string   `json:"OU,omitempty"`
 }
 
-// IndexSchema describes an index on a table.
+
+// IndexSchema describes an index on a table (column or expression).
 type IndexSchema struct {
 	Name    string `json:"N,omitempty"`
 	Table  string `json:"T,omitempty"`
-	Column string `json:"C,omitempty"`
+	Column string `json:"C,omitempty"` // column name (for simple index)
 	Unique bool   `json:"U,omitempty"`
 	IndexID uint32 `json:"I,omitempty"`
+	// ExprSQL stores the serialized expression for expression indexes.
+	// e.g., "LOWER(email)" for CREATE INDEX idx ON t(LOWER(email)).
+	// Empty for simple column indexes.
+	ExprSQL string `json:"E,omitempty"`
 }
-
 // ─── Interfaces ────────────────────────────────────────────────────
 
 // CatalogManager manages table and index metadata.

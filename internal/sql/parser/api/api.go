@@ -187,17 +187,20 @@ type DropTableStmt struct {
 	Table    string
 	IfExists bool
 }
-
-func (*DropTableStmt) stmtNode() {}
-
-// CreateIndexStmt: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column)
+// CreateIndexStmt: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column | expr)
+// When Column is non-empty, it's a simple column index.
+// When Expr is non-nil, it's an expression index.
 type CreateIndexStmt struct {
 	Index       string
 	Table       string
-	Column      string
+	Column      string  // simple column name (for backward compat)
+	Expr        Expr    // expression for expression index (e.g., LOWER(email), col1+col2)
 	Unique      bool
 	IfNotExists bool
 }
+func (*DropTableStmt) stmtNode() {}
+
+
 
 func (*CreateIndexStmt) stmtNode() {}
 

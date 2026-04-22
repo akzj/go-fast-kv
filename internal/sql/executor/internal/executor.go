@@ -531,7 +531,7 @@ func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi
 }
 
 func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executorapi.Result, error) {
-	// I-C1: check existence BEFORE allocating ID to avoid wasting IDs.
+	// Check existence BEFORE allocating ID to avoid wasting IDs.
 	_, err := e.catalog.GetIndex(plan.Schema.Table, plan.Schema.Name)
 	if err == nil {
 		// Index exists.
@@ -544,6 +544,20 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 		return nil, fmt.Errorf("%w: checking index existence: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Validate table exists
+	tbl, err := e.catalog.GetTable(plan.Schema.Table)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Validate column exists for simple indexes
+	if plan.Expr == nil {
+		colIdx := findColumnIndex(tbl, plan.Schema.Column)
+		if colIdx < 0 {
+			return nil, fmt.Errorf("%w: column %q not found", catalogapi.ErrColumnNotFound, plan.Schema.Column)
+		}
+	}
+
 	// Now safe to allocate ID.
 	indexID, err := e.nextID(metaNextIndexID)
 	if err != nil {
@@ -553,32 +567,35 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	schema := plan.Schema
 	schema.IndexID = indexID
 
-	// CR-C: Backfill FIRST, then create catalog entry. If crash during backfill,
-	// catalog has no stale entry. A catalog entry always means fully-built index.
-	tbl, err := e.catalog.GetTable(schema.Table)
-	if err != nil {
-		return nil, fmt.Errorf("%w: backfill get table: %v", executorapi.ErrExecFailed, err)
-	}
-	colIdx := findColumnIndex(tbl, schema.Column)
-	if colIdx < 0 {
-		return nil, fmt.Errorf("%w: backfill column %q not found", executorapi.ErrExecFailed, schema.Column)
-	}
+	// Backfill: scan existing rows and build index entries
 	existingRows, err := e.tableScan(tbl, nil, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
 	}
+
 	batch := e.store.NewWriteBatch()
 	for _, row := range existingRows {
-		val := row.Values[colIdx]
+		var val catalogapi.Value
+		if plan.Expr != nil {
+			// Evaluate expression for expression indexes
+			val, err = evalExpr(plan.Expr, row, tbl.Columns, nil, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: evaluating expression: %v", executorapi.ErrExecFailed, err)
+			}
+		} else {
+			// Get column value for simple column indexes
+			colIdx := findColumnIndex(tbl, schema.Column)
+			val = row.Values[colIdx]
+		}
 		idxKey := e.indexEngine.EncodeIndexKey(tbl.TableID, schema.IndexID, val, row.RowID)
 		if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 			batch.Discard()
 			return nil, fmt.Errorf("%w: backfill insert index: %v", executorapi.ErrExecFailed, err)
 		}
 	}
-	// M2: Add catalog entry to the SAME batch as index entries. Both are
-	// committed atomically — if batch.Commit() succeeds, both index data AND
-	// catalog entry are persisted. No orphan index data possible.
+
+	// Add catalog entry to the SAME batch as index entries for atomicity
 	if err := e.catalog.CreateIndexBatch(schema, batch); err != nil {
 		batch.Discard()
 		return nil, fmt.Errorf("%w: create catalog entry: %v", executorapi.ErrExecFailed, err)

@@ -209,7 +209,10 @@ func (p *planner) planDropTable(stmt *parserapi.DropTableStmt) (*plannerapi.Drop
 	}, nil
 }
 
+
+
 func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.CreateIndexPlan, error) {
+	// Validate table exists
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {
 		if err == catalogapi.ErrTableNotFound {
@@ -218,18 +221,53 @@ func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.
 		return nil, err
 	}
 
-	if findColumnIndex(tbl, stmt.Column) < 0 {
-		return nil, fmt.Errorf("%w: %s.%s", plannerapi.ErrColumnNotFound, stmt.Table, stmt.Column)
+	// Determine which column to index
+	var column string
+	var exprSQL string
+
+	if stmt.Expr != nil {
+		// Expression index: serialize expression
+		exprSQL = serializeExprToSQL(stmt.Expr)
+		// For expression indexes, use first column reference as the "column"
+		// for backward compatibility (the actual expression is in ExprSQL)
+		column = extractColumnFromExpr(stmt.Expr)
+	} else {
+		// Simple column index
+		column = stmt.Column
+		// Validate column exists
+		colIdx := -1
+		for i, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, column) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 {
+			return nil, fmt.Errorf("%w: column %s not found in table %s", plannerapi.ErrColumnNotFound, column, stmt.Table)
+		}
+	}
+
+	// Check if index already exists (unless IF NOT EXISTS)
+	if !stmt.IfNotExists {
+		_, err := p.catalog.GetIndex(stmt.Table, stmt.Index)
+		if err == nil {
+			return nil, fmt.Errorf("%w: index %s already exists", catalogapi.ErrIndexExists, stmt.Index)
+		}
+		if err != catalogapi.ErrIndexNotFound {
+			return nil, err
+		}
 	}
 
 	return &plannerapi.CreateIndexPlan{
 		Schema: catalogapi.IndexSchema{
-			Name:   stmt.Index,
-			Table:  stmt.Table,
-			Column: stmt.Column,
-			Unique: stmt.Unique,
+			Name:    stmt.Index,
+			Table:   stmt.Table,
+			Column:  column,
+			Unique:  stmt.Unique,
+			ExprSQL: exprSQL,
 		},
 		IfNotExists: stmt.IfNotExists,
+		Expr:        stmt.Expr,
 	}, nil
 }
 

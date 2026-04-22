@@ -761,15 +761,28 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	stmt.Table = p.cur.Literal
 	p.advance()
 
-	// (column)
+	// (column | expression)
 	if err := p.expect(api.TokLParen); err != nil {
 		return nil, err
 	}
-	if p.cur.Type != api.TokIdent {
-		return nil, p.errorf("expected column name")
+
+	// Try to parse as expression first (handles function calls, arithmetic, etc.)
+	expr, err := p.parseExpr()
+	if err == nil && expr != nil {
+		stmt.Expr = expr
+		// If it's a simple column reference, also set Column for backward compat
+		if colRef, ok := expr.(*api.ColumnRef); ok {
+			stmt.Column = colRef.Column
+		}
+	} else {
+		// Fallback to simple column name
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name or expression")
+		}
+		stmt.Column = p.cur.Literal
+		p.advance()
 	}
-	stmt.Column = p.cur.Literal
-	p.advance()
+
 	if err := p.expect(api.TokRParen); err != nil {
 		return nil, err
 	}
