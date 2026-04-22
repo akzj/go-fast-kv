@@ -79,6 +79,10 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planAlterTable(s)
 	case *parserapi.PragmaStmt:
 		return p.planPragma(s)
+	case *parserapi.TriggerStmt:
+		return p.planCreateTrigger(s)
+	case *parserapi.DropTriggerStmt:
+		return p.planDropTrigger(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -2245,4 +2249,124 @@ func unaryOpString(op parserapi.UnaryOp) string {
 		return "-"
 	}
 	return ""
+}
+
+// ─── Trigger Planning ────────────────────────────────────────────────
+
+func (p *planner) planCreateTrigger(stmt *parserapi.TriggerStmt) (*plannerapi.CreateTriggerPlan, error) {
+	// Verify table exists
+	_, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		if err == catalogapi.ErrTableNotFound {
+			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+		}
+		return nil, err
+	}
+
+	// Build trigger schema
+	schema := catalogapi.TriggerSchema{
+		Name:   stmt.Name,
+		Table:  stmt.Table,
+		Timing: stmt.Timing,
+		Event:  stmt.Event,
+	}
+
+	// Serialize WHEN condition if present
+	if stmt.WhenCond != nil {
+		schema.WhenCond = serializeExpr(stmt.WhenCond)
+	}
+
+	// Serialize trigger body (concatenate statement SQL representations)
+	var bodySQL strings.Builder
+	for i, bodyStmt := range stmt.Body {
+		if i > 0 {
+			bodySQL.WriteString("; ")
+		}
+		bodySQL.WriteString(statementToSQL(bodyStmt))
+	}
+	schema.Body = bodySQL.String()
+
+	return &plannerapi.CreateTriggerPlan{Schema: schema}, nil
+}
+
+func (p *planner) planDropTrigger(stmt *parserapi.DropTriggerStmt) (*plannerapi.DropTriggerPlan, error) {
+	return &plannerapi.DropTriggerPlan{
+		Name:     stmt.Name,
+		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// statementToSQL converts a statement to its SQL string representation.
+func statementToSQL(stmt parserapi.Statement) string {
+	switch s := stmt.(type) {
+	case *parserapi.InsertStmt:
+		return insertStmtToSQL(s)
+	case *parserapi.UpdateStmt:
+		return updateStmtToSQL(s)
+	case *parserapi.DeleteStmt:
+		return deleteStmtToSQL(s)
+	default:
+		return ""
+	}
+}
+
+func insertStmtToSQL(stmt *parserapi.InsertStmt) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(stmt.Table)
+	if len(stmt.Columns) > 0 {
+		b.WriteString(" (")
+		for i, col := range stmt.Columns {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(col)
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(" VALUES (")
+	for i, row := range stmt.Values {
+		if i > 0 {
+			b.WriteString("), (")
+		}
+		for j, expr := range row {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(serializeExpr(expr))
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func updateStmtToSQL(stmt *parserapi.UpdateStmt) string {
+	var b strings.Builder
+	b.WriteString("UPDATE ")
+	b.WriteString(stmt.Table)
+	b.WriteString(" SET ")
+	for i, asgn := range stmt.Assignments {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(asgn.Column)
+		b.WriteString(" = ")
+		b.WriteString(serializeExpr(asgn.Value))
+	}
+	if stmt.Where != nil {
+		b.WriteString(" WHERE ")
+		b.WriteString(serializeExpr(stmt.Where))
+	}
+	return b.String()
+}
+
+func deleteStmtToSQL(stmt *parserapi.DeleteStmt) string {
+	var b strings.Builder
+	b.WriteString("DELETE FROM ")
+	b.WriteString(stmt.Table)
+	if stmt.Where != nil {
+		b.WriteString(" WHERE ")
+		b.WriteString(serializeExpr(stmt.Where))
+	}
+	return b.String()
 }

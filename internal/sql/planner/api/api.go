@@ -123,6 +123,21 @@ type AlterTablePlan struct {
 
 func (*AlterTablePlan) planNode() {}
 
+// CreateTriggerPlan creates a trigger.
+type CreateTriggerPlan struct {
+	Schema catalogapi.TriggerSchema
+}
+
+func (*CreateTriggerPlan) planNode() {}
+
+// DropTriggerPlan drops a trigger.
+type DropTriggerPlan struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropTriggerPlan) planNode() {}
+
 // ─── DML Plans ──────────────────────────────────────────────────────
 
 // InsertPlan inserts rows into a table.
@@ -350,6 +365,10 @@ func planDescription(plan Plan) string {
 		return fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
 	case *PragmaPlan:
 		return p.String()
+	case *CreateTriggerPlan:
+		return fmt.Sprintf("CREATE TRIGGER %s ON %s", p.Schema.Name, p.Schema.Table)
+	case *DropTriggerPlan:
+		return fmt.Sprintf("DROP TRIGGER %s", p.Name)
 	default:
 		return fmt.Sprintf("%T", plan)
 	}

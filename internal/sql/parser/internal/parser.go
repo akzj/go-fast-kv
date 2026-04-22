@@ -335,8 +335,10 @@ func (p *parser) parseCreate() (api.Statement, error) {
 		return p.parseCreateTable()
 	case api.TokIndex:
 		return p.parseCreateIndex(false)
+	case api.TokTrigger:
+		return p.parseCreateTrigger()
 	default:
-		return nil, p.errorf("expected TABLE or INDEX after CREATE")
+		return nil, p.errorf("expected TABLE, INDEX, or TRIGGER after CREATE")
 	}
 }
 
@@ -791,6 +793,197 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	return stmt, nil
 }
 
+// ─── TRIGGER ──────────────────────────────────────────────────────
+
+// parseCreateTrigger parses: CREATE TRIGGER name [BEFORE|AFTER] [INSERT|UPDATE|DELETE] ON table [WHEN condition] BEGIN ... END
+func (p *parser) parseCreateTrigger() (api.Statement, error) {
+	p.advance() // consume TRIGGER
+
+	// Trigger name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected trigger name")
+	}
+	name := p.cur.Literal
+	p.advance()
+
+	stmt := &api.TriggerStmt{Name: name}
+
+	// Timing: BEFORE or AFTER
+	if p.cur.Type == api.TokBefore || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "BEFORE") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume BEFORE identifier
+		} else {
+			p.advance() // consume TokBefore
+		}
+		stmt.Timing = "BEFORE"
+	} else if p.cur.Type == api.TokAfter || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AFTER") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume AFTER identifier
+		} else {
+			p.advance() // consume TokAfter
+		}
+		stmt.Timing = "AFTER"
+	} else if p.cur.Type == api.TokIdent {
+		// Could be INSTEAD OF or the event keyword directly
+		upper := strings.ToUpper(p.cur.Literal)
+		if upper == "INSTEAD" {
+			// INSTEAD OF - consume OF and expect event
+			p.advance()
+			if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "OF" {
+				return nil, p.errorf("expected OF after INSTEAD")
+			}
+			p.advance() // consume OF
+			stmt.Timing = "INSTEAD OF"
+		} else if upper == "BEFORE" {
+			p.advance()
+			stmt.Timing = "BEFORE"
+		} else if upper == "AFTER" {
+			p.advance()
+			stmt.Timing = "AFTER"
+		} else {
+			return nil, p.errorf("expected BEFORE or AFTER after trigger name")
+		}
+	} else {
+		return nil, p.errorf("expected BEFORE or AFTER after trigger name")
+	}
+
+	// Event: INSERT, UPDATE, or DELETE
+	eventUpper := strings.ToUpper(p.cur.Literal)
+	switch eventUpper {
+	case "INSERT":
+		stmt.Event = "INSERT"
+		p.advance()
+	case "UPDATE":
+		stmt.Event = "UPDATE"
+		p.advance()
+		// Check for UPDATE OF col, col... (column-specific trigger)
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "OF" {
+			p.advance() // consume OF
+			// Parse column list (stored in Table field as qualifier for now)
+			var cols []string
+			for {
+				if p.cur.Type != api.TokIdent {
+					break
+				}
+				cols = append(cols, p.cur.Literal)
+				p.advance()
+				if p.cur.Type != api.TokComma {
+					break
+				}
+				p.advance()
+			}
+		}
+	case "DELETE":
+		stmt.Event = "DELETE"
+		p.advance()
+	default:
+		return nil, p.errorf("expected INSERT, UPDATE, or DELETE after trigger timing")
+	}
+
+	// ON table_name
+	if err := p.expect(api.TokOn); err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after ON")
+	}
+	stmt.Table = p.cur.Literal
+	p.advance()
+
+	// Optional FOR EACH ROW
+	if p.cur.Type == api.TokForEachRow || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
+		// Handle FOR keyword
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume FOR
+		} else {
+			p.advance() // consume TokForEachRow
+		}
+		// Expect EACH keyword
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "EACH" {
+			return nil, p.errorf("expected EACH after FOR")
+		}
+		p.advance()
+		// Expect ROW keyword
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "ROW" {
+			return nil, p.errorf("expected ROW after FOR EACH")
+		}
+		p.advance()
+	}
+
+	// Optional WHEN condition
+	if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "WHEN" {
+		p.advance()
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WhenCond = cond
+	}
+
+	// BEGIN ... END block
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "BEGIN" {
+		return nil, p.errorf("expected BEGIN after trigger definition")
+	}
+	p.advance() // consume BEGIN
+
+	// Parse trigger body statements until END
+	var body []api.Statement
+	for {
+		// Check for END keyword
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END" {
+			break
+		}
+		if p.cur.Type == api.TokEOF {
+			return nil, p.errorf("unterminated trigger body: expected END")
+		}
+
+		// Parse a statement
+		// Note: we need to handle semicolons between statements
+		stmt_body, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		if stmt_body != nil {
+			body = append(body, stmt_body)
+		}
+
+		// Consume semicolon if present
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "END" {
+		return nil, p.errorf("expected END at end of trigger body")
+	}
+	p.advance()
+
+	stmt.Body = body
+	return stmt, nil
+}
+
+// parseDropTrigger parses: DROP TRIGGER [IF EXISTS] name
+func (p *parser) parseDropTrigger() (api.Statement, error) {
+	p.advance() // consume TRIGGER
+	stmt := &api.DropTriggerStmt{}
+
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected trigger name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+	return stmt, nil
+}
+
 // ─── DROP ─────────────────────────────────────────────────────────
 
 func (p *parser) parseDrop() (api.Statement, error) {
@@ -800,8 +993,10 @@ func (p *parser) parseDrop() (api.Statement, error) {
 		return p.parseDropTable()
 	case api.TokIndex:
 		return p.parseDropIndex()
+	case api.TokTrigger:
+		return p.parseDropTrigger()
 	default:
-		return nil, p.errorf("expected TABLE or INDEX after DROP")
+		return nil, p.errorf("expected TABLE, INDEX, or TRIGGER after DROP")
 	}
 }
 

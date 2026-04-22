@@ -29,8 +29,9 @@ func New(kv kvstoreapi.Store) *Catalog {
 // ─── Key helpers ─────────────────────────────────────────────────
 
 const (
-	tablePrefix = "_sql:table:"
-	indexPrefix = "_sql:index:"
+	tablePrefix  = "_sql:table:"
+	indexPrefix  = "_sql:index:"
+	triggerPrefix = "_sql:trigger:"
 )
 
 // tableKey returns the KV key for a table schema.
@@ -41,6 +42,16 @@ func tableKey(name string) []byte {
 // indexKey returns the KV key for an index schema.
 func indexKey(tableName, indexName string) []byte {
 	return []byte(indexPrefix + strings.ToUpper(tableName) + ":" + strings.ToUpper(indexName))
+}
+
+// triggerKey returns the KV key for a trigger schema.
+func triggerKey(triggerName string) []byte {
+	return []byte(triggerPrefix + strings.ToUpper(triggerName))
+}
+
+// tableTriggersPrefix returns the prefix for all triggers on a table.
+func tableTriggersPrefix(tableName string) []byte {
+	return []byte(triggerPrefix + "table:" + strings.ToUpper(tableName) + ":")
 }
 
 // tableIndexPrefix returns the prefix for all indexes on a table.
@@ -418,4 +429,102 @@ func (c *Catalog) renameTableImpl(oldName, newName string) error {
 
 	// Delete old entry
 	return c.kv.Delete(oldKey)
+}
+
+// CreateTrigger creates a trigger.
+func (c *Catalog) CreateTrigger(schema api.TriggerSchema) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.createTriggerImpl(schema)
+}
+
+func (c *Catalog) createTriggerImpl(schema api.TriggerSchema) error {
+	// Check if trigger already exists
+	upperName := strings.ToUpper(schema.Name)
+	key := triggerKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == nil {
+		return api.ErrTriggerExists
+	}
+	if err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+
+	// Store trigger schema
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return c.kv.Put(key, data)
+}
+
+// GetTrigger returns a trigger by name.
+func (c *Catalog) GetTrigger(triggerName string) (*api.TriggerSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getTriggerImpl(triggerName)
+}
+
+func (c *Catalog) getTriggerImpl(triggerName string) (*api.TriggerSchema, error) {
+	key := triggerKey(strings.ToUpper(triggerName))
+	data, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return nil, api.ErrTriggerNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var schema api.TriggerSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil, err
+	}
+	return &schema, nil
+}
+
+// DropTrigger removes a trigger.
+func (c *Catalog) DropTrigger(triggerName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropTriggerImpl(triggerName)
+}
+
+func (c *Catalog) dropTriggerImpl(triggerName string) error {
+	key := triggerKey(strings.ToUpper(triggerName))
+	_, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrTriggerNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return c.kv.Delete(key)
+}
+
+// ListTriggers returns all triggers for a given table.
+func (c *Catalog) ListTriggers(tableName string) ([]api.TriggerSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.listTriggersImpl(tableName)
+}
+
+func (c *Catalog) listTriggersImpl(tableName string) ([]api.TriggerSchema, error) {
+	upperTable := strings.ToUpper(tableName)
+	prefix := []byte(triggerPrefix)
+	end := append(prefix, 0xFF)
+
+	var triggers []api.TriggerSchema
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		var schema api.TriggerSchema
+		if err := json.Unmarshal(iter.Value(), &schema); err != nil {
+			continue
+		}
+		if strings.ToUpper(schema.Table) == upperTable {
+			triggers = append(triggers, schema)
+		}
+	}
+	return triggers, iter.Err()
 }

@@ -176,6 +176,10 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execAlterTable(p)
 	case *plannerapi.PragmaPlan:
 		return e.execPragma(p)
+	case *plannerapi.CreateTriggerPlan:
+		return e.execCreateTrigger(p)
+	case *plannerapi.DropTriggerPlan:
+		return e.execDropTrigger(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -262,6 +266,10 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execAlterTable(p)
 	case *plannerapi.PragmaPlan:
 		return e.execPragma(p)
+	case *plannerapi.CreateTriggerPlan:
+		return e.execCreateTrigger(p)
+	case *plannerapi.DropTriggerPlan:
+		return e.execDropTrigger(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -579,6 +587,39 @@ func (e *executor) pragmaDatabaseList() (*executorapi.Result, error) {
 			{catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}, catalogapi.Value{Type: catalogapi.TypeText, Text: "main"}, catalogapi.Value{Type: catalogapi.TypeText, Text: ""}},
 		},
 	}, nil
+}
+
+// execCreateTrigger creates a trigger in the catalog.
+func (e *executor) execCreateTrigger(plan *plannerapi.CreateTriggerPlan) (*executorapi.Result, error) {
+	err := e.catalog.CreateTrigger(plan.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create trigger: %v", executorapi.ErrExecFailed, err)
+	}
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execDropTrigger drops a trigger from the catalog.
+func (e *executor) execDropTrigger(plan *plannerapi.DropTriggerPlan) (*executorapi.Result, error) {
+	// Check if trigger exists (unless IF EXISTS was specified)
+	if !plan.IfExists {
+		_, err := e.catalog.GetTrigger(plan.Name)
+		if err != nil {
+			if err == catalogapi.ErrTriggerNotFound {
+				return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+			}
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	err := e.catalog.DropTrigger(plan.Name)
+	if err != nil {
+		if err == catalogapi.ErrTriggerNotFound && plan.IfExists {
+			// IF EXISTS was specified and trigger doesn't exist — OK
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: drop trigger: %v", executorapi.ErrExecFailed, err)
+	}
+	return &executorapi.Result{RowsAffected: 1}, nil
 }
 
 // pragmaTableInfo returns column information for a table.

@@ -48,6 +48,12 @@ var ErrIndexExists = sqlerrors.ErrIndexExists("")
 // ErrColumnNotFound is returned when a column does not exist in a table.
 var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
+// ErrTriggerNotFound is returned when a trigger does not exist.
+var ErrTriggerNotFound = sqlerrors.ErrTriggerNotFound("")
+
+// ErrTriggerExists is returned when trying to create a trigger that already exists.
+var ErrTriggerExists = sqlerrors.ErrTriggerExists("")
+
 // ─── Schema Types ─────────────────────────────────────────────────
 
 // TableSchema describes a table's structure.
@@ -101,6 +107,16 @@ type IndexSchema struct {
 	// e.g., "LOWER(email)" for CREATE INDEX idx ON t(LOWER(email)).
 	// Empty for simple column indexes.
 	ExprSQL string `json:"E,omitempty"`
+}
+
+// TriggerSchema describes a trigger on a table.
+type TriggerSchema struct {
+	Name     string `json:"N,omitempty"`
+	Table    string `json:"T,omitempty"`
+	Timing   string `json:"M,omitempty"` // "BEFORE", "AFTER", "INSTEAD OF"
+	Event    string `json:"E,omitempty"` // "INSERT", "UPDATE", "DELETE"
+	WhenCond string `json:"W,omitempty"` // WHEN condition expression (or "")
+	Body     string `json:"B,omitempty"` // trigger body SQL
 }
 // ─── Interfaces ────────────────────────────────────────────────────
 
@@ -158,4 +174,20 @@ type CatalogManager interface {
 	// Returns ErrTableNotFound if the table does not exist.
 	// Returns ErrTableExists if the new name already exists.
 	RenameTable(oldName, newName string) error
+
+	// CreateTrigger creates a trigger.
+	// Returns an error if the trigger already exists.
+	CreateTrigger(schema TriggerSchema) error
+
+	// GetTrigger returns a trigger by name.
+	// Returns ErrTriggerNotFound if the trigger does not exist.
+	GetTrigger(triggerName string) (*TriggerSchema, error)
+
+	// DropTrigger removes a trigger.
+	// Returns ErrTriggerNotFound if the trigger does not exist.
+	DropTrigger(triggerName string) error
+
+	// ListTriggers returns all triggers for a given table.
+	// Returns an empty slice (not error) if the table has no triggers.
+	ListTriggers(tableName string) ([]TriggerSchema, error)
 }

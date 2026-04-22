@@ -378,6 +378,22 @@ func ErrDiskFull() *SQLError {
 	}
 }
 
+// ErrTriggerNotFound returns an error for a trigger that does not exist.
+func ErrTriggerNotFound(triggerName string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateUndefinedTable,
+		Message:  fmt.Sprintf("trigger %q does not exist", triggerName),
+	}
+}
+
+// ErrTriggerExists returns an error for a trigger that already exists.
+func ErrTriggerExists(triggerName string) *SQLError {
+	return &SQLError{
+		SQLState: SQLStateDuplicateObject,
+		Message:  fmt.Sprintf("trigger %q already exists", triggerName),
+	}
+}
+
 // Wrap wraps an existing error with a SQLSTATE code.
 func Wrap(err error, sqlState string, message string) *SQLError {
 	return &SQLError{

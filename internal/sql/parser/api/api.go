@@ -163,6 +163,12 @@ const (
 	TokJsonRemove     TokenType = 147 // JSON_REMOVE
 	TokJsonType       TokenType = 148 // JSON_TYPE
 	TokPragma        TokenType = 149 // PRAGMA
+	TokTrigger       TokenType = 150 // TRIGGER
+	TokBefore        TokenType = 151 // BEFORE
+	TokAfter         TokenType = 152 // AFTER
+	TokForEachRow    TokenType = 153 // FOR EACH ROW
+	TokBeginTrigger  TokenType = 154 // BEGIN (trigger body)
+	TokEndTrigger    TokenType = 155 // END (trigger body)
 )
 
 // Token represents a single lexical token.
@@ -707,6 +713,26 @@ type PragmaStmt struct {
 }
 
 func (*PragmaStmt) stmtNode() {}
+
+// TriggerStmt: CREATE TRIGGER name [BEFORE|AFTER] [INSERT|UPDATE|DELETE] ON table [WHEN condition] BEGIN ... END
+type TriggerStmt struct {
+	Name      string       // trigger name
+	Timing    string       // "BEFORE" or "AFTER"
+	Event     string       // "INSERT", "UPDATE", "DELETE"
+	Table     string       // target table name
+	WhenCond  Expr         // nil if no WHEN clause
+	Body      []Statement  // trigger body statements
+}
+
+func (*TriggerStmt) stmtNode() {}
+
+// DropTriggerStmt: DROP TRIGGER [IF EXISTS] name
+type DropTriggerStmt struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropTriggerStmt) stmtNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 
