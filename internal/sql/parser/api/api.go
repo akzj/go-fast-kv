@@ -162,6 +162,7 @@ const (
 	TokJsonInsert     TokenType = 146 // JSON_INSERT
 	TokJsonRemove     TokenType = 147 // JSON_REMOVE
 	TokJsonType       TokenType = 148 // JSON_TYPE
+	TokPragma        TokenType = 149 // PRAGMA
 )
 
 // Token represents a single lexical token.
@@ -696,6 +697,16 @@ type ExplainStmt struct {
 }
 
 func (*ExplainStmt) stmtNode() {}
+
+// PragmaStmt represents a PRAGMA command.
+// Syntax: PRAGMA name [= value]
+type PragmaStmt struct {
+	Name  string       // pragma name: "database_list", "table_info", "index_list", etc.
+	Arg   string       // optional argument: table name, value, etc.
+	Value Expr         // optional value to SET (for PRAGMA name = value)
+}
+
+func (*PragmaStmt) stmtNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

@@ -77,6 +77,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return nil, nil
 	case *parserapi.AlterTableStmt:
 		return p.planAlterTable(s)
+	case *parserapi.PragmaStmt:
+		return p.planPragma(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -348,6 +350,23 @@ func (p *planner) planAlterTable(stmt *parserapi.AlterTableStmt) (*plannerapi.Al
 	// For RENAME TO, store new table name
 	if stmt.Operation == parserapi.AlterRenameTable {
 		plan.TableNew = stmt.TableNew
+	}
+
+	return plan, nil
+}
+
+// planPragma creates a PragmaPlan from a PragmaStmt.
+func (p *planner) planPragma(stmt *parserapi.PragmaStmt) (*plannerapi.PragmaPlan, error) {
+	plan := &plannerapi.PragmaPlan{
+		Name: strings.ToLower(stmt.Name), // normalize to lowercase for case-insensitive comparison
+		Arg:  stmt.Arg,
+	}
+
+	// Resolve value if present
+	if stmt.Value != nil {
+		if lit, ok := stmt.Value.(*parserapi.Literal); ok {
+			plan.Value = lit.Value
+		}
 	}
 
 	return plan, nil

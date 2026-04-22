@@ -129,6 +129,7 @@ var keywords = map[string]api.TokenType{
 	"JSON_INSERT":   api.TokJsonInsert,
 	"JSON_REMOVE":   api.TokJsonRemove,
 	"JSON_TYPE":     api.TokJsonType,
+	"PRAGMA":        api.TokPragma,
 }
 
 // lexer tokenizes SQL input.

@@ -174,6 +174,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execWith(p)
 	case *plannerapi.AlterTablePlan:
 		return e.execAlterTable(p)
+	case *plannerapi.PragmaPlan:
+		return e.execPragma(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -258,6 +260,8 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execWith(p)
 	case *plannerapi.AlterTablePlan:
 		return e.execAlterTable(p)
+	case *plannerapi.PragmaPlan:
+		return e.execPragma(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -541,6 +545,163 @@ func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi
 	}
 
 	return &executorapi.Result{RowsAffected: 0}, nil
+}
+
+// execPragma handles PRAGMA commands.
+func (e *executor) execPragma(plan *plannerapi.PragmaPlan) (*executorapi.Result, error) {
+	// Pragma names are case-insensitive, normalize to lowercase
+	name := strings.ToLower(plan.Name)
+	switch name {
+	case "database_list":
+		return e.pragmaDatabaseList()
+	case "table_info":
+		if plan.Arg == "" {
+			return nil, fmt.Errorf("%w: table_info requires table name argument", executorapi.ErrExecFailed)
+		}
+		return e.pragmaTableInfo(plan.Arg)
+	case "table_list", "tables":
+		return e.pragmaTableList()
+	case "index_list":
+		if plan.Arg == "" {
+			return nil, fmt.Errorf("%w: index_list requires table name argument", executorapi.ErrExecFailed)
+		}
+		return e.pragmaIndexList(plan.Arg)
+	default:
+		return nil, fmt.Errorf("%w: unknown pragma: %s", executorapi.ErrExecFailed, name)
+	}
+}
+
+// pragmaDatabaseList returns a list of all databases (just "main" for single-db).
+func (e *executor) pragmaDatabaseList() (*executorapi.Result, error) {
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "file"},
+		Rows: [][]catalogapi.Value{
+			{catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}, catalogapi.Value{Type: catalogapi.TypeText, Text: "main"}, catalogapi.Value{Type: catalogapi.TypeText, Text: ""}},
+		},
+	}, nil
+}
+
+// pragmaTableInfo returns column information for a table.
+func (e *executor) pragmaTableInfo(tableName string) (*executorapi.Result, error) {
+	schema, err := e.catalog.GetTable(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// SQLite-style table_info columns: cid, name, type, notnull, dflt_value, pk
+	rows := make([][]catalogapi.Value, 0, len(schema.Columns))
+	for i, col := range schema.Columns {
+		var dfltValue catalogapi.Value
+		if col.DefaultValue != nil {
+			dfltValue = *col.DefaultValue
+		} else {
+			dfltValue = catalogapi.Value{IsNull: true}
+		}
+
+		pk := 0
+		if schema.PrimaryKey == col.Name {
+			pk = 1
+			// For AUTOINCREMENT primary key, pk=2
+			if col.AutoInc {
+				pk = 2
+			}
+		}
+
+		var typeName string
+		switch col.Type {
+		case catalogapi.TypeInt:
+			typeName = "INT"
+		case catalogapi.TypeFloat:
+			typeName = "FLOAT"
+		case catalogapi.TypeText:
+			typeName = "TEXT"
+		case catalogapi.TypeBlob:
+			typeName = "BLOB"
+		default:
+			typeName = "NULL"
+		}
+
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(i)},          // cid
+			catalogapi.Value{Type: catalogapi.TypeText, Text: col.Name},         // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: typeName},          // type
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: boolToInt(col.NotNull)}, // notnull
+			dfltValue, // dflt_value
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(pk)}, // pk
+		})
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"cid", "name", "type", "notnull", "dflt_value", "pk"},
+		Rows:    rows,
+	}, nil
+}
+
+// pragmaTableList returns a list of all tables.
+func (e *executor) pragmaTableList() (*executorapi.Result, error) {
+	tables, err := e.catalog.ListTables()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	rows := make([][]catalogapi.Value, 0, len(tables))
+	for _, name := range tables {
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},                      // seq
+			catalogapi.Value{Type: catalogapi.TypeText, Text: name},                   // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "table"},                // type
+			catalogapi.Value{Type: catalogapi.TypeText, Text: name},                    // tbl_name
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},                       // ncol
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "CREATE TABLE " + name}, // sql
+		})
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "type", "tbl_name", "ncol", "sql"},
+		Rows:    rows,
+	}, nil
+}
+
+// pragmaIndexList returns a list of all indexes for a table.
+func (e *executor) pragmaIndexList(tableName string) (*executorapi.Result, error) {
+	indexes, err := e.catalog.ListIndexes(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	rows := make([][]catalogapi.Value, 0, len(indexes))
+	seq := 0
+	for _, idx := range indexes {
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(seq)},          // seq
+			catalogapi.Value{Type: catalogapi.TypeText, Text: idx.Name},           // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: boolToText(idx.Unique)}, // unique
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "c"},                 // origin
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "c"},                 // partial
+		})
+		seq++
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "unique", "origin", "partial"},
+		Rows:    rows,
+	}, nil
+}
+
+// boolToInt converts bool to int (0 or 1).
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// boolToText converts bool to SQLite text representation.
+func boolToText(b bool) string {
+	if b {
+		return "YES"
+	}
+	return "NO"
 }
 
 func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executorapi.Result, error) {

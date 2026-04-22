@@ -405,6 +405,128 @@ func TestExec_AlterTable(t *testing.T) {
 	})
 }
 
+func TestExec_Pragma(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_name ON users(name)")
+	env.execSQL(t, "CREATE TABLE orders (id INT, product TEXT)")
+
+	t.Run("DatabaseList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA database_list")
+		if len(result.Columns) != 3 {
+			t.Errorf("Columns = %d, want 3", len(result.Columns))
+		}
+		if result.Columns[0] != "seq" || result.Columns[1] != "name" || result.Columns[2] != "file" {
+			t.Errorf("Columns = %v, want [seq, name, file]", result.Columns)
+		}
+		if len(result.Rows) != 1 {
+			t.Errorf("Rows = %d, want 1", len(result.Rows))
+		}
+		// Verify main database
+		if result.Rows[0][1].Text != "main" {
+			t.Errorf("Database name = %s, want main", result.Rows[0][1].Text)
+		}
+	})
+
+	t.Run("TableInfo", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA table_info(users)")
+		if len(result.Columns) != 6 {
+			t.Errorf("Columns = %d, want 6", len(result.Columns))
+		}
+		if len(result.Rows) != 3 {
+			t.Errorf("Rows = %d, want 3", len(result.Rows))
+		}
+		// Column names are uppercased by the catalog
+		if result.Rows[0][1].Text != "ID" {
+			t.Errorf("Column[0].name = %s, want ID", result.Rows[0][1].Text)
+		}
+		if result.Rows[0][2].Text != "INT" {
+			t.Errorf("Column[0].type = %s, want INT", result.Rows[0][2].Text)
+		}
+		if result.Rows[1][1].Text != "NAME" {
+			t.Errorf("Column[1].name = %s, want NAME", result.Rows[1][1].Text)
+		}
+		if result.Rows[1][3].Int != 1 {
+			t.Errorf("Column[1].notnull = %d, want 1", result.Rows[1][3].Int)
+		}
+		// id is PRIMARY KEY AUTOINCREMENT, so pk=2
+		if result.Rows[0][5].Int != 2 {
+			t.Errorf("Column[0].pk = %d, want 2 for AUTOINCREMENT primary key", result.Rows[0][5].Int)
+		}
+	})
+
+	t.Run("TableInfo_NonExistent", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA table_info(nonexistent)")
+		if err == nil {
+			t.Error("expected error for non-existent table")
+		}
+	})
+
+	t.Run("TableList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA table_list")
+		if len(result.Rows) < 2 {
+			t.Errorf("Rows = %d, want >= 2", len(result.Rows))
+		}
+		// Find USERS table (uppercased by catalog)
+		found := false
+		for _, row := range result.Rows {
+			if row[1].Text == "USERS" {
+				found = true
+				if row[2].Text != "table" {
+					t.Errorf("users type = %s, want table", row[2].Text)
+				}
+			}
+		}
+		if !found {
+			t.Error("USERS table not found in table_list")
+		}
+	})
+
+	t.Run("IndexList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA index_list(users)")
+		if len(result.Columns) != 5 {
+			t.Errorf("Columns = %d, want 5", len(result.Columns))
+		}
+		if len(result.Rows) < 1 {
+			t.Errorf("Rows = %d, want >= 1", len(result.Rows))
+		}
+		// Check for idx_name (uppercased by catalog to IDX_NAME)
+		found := false
+		for _, row := range result.Rows {
+			if row[1].Text == "IDX_NAME" {
+				found = true
+				if row[2].Text != "NO" {
+					t.Errorf("IDX_NAME unique = %s, want NO", row[2].Text)
+				}
+			}
+		}
+		if !found {
+			t.Error("IDX_NAME not found in index_list")
+		}
+	})
+
+	t.Run("IndexList_NoIndexes", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA index_list(orders)")
+		if len(result.Rows) != 0 {
+			t.Errorf("Rows = %d, want 0 for table without indexes", len(result.Rows))
+		}
+	})
+
+	t.Run("UnknownPragma", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA unknown_pragma")
+		if err == nil {
+			t.Error("expected error for unknown pragma")
+		}
+	})
+
+	t.Run("TableInfo_MissingArg", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA table_info")
+		if err == nil {
+			t.Error("expected error for table_info without argument")
+		}
+	})
+}
+
 func TestExec_Insert(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")

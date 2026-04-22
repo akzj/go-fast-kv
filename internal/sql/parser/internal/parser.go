@@ -91,8 +91,10 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseAlterTable()
 	case api.TokTruncate:
 		return p.parseTruncate()
+	case api.TokPragma:
+		return p.parsePragma()
 	default:
-		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, TRUNCATE, BEGIN, COMMIT, ROLLBACK)")
+		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, TRUNCATE, BEGIN, COMMIT, ROLLBACK, PRAGMA)")
 	}
 }
 
@@ -1688,6 +1690,77 @@ func (p *parser) parseTruncate() (api.Statement, error) {
 		Table: p.cur.Literal,
 	}
 	p.advance()
+	return stmt, nil
+}
+
+// ─── PRAGMA ────────────────────────────────────────────────────────
+
+func (p *parser) parsePragma() (api.Statement, error) {
+	p.advance() // consume PRAGMA
+
+	// Pragma name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected pragma name")
+	}
+	name := p.cur.Literal
+	p.advance()
+
+	stmt := &api.PragmaStmt{Name: name}
+
+	// Check for = value or (arg)
+	switch p.cur.Type {
+	case api.TokEQ:
+		// PRAGMA name = value
+		p.advance()
+		// Value can be integer or identifier (like "0", "1", "NONE", etc.)
+		switch p.cur.Type {
+		case api.TokInteger:
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},
+			}
+			// Try to parse the integer value
+			if val, err := strconv.ParseInt(p.cur.Literal, 10, 64); err == nil {
+				stmt.Value = &api.Literal{
+					Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: val},
+				}
+			}
+			p.advance()
+		case api.TokIdent:
+			// Identifier like "NONE", "FULL", etc.
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeText, Text: p.cur.Literal},
+			}
+			p.advance()
+		case api.TokString:
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeText, Text: p.cur.Literal},
+			}
+			p.advance()
+		default:
+			return nil, p.errorf("expected value after =")
+		}
+	case api.TokLParen:
+		// PRAGMA name(arg)
+		p.advance()
+		// Argument is typically a table name (identifier)
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected argument")
+		}
+		stmt.Arg = p.cur.Literal
+		p.advance()
+		if err := p.expect(api.TokRParen); err != nil {
+			return nil, err
+		}
+	case api.TokEOF, api.TokSemicolon:
+		// No value, just PRAGMA name
+	default:
+		// Might be identifier without parentheses: PRAGMA name value
+		if p.cur.Type == api.TokIdent {
+			stmt.Arg = p.cur.Literal
+			p.advance()
+		}
+	}
+
 	return stmt, nil
 }
 

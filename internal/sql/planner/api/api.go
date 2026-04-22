@@ -287,6 +287,25 @@ func (p *ExplainPlan) String() string {
 	return "EXPLAIN\n└─ " + innerStr
 }
 
+// PragmaPlan represents a PRAGMA command execution plan.
+type PragmaPlan struct {
+	Name  string // pragma name: "database_list", "table_info", "index_list", etc.
+	Arg   string // optional argument (e.g., table name for table_info)
+	Value catalogapi.Value // optional value for SET pragma
+}
+
+func (*PragmaPlan) planNode() {}
+
+func (p *PragmaPlan) String() string {
+	if p.Arg != "" {
+		return fmt.Sprintf("PRAGMA %s(%s)", p.Name, p.Arg)
+	}
+	if p.Value.Type != catalogapi.TypeNull && !p.Value.IsNull {
+		return fmt.Sprintf("PRAGMA %s = %v", p.Name, p.Value)
+	}
+	return fmt.Sprintf("PRAGMA %s", p.Name)
+}
+
 // planDescription returns a string description of any plan.
 func planDescription(plan Plan) string {
 	switch p := plan.(type) {
@@ -329,6 +348,8 @@ func planDescription(plan Plan) string {
 		return "WITH"
 	case *InsertSelectPlan:
 		return fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
+	case *PragmaPlan:
+		return p.String()
 	default:
 		return fmt.Sprintf("%T", plan)
 	}
