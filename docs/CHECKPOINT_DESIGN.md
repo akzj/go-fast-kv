@@ -1,5 +1,12 @@
 # go-fast-kv Checkpoint 优化设计
 
+## 状态：规划中
+
+本文档描述计划的 checkpoint 优化方案，用于消除当前 checkpoint 的 P0 瓶颈。
+
+**已实现**：两阶段 checkpoint 基础架构
+**计划中**：非阻塞 checkpoint、WAL ModuleType 字段
+
 ## 1. 概述
 
 **目标**：消除当前 checkpoint 的 P0 瓶颈，实现非阻塞 checkpoint。

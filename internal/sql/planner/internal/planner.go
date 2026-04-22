@@ -16,11 +16,14 @@ var _ plannerapi.Planner = (*planner)(nil)
 
 type planner struct {
 	catalog catalogapi.CatalogManager
+	parser  parserapi.Parser
+	// cteSchemas holds CTE schemas indexed by name, populated during WithStmt planning
+	cteSchemas map[string]*catalogapi.TableSchema
 }
 
-// New creates a new Planner backed by the given catalog.
-func New(catalog catalogapi.CatalogManager) *planner {
-	return &planner{catalog: catalog}
+// New creates a new Planner backed by the given catalog and parser.
+func New(catalog catalogapi.CatalogManager, parser parserapi.Parser) *planner {
+	return &planner{catalog: catalog, parser: parser}
 }
 
 // Plan converts a parsed AST statement into an execution plan.
@@ -40,6 +43,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planSelect(s)
 	case *parserapi.DeleteStmt:
 		return p.planDelete(s)
+	case *parserapi.TruncateStmt:
+		return p.planTruncate(s)
 	case *parserapi.UpdateStmt:
 		return p.planUpdate(s)
 	case *parserapi.ExplainStmt:
@@ -55,6 +60,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planIntersect(s)
 	case *parserapi.ExceptStmt:
 		return p.planExcept(s)
+	case *parserapi.WithStmt:
+		return p.planWith(s)
 	// Transaction control statements — nil plan signals "transaction control"
 	// to sql.DB.Exec(), which manages the transaction lifecycle.
 	case *parserapi.BeginStmt:
@@ -71,6 +78,18 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return nil, nil
 	case *parserapi.AlterTableStmt:
 		return p.planAlterTable(s)
+	case *parserapi.PragmaStmt:
+		return p.planPragma(s)
+	case *parserapi.TriggerStmt:
+		return p.planCreateTrigger(s)
+	case *parserapi.DropTriggerStmt:
+		return p.planDropTrigger(s)
+	case *parserapi.CreateViewStmt:
+		return p.planCreateView(s)
+	case *parserapi.DropViewStmt:
+		return p.planDropView(s)
+	case *parserapi.CreateFTSStmt:
+		return p.planCreateFTS(s)
 	default:
 		return nil, fmt.Errorf("%w: unsupported statement type %T", plannerapi.ErrInvalidPlan, stmt)
 	}
@@ -207,7 +226,10 @@ func (p *planner) planDropTable(stmt *parserapi.DropTableStmt) (*plannerapi.Drop
 	}, nil
 }
 
+
+
 func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.CreateIndexPlan, error) {
+	// Validate table exists
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {
 		if err == catalogapi.ErrTableNotFound {
@@ -216,18 +238,59 @@ func (p *planner) planCreateIndex(stmt *parserapi.CreateIndexStmt) (*plannerapi.
 		return nil, err
 	}
 
-	if findColumnIndex(tbl, stmt.Column) < 0 {
-		return nil, fmt.Errorf("%w: %s.%s", plannerapi.ErrColumnNotFound, stmt.Table, stmt.Column)
+	// Determine which column to index
+	var column string
+	var exprSQL string
+
+	if stmt.Expr != nil {
+		// Check if this is just a simple column reference (not an expression index)
+		if _, isColRef := stmt.Expr.(*parserapi.ColumnRef); isColRef {
+			// Simple column index: use Column field
+			column = stmt.Column
+		} else {
+			// Expression index: serialize expression
+			exprSQL = serializeExprToSQL(stmt.Expr)
+			// For expression indexes, use first column reference as the "column"
+			// for backward compatibility (the actual expression is in ExprSQL)
+			column = extractColumnFromExpr(stmt.Expr)
+		}
+	} else {
+		// Simple column index
+		column = stmt.Column
+		// Validate column exists
+		colIdx := -1
+		for i, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, column) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 {
+			return nil, fmt.Errorf("%w: column %s not found in table %s", plannerapi.ErrColumnNotFound, column, stmt.Table)
+		}
+	}
+
+	// Check if index already exists (unless IF NOT EXISTS)
+	if !stmt.IfNotExists {
+		_, err := p.catalog.GetIndex(stmt.Table, stmt.Index)
+		if err == nil {
+			return nil, fmt.Errorf("%w: index %s already exists", catalogapi.ErrIndexExists, stmt.Index)
+		}
+		if err != catalogapi.ErrIndexNotFound {
+			return nil, err
+		}
 	}
 
 	return &plannerapi.CreateIndexPlan{
 		Schema: catalogapi.IndexSchema{
-			Name:   stmt.Index,
-			Table:  stmt.Table,
-			Column: stmt.Column,
-			Unique: stmt.Unique,
+			Name:    stmt.Index,
+			Table:   stmt.Table,
+			Column:  column,
+			Unique:  stmt.Unique,
+			ExprSQL: exprSQL,
 		},
 		IfNotExists: stmt.IfNotExists,
+		Expr:        stmt.Expr,
 	}, nil
 }
 
@@ -295,6 +358,28 @@ func (p *planner) planAlterTable(stmt *parserapi.AlterTableStmt) (*plannerapi.Al
 		}
 	}
 
+	// For RENAME TO, store new table name
+	if stmt.Operation == parserapi.AlterRenameTable {
+		plan.TableNew = stmt.TableNew
+	}
+
+	return plan, nil
+}
+
+// planPragma creates a PragmaPlan from a PragmaStmt.
+func (p *planner) planPragma(stmt *parserapi.PragmaStmt) (*plannerapi.PragmaPlan, error) {
+	plan := &plannerapi.PragmaPlan{
+		Name: strings.ToLower(stmt.Name), // normalize to lowercase for case-insensitive comparison
+		Arg:  stmt.Arg,
+	}
+
+	// Resolve value if present
+	if stmt.Value != nil {
+		if lit, ok := stmt.Value.(*parserapi.Literal); ok {
+			plan.Value = lit.Value
+		}
+	}
+
 	return plan, nil
 }
 
@@ -307,6 +392,11 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
 		}
 		return nil, err
+	}
+
+	// INSERT ... ON CONFLICT → route to UpsertPlan
+	if stmt.OnConflict != nil {
+		return p.planUpsert(stmt, tbl)
 	}
 
 	// INSERT ... SELECT
@@ -333,11 +423,16 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 		}, nil
 	}
 
-	// Check if any expression contains a ParamRef (needs execution-time resolution)
+	// Check if any expression contains a ParamRef or ColumnRef (needs execution-time resolution)
+	// ColumnRef is needed for trigger context (NEW.col, OLD.col references)
 	hasParams := false
 	for _, exprRow := range stmt.Values {
 		for _, expr := range exprRow {
 			if _, ok := expr.(*parserapi.ParamRef); ok {
+				hasParams = true
+				break
+			}
+			if _, ok := expr.(*parserapi.ColumnRef); ok {
 				hasParams = true
 				break
 			}
@@ -363,6 +458,92 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 	}
 
 	return &plannerapi.InsertPlan{Table: tbl, Rows: rows}, nil
+}
+
+// planUpsert handles INSERT ... ON CONFLICT
+func (p *planner) planUpsert(stmt *parserapi.InsertStmt, tbl *catalogapi.TableSchema) (plannerapi.Plan, error) {
+	oc := stmt.OnConflict
+
+	// Resolve conflict columns to indices
+	conflictCols := make([]int, 0, len(oc.ConflictColumns))
+	for _, colName := range oc.ConflictColumns {
+		idx := findColumnIndex(tbl, colName)
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ON CONFLICT column %s", plannerapi.ErrColumnNotFound, colName)
+		}
+		conflictCols = append(conflictCols, idx)
+	}
+
+	plan := &plannerapi.UpsertPlan{
+		Table:           tbl,
+		ConflictColumns: conflictCols,
+	}
+
+	if oc.Action == parserapi.ConflictDoNothing {
+		plan.Action = plannerapi.UpsertDoNothing
+		// Still need to resolve INSERT values
+		return p.finishUpsertPlan(stmt, plan)
+	}
+
+	// DO UPDATE
+	plan.Action = plannerapi.UpsertDoUpdate
+
+	// Resolve UPDATE assignments
+	plan.UpdateAssignments = make(map[int]catalogapi.Value)
+	plan.ParamUpdateAssignments = make(map[int]parserapi.Expr)
+
+	for i, colName := range oc.UpdateColumns {
+		idx := findColumnIndex(tbl, colName)
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: ON CONFLICT UPDATE SET column %s", plannerapi.ErrColumnNotFound, colName)
+		}
+		expr := oc.UpdateValues[i]
+		if _, ok := expr.(*parserapi.ParamRef); ok {
+			plan.ParamUpdateAssignments[idx] = expr
+		} else {
+			val, err := resolveExprToValue(expr)
+			if err != nil {
+				return nil, fmt.Errorf("ON CONFLICT UPDATE SET %s: %w", colName, err)
+			}
+			plan.UpdateAssignments[idx] = val
+		}
+	}
+
+	return p.finishUpsertPlan(stmt, plan)
+}
+
+// finishUpsertPlan resolves INSERT values and finalizes the upsert plan.
+func (p *planner) finishUpsertPlan(stmt *parserapi.InsertStmt, plan *plannerapi.UpsertPlan) (plannerapi.Plan, error) {
+	// Check if any INSERT value has parameters
+	hasParams := false
+	for _, exprRow := range stmt.Values {
+		for _, expr := range exprRow {
+			if _, ok := expr.(*parserapi.ParamRef); ok {
+				hasParams = true
+				break
+			}
+		}
+		if hasParams {
+			break
+		}
+	}
+
+	if hasParams {
+		plan.Exprs = stmt.Values
+		return plan, nil
+	}
+
+	// Resolve literals at planning time
+	rows := make([][]catalogapi.Value, len(stmt.Values))
+	for i, exprRow := range stmt.Values {
+		resolved, err := p.resolveInsertRow(plan.Table, stmt.Columns, exprRow)
+		if err != nil {
+			return nil, fmt.Errorf("row %d: %w", i+1, err)
+		}
+		rows[i] = resolved
+	}
+	plan.Rows = rows
+	return plan, nil
 }
 
 func (p *planner) resolveInsertRow(tbl *catalogapi.TableSchema, columns []string, exprs []parserapi.Expr) ([]catalogapi.Value, error) {
@@ -463,6 +644,85 @@ func (p *planner) planExcept(s *parserapi.ExceptStmt) (plannerapi.Plan, error) {
 	return &plannerapi.ExceptPlan{Left: leftPlan, Right: rightPlan}, nil
 }
 
+func (p *planner) planWith(s *parserapi.WithStmt) (plannerapi.Plan, error) {
+	// Build CTE schemas from the SELECT list of each CTE
+	// These are needed by the planner to resolve column references
+	p.cteSchemas = make(map[string]*catalogapi.TableSchema)
+	ctePlans := make([]*plannerapi.CTEPlan, len(s.CTEs))
+	for i, cte := range s.CTEs {
+		// Build the CTE schema from the SelectStmt's projection
+		// For UnionStmt, get columns from the left side (anchor)
+		var selectCols []parserapi.SelectColumn
+		switch stmt := cte.SelectStmt.(type) {
+		case *parserapi.SelectStmt:
+			selectCols = stmt.Columns
+		case *parserapi.UnionStmt:
+			if leftSelect, ok := stmt.Left.(*parserapi.SelectStmt); ok {
+				selectCols = leftSelect.Columns
+			}
+		}
+
+		schema := &catalogapi.TableSchema{
+			Name: cte.Name,
+		}
+		for _, col := range selectCols {
+			colDef := catalogapi.ColumnDef{Name: col.Alias}
+			if _, ok := col.Expr.(*parserapi.StarExpr); ok {
+				colDef.Type = catalogapi.TypeBlob
+			} else {
+				colDef.Type = catalogapi.TypeBlob
+			}
+			schema.Columns = append(schema.Columns, colDef)
+		}
+		p.cteSchemas[cte.Name] = schema
+
+		// Plan the CTE body (can be SelectStmt or UnionStmt)
+		cteBodyPlan, err := p.Plan(cte.SelectStmt)
+		if err != nil {
+			p.cteSchemas = nil
+			return nil, fmt.Errorf("planning CTE %s: %w", cte.Name, err)
+		}
+
+		// For recursive CTEs, split anchor and recursive parts from UNION ALL
+		var anchorPlan, recursivePlan plannerapi.Plan
+		if cte.IsRecursive {
+			// Check if the body is a UnionPlan with UNION ALL
+			if unionPlan, ok := cteBodyPlan.(*plannerapi.UnionPlan); ok && unionPlan.UnionAll {
+				anchorPlan = unionPlan.Left
+				recursivePlan = unionPlan.Right
+			} else {
+				// Fallback: treat entire body as anchor (no self-reference)
+				anchorPlan = cteBodyPlan
+				recursivePlan = nil
+			}
+		}
+
+		// Store the full body plan in SelectPlan (used for anchor execution in non-recursive CTE)
+		ctePlans[i] = &plannerapi.CTEPlan{
+			Name:          cte.Name,
+			SelectPlan:    cteBodyPlan,
+			IsRecursive:   cte.IsRecursive,
+			AnchorPlan:    anchorPlan,
+			RecursivePlan: recursivePlan,
+		}
+	}
+
+	// Plan the main statement (with cteSchemas set)
+	mainPlan, err := p.Plan(s.Statement)
+	if err != nil {
+		p.cteSchemas = nil // clean up
+		return nil, fmt.Errorf("planning main statement: %w", err)
+	}
+
+	// Clean up CTE schemas after planning
+	p.cteSchemas = nil
+
+	return &plannerapi.WithPlan{
+		CTEs:      ctePlans,
+		Statement: mainPlan,
+	}, nil
+}
+
 func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
 	// Handle derived table (subquery in FROM clause)
 	if stmt.DerivedTable != nil {
@@ -518,18 +778,71 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		}, nil
 	}
 
-	// Single-table SELECT
-	tbl, err := p.catalog.GetTable(stmt.Table)
-	if err != nil {
-		if err == catalogapi.ErrTableNotFound {
-			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+	// Single-table SELECT — check if it's a CTE first
+	var tbl *catalogapi.TableSchema
+	isCTE := false
+	if p.cteSchemas != nil {
+		if cteSchema, ok := p.cteSchemas[stmt.Table]; ok {
+			tbl = cteSchema
+			isCTE = true
 		}
-		return nil, err
+	}
+	if tbl == nil {
+		var err error
+		tbl, err = p.catalog.GetTable(stmt.Table)
+		if err != nil {
+			if err == catalogapi.ErrTableNotFound {
+				// Check if it's a VIEW
+				view, viewErr := p.catalog.GetView(stmt.Table)
+				if viewErr == nil {
+					// It's a view — re-parse the view's SELECT SQL
+					viewSelect, err := p.parser.Parse(view.QuerySQL)
+					if err != nil {
+						return nil, fmt.Errorf("invalid view %q: %v", stmt.Table, err)
+					}
+					viewSelectStmt, ok := viewSelect.(*parserapi.SelectStmt)
+					if !ok {
+						return nil, fmt.Errorf("view %q must define a SELECT statement", stmt.Table)
+					}
+					// Treat as a derived table: set DerivedTable and call planDerivedTableSelect
+					stmt.DerivedTable = &parserapi.DerivedTable{
+						Subquery: &parserapi.SubqueryExpr{
+							Stmt: viewSelectStmt,
+						},
+						Alias: stmt.Table,
+					}
+					stmt.Table = "" // clear table name
+					return p.planDerivedTableSelect(stmt)
+				}
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+			}
+			return nil, err
+		}
 	}
 
 	colIndices, err := p.resolveSelectColumns(tbl, stmt.Columns, stmt.GroupBy)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle CTE as a derived table (materialized at execution time)
+	if isCTE {
+		// Create a DerivedTableScanPlan for CTE — executor will resolve from cteResults
+		return &plannerapi.SelectPlan{
+			Table:         tbl,
+			Scan:          &plannerapi.DerivedTableScanPlan{Schema: tbl, Filter: stmt.Where},
+			Columns:       colIndices,
+			SelectColumns: stmt.Columns,
+			Filter:        nil, // Filter applied by execSelectFromDerived
+			GroupByExprs:  stmt.GroupBy,
+			Having:        stmt.Having,
+			OrderBy:       nil, // TODO: handle ORDER BY for CTEs
+			Limit:         -1,
+			Offset:        -1,
+			Distinct:      stmt.Distinct,
+			LockMode:      stmt.LockMode,
+			LockWait:      stmt.LockWait,
+		}, nil
 	}
 
 	scan, residualFilter, err := p.planScan(tbl, stmt.Where)
@@ -860,11 +1173,17 @@ func (p *planner) resolveSelectColumnsFromDerived(cols []parserapi.SelectColumn,
 		case *parserapi.StringFuncExpr:
 			// StringFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
+		case *parserapi.JsonFuncExpr:
+			// JsonFuncExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		case *parserapi.NullIfExpr:
 			// NullIfExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		case *parserapi.CastExpr:
 			// CastExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
+		case *parserapi.WindowFuncExpr:
+			// WindowFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		default:
 			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
@@ -1301,6 +1620,18 @@ func (p *planner) planDelete(stmt *parserapi.DeleteStmt) (*plannerapi.DeletePlan
 	return &plannerapi.DeletePlan{Table: tbl, Scan: scan}, nil
 }
 
+func (p *planner) planTruncate(stmt *parserapi.TruncateStmt) (*plannerapi.TruncatePlan, error) {
+	tbl, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		if err == catalogapi.ErrTableNotFound {
+			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+		}
+		return nil, err
+	}
+
+	return &plannerapi.TruncatePlan{Table: tbl, TableID: tbl.TableID}, nil
+}
+
 func (p *planner) planUpdate(stmt *parserapi.UpdateStmt) (*plannerapi.UpdatePlan, error) {
 	tbl, err := p.catalog.GetTable(stmt.Table)
 	if err != nil {
@@ -1310,10 +1641,15 @@ func (p *planner) planUpdate(stmt *parserapi.UpdateStmt) (*plannerapi.UpdatePlan
 		return nil, err
 	}
 
-	// Check if any assignment contains a ParamRef (needs execution-time resolution)
+	// Check if any assignment contains a ParamRef or ColumnRef (needs execution-time resolution)
+	// ColumnRef is needed for trigger context (NEW.col, OLD.col references)
 	hasParams := false
 	for _, a := range stmt.Assignments {
 		if _, ok := a.Value.(*parserapi.ParamRef); ok {
+			hasParams = true
+			break
+		}
+		if _, ok := a.Value.(*parserapi.ColumnRef); ok {
 			hasParams = true
 			break
 		}
@@ -1371,6 +1707,31 @@ func (p *planner) planScan(tbl *catalogapi.TableSchema, where parserapi.Expr) (p
 	}
 
 	conditions := flattenAnd(where)
+
+	// Check for FTS MATCH expression
+	for i, cond := range conditions {
+		if match, ok := cond.(*parserapi.MatchExpr); ok {
+			// FTS MATCH query — create FTSSearchPlan
+			var residualParts []parserapi.Expr
+			for j, c := range conditions {
+				if j != i {
+					residualParts = append(residualParts, c)
+				}
+			}
+			var residual parserapi.Expr
+			if len(residualParts) == 1 {
+				residual = residualParts[0]
+			} else if len(residualParts) > 1 {
+				residual = buildAndChain(residualParts)
+			}
+			return &plannerapi.FTSSearchPlan{
+				Table:         tbl.Name,
+				TableID:       tbl.TableID,
+				Query:         match.Query,
+				ResidualFilter: residual,
+			}, residual, nil
+		}
+	}
 
 	// First: check for LIKE prefix candidates (highest priority — more specific than EQ)
 	for i, cond := range conditions {
@@ -1622,11 +1983,17 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 		case *parserapi.StringFuncExpr:
 			// StringFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
+		case *parserapi.JsonFuncExpr:
+			// JsonFuncExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		case *parserapi.NullIfExpr:
 			// NullIfExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		case *parserapi.CastExpr:
 			// CastExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
+		case *parserapi.WindowFuncExpr:
+			// WindowFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		default:
 			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
@@ -1731,12 +2098,36 @@ func walkExprForSubqueries(expr parserapi.Expr, p *planner) error {
 // detectEquiJoin checks if the ON clause is an equi-join (t1.col = t2.col).
 // Returns left and right key column indices if it's an equi-join, or -1/-1 if not.
 // Handles both orderings: t1.col = t2.col AND t2.col = t1.col.
+// Also handles composite conditions: a = b AND extra_condition (extracts the equi-join).
 func detectEquiJoin(on parserapi.Expr, leftTable, rightTable string, leftTableSchema, rightTableSchema *catalogapi.TableSchema) (leftIdx, rightIdx int, isEqui bool) {
 	if on == nil {
 		return -1, -1, false
 	}
 
-	bin, ok := on.(*parserapi.BinaryExpr)
+	// Try direct equi-join first (simple a = b)
+	if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(on, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+		return leftIdx, rightIdx, true
+	}
+
+	// Try to extract equi-join from AND expression (a = b AND extra)
+	if bin, ok := on.(*parserapi.BinaryExpr); ok && bin.Op == parserapi.BinAnd {
+		// Try left side of AND
+		if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(bin.Left, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+			return leftIdx, rightIdx, true
+		}
+		// Try right side of AND
+		if leftIdx, rightIdx, isEqui := tryDetectEquiJoinDirect(bin.Right, leftTable, rightTable, leftTableSchema, rightTableSchema); isEqui {
+			return leftIdx, rightIdx, true
+		}
+	}
+
+	return -1, -1, false
+}
+
+// tryDetectEquiJoinDirect tries to detect a direct equi-join condition.
+// Returns left/right column indices if it's a simple a = b pattern.
+func tryDetectEquiJoinDirect(expr parserapi.Expr, leftTable, rightTable string, leftTableSchema, rightTableSchema *catalogapi.TableSchema) (leftIdx, rightIdx int, isEqui bool) {
+	bin, ok := expr.(*parserapi.BinaryExpr)
 	if !ok || bin.Op != parserapi.BinEQ {
 		return -1, -1, false
 	}
@@ -1922,4 +2313,156 @@ func unaryOpString(op parserapi.UnaryOp) string {
 		return "-"
 	}
 	return ""
+}
+
+// ─── Trigger Planning ────────────────────────────────────────────────
+
+func (p *planner) planCreateTrigger(stmt *parserapi.TriggerStmt) (*plannerapi.CreateTriggerPlan, error) {
+	// Verify table exists
+	_, err := p.catalog.GetTable(stmt.Table)
+	if err != nil {
+		if err == catalogapi.ErrTableNotFound {
+			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+		}
+		return nil, err
+	}
+
+	// Build trigger schema
+	schema := catalogapi.TriggerSchema{
+		Name:   stmt.Name,
+		Table:  stmt.Table,
+		Timing: stmt.Timing,
+		Event:  stmt.Event,
+	}
+
+	// Serialize WHEN condition if present
+	if stmt.WhenCond != nil {
+		schema.WhenCond = serializeExpr(stmt.WhenCond)
+	}
+
+	// Serialize trigger body (concatenate statement SQL representations)
+	var bodySQL strings.Builder
+	for i, bodyStmt := range stmt.Body {
+		if i > 0 {
+			bodySQL.WriteString("; ")
+		}
+		bodySQL.WriteString(statementToSQL(bodyStmt))
+	}
+	schema.Body = bodySQL.String()
+
+	return &plannerapi.CreateTriggerPlan{Schema: schema}, nil
+}
+
+func (p *planner) planDropTrigger(stmt *parserapi.DropTriggerStmt) (*plannerapi.DropTriggerPlan, error) {
+	return &plannerapi.DropTriggerPlan{
+		Name:     stmt.Name,
+		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// ─── VIEW Planning ───────────────────────────────────────────────────
+
+func (p *planner) planCreateView(stmt *parserapi.CreateViewStmt) (*plannerapi.CreateViewPlan, error) {
+	// Use the raw SQL captured by the parser
+	return &plannerapi.CreateViewPlan{
+		Name:     stmt.Name,
+		QuerySQL: stmt.QuerySQL,
+	}, nil
+}
+
+func (p *planner) planDropView(stmt *parserapi.DropViewStmt) (*plannerapi.DropViewPlan, error) {
+	return &plannerapi.DropViewPlan{
+		Name:     stmt.Name,
+		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// ─── FTS Planning ───────────────────────────────────────────────────
+
+func (p *planner) planCreateFTS(stmt *parserapi.CreateFTSStmt) (*plannerapi.CreateFTSPlan, error) {
+	schema := plannerapi.FTSIndexSchema{
+		Name:       stmt.Name,
+		Columns:    stmt.Columns,
+		Tokenizer:  stmt.Tokenize,
+		FTSVersion: stmt.FTSVersion,
+	}
+	return &plannerapi.CreateFTSPlan{
+		Schema:      schema,
+		IfNotExists: stmt.IfNotExists,
+	}, nil
+}
+
+// statementToSQL converts a statement to its SQL string representation.
+func statementToSQL(stmt parserapi.Statement) string {
+	switch s := stmt.(type) {
+	case *parserapi.InsertStmt:
+		return insertStmtToSQL(s)
+	case *parserapi.UpdateStmt:
+		return updateStmtToSQL(s)
+	case *parserapi.DeleteStmt:
+		return deleteStmtToSQL(s)
+	default:
+		return ""
+	}
+}
+
+func insertStmtToSQL(stmt *parserapi.InsertStmt) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(stmt.Table)
+	if len(stmt.Columns) > 0 {
+		b.WriteString(" (")
+		for i, col := range stmt.Columns {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(col)
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(" VALUES (")
+	for i, row := range stmt.Values {
+		if i > 0 {
+			b.WriteString("), (")
+		}
+		for j, expr := range row {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(serializeExpr(expr))
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func updateStmtToSQL(stmt *parserapi.UpdateStmt) string {
+	var b strings.Builder
+	b.WriteString("UPDATE ")
+	b.WriteString(stmt.Table)
+	b.WriteString(" SET ")
+	for i, asgn := range stmt.Assignments {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(asgn.Column)
+		b.WriteString(" = ")
+		b.WriteString(serializeExpr(asgn.Value))
+	}
+	if stmt.Where != nil {
+		b.WriteString(" WHERE ")
+		b.WriteString(serializeExpr(stmt.Where))
+	}
+	return b.String()
+}
+
+func deleteStmtToSQL(stmt *parserapi.DeleteStmt) string {
+	var b strings.Builder
+	b.WriteString("DELETE FROM ")
+	b.WriteString(stmt.Table)
+	if stmt.Where != nil {
+		b.WriteString(" WHERE ")
+		b.WriteString(serializeExpr(stmt.Where))
+	}
+	return b.String()
 }

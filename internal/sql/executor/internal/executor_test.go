@@ -44,8 +44,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
-	pl := planner.New(cat)
-	ex := New(store, cat, tbl, idx, pl, p)
+	pl := planner.New(cat, p)
+	ex := New(store, cat, tbl, idx, nil, pl, p)
 
 	return &testEnv{
 		store:   store,
@@ -87,6 +87,65 @@ func (env *testEnv) execSQLErr(t *testing.T, sql string) (*executorapi.Result, e
 		return nil, err
 	}
 	return env.exec.Execute(plan)
+}
+
+// ─── View Tests ───────────────────────────────────────────────────
+
+func TestExec_CreateView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+
+	// Create view
+	result := env.execSQL(t, "CREATE VIEW active_users AS SELECT id, name FROM users WHERE id = 1")
+	if result.RowsAffected != 1 {
+		t.Errorf("expected 1 row affected, got %d", result.RowsAffected)
+	}
+}
+
+func TestExec_DropView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE t1 (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice')")
+
+	// Create view
+	env.execSQL(t, "CREATE VIEW v1 AS SELECT * FROM t1")
+
+	// Drop view
+	result := env.execSQL(t, "DROP VIEW v1")
+	if result.RowsAffected != 1 {
+		t.Errorf("expected 1 row affected, got %d", result.RowsAffected)
+	}
+}
+
+func TestExec_SelectFromView(t *testing.T) {
+	env := newTestEnv(t)
+	// Create a table first
+	env.execSQL(t, "CREATE TABLE t1 (id INT, name TEXT)")
+	env.execSQL(t, "INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')")
+
+	// Create view
+	env.execSQL(t, "CREATE VIEW v1 AS SELECT id, name FROM t1 WHERE id = 1")
+
+	// Query view
+	result := env.execSQL(t, "SELECT * FROM v1")
+	if len(result.Rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Int != 1 || result.Rows[0][1].Text != "Alice" {
+		t.Errorf("unexpected row: %v", result.Rows[0])
+	}
+}
+
+func TestExec_DropViewIfExists(t *testing.T) {
+	env := newTestEnv(t)
+	// Try to drop non-existent view with IF EXISTS
+	result := env.execSQL(t, "DROP VIEW IF EXISTS nonexistent")
+	if result.RowsAffected != 0 {
+		t.Errorf("expected 0 rows affected, got %d", result.RowsAffected)
+	}
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -355,6 +414,174 @@ func TestExec_AlterTable(t *testing.T) {
 		_, err := env.execSQLErr(t, "ALTER TABLE users ADD COLUMN id INT")
 		if err == nil {
 			t.Error("expected error for duplicate column")
+		}
+	})
+
+	t.Run("RenameTo", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE old_name (id INT PRIMARY KEY, name TEXT)")
+		env.execSQL(t, "ALTER TABLE old_name RENAME TO new_name")
+
+		// New table name should exist
+		schema, err := env.cat.GetTable("new_name")
+		if err != nil {
+			t.Fatalf("GetTable new_name failed: %v", err)
+		}
+		if schema.Name != "NEW_NAME" {
+			t.Errorf("table name: expected NEW_NAME, got %s", schema.Name)
+		}
+
+		// Old table name should not exist
+		_, err = env.cat.GetTable("old_name")
+		if err != catalogapi.ErrTableNotFound {
+			t.Errorf("old_name should not exist: got %v", err)
+		}
+
+		// INSERT/SELECT should work with new table name
+		env.execSQL(t, "INSERT INTO new_name VALUES (1, 'Alice')")
+		sel := env.execSQL(t, "SELECT * FROM new_name")
+		if len(sel.Rows) != 1 {
+			t.Fatalf("rows = %d, want 1", len(sel.Rows))
+		}
+		if sel.Rows[0][1].Text != "Alice" {
+			t.Errorf("name = %q, want %q", sel.Rows[0][1].Text, "Alice")
+		}
+	})
+
+	t.Run("RenameTo_Duplicate", func(t *testing.T) {
+		env.execSQL(t, "CREATE TABLE dup1 (id INT PRIMARY KEY)")
+		env.execSQL(t, "CREATE TABLE dup2 (id INT PRIMARY KEY)")
+		_, err := env.execSQLErr(t, "ALTER TABLE dup1 RENAME TO dup2")
+		if err == nil {
+			t.Error("expected error for duplicate table name")
+		}
+	})
+
+	t.Run("RenameTo_NonExistent", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "ALTER TABLE nonexistent RENAME TO new_name")
+		if err == nil {
+			t.Error("expected error for non-existent table")
+		}
+	})
+}
+
+func TestExec_Pragma(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_name ON users(name)")
+	env.execSQL(t, "CREATE TABLE orders (id INT, product TEXT)")
+
+	t.Run("DatabaseList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA database_list")
+		if len(result.Columns) != 3 {
+			t.Errorf("Columns = %d, want 3", len(result.Columns))
+		}
+		if result.Columns[0] != "seq" || result.Columns[1] != "name" || result.Columns[2] != "file" {
+			t.Errorf("Columns = %v, want [seq, name, file]", result.Columns)
+		}
+		if len(result.Rows) != 1 {
+			t.Errorf("Rows = %d, want 1", len(result.Rows))
+		}
+		// Verify main database
+		if result.Rows[0][1].Text != "main" {
+			t.Errorf("Database name = %s, want main", result.Rows[0][1].Text)
+		}
+	})
+
+	t.Run("TableInfo", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA table_info(users)")
+		if len(result.Columns) != 6 {
+			t.Errorf("Columns = %d, want 6", len(result.Columns))
+		}
+		if len(result.Rows) != 3 {
+			t.Errorf("Rows = %d, want 3", len(result.Rows))
+		}
+		// Column names are uppercased by the catalog
+		if result.Rows[0][1].Text != "ID" {
+			t.Errorf("Column[0].name = %s, want ID", result.Rows[0][1].Text)
+		}
+		if result.Rows[0][2].Text != "INT" {
+			t.Errorf("Column[0].type = %s, want INT", result.Rows[0][2].Text)
+		}
+		if result.Rows[1][1].Text != "NAME" {
+			t.Errorf("Column[1].name = %s, want NAME", result.Rows[1][1].Text)
+		}
+		if result.Rows[1][3].Int != 1 {
+			t.Errorf("Column[1].notnull = %d, want 1", result.Rows[1][3].Int)
+		}
+		// id is PRIMARY KEY AUTOINCREMENT, so pk=2
+		if result.Rows[0][5].Int != 2 {
+			t.Errorf("Column[0].pk = %d, want 2 for AUTOINCREMENT primary key", result.Rows[0][5].Int)
+		}
+	})
+
+	t.Run("TableInfo_NonExistent", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA table_info(nonexistent)")
+		if err == nil {
+			t.Error("expected error for non-existent table")
+		}
+	})
+
+	t.Run("TableList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA table_list")
+		if len(result.Rows) < 2 {
+			t.Errorf("Rows = %d, want >= 2", len(result.Rows))
+		}
+		// Find USERS table (uppercased by catalog)
+		found := false
+		for _, row := range result.Rows {
+			if row[1].Text == "USERS" {
+				found = true
+				if row[2].Text != "table" {
+					t.Errorf("users type = %s, want table", row[2].Text)
+				}
+			}
+		}
+		if !found {
+			t.Error("USERS table not found in table_list")
+		}
+	})
+
+	t.Run("IndexList", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA index_list(users)")
+		if len(result.Columns) != 5 {
+			t.Errorf("Columns = %d, want 5", len(result.Columns))
+		}
+		if len(result.Rows) < 1 {
+			t.Errorf("Rows = %d, want >= 1", len(result.Rows))
+		}
+		// Check for idx_name (uppercased by catalog to IDX_NAME)
+		found := false
+		for _, row := range result.Rows {
+			if row[1].Text == "IDX_NAME" {
+				found = true
+				if row[2].Text != "NO" {
+					t.Errorf("IDX_NAME unique = %s, want NO", row[2].Text)
+				}
+			}
+		}
+		if !found {
+			t.Error("IDX_NAME not found in index_list")
+		}
+	})
+
+	t.Run("IndexList_NoIndexes", func(t *testing.T) {
+		result := env.execSQL(t, "PRAGMA index_list(orders)")
+		if len(result.Rows) != 0 {
+			t.Errorf("Rows = %d, want 0 for table without indexes", len(result.Rows))
+		}
+	})
+
+	t.Run("UnknownPragma", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA unknown_pragma")
+		if err == nil {
+			t.Error("expected error for unknown pragma")
+		}
+	})
+
+	t.Run("TableInfo_MissingArg", func(t *testing.T) {
+		_, err := env.execSQLErr(t, "PRAGMA table_info")
+		if err == nil {
+			t.Error("expected error for table_info without argument")
 		}
 	})
 }
@@ -693,6 +920,73 @@ func TestExec_DeleteAll_LargeTable(t *testing.T) {
 	}
 }
 
+func TestExec_Truncate(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob')")
+	env.execSQL(t, "INSERT INTO users VALUES (3, 'Charlie')")
+
+	// TRUNCATE the table
+	result := env.execSQL(t, "TRUNCATE TABLE users")
+	if result.RowsAffected != 0 {
+		t.Errorf("RowsAffected = %d, want 0", result.RowsAffected)
+	}
+
+	// Verify table is empty
+	sel := env.execSQL(t, "SELECT * FROM users")
+	if len(sel.Rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(sel.Rows))
+	}
+
+	// Verify table structure still exists (can re-insert)
+	env.execSQL(t, "INSERT INTO users VALUES (10, 'Dave')")
+	sel = env.execSQL(t, "SELECT * FROM users")
+	if len(sel.Rows) != 1 {
+		t.Errorf("rows = %d, want 1 after re-insert", len(sel.Rows))
+	}
+	if sel.Rows[0][0].Int != 10 {
+		t.Errorf("id = %d, want 10", sel.Rows[0][0].Int)
+	}
+}
+
+func TestExec_Truncate_LargeTable(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE big (id INT PRIMARY KEY, val TEXT)")
+
+	// Insert 1000 rows
+	for i := 1; i <= 1000; i++ {
+		env.execSQL(t, "INSERT INTO big VALUES ("+strconv.Itoa(i)+", 'row"+strconv.Itoa(i)+"')")
+	}
+
+	// TRUNCATE the table
+	result := env.execSQL(t, "TRUNCATE TABLE big")
+	if result.RowsAffected != 0 {
+		t.Errorf("RowsAffected = %d, want 0", result.RowsAffected)
+	}
+
+	// Verify no rows remain
+	sel := env.execSQL(t, "SELECT COUNT(*) FROM big")
+	if sel.Rows[0][0].Int != 0 {
+		t.Errorf("COUNT(*) = %d, want 0", sel.Rows[0][0].Int)
+	}
+
+	// Verify table structure still exists
+	env.execSQL(t, "INSERT INTO big VALUES (9999, 'new')")
+	sel = env.execSQL(t, "SELECT COUNT(*) FROM big")
+	if sel.Rows[0][0].Int != 1 {
+		t.Errorf("COUNT(*) = %d, want 1 after re-insert", sel.Rows[0][0].Int)
+	}
+}
+
+func TestExec_Truncate_NonExistentTable(t *testing.T) {
+	env := newTestEnv(t)
+	_, err := env.execSQLErr(t, "TRUNCATE TABLE nonexistent")
+	if err == nil {
+		t.Fatal("expected error for non-existent table")
+	}
+}
+
 func TestExec_Update(t *testing.T) {
 	env := newTestEnv(t)
 	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
@@ -731,6 +1025,105 @@ func TestExec_CreateIndex(t *testing.T) {
 
 	// IF NOT EXISTS should succeed silently
 	env.execSQL(t, "CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
+}
+
+func TestExec_CreateIndex_Expression(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+
+	// Create expression index with LOWER function
+	env.execSQL(t, "CREATE INDEX idx_lower_email ON users (LOWER(email))")
+
+	idx, err := env.cat.GetIndex("users", "idx_lower_email")
+	if err != nil {
+		t.Fatalf("GetIndex: %v", err)
+	}
+	if idx.Column != "EMAIL" {
+		t.Errorf("column = %q, want %q", idx.Column, "EMAIL")
+	}
+	if idx.ExprSQL == "" {
+		t.Error("ExprSQL should be set for expression index")
+	}
+	if idx.IndexID == 0 {
+		t.Error("IndexID should be assigned (non-zero)")
+	}
+
+	// Insert data - should populate the index
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Test@Example.COM')")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Another@TEST.com')")
+
+	// Query that could use the expression index
+	result := env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(result.Rows) != 1 {
+		t.Errorf("expected 1 row, got %d", len(result.Rows))
+	}
+}
+
+func TestExec_DropIndex(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_age ON users (age)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+
+	// Verify index exists
+	_, err := env.cat.GetIndex("users", "idx_age")
+	if err != nil {
+		t.Fatalf("GetIndex before drop: %v", err)
+	}
+
+	// Drop the index
+	env.execSQL(t, "DROP INDEX idx_age ON users")
+
+	// Verify index is gone
+	_, err = env.cat.GetIndex("users", "idx_age")
+	if err != catalogapi.ErrIndexNotFound {
+		t.Errorf("GetIndex after drop: err = %v, want ErrIndexNotFound", err)
+	}
+
+	// Queries should still work (table scan)
+	result := env.execSQL(t, "SELECT * FROM users WHERE age = 30")
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows after index drop = %d, want 1", len(result.Rows))
+	}
+}
+
+func TestExec_DropIndex_IfExists(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+	// DROP INDEX IF EXISTS with non-existent index should succeed silently
+	env.execSQL(t, "DROP INDEX IF EXISTS idx_age ON users")
+
+	// No error means test passes
+}
+
+func TestExec_DropIndex_NotExists(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+	// DROP INDEX without IF EXISTS on non-existent index should fail
+	_, err := env.execSQLErr(t, "DROP INDEX idx_age ON users")
+	if err == nil {
+		t.Fatal("expected error for non-existent index")
+	}
+}
+
+func TestExec_DropIndex_CascadeToData(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+	env.execSQL(t, "CREATE INDEX idx_age ON users (age)")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Alice', 30)")
+	env.execSQL(t, "INSERT INTO users VALUES (2, 'Bob', 25)")
+
+	// Drop the index
+	env.execSQL(t, "DROP INDEX idx_age ON users")
+
+	// Table data should still exist
+	result := env.execSQL(t, "SELECT COUNT(*) FROM users")
+	if result.Rows[0][0].Int != 2 {
+		t.Errorf("count = %d, want 2", result.Rows[0][0].Int)
+	}
 }
 
 func TestExec_IndexScan(t *testing.T) {
@@ -2254,4 +2647,177 @@ func TestExec_IndexNestedLoopJoin(t *testing.T) {
 			t.Errorf("Carol's amount should be NULL, got %v", result.Rows[0][1])
 		}
 	})
+}
+
+
+func TestExec_UpdateWithExpressionIndex(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+	env.execSQL(t, "CREATE INDEX idx_lower_email ON users (LOWER(email))")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Test@Example.COM')")
+
+	// Verify LOWER expression works in SELECT
+	r := env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(r.Rows) != 1 {
+		t.Errorf("expected 1 row before update, got %d", len(r.Rows))
+	}
+
+	// UPDATE - should update both table and expression index
+	env.execSQL(t, "UPDATE users SET email = 'New@Example.com' WHERE id = 1")
+
+	// Query using expression index - should find the updated row
+	r = env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'new@example.com'")
+	if len(r.Rows) != 1 {
+		t.Errorf("expected 1 row after update, got %d", len(r.Rows))
+	}
+
+	// Verify old value is gone
+	r = env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(r.Rows) != 0 {
+		t.Errorf("expected 0 rows for old value, got %d", len(r.Rows))
+	}
+}
+
+func TestExec_CreateAndDropTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create table first
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, updated_at TEXT)")
+
+	// Create a trigger
+	env.execSQL(t, "CREATE TRIGGER update_ts AFTER UPDATE ON users BEGIN UPDATE users SET updated_at = 'changed' WHERE id = new.id; END")
+
+	// Verify trigger exists in catalog
+	triggers, err := env.cat.ListTriggers("users")
+	if err != nil {
+		t.Fatalf("ListTriggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("expected 1 trigger, got %d", len(triggers))
+	}
+	if triggers[0].Name != "UPDATE_TS" {
+		t.Errorf("trigger name = %q, want %q", triggers[0].Name, "UPDATE_TS")
+	}
+	if triggers[0].Timing != "AFTER" {
+		t.Errorf("timing = %q, want %q", triggers[0].Timing, "AFTER")
+	}
+	if triggers[0].Event != "UPDATE" {
+		t.Errorf("event = %q, want %q", triggers[0].Event, "UPDATE")
+	}
+
+	// Drop the trigger
+	env.execSQL(t, "DROP TRIGGER update_ts")
+
+	// Verify trigger is gone
+	triggers, err = env.cat.ListTriggers("users")
+	if err != nil {
+		t.Fatalf("ListTriggers after drop: %v", err)
+	}
+	if len(triggers) != 0 {
+		t.Errorf("expected 0 triggers after drop, got %d", len(triggers))
+	}
+}
+
+func TestExec_InsertTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create source and audit tables
+	env.execSQL(t, "CREATE TABLE source (id INT PRIMARY KEY, value TEXT)")
+	env.execSQL(t, "CREATE TABLE audit (id INT, action TEXT, value TEXT)")
+
+	// Create INSERT trigger
+	env.execSQL(t, "CREATE TRIGGER log_insert AFTER INSERT ON source BEGIN INSERT INTO audit VALUES (new.id, 'INSERT', new.value); END")
+
+	// Insert a row
+	env.execSQL(t, "INSERT INTO source VALUES (1, 'test')")
+
+	// Verify audit log was created by trigger
+	result := env.execSQL(t, "SELECT action, value FROM audit WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 audit row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "INSERT" {
+		t.Errorf("action = %q, want %q", result.Rows[0][0].Text, "INSERT")
+	}
+	if result.Rows[0][1].Text != "test" {
+		t.Errorf("value = %q, want %q", result.Rows[0][1].Text, "test")
+	}
+}
+
+func TestExec_UpdateTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create tables
+	env.execSQL(t, "CREATE TABLE items (id INT PRIMARY KEY, quantity INT, status TEXT)")
+	env.execSQL(t, "CREATE TABLE stock_log (item_id INT, old_qty INT, new_qty INT)")
+
+	// Create UPDATE trigger that logs changes
+	env.execSQL(t, "CREATE TRIGGER log_quantity AFTER UPDATE ON items BEGIN INSERT INTO stock_log VALUES (old.id, old.quantity, new.quantity); END")
+
+	// Insert initial data
+	env.execSQL(t, "INSERT INTO items VALUES (1, 100, 'active')")
+
+	// Update the quantity
+	env.execSQL(t, "UPDATE items SET quantity = 50 WHERE id = 1")
+
+	// Verify stock log was created by trigger
+	result := env.execSQL(t, "SELECT old_qty, new_qty FROM stock_log WHERE item_id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 stock_log row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Int != 100 {
+		t.Errorf("old_qty = %d, want 100", result.Rows[0][0].Int)
+	}
+	if result.Rows[0][1].Int != 50 {
+		t.Errorf("new_qty = %d, want 50", result.Rows[0][1].Int)
+	}
+}
+
+func TestExec_DeleteTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create tables
+	env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "CREATE TABLE deleted_log (id INT, name TEXT)")
+
+	// Create DELETE trigger
+	env.execSQL(t, "CREATE TRIGGER archive_delete AFTER DELETE ON products BEGIN INSERT INTO deleted_log VALUES (old.id, old.name); END")
+
+	// Insert data
+	env.execSQL(t, "INSERT INTO products VALUES (1, 'Widget')")
+
+	// Delete the product
+	env.execSQL(t, "DELETE FROM products WHERE id = 1")
+
+	// Verify deleted row was logged
+	result := env.execSQL(t, "SELECT name FROM deleted_log WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 deleted_log row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "Widget" {
+		t.Errorf("name = %q, want %q", result.Rows[0][0].Text, "Widget")
+	}
+}
+
+func TestExec_BeforeTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create table with a constraint enforced by trigger
+	env.execSQL(t, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)")
+	env.execSQL(t, "CREATE TABLE blocked_orders (id INT, reason TEXT)")
+
+	// BEFORE trigger that cancels high-value orders
+	env.execSQL(t, "CREATE TRIGGER cancel_high_value BEFORE INSERT ON orders WHEN new.amount > 1000 BEGIN INSERT INTO blocked_orders VALUES (new.id, 'exceeded limit'); END")
+
+	// Insert a high-value order (should be blocked)
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 5000)")
+
+	// Verify order was blocked by trigger
+	result := env.execSQL(t, "SELECT reason FROM blocked_orders WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 blocked_orders row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "exceeded limit" {
+		t.Errorf("reason = %q, want %q", result.Rows[0][0].Text, "exceeded limit")
+	}
 }

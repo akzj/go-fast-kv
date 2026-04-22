@@ -216,3 +216,26 @@ type IndexEngine interface {
 	// Uses kvstore.DeleteRange for efficiency.
 	DropIndexData(tableID uint32, indexID uint32) error
 }
+
+// ─── FTSEngine ──────────────────────────────────────────────────────
+
+// FTSEngine provides full-text search operations using an inverted index.
+//
+// FTS entries are stored as KV pairs where the key encodes
+// (tableName, token, docID) and the value is empty.
+type FTSEngine interface {
+	// IndexDocument adds a document to the FTS inverted index.
+	// texts contains the values from FTS columns for tokenization.
+	// tokenizer is "simple" or "porter".
+	IndexDocument(tableName string, docID uint64, texts []string, tokenizer string) error
+
+	// RemoveDocument removes a document from the FTS inverted index.
+	RemoveDocument(tableName string, docID uint64, texts []string, tokenizer string) error
+
+	// Search performs an FTS query and returns matching row IDs.
+	// query supports: term, "term1 AND term2", "term1 OR term2"
+	Search(tableName string, query string) ([]uint64, error)
+
+	// DropFTSData deletes all FTS data for a table.
+	DropFTSData(tableName string) error
+}

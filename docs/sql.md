@@ -83,6 +83,78 @@ Drops a table only if it exists (no error if it doesn't).
 DROP TABLE IF EXISTS table_name
 ```
 
+### ALTER TABLE
+
+Modify an existing table's structure.
+
+```sql
+ALTER TABLE t ADD COLUMN c TYPE          -- 添加列
+ALTER TABLE t DROP COLUMN c               -- 删除列
+ALTER TABLE t RENAME COLUMN old TO new    -- 重命名列
+ALTER TABLE t RENAME TO new_name          -- 重命名表
+```
+
+**Supported operations:**
+
+| Operation | Description |
+|-----------|-------------|
+| `ADD COLUMN` | Add a new column with specified type |
+| `DROP COLUMN` | Remove a column from the table |
+| `RENAME COLUMN` | Rename an existing column |
+| `RENAME TO` | Rename the entire table |
+
+**Examples:**
+```sql
+-- Add a new column
+ALTER TABLE users ADD COLUMN email TEXT
+
+-- Drop a column
+ALTER TABLE users DROP COLUMN email
+
+-- Rename a column
+ALTER TABLE users RENAME COLUMN name TO full_name
+
+-- Rename the table
+ALTER TABLE users RENAME TO customers
+```
+
+### CREATE VIEW
+
+Creates a virtual table based on the result of a SELECT statement.
+
+**Syntax:**
+```sql
+CREATE VIEW view_name AS select_statement
+```
+
+**Example:**
+```sql
+CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1;
+
+-- Query the view like a table
+SELECT * FROM active_users WHERE id > 10;
+```
+
+### DROP VIEW
+
+Removes a view from the database.
+
+**Syntax:**
+```sql
+DROP VIEW view_name;
+DROP VIEW IF EXISTS view_name;
+```
+
+**Example:**
+```sql
+DROP VIEW active_users;
+```
+
+---
+
+
+---
+
 ### Constraints
 
 Constraints enforce data integrity rules on tables.
@@ -137,8 +209,14 @@ Establishes a referential constraint between tables. When a row is inserted or u
 
 **Syntax:**
 ```sql
+-- Single column
 FOREIGN KEY (column_name) REFERENCES referenced_table(referenced_column)
+
+-- Multiple columns
+FOREIGN KEY (col1, col2) REFERENCES referenced_table(pk1, pk2)
 ```
+
+**Multi-column support:** ✅ Both single and multi-column foreign keys are supported.
 
 **Supported actions for ON DELETE and ON UPDATE:**
 - `CASCADE` — Delete/update matching rows in child table
@@ -167,9 +245,13 @@ CREATE TABLE orders (
 
 ### Known Limitations
 
-| Issue | Description | Severity |
-|-------|-------------|----------|
-| TestSnapshotIsolation Intermittent | Snapshot Isolation test has ~5% failure rate due to race condition in test setup | Low (test only, not production code) |
+No known issues. All documented features are production-ready.
+
+### Resolved Issues
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| TestSnapshotIsolation intermittent failure | Schema stored as BLOB; vacuum deleted it prematurely | Schema compression (54B inline), vacuum skips `_sql:*` catalog keys |
 
 ---
 
@@ -214,6 +296,7 @@ Creates an index on a column for faster lookups.
 
 ```sql
 CREATE INDEX idx_name ON table_name (column_name)
+CREATE UNIQUE INDEX idx_name ON table_name (column_name)  -- unique index
 ```
 
 ### DROP INDEX
@@ -221,7 +304,8 @@ CREATE INDEX idx_name ON table_name (column_name)
 Removes an index.
 
 ```sql
-DROP INDEX idx_name
+DROP INDEX idx_name ON table_name
+DROP INDEX IF EXISTS idx_name ON table_name  -- no error if not exists
 ```
 
 ---

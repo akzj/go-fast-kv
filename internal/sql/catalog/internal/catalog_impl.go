@@ -14,23 +14,38 @@ import (
 // Compile-time interface check
 var _ api.CatalogManager = (*Catalog)(nil)
 
+// DefaultSchemaCacheSize is the default maximum number of table schemas to cache.
+const DefaultSchemaCacheSize = 128
+
 // Catalog implements api.CatalogManager using kvstore for persistence.
 // All exported methods are protected by a mutex to prevent TOCTOU races.
 type Catalog struct {
 	kv  kvstoreapi.Store
 	mu sync.RWMutex
+
+	// Schema cache: table name → cached TableSchema
+	schemaCache    map[string]*api.TableSchema
+	schemaCacheOrder []string // insertion order for LRU eviction
+	schemaCacheSize int
 }
 
 // New creates a new Catalog that persists to kv.
 func New(kv kvstoreapi.Store) *Catalog {
-	return &Catalog{kv: kv}
+	return &Catalog{
+		kv: kv,
+		schemaCache:    make(map[string]*api.TableSchema),
+		schemaCacheOrder: make([]string, 0, DefaultSchemaCacheSize),
+		schemaCacheSize: DefaultSchemaCacheSize,
+	}
 }
 
 // ─── Key helpers ─────────────────────────────────────────────────
 
 const (
-	tablePrefix = "_sql:table:"
-	indexPrefix = "_sql:index:"
+	tablePrefix  = "_sql:table:"
+	indexPrefix  = "_sql:index:"
+	triggerPrefix = "_sql:trigger:"
+	viewPrefix    = "_sql:view:"
 )
 
 // tableKey returns the KV key for a table schema.
@@ -41,6 +56,21 @@ func tableKey(name string) []byte {
 // indexKey returns the KV key for an index schema.
 func indexKey(tableName, indexName string) []byte {
 	return []byte(indexPrefix + strings.ToUpper(tableName) + ":" + strings.ToUpper(indexName))
+}
+
+// triggerKey returns the KV key for a trigger schema.
+func triggerKey(triggerName string) []byte {
+	return []byte(triggerPrefix + strings.ToUpper(triggerName))
+}
+
+// viewKey returns the KV key for a view schema.
+func viewKey(name string) []byte {
+	return []byte(viewPrefix + strings.ToUpper(name))
+}
+
+// tableTriggersPrefix returns the prefix for all triggers on a table.
+func tableTriggersPrefix(tableName string) []byte {
+	return []byte(triggerPrefix + "table:" + strings.ToUpper(tableName) + ":")
 }
 
 // tableIndexPrefix returns the prefix for all indexes on a table.
@@ -73,7 +103,22 @@ func (c *Catalog) createTableImpl(schema api.TableSchema) error {
 	if err != nil {
 		return err
 	}
-	return c.kv.Put(key, data)
+	if err := c.kv.Put(key, data); err != nil {
+		return err
+	}
+
+	// Pre-cache the new schema
+	if len(c.schemaCache) >= c.schemaCacheSize {
+		if len(c.schemaCacheOrder) > 0 {
+			oldest := c.schemaCacheOrder[0]
+			delete(c.schemaCache, oldest)
+			c.schemaCacheOrder = c.schemaCacheOrder[1:]
+		}
+	}
+	c.schemaCache[upperName] = &schema
+	c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
+
+	return nil
 }
 
 func (c *Catalog) GetTable(name string) (*api.TableSchema, error) {
@@ -83,7 +128,14 @@ func (c *Catalog) GetTable(name string) (*api.TableSchema, error) {
 }
 
 func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
-	key := tableKey(strings.ToUpper(name))
+	upperName := strings.ToUpper(name)
+
+	// Check cache first
+	if cached, ok := c.schemaCache[upperName]; ok {
+		return cached, nil
+	}
+
+	key := tableKey(upperName)
 	data, err := c.kv.Get(key)
 	if err == kvstoreapi.ErrKeyNotFound {
 		return nil, api.ErrTableNotFound
@@ -96,6 +148,19 @@ func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
 	if err := json.Unmarshal(data, &schema); err != nil {
 		return nil, err
 	}
+
+	// Cache the schema (LRU eviction if needed)
+	if len(c.schemaCache) >= c.schemaCacheSize {
+		// Evict oldest entry (FIFO)
+		if len(c.schemaCacheOrder) > 0 {
+			oldest := c.schemaCacheOrder[0]
+			delete(c.schemaCache, oldest)
+			c.schemaCacheOrder = c.schemaCacheOrder[1:]
+		}
+	}
+	c.schemaCache[upperName] = &schema
+	c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
+
 	return &schema, nil
 }
 
@@ -122,6 +187,9 @@ func (c *Catalog) dropTableImpl(name string) error {
 	if err := c.kv.Delete(key); err != nil {
 		return err
 	}
+
+	// Invalidate cache entry
+	delete(c.schemaCache, upperName)
 
 	// Delete all indexes on this table
 	prefix := tableIndexPrefix(upperName)
@@ -365,5 +433,258 @@ func (c *Catalog) alterTableImpl(schema api.TableSchema) error {
 	if err != nil {
 		return err
 	}
+	if err := c.kv.Put(key, data); err != nil {
+		return err
+	}
+
+	// Update cache with new schema
+	c.schemaCache[upperName] = &schema
+
+	return nil
+}
+
+func (c *Catalog) RenameTable(oldName, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.renameTableImpl(oldName, newName)
+}
+
+func (c *Catalog) renameTableImpl(oldName, newName string) error {
+	upperOld := strings.ToUpper(oldName)
+	upperNew := strings.ToUpper(newName)
+
+	// Check if old table exists
+	oldKey := tableKey(upperOld)
+	data, err := c.kv.Get(oldKey)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrTableNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	// Check if new name already exists
+	newKey := tableKey(upperNew)
+	_, err = c.kv.Get(newKey)
+	if err == nil {
+		return api.ErrTableExists
+	}
+	if err != nil && err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+
+	// Parse existing schema
+	var schema api.TableSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return err
+	}
+
+	// Update the table name in the schema
+	schema.Name = upperNew
+
+	// Write new entry with updated name
+	newData, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	if err := c.kv.Put(newKey, newData); err != nil {
+		return err
+	}
+
+	// Delete old entry
+	if err := c.kv.Delete(oldKey); err != nil {
+		return err
+	}
+
+	// Update cache: remove old entry, add new entry
+	delete(c.schemaCache, upperOld)
+	c.schemaCache[upperNew] = &schema
+
+	return nil
+}
+
+// CreateTrigger creates a trigger.
+func (c *Catalog) CreateTrigger(schema api.TriggerSchema) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.createTriggerImpl(schema)
+}
+
+func (c *Catalog) createTriggerImpl(schema api.TriggerSchema) error {
+	// Check if trigger already exists
+	upperName := strings.ToUpper(schema.Name)
+	key := triggerKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == nil {
+		return api.ErrTriggerExists
+	}
+	if err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+
+	// Store trigger schema
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
 	return c.kv.Put(key, data)
+}
+
+// GetTrigger returns a trigger by name.
+func (c *Catalog) GetTrigger(triggerName string) (*api.TriggerSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getTriggerImpl(triggerName)
+}
+
+func (c *Catalog) getTriggerImpl(triggerName string) (*api.TriggerSchema, error) {
+	key := triggerKey(strings.ToUpper(triggerName))
+	data, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return nil, api.ErrTriggerNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var schema api.TriggerSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil, err
+	}
+	return &schema, nil
+}
+
+// DropTrigger removes a trigger.
+func (c *Catalog) DropTrigger(triggerName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropTriggerImpl(triggerName)
+}
+
+func (c *Catalog) dropTriggerImpl(triggerName string) error {
+	key := triggerKey(strings.ToUpper(triggerName))
+	_, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrTriggerNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return c.kv.Delete(key)
+}
+
+// ListTriggers returns all triggers for a given table.
+func (c *Catalog) ListTriggers(tableName string) ([]api.TriggerSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.listTriggersImpl(tableName)
+}
+
+func (c *Catalog) listTriggersImpl(tableName string) ([]api.TriggerSchema, error) {
+	upperTable := strings.ToUpper(tableName)
+	prefix := []byte(triggerPrefix)
+	end := append(prefix, 0xFF)
+
+	var triggers []api.TriggerSchema
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		var schema api.TriggerSchema
+		if err := json.Unmarshal(iter.Value(), &schema); err != nil {
+			continue
+		}
+		if strings.ToUpper(schema.Table) == upperTable {
+			triggers = append(triggers, schema)
+		}
+	}
+	return triggers, iter.Err()
+}
+
+// ─── View Management ──────────────────────────────────────────────
+
+func (c *Catalog) CreateView(schema api.ViewSchema) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.createViewImpl(schema)
+}
+
+func (c *Catalog) createViewImpl(schema api.ViewSchema) error {
+	upperName := strings.ToUpper(schema.Name)
+	key := viewKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == nil {
+		return api.ErrViewExists
+	}
+	if err != kvstoreapi.ErrKeyNotFound {
+		return err
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return c.kv.Put(key, data)
+}
+
+func (c *Catalog) GetView(name string) (*api.ViewSchema, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getViewImpl(name)
+}
+
+func (c *Catalog) getViewImpl(name string) (*api.ViewSchema, error) {
+	upperName := strings.ToUpper(name)
+	key := viewKey(upperName)
+	data, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return nil, api.ErrViewNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var schema api.ViewSchema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil, err
+	}
+	return &schema, nil
+}
+
+func (c *Catalog) DropView(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropViewImpl(name)
+}
+
+func (c *Catalog) dropViewImpl(name string) error {
+	upperName := strings.ToUpper(name)
+	key := viewKey(upperName)
+	_, err := c.kv.Get(key)
+	if err == kvstoreapi.ErrKeyNotFound {
+		return api.ErrViewNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return c.kv.Delete(key)
+}
+
+func (c *Catalog) ListViews() ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.listViewsImpl()
+}
+
+func (c *Catalog) listViewsImpl() ([]string, error) {
+	prefix := []byte(viewPrefix)
+	end := append(prefix, 0xFF)
+
+	var views []string
+	iter := c.kv.Scan(prefix, end)
+	defer iter.Close()
+
+	for iter.Next() {
+		name := strings.TrimPrefix(string(iter.Key()), viewPrefix)
+		views = append(views, name)
+	}
+	return views, iter.Err()
 }

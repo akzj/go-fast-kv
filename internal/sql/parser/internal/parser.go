@@ -15,10 +15,11 @@ var _ api.Parser = (*parser)(nil)
 
 // parser is a recursive descent SQL parser.
 type parser struct {
-	lex   *lexer
-	cur   api.Token // current token
-	peek  api.Token // lookahead token
-	depth int       // recursion depth for stack overflow prevention
+	lex      *lexer
+	cur      api.Token // current token
+	peek     api.Token // lookahead token
+	depth    int       // recursion depth for stack overflow prevention
+	rawInput string    // original input SQL for capturing raw SQL text
 	// questionCount tracks ? placeholder position for sequential numbering
 	questionCount int
 }
@@ -39,6 +40,7 @@ func New() api.Parser {
 // Parse parses a single SQL statement.
 func (p *parser) Parse(sql string) (api.Statement, error) {
 	p.lex = newLexer(sql)
+	p.rawInput = sql
 	p.cur = p.lex.nextToken()
 	p.peek = p.lex.nextToken()
 	p.questionCount = 0 // reset ? placeholder counter
@@ -69,6 +71,8 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseInsert()
 	case api.TokSelect:
 		return p.parseSelect()
+	case api.TokWith:
+		return p.parseWith()
 	case api.TokDelete:
 		return p.parseDelete()
 	case api.TokUpdate:
@@ -87,8 +91,12 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseRelease()
 	case api.TokAlter:
 		return p.parseAlterTable()
+	case api.TokTruncate:
+		return p.parseTruncate()
+	case api.TokPragma:
+		return p.parsePragma()
 	default:
-		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, BEGIN, COMMIT, ROLLBACK)")
+		return nil, p.errorf("expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, TRUNCATE, BEGIN, COMMIT, ROLLBACK, PRAGMA)")
 	}
 }
 
@@ -179,16 +187,23 @@ func (p *parser) parseAlterTable() (api.Statement, error) {
 	}
 	p.advance()
 
-	// Operation: ADD COLUMN, DROP COLUMN, RENAME COLUMN
+	// Operation: ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO
 	switch p.cur.Type {
 	case api.TokAdd:
 		return p.parseAlterAddColumn(stmt)
 	case api.TokDrop:
 		return p.parseAlterDropColumn(stmt)
 	case api.TokRename:
-		return p.parseAlterRenameColumn(stmt)
+		// Could be RENAME COLUMN or RENAME TO — check what's after RENAME
+		// If COLUMN keyword follows, it's RENAME COLUMN old TO new
+		// If table name follows (no COLUMN), it's RENAME TO new_name
+		if p.peek.Type == api.TokColumn {
+			return p.parseAlterRenameColumn(stmt)
+		}
+		// RENAME TO new_name
+		return p.parseAlterRenameTo(stmt)
 	default:
-		return nil, p.errorf("expected ADD, DROP, or RENAME after ALTER TABLE table_name")
+		return nil, p.errorf("expected ADD, DROP, RENAME COLUMN, or RENAME TO after ALTER TABLE table_name")
 	}
 }
 
@@ -288,6 +303,28 @@ func (p *parser) parseAlterRenameColumn(stmt *api.AlterTableStmt) (api.Statement
 	return stmt, nil
 }
 
+// parseAlterRenameTo parses: ALTER TABLE t RENAME TO new_name
+func (p *parser) parseAlterRenameTo(stmt *api.AlterTableStmt) (api.Statement, error) {
+	// p.cur = TokRename, p.peek = TokTo
+	p.advance() // consume TokRename
+
+	// Expect "TO" keyword
+	if err := p.expect(api.TokTo); err != nil {
+		return nil, err
+	}
+	// cur = new table name
+
+	// New table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected new table name")
+	}
+	stmt.TableNew = p.cur.Literal
+	p.advance() // consume new table name
+
+	stmt.Operation = api.AlterRenameTable
+	return stmt, nil
+}
+
 // ─── CREATE ───────────────────────────────────────────────────────
 
 func (p *parser) parseCreate() (api.Statement, error) {
@@ -300,10 +337,80 @@ func (p *parser) parseCreate() (api.Statement, error) {
 		return p.parseCreateTable()
 	case api.TokIndex:
 		return p.parseCreateIndex(false)
+	case api.TokTrigger:
+		return p.parseCreateTrigger()
+	case api.TokView:
+		return p.parseCreateView()
+	case api.TokVirtual:
+		return p.parseCreateFTS()
 	default:
-		return nil, p.errorf("expected TABLE or INDEX after CREATE")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, VIEW, or VIRTUAL after CREATE")
 	}
 }
+
+// ─── CREATE VIEW ─────────────────────────────────────────────────
+
+func (p *parser) parseCreateView() (api.Statement, error) {
+	p.advance() // consume VIEW
+
+	// View name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected view name")
+	}
+	viewName := p.cur.Literal
+	p.advance()
+
+	// AS keyword
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+		return nil, p.errorf("expected AS after view name")
+	}
+	p.advance()
+
+	// Capture raw SELECT SQL text BEFORE parsing
+	if p.cur.Type != api.TokSelect {
+		return nil, p.errorf("expected SELECT statement in view definition")
+	}
+	querySQL := p.rawSQLFromCurrentPos()
+
+	// Parse SELECT statement for validation
+	selectStmt, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.CreateViewStmt{
+		Name:     viewName,
+		QuerySQL: querySQL,
+		Select:   selectStmt,
+	}, nil
+}
+
+// ─── DROP VIEW ────────────────────────────────────────────────────
+
+func (p *parser) parseDropView() (api.Statement, error) {
+	p.advance() // consume VIEW
+	stmt := &api.DropViewStmt{}
+
+	// IF EXISTS
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	// View name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected view name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+
+	return stmt, nil
+}
+
+// ─── CREATE TABLE ─────────────────────────────────────────────────
 
 func (p *parser) parseCreateTable() (api.Statement, error) {
 	p.advance() // consume TABLE
@@ -423,7 +530,7 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 	col.Name = p.cur.Literal
 	p.advance()
 
-	// Type name
+	// Type name or SERIAL/SERIAL PRIMARY KEY shortcut
 	switch p.cur.Type {
 	case api.TokIntKw:
 		col.TypeName = "INT"
@@ -435,6 +542,9 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		col.TypeName = "FLOAT"
 	case api.TokBlobKw:
 		col.TypeName = "BLOB"
+	case api.TokSerial:
+		col.TypeName = "INT"
+		col.AutoInc = true
 	default:
 		return col, p.errorf("expected type name (INT, TEXT, FLOAT, BLOB)")
 	}
@@ -503,7 +613,7 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 		}
 	}
 
-	// Optional CHECK constraint
+	// Optional CHECK constraint: CHECK (expr) or CHECK expr
 	if p.cur.Type == api.TokCheck {
 		p.advance()
 		if p.cur.Type != api.TokLParen {
@@ -730,18 +840,309 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	stmt.Table = p.cur.Literal
 	p.advance()
 
-	// (column)
+	// (column | expression)
 	if err := p.expect(api.TokLParen); err != nil {
 		return nil, err
 	}
-	if p.cur.Type != api.TokIdent {
-		return nil, p.errorf("expected column name")
+
+	// Try to parse as expression first (handles function calls, arithmetic, etc.)
+	expr, err := p.parseExpr()
+	if err == nil && expr != nil {
+		stmt.Expr = expr
+		// Extract column for backward compat
+		stmt.Column = extractFirstColumn(expr)
+	} else {
+		// Fallback to simple column name
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name or expression")
+		}
+		stmt.Column = p.cur.Literal
+		p.advance()
 	}
-	stmt.Column = p.cur.Literal
-	p.advance()
+
 	if err := p.expect(api.TokRParen); err != nil {
 		return nil, err
 	}
+	return stmt, nil
+}
+
+// ─── FTS (Full-Text Search) ───────────────────────────────────────
+
+// parseCreateFTS parses: CREATE VIRTUAL TABLE name USING fts5|fts4|fts3(col1, col2, ...) [tokenize='...']
+func (p *parser) parseCreateFTS() (api.Statement, error) {
+	p.advance() // consume VIRTUAL
+	if err := p.expect(api.TokTable); err != nil {
+		return nil, err
+	}
+
+	stmt := &api.CreateFTSStmt{}
+
+	// IF NOT EXISTS
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokNot); err != nil {
+			return nil, err
+		}
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+
+	// Table name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+
+	// USING fts5|fts4|fts3
+	if err := p.expect(api.TokUsing); err != nil {
+		return nil, err
+	}
+
+	switch p.cur.Type {
+	case api.TokFTS5:
+		stmt.FTSVersion = "fts5"
+	case api.TokFTS4:
+		stmt.FTSVersion = "fts4"
+	case api.TokFTS3:
+		stmt.FTSVersion = "fts3"
+	default:
+		return nil, p.errorf("expected fts5, fts4, or fts3 after USING")
+	}
+	p.advance()
+
+	// Optional column list: (col1, col2, ...)
+	if p.cur.Type == api.TokLParen {
+		p.advance()
+		for {
+			if p.cur.Type == api.TokRParen {
+				p.advance()
+				break
+			}
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name")
+			}
+			stmt.Columns = append(stmt.Columns, p.cur.Literal)
+			p.advance()
+			if p.cur.Type == api.TokComma {
+				p.advance()
+				continue
+			}
+			if p.cur.Type == api.TokRParen {
+				p.advance()
+				break
+			}
+			return nil, p.errorf("expected , or ) after column name")
+		}
+	}
+
+	// Optional tokenize parameter: tokenize='porter' or tokenize='simple'
+	if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "TOKENIZE" {
+		p.advance()
+		if p.cur.Type != api.TokEQ {
+			return nil, p.errorf("expected = after TOKENIZE")
+		}
+		p.advance()
+		if p.cur.Type != api.TokString {
+			return nil, p.errorf("expected string literal for TOKENIZE value")
+		}
+		stmt.Tokenize = p.cur.Literal
+		p.advance()
+	}
+
+	return stmt, nil
+}
+
+// ─── TRIGGER ──────────────────────────────────────────────────────
+
+// parseCreateTrigger parses: CREATE TRIGGER name [BEFORE|AFTER] [INSERT|UPDATE|DELETE] ON table [WHEN condition] BEGIN ... END
+func (p *parser) parseCreateTrigger() (api.Statement, error) {
+	p.advance() // consume TRIGGER
+
+	// Trigger name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected trigger name")
+	}
+	name := p.cur.Literal
+	p.advance()
+
+	stmt := &api.TriggerStmt{Name: name}
+
+	// Timing: BEFORE or AFTER
+	if p.cur.Type == api.TokBefore || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "BEFORE") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume BEFORE identifier
+		} else {
+			p.advance() // consume TokBefore
+		}
+		stmt.Timing = "BEFORE"
+	} else if p.cur.Type == api.TokAfter || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AFTER") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume AFTER identifier
+		} else {
+			p.advance() // consume TokAfter
+		}
+		stmt.Timing = "AFTER"
+	} else if p.cur.Type == api.TokIdent {
+		// Could be INSTEAD OF or the event keyword directly
+		upper := strings.ToUpper(p.cur.Literal)
+		if upper == "INSTEAD" {
+			// INSTEAD OF - consume OF and expect event
+			p.advance()
+			if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "OF" {
+				return nil, p.errorf("expected OF after INSTEAD")
+			}
+			p.advance() // consume OF
+			stmt.Timing = "INSTEAD OF"
+		} else if upper == "BEFORE" {
+			p.advance()
+			stmt.Timing = "BEFORE"
+		} else if upper == "AFTER" {
+			p.advance()
+			stmt.Timing = "AFTER"
+		} else {
+			return nil, p.errorf("expected BEFORE or AFTER after trigger name")
+		}
+	} else {
+		return nil, p.errorf("expected BEFORE or AFTER after trigger name")
+	}
+
+	// Event: INSERT, UPDATE, or DELETE
+	eventUpper := strings.ToUpper(p.cur.Literal)
+	switch eventUpper {
+	case "INSERT":
+		stmt.Event = "INSERT"
+		p.advance()
+	case "UPDATE":
+		stmt.Event = "UPDATE"
+		p.advance()
+		// Check for UPDATE OF col, col... (column-specific trigger)
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "OF" {
+			p.advance() // consume OF
+			// Parse column list (stored in Table field as qualifier for now)
+			var cols []string
+			for {
+				if p.cur.Type != api.TokIdent {
+					break
+				}
+				cols = append(cols, p.cur.Literal)
+				p.advance()
+				if p.cur.Type != api.TokComma {
+					break
+				}
+				p.advance()
+			}
+		}
+	case "DELETE":
+		stmt.Event = "DELETE"
+		p.advance()
+	default:
+		return nil, p.errorf("expected INSERT, UPDATE, or DELETE after trigger timing")
+	}
+
+	// ON table_name
+	if err := p.expect(api.TokOn); err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after ON")
+	}
+	stmt.Table = p.cur.Literal
+	p.advance()
+
+	// Optional FOR EACH ROW
+	if p.cur.Type == api.TokForEachRow || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
+		// Handle FOR keyword
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume FOR
+		} else {
+			p.advance() // consume TokForEachRow
+		}
+		// Expect EACH keyword
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "EACH" {
+			return nil, p.errorf("expected EACH after FOR")
+		}
+		p.advance()
+		// Expect ROW keyword
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "ROW" {
+			return nil, p.errorf("expected ROW after FOR EACH")
+		}
+		p.advance()
+	}
+
+	// Optional WHEN condition
+	if p.cur.Type == api.TokWhen || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "WHEN") {
+		p.advance()
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WhenCond = cond
+	}
+
+	// BEGIN ... END block
+	if p.cur.Type != api.TokBegin && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "BEGIN") {
+		return nil, p.errorf("expected BEGIN after trigger definition")
+	}
+	p.advance() // consume BEGIN
+
+	// Parse trigger body statements until END
+	var body []api.Statement
+	for {
+		// Check for END keyword
+		if p.cur.Type == api.TokEnd || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END") {
+			break
+		}
+		if p.cur.Type == api.TokEOF {
+			return nil, p.errorf("unterminated trigger body: expected END")
+		}
+
+		// Parse a statement
+		// Note: we need to handle semicolons between statements
+		stmt_body, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		if stmt_body != nil {
+			body = append(body, stmt_body)
+		}
+
+		// Consume semicolon if present
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END
+	if p.cur.Type != api.TokEnd && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END") {
+		return nil, p.errorf("expected END at end of trigger body")
+	}
+	p.advance()
+
+	stmt.Body = body
+	return stmt, nil
+}
+
+// parseDropTrigger parses: DROP TRIGGER [IF EXISTS] name
+func (p *parser) parseDropTrigger() (api.Statement, error) {
+	p.advance() // consume TRIGGER
+	stmt := &api.DropTriggerStmt{}
+
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected trigger name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
 	return stmt, nil
 }
 
@@ -754,8 +1155,12 @@ func (p *parser) parseDrop() (api.Statement, error) {
 		return p.parseDropTable()
 	case api.TokIndex:
 		return p.parseDropIndex()
+	case api.TokTrigger:
+		return p.parseDropTrigger()
+	case api.TokView:
+		return p.parseDropView()
 	default:
-		return nil, p.errorf("expected TABLE or INDEX after DROP")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, or VIEW after DROP")
 	}
 }
 
@@ -925,7 +1330,110 @@ func (p *parser) parseInsert() (api.Statement, error) {
 		}
 		p.advance()
 	}
+	// Optional ON CONFLICT clause
+	if p.cur.Type == api.TokOn {
+		p.advance() // consume ON
+		if p.cur.Type == api.TokConflict || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "CONFLICT") {
+			if p.cur.Type == api.TokIdent {
+				p.advance() // consume CONFLICT identifier
+			} else {
+				p.advance() // consume CONFLICT token
+			}
+			// ON CONFLICT (column, ...) or ON CONFLICT DO NOTHING
+			onConflict, err := p.parseOnConflictClause()
+			if err != nil {
+				return nil, err
+			}
+			stmt.OnConflict = onConflict
+		}
+	}
 	return stmt, nil
+}
+
+// parseOnConflictClause parses: ON CONFLICT (col, ...) DO [NOTHING | UPDATE SET col=val]
+func (p *parser) parseOnConflictClause() (*api.OnConflictClause, error) {
+	clause := &api.OnConflictClause{}
+
+	// Check if there's a conflict column list: ON CONFLICT (col, ...)
+	if p.cur.Type == api.TokLParen {
+		p.advance() // consume '('
+		for {
+			if p.cur.Type != api.TokIdent {
+				return nil, p.errorf("expected column name in ON CONFLICT")
+			}
+			clause.ConflictColumns = append(clause.ConflictColumns, p.cur.Literal)
+			p.advance()
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(api.TokRParen); err != nil {
+			return nil, err
+		}
+	}
+
+	// DO NOTHING or DO UPDATE SET ...
+	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "DO" {
+		return nil, p.errorf("expected DO after ON CONFLICT")
+	}
+	p.advance() // consume DO
+
+	// Check for DO NOTHING
+	if p.cur.Type == api.TokNothing || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "NOTHING") {
+		clause.Action = api.ConflictDoNothing
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume NOTHING identifier
+		} else {
+			p.advance() // consume NOTHING token
+		}
+		return clause, nil
+	}
+
+	// DO UPDATE SET col=val, col=val, ...
+	// Accept both UPDATE keyword and UPDATE identifier
+	if p.cur.Type == api.TokUpdate || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "UPDATE") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume UPDATE identifier
+		} else {
+			p.advance() // consume UPDATE token
+		}
+	}
+	if err := p.expect(api.TokSet); err != nil {
+		return nil, err
+	}
+
+	clause.Action = api.ConflictDoUpdate
+	// Parse SET assignments
+	for {
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected column name in ON CONFLICT UPDATE SET")
+		}
+		clause.UpdateColumns = append(clause.UpdateColumns, p.cur.Literal)
+		p.advance()
+		if err := p.expect(api.TokEQ); err != nil {
+			return nil, err
+		}
+		// Parse value expression
+		var expr api.Expr
+		if p.cur.Type == api.TokDefault {
+			p.advance()
+			expr = &api.DefaultExpr{}
+		} else {
+			val, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			expr = val
+		}
+		clause.UpdateValues = append(clause.UpdateValues, expr)
+		if p.cur.Type != api.TokComma {
+			break
+		}
+		p.advance()
+	}
+
+	return clause, nil
 }
 
 // ─── EXPLAIN ──────────────────────────────────────────────────────
@@ -946,6 +1454,92 @@ func (p *parser) parseExplain() (api.Statement, error) {
 }
 
 // ─── SELECT ───────────────────────────────────────────────────────
+
+// parseWith handles WITH clause (CTE - Common Table Expressions).
+// Syntax: WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...) SELECT ...
+//        WITH RECURSIVE cte AS (...) SELECT ...
+func (p *parser) parseWith() (api.Statement, error) {
+	p.advance() // consume WITH
+
+	isRecursive := false
+	// Check for RECURSIVE keyword
+	if p.cur.Type == api.TokRecursive || strings.ToUpper(p.cur.Literal) == "RECURSIVE" {
+		isRecursive = true
+		p.advance() // consume RECURSIVE
+	}
+
+	// Parse one or more CTE definitions separated by comma
+	var ctes []*api.CTEClause
+	for {
+		// Parse CTE name
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected CTE name")
+		}
+		cteName := p.cur.Literal
+		p.advance()
+
+		// Expect AS
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+			return nil, p.errorf("expected AS after CTE name")
+		}
+		p.advance()
+
+		// Expect '('
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after AS")
+		}
+		p.advance() // consume '('
+
+		// Parse the CTE's SELECT statement
+		subq, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+
+		// Expect ')'
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after CTE definition")
+		}
+		p.advance() // consume ')'
+
+		ctes = append(ctes, &api.CTEClause{
+			Name:        cteName,
+			SelectStmt:  subq, // can be SelectStmt or UnionStmt
+			IsRecursive: isRecursive,
+		})
+
+		// Check for comma (more CTEs) or end
+		if p.cur.Type == api.TokComma {
+			p.advance() // consume ','
+			continue
+		}
+		break
+	}
+
+	// Parse the main statement (usually SELECT)
+	var mainStmt api.Statement
+	var err error
+	switch {
+	case p.cur.Type == api.TokSelect:
+		mainStmt, err = p.parseSelect()
+	case p.cur.Type == api.TokInsert:
+		mainStmt, err = p.parseInsert()
+	case p.cur.Type == api.TokUpdate:
+		mainStmt, err = p.parseUpdate()
+	case p.cur.Type == api.TokDelete:
+		mainStmt, err = p.parseDelete()
+	default:
+		return nil, p.errorf("expected SELECT/INSERT/UPDATE/DELETE after CTE definition")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.WithStmt{
+		CTEs:      ctes,
+		Statement: mainStmt,
+	}, nil
+}
 
 func (p *parser) parseSelect() (api.Statement, error) {
 	p.advance() // consume SELECT
@@ -1441,6 +2035,94 @@ func (p *parser) parseDelete() (api.Statement, error) {
 	return stmt, nil
 }
 
+// ─── TRUNCATE ─────────────────────────────────────────────────────
+
+func (p *parser) parseTruncate() (api.Statement, error) {
+	p.advance() // consume TRUNCATE
+	if err := p.expect(api.TokTable); err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected table name after TABLE")
+	}
+	stmt := &api.TruncateStmt{
+		Table: p.cur.Literal,
+	}
+	p.advance()
+	return stmt, nil
+}
+
+// ─── PRAGMA ────────────────────────────────────────────────────────
+
+func (p *parser) parsePragma() (api.Statement, error) {
+	p.advance() // consume PRAGMA
+
+	// Pragma name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected pragma name")
+	}
+	name := p.cur.Literal
+	p.advance()
+
+	stmt := &api.PragmaStmt{Name: name}
+
+	// Check for = value or (arg)
+	switch p.cur.Type {
+	case api.TokEQ:
+		// PRAGMA name = value
+		p.advance()
+		// Value can be integer or identifier (like "0", "1", "NONE", etc.)
+		switch p.cur.Type {
+		case api.TokInteger:
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},
+			}
+			// Try to parse the integer value
+			if val, err := strconv.ParseInt(p.cur.Literal, 10, 64); err == nil {
+				stmt.Value = &api.Literal{
+					Value: catalogapi.Value{Type: catalogapi.TypeInt, Int: val},
+				}
+			}
+			p.advance()
+		case api.TokIdent:
+			// Identifier like "NONE", "FULL", etc.
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeText, Text: p.cur.Literal},
+			}
+			p.advance()
+		case api.TokString:
+			stmt.Value = &api.Literal{
+				Value: catalogapi.Value{Type: catalogapi.TypeText, Text: p.cur.Literal},
+			}
+			p.advance()
+		default:
+			return nil, p.errorf("expected value after =")
+		}
+	case api.TokLParen:
+		// PRAGMA name(arg)
+		p.advance()
+		// Argument is typically a table name (identifier)
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected argument")
+		}
+		stmt.Arg = p.cur.Literal
+		p.advance()
+		if err := p.expect(api.TokRParen); err != nil {
+			return nil, err
+		}
+	case api.TokEOF, api.TokSemicolon:
+		// No value, just PRAGMA name
+	default:
+		// Might be identifier without parentheses: PRAGMA name value
+		if p.cur.Type == api.TokIdent {
+			stmt.Arg = p.cur.Literal
+			p.advance()
+		}
+	}
+
+	return stmt, nil
+}
+
 // ─── UPDATE ───────────────────────────────────────────────────────
 
 func (p *parser) parseUpdate() (api.Statement, error) {
@@ -1580,6 +2262,24 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		pattern := p.cur.Literal
 		p.advance()
 		return &api.LikeExpr{Expr: left, Pattern: pattern}, nil
+	}
+
+	// MATCH — FTS full-text search
+	if p.cur.Type == api.TokMatch {
+		p.advance()
+		// Optional qualified name (table.column or just column)
+		var table string
+		if colRef, ok := left.(*api.ColumnRef); ok && colRef.Column != "" {
+			table = colRef.Table
+			// Check for table.column syntax (but for FTS we want just table)
+			// Actually, for FTS the left side should be table reference
+		}
+		if p.cur.Type != api.TokString {
+			return nil, p.errorf("expected query string after MATCH")
+		}
+		query := p.cur.Literal
+		p.advance()
+		return &api.MatchExpr{Table: table, Query: query}, nil
 	}
 
 	// BETWEEN ... AND ...
@@ -1745,6 +2445,16 @@ func isAggregateFunc(name string) bool {
 func isStringFunc(name string) bool {
 	switch strings.ToUpper(name) {
 	case "SUBSTRING", "CONCAT", "TRIM", "UPPER", "LOWER", "LENGTH":
+		return true
+	default:
+		return false
+	}
+}
+
+// isJsonFunc returns true for JSON function names (case-insensitive).
+func isJsonFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "JSON_EXTRACT", "JSON_SET", "JSON_INSERT", "JSON_REMOVE", "JSON_TYPE":
 		return true
 	default:
 		return false
@@ -1943,6 +2653,7 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 
 	case api.TokMax, api.TokMin, api.TokCount, api.TokSum, api.TokAvg:
 		// Aggregate function: MAX(expr), COUNT(*), etc.
+		// Also supports OVER clause for window functions: SUM(x) OVER (...)
 		funcName := p.cur.Literal
 		p.advance() // consume function name
 		// expect '('
@@ -1962,7 +2673,40 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		} else if len(args) > 1 {
 			return nil, p.errorf("%s requires at most one argument", funcName)
 		}
+		// Check for OVER clause (window function)
+		if p.cur.Type == api.TokOver {
+			p.advance() // consume OVER
+			window, err := p.parseWindowSpec()
+			if err != nil {
+				return nil, err
+			}
+			return &api.WindowFuncExpr{Func: strings.ToUpper(funcName), Args: args, Window: window}, nil
+		}
 		return &api.AggregateCallExpr{Func: strings.ToUpper(funcName), Arg: arg}, nil
+
+	case api.TokRowNumber, api.TokRank, api.TokDenseRank, api.TokFirstValue, api.TokLastValue, api.TokLag, api.TokLead:
+		// Window function: ROW_NUMBER() OVER (...), RANK() OVER (...), SUM(x) OVER (...), etc.
+		funcName := strings.ToUpper(p.cur.Literal)
+		p.advance() // consume function name
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		var window *api.WindowSpec
+		if p.cur.Type == api.TokOver {
+			p.advance() // consume OVER
+			window, err = p.parseWindowSpec()
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &api.WindowFuncExpr{Func: funcName, Args: args, Window: window}, nil
 
 	case api.TokCoalesce:
 		// COALESCE(expr1, expr2, ...)
@@ -2128,6 +2872,23 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance() // consume ')'
 		return &api.StringFuncExpr{Func: strings.ToUpper(funcName), Args: args}, nil
 
+	case api.TokJsonExtract, api.TokJsonSet, api.TokJsonInsert, api.TokJsonRemove, api.TokJsonType:
+		// JSON_EXTRACT(json, path), JSON_SET(json, path, value), JSON_INSERT(json, path, value),
+		// JSON_REMOVE(json, path), JSON_TYPE(json, path)
+		funcName := p.cur.Literal
+		p.advance() // consume keyword
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		return &api.JsonFuncExpr{Func: strings.ToUpper(funcName), Args: args}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
@@ -2166,6 +2927,10 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 				}
 				// Other string functions: all use standard (arg1, arg2, ...) syntax
 				return &api.StringFuncExpr{Func: upperName, Args: args}, nil
+			}
+			// JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE
+			if isJsonFunc(name) {
+				return &api.JsonFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
 			}
 			// Unknown function — treat as column reference for backward compatibility
 			return &api.ColumnRef{Column: name}, nil
@@ -2316,6 +3081,21 @@ func (p *parser) advance() {
 	p.peek = p.lex.nextToken()
 }
 
+// rawSQLFromCurrentPos returns the raw SQL text from current token position to end of input.
+// This is used to capture the raw SELECT text when creating a VIEW.
+func (p *parser) rawSQLFromCurrentPos() string {
+	if p.rawInput == "" {
+		return ""
+	}
+	// Find the token position in the raw input
+	startPos := p.cur.Pos
+	// Trim any leading whitespace
+	for startPos < len(p.rawInput) && (p.rawInput[startPos] == ' ' || p.rawInput[startPos] == '\t' || p.rawInput[startPos] == '\n' || p.rawInput[startPos] == '\r') {
+		startPos++
+	}
+	return strings.TrimSpace(p.rawInput[startPos:])
+}
+
 // expect consumes the current token if it matches the expected type.
 func (p *parser) expect(typ api.TokenType) error {
 	if p.cur.Type != typ {
@@ -2383,6 +3163,169 @@ func tokenName(typ api.TokenType) string {
 }
 
 // isAliasTerminator returns true if token type terminates a column alias without AS.
+// parseWindowSpec parses: OVER ( [PARTITION BY expr [, expr]*] [ORDER BY sortspec [, sortspec]*] [ROWS|RANGE BETWEEN bound AND bound] )
+func (p *parser) parseWindowSpec() (*api.WindowSpec, error) {
+	// Expect '(' after OVER
+	if p.cur.Type != api.TokLParen {
+		return nil, p.errorf("expected ( after OVER")
+	}
+	p.advance() // consume '('
+
+	spec := &api.WindowSpec{}
+
+	// Parse PARTITION BY clause (optional)
+	if p.cur.Type == api.TokPartition {
+		p.advance() // consume PARTITION
+		if p.cur.Type == api.TokBy {
+			p.advance() // consume BY
+		}
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			spec.PartitionBy = append(spec.PartitionBy, expr)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume ','
+		}
+	}
+
+	// Parse ORDER BY clause (optional)
+	if p.cur.Type == api.TokOrder {
+		p.advance() // consume ORDER
+		if p.cur.Type == api.TokBy {
+			p.advance() // consume BY
+		}
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			// Extract column from expression
+			var col string
+			if ref, ok := expr.(*api.ColumnRef); ok {
+				col = ref.Column
+				if ref.Table != "" {
+					col = ref.Table + "." + ref.Column
+				}
+			} else {
+				return nil, p.errorf("ORDER BY in window must be a column reference, got %T", expr)
+			}
+			ob := &api.OrderByClause{Column: col}
+			if p.cur.Type == api.TokDesc {
+				ob.Desc = true
+				p.advance()
+			} else if p.cur.Type == api.TokAsc {
+				p.advance()
+			}
+			spec.OrderBy = append(spec.OrderBy, ob)
+			if p.cur.Type != api.TokComma {
+				break
+			}
+			p.advance() // consume ','
+		}
+	}
+
+	// Parse ROWS/RANGE BETWEEN ... AND ... (optional)
+	if p.cur.Type == api.TokRows || p.cur.Type == api.TokRange {
+		spec.FrameMode = strings.ToUpper(p.cur.Literal)
+		p.advance() // consume ROWS or RANGE
+
+		// Expect BETWEEN
+		if p.cur.Type != api.TokBetween {
+			return nil, p.errorf("expected BETWEEN after %s", spec.FrameMode)
+		}
+		p.advance() // consume BETWEEN
+
+		// Parse frame start
+		startBound, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		spec.FrameStart = *startBound
+
+		// Expect AND
+		if p.cur.Type != api.TokAnd {
+			return nil, p.errorf("expected AND between frame bounds")
+		}
+		p.advance() // consume AND
+
+		// Parse frame end
+		endBound, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		spec.FrameEnd = *endBound
+	}
+
+	// Expect ')'
+	if p.cur.Type != api.TokRParen {
+		return nil, p.errorf("expected ) after window specification")
+	}
+	p.advance() // consume ')'
+
+	return spec, nil
+}
+
+// parseFrameBound parses a single frame bound: UNBOUNDED PRECEDING, CURRENT ROW, <expr> PRECEDING, <expr> FOLLOWING
+func (p *parser) parseFrameBound() (*api.FrameBound, error) {
+	bound := &api.FrameBound{}
+
+	if p.cur.Type == api.TokUnbounded {
+		bound.Type = "UNBOUNDED PRECEDING"
+		p.advance()
+		// Check for PRECEDING or FOLLOWING keyword
+		if p.cur.Type == api.TokFollowing {
+			bound.Type = "UNBOUNDED FOLLOWING"
+			p.advance()
+		} else if p.cur.Type == api.TokIdent {
+			upper := strings.ToUpper(p.cur.Literal)
+			if upper == "PRECEDING" {
+				p.advance()
+			} else if upper == "FOLLOWING" {
+				bound.Type = "UNBOUNDED FOLLOWING"
+				p.advance()
+			}
+		}
+	} else if p.cur.Type == api.TokCurrent {
+		bound.Type = "CURRENT ROW"
+		p.advance()
+		// Consume "ROW" if it follows CURRENT
+		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "ROW" {
+			p.advance()
+		}
+	} else {
+		// Could be <n> PRECEDING or <n> FOLLOWING
+		// Parse expression first
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		bound.Expr = expr
+
+		// Look ahead for PRECEDING or FOLLOWING
+		if p.cur.Type == api.TokIdent {
+			keyword := strings.ToUpper(p.cur.Literal)
+			if keyword == "PRECEDING" {
+				bound.Type = "PRECEDING"
+				p.advance()
+			} else if keyword == "FOLLOWING" {
+				bound.Type = "FOLLOWING"
+				p.advance()
+			} else {
+				return nil, p.errorf("expected PRECEDING or FOLLOWING after expression")
+			}
+		} else if p.cur.Type == api.TokFollowing {
+			bound.Type = "FOLLOWING"
+			p.advance()
+		}
+	}
+
+	return bound, nil
+}
+
 func isAliasTerminator(t api.TokenType) bool {
 	switch t {
 	case api.TokFrom, api.TokWhere, api.TokGroup, api.TokHaving,
@@ -2396,4 +3339,27 @@ func isAliasTerminator(t api.TokenType) bool {
 	default:
 		return false
 	}
+}
+
+// extractFirstColumn extracts the first column reference from an expression.
+// Used to set Column field for backward compatibility with simple column indexes.
+func extractFirstColumn(expr api.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *api.ColumnRef:
+		return e.Column
+	case *api.StringFuncExpr:
+		if len(e.Args) > 0 {
+			return extractFirstColumn(e.Args[0])
+		}
+	case *api.BinaryExpr:
+		if e.Left != nil {
+			return extractFirstColumn(e.Left)
+		}
+	case *api.UnaryExpr:
+		return extractFirstColumn(e.Operand)
+	}
+	return ""
 }

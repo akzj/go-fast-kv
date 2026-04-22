@@ -88,13 +88,7 @@ type DropTablePlan struct {
 
 func (*DropTablePlan) planNode() {}
 
-// CreateIndexPlan creates an index on a table column.
-type CreateIndexPlan struct {
-	Schema      catalogapi.IndexSchema
-	IfNotExists bool
-}
 
-func (*CreateIndexPlan) planNode() {}
 
 // DropIndexPlan drops an index.
 type DropIndexPlan struct {
@@ -102,6 +96,16 @@ type DropIndexPlan struct {
 	TableName string
 	IfExists  bool
 }
+// CreateIndexPlan creates an index on a table column or expression.
+type CreateIndexPlan struct {
+	Schema      catalogapi.IndexSchema
+	IfNotExists bool
+	// Expr is the parsed expression for expression indexes.
+	// nil for simple column indexes.
+	Expr parserapi.Expr
+}
+
+func (*CreateIndexPlan) planNode() {}
 
 func (*DropIndexPlan) planNode() {}
 
@@ -110,13 +114,84 @@ type AlterTablePlan struct {
 	TableName    string
 	Operation    parserapi.AlterOp
 	ColumnName   string
-	ColumnNew    string // new column name for RENAME
+	ColumnNew    string // new column name for RENAME COLUMN
+	TableNew     string // new table name for RENAME TO
 	TypeName     string // column type for ADD
 	NotNull      bool
 	Unique       bool
 }
 
 func (*AlterTablePlan) planNode() {}
+
+// CreateTriggerPlan creates a trigger.
+type CreateTriggerPlan struct {
+	Schema catalogapi.TriggerSchema
+}
+
+func (*CreateTriggerPlan) planNode() {}
+
+// DropTriggerPlan drops a trigger.
+type DropTriggerPlan struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropTriggerPlan) planNode() {}
+
+// CreateViewPlan creates a view from a SELECT statement.
+type CreateViewPlan struct {
+	Name    string
+	QuerySQL string // serialized SELECT statement
+}
+
+func (*CreateViewPlan) planNode() {}
+
+// DropViewPlan drops a view.
+type DropViewPlan struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropViewPlan) planNode() {}
+
+// ─── FTS Plans ─────────────────────────────────────────────────────
+
+// FTSIndexSchema stores FTS table metadata.
+type FTSIndexSchema struct {
+	Name       string
+	TableID    uint32
+	Columns    []string
+	Tokenizer  string // "simple", "porter", ""
+	FTSVersion string // "fts5", "fts4", "fts3"
+}
+
+// CreateFTSPlan creates a FTS virtual table.
+type CreateFTSPlan struct {
+	Schema     FTSIndexSchema
+	IfNotExists bool
+}
+
+func (*CreateFTSPlan) planNode() {}
+
+// FTSSearchPlan represents a FTS MATCH search.
+type FTSSearchPlan struct {
+	Table          string       // FTS table name
+	TableID        uint32       // FTS table ID
+	Query          string       // FTS query string
+	ResidualFilter parserapi.Expr // other filter conditions (AND'd with MATCH)
+}
+
+func (*FTSSearchPlan) planNode() {}
+func (*FTSSearchPlan) scanNode() {}
+
+// DropFTSPlan drops a FTS table (same as DROP TABLE).
+type DropFTSPlan struct {
+	TableName string
+	TableID   uint32
+	IfExists  bool
+}
+
+func (*DropFTSPlan) planNode() {}
 
 // ─── DML Plans ──────────────────────────────────────────────────────
 
@@ -128,6 +203,27 @@ type InsertPlan struct {
 }
 
 func (*InsertPlan) planNode() {}
+
+// UpsertPlan: INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
+type UpsertPlan struct {
+	Table       *catalogapi.TableSchema
+	Rows        [][]catalogapi.Value   // resolved values for INSERT
+	Exprs       [][]parserapi.Expr     // raw expressions for parameterized inserts
+	ConflictColumns []int            // column indices for conflict detection
+	Action      UpsertAction          // DO NOTHING or DO UPDATE
+	// For DO UPDATE:
+	UpdateAssignments map[int]catalogapi.Value // columnIndex → resolved value
+	ParamUpdateAssignments map[int]parserapi.Expr // columnIndex → raw expr (for parameterized)
+}
+
+type UpsertAction int
+
+const (
+	UpsertDoNothing UpsertAction = 0
+	UpsertDoUpdate  UpsertAction = 1
+)
+
+func (*UpsertPlan) planNode() {}
 
 // InsertSelectPlan inserts rows from a SELECT query into a table.
 type InsertSelectPlan struct {
@@ -174,6 +270,14 @@ type DeletePlan struct {
 
 func (*DeletePlan) planNode() {}
 
+// TruncatePlan truncates a table (deletes all rows efficiently).
+type TruncatePlan struct {
+	Table    *catalogapi.TableSchema
+	TableID  uint32
+}
+
+func (*TruncatePlan) planNode() {}
+
 // UpdatePlan updates rows in a table.
 type UpdatePlan struct {
 	Table       *catalogapi.TableSchema
@@ -209,6 +313,26 @@ type ExceptPlan struct {
 
 func (*ExceptPlan) planNode() {}
 
+// WithPlan represents a WITH clause (CTE - Common Table Expressions).
+// The executor materializes each CTE and uses it in the main statement.
+type WithPlan struct {
+	CTEs      []*CTEPlan // CTE definitions with their execution plans
+	Statement Plan      // the main statement plan
+}
+
+func (*WithPlan) planNode() {}
+
+// CTEPlan represents a single CTE definition with its execution plan.
+type CTEPlan struct {
+	Name        string      // CTE name, e.g., "temp"
+	SelectPlan  Plan        // original full plan (for non-recursive or anchor reference)
+	IsRecursive bool        // true for WITH RECURSIVE
+
+	// For recursive CTEs: split anchor and recursive parts from UNION ALL
+	AnchorPlan    Plan       // anchor query plan (left side of UNION ALL) — SELECT 1 as n
+	RecursivePlan Plan       // recursive query plan (right side of UNION ALL) — SELECT n+1 FROM cnt WHERE n<10
+}
+
 // ─── EXPLAIN Plan ──────────────────────────────────────────────────
 
 // ExplainPlan wraps an inner plan for EXPLAIN output.
@@ -233,6 +357,25 @@ func (p *ExplainPlan) String() string {
 	return "EXPLAIN\n└─ " + innerStr
 }
 
+// PragmaPlan represents a PRAGMA command execution plan.
+type PragmaPlan struct {
+	Name  string // pragma name: "database_list", "table_info", "index_list", etc.
+	Arg   string // optional argument (e.g., table name for table_info)
+	Value catalogapi.Value // optional value for SET pragma
+}
+
+func (*PragmaPlan) planNode() {}
+
+func (p *PragmaPlan) String() string {
+	if p.Arg != "" {
+		return fmt.Sprintf("PRAGMA %s(%s)", p.Name, p.Arg)
+	}
+	if p.Value.Type != catalogapi.TypeNull && !p.Value.IsNull {
+		return fmt.Sprintf("PRAGMA %s = %v", p.Name, p.Value)
+	}
+	return fmt.Sprintf("PRAGMA %s", p.Name)
+}
+
 // planDescription returns a string description of any plan.
 func planDescription(plan Plan) string {
 	switch p := plan.(type) {
@@ -240,8 +383,15 @@ func planDescription(plan Plan) string {
 		return p.String()
 	case *InsertPlan:
 		return fmt.Sprintf("INSERT INTO %s", p.Table.Name)
+	case *UpsertPlan:
+		if p.Action == UpsertDoNothing {
+			return fmt.Sprintf("UPSERT INTO %s (ON CONFLICT DO NOTHING)", p.Table.Name)
+		}
+		return fmt.Sprintf("UPSERT INTO %s (ON CONFLICT DO UPDATE)", p.Table.Name)
 	case *DeletePlan:
 		return fmt.Sprintf("DELETE FROM %s", p.Table.Name)
+	case *TruncatePlan:
+		return fmt.Sprintf("TRUNCATE TABLE %s", p.Table.Name)
 	case *UpdatePlan:
 		return fmt.Sprintf("UPDATE %s", p.Table.Name)
 	case *CreateTablePlan:
@@ -264,8 +414,16 @@ func planDescription(plan Plan) string {
 		return "INTERSECT"
 	case *ExceptPlan:
 		return "EXCEPT"
+	case *WithPlan:
+		return "WITH"
 	case *InsertSelectPlan:
 		return fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
+	case *PragmaPlan:
+		return p.String()
+	case *CreateTriggerPlan:
+		return fmt.Sprintf("CREATE TRIGGER %s ON %s", p.Schema.Name, p.Schema.Table)
+	case *DropTriggerPlan:
+		return fmt.Sprintf("DROP TRIGGER %s", p.Name)
 	default:
 		return fmt.Sprintf("%T", plan)
 	}

@@ -22,6 +22,7 @@ var (
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
+	ftsEngine engineapi.FTSEngine,
 	planner plannerapi.Planner, parser parserapi.Parser) api.Executor {
-	return internal.New(store, catalog, tableEngine, indexEngine, planner, parser)
+	return internal.New(store, catalog, tableEngine, indexEngine, ftsEngine, planner, parser)
 }

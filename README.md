@@ -133,7 +133,7 @@ SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `FOREIGN KEY` | ❌ | Not supported |
+| `FOREIGN KEY` | ✅ | Multi-column supported |
 | `AUTOINCREMENT` | ❌ | Not supported |
 | `SAVEPOINT` | ❌ | Not supported |
 | Named parameters | ❌ | Only `$1`, `$2`, ... positional |

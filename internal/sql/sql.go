@@ -16,6 +16,11 @@
 //	    fmt.Println(row)
 //	}
 //
+//	// Using prepared statements for repeated queries:
+//	stmt, _ := db.Prepare("SELECT * FROM users WHERE age > $1")
+//	result1, _ := stmt.Query(sql.Value{Type: catalogapi.TypeInt, Int: 25})
+//	result2, _ := stmt.Query(sql.Value{Type: catalogapi.TypeInt, Int: 30})
+//
 //	db.Close()
 //	store.Close()
 package sql
@@ -26,7 +31,6 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"time"
 
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
@@ -41,6 +45,7 @@ import (
 	"github.com/akzj/go-fast-kv/internal/sql/executor"
 	"github.com/akzj/go-fast-kv/internal/sql/parser"
 	"github.com/akzj/go-fast-kv/internal/sql/planner"
+	"github.com/akzj/go-fast-kv/internal/sql/stmtcache"
 )
 
 // ─── Re-export types for user convenience ───────────────────────────
@@ -80,6 +85,8 @@ type DB struct {
 	// Uses goroutine ID as key, so each goroutine has its own independent transaction context.
 	txnMgr txnapi.TxnContextFactory
 	txnCtxMap sync.Map // map[int64]txnapi.TxnContext
+	// Prepared statement cache for improved performance on repeated queries.
+	stmtCache *stmtcache.StatementCache
 }
 
 // Open creates a new SQL database using the given KV store.
@@ -99,15 +106,16 @@ func Open(store kvstoreapi.Store) *DB {
 	// Layer 2: engine (table/index CRUD)
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
+	fts := engine.NewFTSEngine(store)
 
 	// Layer 3: parser (standalone)
 	p := parser.New()
 
 	// Layer 4: planner (AST → execution plan)
-	pl := planner.New(cat)
+	pl := planner.New(cat, p)
 
 	// Layer 5: executor (plan → result)
-	ex := executor.New(store, cat, tbl, idx, pl, p)
+	ex := executor.New(store, cat, tbl, idx, fts, pl, p)
 
 	return &DB{
 		store:    store,
@@ -116,6 +124,7 @@ func Open(store kvstoreapi.Store) *DB {
 		planner:  pl,
 		executor: ex,
 		txnMgr:   store.TxnManager(),
+		stmtCache: stmtcache.NewStatementCache(stmtcache.DefaultMaxSize),
 	}
 }
 
@@ -169,6 +178,74 @@ func (db *DB) QueryParams(sql string, params []catalogapi.Value) (*Result, error
 	return db.execParams(sql, params)
 }
 
+// Prepare prepares a SQL statement for repeated execution.
+// The prepared statement is parsed and planned once, then can be executed
+// multiple times with different parameter values.
+//
+// Use for: queries that are executed multiple times with different parameters.
+//
+// Example:
+//
+//	stmt, err := db.Prepare("SELECT * FROM users WHERE age > $1")
+//	if err != nil {
+//	    return nil, err
+//	}
+//	result1, err := stmt.Query(sql.Value{Type: catalogapi.TypeInt, Int: 25})
+//	result2, err := stmt.Query(sql.Value{Type: catalogapi.TypeInt, Int: 30})
+//
+// Note: Prepared statements are cached internally. Calling Prepare with the
+// same SQL string returns the cached statement (or creates a new one if not cached).
+func (db *DB) Prepare(sql string) (*stmtcache.PreparedStmt, error) {
+	if db.closed {
+		return nil, fmt.Errorf("sql: database is closed")
+	}
+
+	// Check cache first
+	cached := db.stmtCache.Get(sql)
+	if cached != nil {
+		return cached, nil
+	}
+
+	// Parse SQL → AST
+	stmt, err := db.parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create execute function that captures db's dependencies
+	execFn := func(stmt parserapi.Statement, plan plannerapi.Plan, params []catalogapi.Value) (*executorapi.Result, error) {
+		// If plan is nil, we need to plan it
+		if plan == nil {
+			var err error
+			plan, err = db.planner.Plan(stmt)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Get transaction context if available
+		goroutineID := goroutineID()
+		var txnCtx txnapi.TxnContext
+		if val, ok := db.txnCtxMap.Load(goroutineID); ok {
+			txnCtx = val.(txnapi.TxnContext)
+		}
+
+		// Execute with params
+		if txnCtx != nil {
+			return db.executor.ExecuteWithTxnAndParams(plan, txnCtx, params)
+		}
+		return db.executor.ExecuteWithParams(plan, params)
+	}
+
+	// Create prepared statement
+	p := stmtcache.NewPreparedStmt(sql, stmt, execFn)
+
+	// Store in cache
+	db.stmtCache.Put(sql, p)
+
+	return p, nil
+}
+
 // Close releases SQL layer resources.
 // Close does NOT close the underlying KV store — the caller
 // is responsible for calling store.Close() separately.
@@ -201,33 +278,23 @@ func (db *DB) exec(sql string) (*Result, error) {
 		return nil, err
 	}
 
-	// Handle EXPLAIN: format plan text (optionally with stats)
-	if explainStmt, ok := stmt.(*parserapi.ExplainStmt); ok {
-		var planText string
-		if selectPlan, ok := plan.(*plannerapi.SelectPlan); ok {
-			planText = selectPlan.String()
+	// Handle EXPLAIN: delegate to executor for proper plan formatting + timing
+	if _, ok := stmt.(*parserapi.ExplainStmt); ok {
+		var result *executorapi.Result
+		var err error
+		if txnCtx != nil {
+			result, err = db.executor.ExecuteWithTxn(plan, txnCtx)
 		} else {
-			planText = fmt.Sprintf("%T", plan)
+			result, err = db.executor.Execute(plan)
 		}
-		if explainStmt.Analyze {
-			// Execute the plan to collect stats
-			start := time.Now()
-			var result *Result
-			var err error
-			if txnCtx != nil {
-				result, err = db.executor.ExecuteWithTxn(plan, txnCtx)
-			} else {
-				result, err = db.executor.Execute(plan)
-			}
-			if err != nil {
-				return nil, err
-			}
-			elapsed := time.Since(start)
-			planText += fmt.Sprintf("\n[rows=%d, time=%v]", len(result.Rows), elapsed)
+		if err != nil {
+			return nil, err
 		}
-		return &executorapi.Result{
-			Columns: []string{"QUERY PLAN"},
-			Rows:    [][]catalogapi.Value{{{Text: planText}}},
+		// Convert executorapi.Result to our Result type
+		return &Result{
+			Columns:     result.Columns,
+			Rows:        result.Rows,
+			RowsAffected: result.RowsAffected,
 		}, nil
 	}
 

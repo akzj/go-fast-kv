@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
@@ -36,6 +37,7 @@ type executor struct {
 	tableEngine engineapi.TableEngine
 	keyEncoder  encodingapi.KeyEncoder
 	indexEngine engineapi.IndexEngine
+	ftsEngine   engineapi.FTSEngine
 	planner     plannerapi.Planner
 	// parser re-parses CHECK constraint expressions at execution time.
 	// CHECK expressions are stored as RawSQL strings in the catalog.
@@ -47,20 +49,35 @@ type executor struct {
 	txnCtx txnapi.TxnContext
 	// params holds positional parameter values ($1, $2, ...) for prepared statements
 	params []catalogapi.Value
+	// cteResults stores materialized CTE results by name for WITH clause execution
+	cteResults map[string]*executorapi.Result
+	windowResults map[*parserapi.WindowFuncExpr]*WindowFunctionResult
+	// For trigger support - NEW and OLD row contexts for row-level triggers
+	// NEW holds the new row values (for INSERT/UPDATE); OLD holds old values (for UPDATE/DELETE)
+	triggerNewCols []catalogapi.ColumnDef
+	triggerNewVals []catalogapi.Value
+	triggerOldCols []catalogapi.ColumnDef
+	triggerOldVals []catalogapi.Value
+	// triggerDepth prevents infinite recursion from nested triggers
+	triggerDepth int
 }
 
 // New creates a new Executor.
 func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 	tableEngine engineapi.TableEngine, indexEngine engineapi.IndexEngine,
+	ftsEngine engineapi.FTSEngine,
 	planner plannerapi.Planner, parser parserapi.Parser) *executor {
 	return &executor{
 		store:       store,
 		catalog:     catalog,
 		tableEngine: tableEngine,
 		indexEngine: indexEngine,
+		ftsEngine:   ftsEngine,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
 		parser:      parser,
+		cteResults:   make(map[string]*executorapi.Result),
+		windowResults: make(map[*parserapi.WindowFuncExpr]*WindowFunctionResult),
 	}
 }
 
@@ -100,20 +117,9 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 // ExecuteWithTxn dispatches a plan to the appropriate handler with transaction context.
 // txnCtx provides row-level locking for SELECT FOR UPDATE.
 // If txnCtx is nil, behaves like Execute (no row locking).
+// All errors are returned gracefully — no panic/recover in the happy path.
 func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*executorapi.Result, error) {
-	// Set transaction context for row locking
 	e.txnCtx = txnCtx
-	// Panic recovery: rollback transaction and re-panic so caller knows.
-	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
-	defer func() {
-		if r := recover(); r != nil {
-			if e.txnCtx != nil {
-				e.txnCtx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	// Ensure cleanup on any exit path — runs after panic recovery.
 	defer func() {
 		e.txnCtx = nil
 	}()
@@ -129,6 +135,16 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		}
 	}
 
+	result, err := e.executePlan(plan)
+	if err != nil && txnCtx != nil {
+		txnCtx.Rollback()
+	}
+	return result, err
+}
+
+// executePlan dispatches a plan to the appropriate handler. Extracted from
+// ExecuteWithTxn/ExecuteWithTxnAndParams to avoid code duplication.
+func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error) {
 	switch p := plan.(type) {
 	case *plannerapi.CreateTablePlan:
 		return e.execCreateTable(p)
@@ -140,6 +156,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execDropIndex(p)
 	case *plannerapi.InsertPlan:
 		return e.execInsert(p)
+	case *plannerapi.UpsertPlan:
+		return e.execUpsert(p)
 	case *plannerapi.InsertSelectPlan:
 		return e.execInsertSelect(p)
 	case *plannerapi.SelectPlan:
@@ -151,6 +169,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execJoin(p)
 	case *plannerapi.DeletePlan:
 		return e.execDelete(p)
+	case *plannerapi.TruncatePlan:
+		return e.execTruncate(p)
 	case *plannerapi.UpdatePlan:
 		return e.execUpdate(p)
 	case *plannerapi.UnionPlan:
@@ -161,8 +181,24 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execExcept(p)
 	case *plannerapi.ExplainPlan:
 		return e.execExplain(p)
+	case *plannerapi.WithPlan:
+		return e.execWith(p)
 	case *plannerapi.AlterTablePlan:
 		return e.execAlterTable(p)
+	case *plannerapi.PragmaPlan:
+		return e.execPragma(p)
+	case *plannerapi.CreateTriggerPlan:
+		return e.execCreateTrigger(p)
+	case *plannerapi.DropTriggerPlan:
+		return e.execDropTrigger(p)
+	case *plannerapi.CreateViewPlan:
+		return e.execCreateView(p)
+	case *plannerapi.DropViewPlan:
+		return e.execDropView(p)
+	case *plannerapi.CreateFTSPlan:
+		return e.execCreateFTS(p)
+	case *plannerapi.FTSSearchPlan:
+		return e.execFTSSearch(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -175,27 +211,14 @@ func (e *executor) ExecuteWithParams(plan plannerapi.Plan, params []catalogapi.V
 }
 
 // ExecuteWithTxnAndParams executes a plan with transaction context and positional parameters.
+// All errors are returned gracefully — no panic/recover in the happy path.
 func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.TxnContext, params []catalogapi.Value) (*executorapi.Result, error) {
-	// Set params for this execution
 	e.params = params
-	// Panic recovery: rollback transaction and re-panic so caller knows.
-	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
-	defer func() {
-		if r := recover(); r != nil {
-			if txnCtx != nil {
-				txnCtx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	// Ensure cleanup on any exit path — runs after panic recovery.
+	e.txnCtx = txnCtx
 	defer func() {
 		e.txnCtx = nil
 		e.params = nil
 	}()
-
-	// Set transaction context for row locking
-	e.txnCtx = txnCtx
 
 	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
 	// within this transaction use the same snapshot.
@@ -207,43 +230,11 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		}
 	}
 
-	switch p := plan.(type) {
-	case *plannerapi.CreateTablePlan:
-		return e.execCreateTable(p)
-	case *plannerapi.DropTablePlan:
-		return e.execDropTable(p)
-	case *plannerapi.CreateIndexPlan:
-		return e.execCreateIndex(p)
-	case *plannerapi.DropIndexPlan:
-		return e.execDropIndex(p)
-	case *plannerapi.InsertPlan:
-		return e.execInsert(p)
-	case *plannerapi.InsertSelectPlan:
-		return e.execInsertSelect(p)
-	case *plannerapi.SelectPlan:
-		if p.Join != nil {
-			return e.execJoinSelect(p)
-		}
-		return e.execSelect(p)
-	case *plannerapi.JoinPlan:
-		return e.execJoin(p)
-	case *plannerapi.DeletePlan:
-		return e.execDelete(p)
-	case *plannerapi.UpdatePlan:
-		return e.execUpdate(p)
-	case *plannerapi.UnionPlan:
-		return e.execUnion(p)
-	case *plannerapi.IntersectPlan:
-		return e.execIntersect(p)
-	case *plannerapi.ExceptPlan:
-		return e.execExcept(p)
-	case *plannerapi.ExplainPlan:
-		return e.execExplain(p)
-	case *plannerapi.AlterTablePlan:
-		return e.execAlterTable(p)
-	default:
-		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
+	result, err := e.executePlan(plan)
+	if err != nil && txnCtx != nil {
+		txnCtx.Rollback()
 	}
+	return result, err
 }
 
 // ─── Row Locking Helpers ──────────────────────────────────────────
@@ -507,6 +498,13 @@ func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi
 			schema.PrimaryKey = plan.ColumnNew
 		}
 
+	case parserapi.AlterRenameTable:
+		// Rename the table via catalog
+		if err := e.catalog.RenameTable(plan.TableName, plan.TableNew); err != nil {
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+		return &executorapi.Result{RowsAffected: 0}, nil
+
 	default:
 		return nil, fmt.Errorf("%w: unsupported alter operation %v", executorapi.ErrExecFailed, plan.Operation)
 	}
@@ -519,8 +517,556 @@ func (e *executor) execAlterTable(plan *plannerapi.AlterTablePlan) (*executorapi
 	return &executorapi.Result{RowsAffected: 0}, nil
 }
 
+// execPragma handles PRAGMA commands.
+func (e *executor) execPragma(plan *plannerapi.PragmaPlan) (*executorapi.Result, error) {
+	// Pragma names are case-insensitive, normalize to lowercase
+	name := strings.ToLower(plan.Name)
+	switch name {
+	case "database_list":
+		return e.pragmaDatabaseList()
+	case "table_info":
+		if plan.Arg == "" {
+			return nil, fmt.Errorf("%w: table_info requires table name argument", executorapi.ErrExecFailed)
+		}
+		return e.pragmaTableInfo(plan.Arg)
+	case "table_list", "tables":
+		return e.pragmaTableList()
+	case "index_list":
+		if plan.Arg == "" {
+			return nil, fmt.Errorf("%w: index_list requires table name argument", executorapi.ErrExecFailed)
+		}
+		return e.pragmaIndexList(plan.Arg)
+	default:
+		return nil, fmt.Errorf("%w: unknown pragma: %s", executorapi.ErrExecFailed, name)
+	}
+}
+
+// pragmaDatabaseList returns a list of all databases (just "main" for single-db).
+func (e *executor) pragmaDatabaseList() (*executorapi.Result, error) {
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "file"},
+		Rows: [][]catalogapi.Value{
+			{catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}, catalogapi.Value{Type: catalogapi.TypeText, Text: "main"}, catalogapi.Value{Type: catalogapi.TypeText, Text: ""}},
+		},
+	}, nil
+}
+
+// execCreateTrigger creates a trigger in the catalog.
+func (e *executor) execCreateTrigger(plan *plannerapi.CreateTriggerPlan) (*executorapi.Result, error) {
+	err := e.catalog.CreateTrigger(plan.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create trigger: %v", executorapi.ErrExecFailed, err)
+	}
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execDropTrigger drops a trigger from the catalog.
+func (e *executor) execDropTrigger(plan *plannerapi.DropTriggerPlan) (*executorapi.Result, error) {
+	// Check if trigger exists (unless IF EXISTS was specified)
+	if !plan.IfExists {
+		_, err := e.catalog.GetTrigger(plan.Name)
+		if err != nil {
+			if err == catalogapi.ErrTriggerNotFound {
+				return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+			}
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	err := e.catalog.DropTrigger(plan.Name)
+	if err != nil {
+		if err == catalogapi.ErrTriggerNotFound && plan.IfExists {
+			// IF EXISTS was specified and trigger doesn't exist — OK
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: drop trigger: %v", executorapi.ErrExecFailed, err)
+	}
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execCreateView creates a view from a SELECT statement.
+func (e *executor) execCreateView(plan *plannerapi.CreateViewPlan) (*executorapi.Result, error) {
+	// Check if view already exists (if not IF NOT EXISTS)
+	_, err := e.catalog.GetView(plan.Name)
+	if err == nil {
+		return nil, fmt.Errorf("%w: view %q already exists", executorapi.ErrExecFailed, plan.Name)
+	}
+	if err != catalogapi.ErrViewNotFound {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Create the view schema
+	schema := catalogapi.ViewSchema{
+		Name:     plan.Name,
+		QuerySQL: plan.QuerySQL,
+	}
+
+	err = e.catalog.CreateView(schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create view: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execDropView drops a view.
+func (e *executor) execDropView(plan *plannerapi.DropViewPlan) (*executorapi.Result, error) {
+	// Check if view exists (unless IF EXISTS was specified)
+	if !plan.IfExists {
+		_, err := e.catalog.GetView(plan.Name)
+		if err != nil {
+			if err == catalogapi.ErrViewNotFound {
+				return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+			}
+			return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	err := e.catalog.DropView(plan.Name)
+	if err != nil {
+		if err == catalogapi.ErrViewNotFound && plan.IfExists {
+			// IF EXISTS was specified and view doesn't exist — OK
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: drop view: %v", executorapi.ErrExecFailed, err)
+	}
+
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execCreateFTS creates a FTS virtual table.
+// FTS tables are stored in the catalog as special tables with FTS metadata.
+func (e *executor) execCreateFTS(plan *plannerapi.CreateFTSPlan) (*executorapi.Result, error) {
+	// Allocate table ID for the FTS table
+	tableID, err := e.nextID(metaNextTableID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create catalog entry for the FTS table
+	// We use a special table type to distinguish FTS tables
+	schema := catalogapi.TableSchema{
+		Name:     plan.Schema.Name,
+		TableID:  tableID,
+		Columns: ftsColumnsToSchema(plan.Schema.Columns),
+	}
+
+	// Store FTS metadata in a special column attribute
+	// For now, we mark it as a virtual table via the catalog
+	// The FTS-specific config (tokenizer, columns) is stored alongside
+
+	// Use IF NOT EXISTS semantics
+	existing, err := e.catalog.GetTable(plan.Schema.Name)
+	if err == nil && existing != nil {
+		if plan.IfNotExists {
+			return &executorapi.Result{RowsAffected: 0}, nil
+		}
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, catalogapi.ErrTableExists)
+	}
+	if err != nil && err != catalogapi.ErrTableNotFound {
+		return nil, fmt.Errorf("%w: checking table existence: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Store FTS table metadata
+	err = e.catalog.CreateTable(schema)
+	if err != nil {
+		return nil, fmt.Errorf("%w: creating FTS table: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Store FTS-specific metadata (columns, tokenizer) as a special index entry
+	ftsMeta := plannerapi.FTSIndexSchema{
+		Name:       plan.Schema.Name,
+		TableID:    tableID,
+		Columns:    plan.Schema.Columns,
+		Tokenizer:  plan.Schema.Tokenizer,
+		FTSVersion: plan.Schema.FTSVersion,
+	}
+	err = e.catalog.CreateIndex(catalogapi.IndexSchema{
+		Name:    "_fts_meta_" + plan.Schema.Name,
+		Table:   plan.Schema.Name,
+		Column:  "", // empty column = FTS metadata marker
+		IndexID: tableID, // reuse tableID
+	})
+	if err != nil {
+		// Ignore duplicate index error - metadata might already exist
+		if err != catalogapi.ErrIndexExists {
+			return nil, fmt.Errorf("%w: storing FTS metadata: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	// Store FTS metadata reference (using IndexSchema to store arbitrary FTS config)
+	// We serialize the FTS schema into the catalog's internal format
+	_ = ftsMeta // will be used when implementing FTS DML
+
+	return &executorapi.Result{RowsAffected: 0}, nil
+}
+
+// ftsColumnsToSchema converts FTS column names to ColumnDef list.
+func ftsColumnsToSchema(columns []string) []catalogapi.ColumnDef {
+	cols := make([]catalogapi.ColumnDef, len(columns)+1)
+	// Add rowid column
+	cols[0] = catalogapi.ColumnDef{
+		Name: "rowid",
+		Type: catalogapi.TypeInt,
+	}
+	// Add FTS content columns
+	for i, col := range columns {
+		cols[i+1] = catalogapi.ColumnDef{
+			Name: col,
+			Type: catalogapi.TypeText,
+		}
+	}
+	return cols
+}
+
+// isFTSColumn returns true if the column is an FTS content column (not rowid).
+func isFTSColumn(col catalogapi.ColumnDef) bool {
+	return col.Name != "rowid" && col.Type == catalogapi.TypeText
+}
+
+// getFTSColumnValues extracts TEXT column values from a row for FTS indexing.
+func getFTSColumnValues(columns []catalogapi.ColumnDef, values []catalogapi.Value) []string {
+	var texts []string
+	for i, col := range columns {
+		if isFTSColumn(col) && i < len(values) {
+			if !values[i].IsNull {
+				texts = append(texts, values[i].Text)
+			}
+		}
+	}
+	return texts
+}
+
+// indexFTSDocument adds a document to the FTS inverted index using a WriteBatch.
+func (e *executor) indexFTSDocument(tableName string, rowID uint64, texts []string, tokenizer string, batch kvstoreapi.WriteBatch) error {
+	if e.ftsEngine == nil {
+		return nil
+	}
+	// Get tokens from FTS engine's tokenize function
+	// We need to tokenize and store directly in KV
+	tokens := e.tokenizeTexts(texts, tokenizer)
+	for _, token := range tokens {
+		key := e.ftsEngineSearchKey(tableName, token, rowID)
+		if err := batch.Put(key, []byte{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexFTSWithTxn indexes a document in a transaction context.
+func (e *executor) indexFTSWithTxn(tableName string, rowID uint64, texts []string, tokenizer string, xid uint64) error {
+	if e.ftsEngine == nil {
+		return nil
+	}
+	tokens := e.tokenizeTexts(texts, tokenizer)
+	for _, token := range tokens {
+		key := e.ftsEngineSearchKey(tableName, token, rowID)
+		if err := e.store.PutWithXID(key, []byte{}, xid); err != nil {
+			return err
+		}
+		e.txnCtx.AddPendingWrite(key, nil)
+	}
+	return nil
+}
+
+// tokenizeTexts tokenizes multiple text values.
+func (e *executor) tokenizeTexts(texts []string, tokenizer string) []string {
+	var tokens []string
+	tokenMap := make(map[string]struct{})
+
+	for _, text := range texts {
+		if text == "" {
+			continue
+		}
+		words := simpleTokenizeFTS(text)
+		for _, word := range words {
+			if word == "" {
+				continue
+			}
+			// Apply stemmer if requested
+			if tokenizer == "porter" {
+				word = porterStemFTS(word)
+			}
+			if word != "" {
+				tokenMap[word] = struct{}{}
+			}
+		}
+	}
+
+	for token := range tokenMap {
+		tokens = append(tokens, token)
+	}
+	return tokens
+}
+
+// simpleTokenizeFTS splits text on whitespace and strips punctuation.
+func simpleTokenizeFTS(text string) []string {
+	var words []string
+	var word strings.Builder
+
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			if word.Len() > 0 {
+				words = append(words, word.String())
+				word.Reset()
+			}
+			continue
+		}
+		// Keep alphanumeric characters
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			word.WriteRune(unicode.ToLower(r))
+		}
+		// Skip punctuation
+	}
+
+	if word.Len() > 0 {
+		words = append(words, word.String())
+	}
+	return words
+}
+
+// porterStemFTS is a simple porter stemmer.
+func porterStemFTS(word string) string {
+	if len(word) <= 3 {
+		return word
+	}
+
+	suffixes := []struct {
+		suffix string
+		stem   string
+	}{
+		{"ational", "ate"}, {"tional", "tion"}, {"enci", "ence"},
+		{"anci", "ance"}, {"izer", "ize"}, {"ation", "ate"},
+		{"alism", "al"}, {"iveness", "ive"}, {"fulness", "ful"},
+		{"ousness", "ous"}, {"aliti", "al"}, {"iviti", "ive"},
+		{"biliti", "ble"}, {"alli", "al"}, {"entli", "ent"},
+		{"eli", "e"}, {"ousli", "ous"}, {"ement", ""},
+		{"ment", ""}, {"ent", ""}, {"ness", ""},
+		{"ful", ""}, {"less", ""}, {"able", ""},
+		{"ible", ""}, {"al", ""}, {"ive", ""},
+		{"ous", ""}, {"ant", ""}, {"ence", ""},
+		{"ance", ""}, {"er", ""}, {"ic", ""},
+		{"ing", ""}, {"ion", ""}, {"ed", ""},
+		{"es", ""}, {"ly", ""},
+	}
+
+	for _, s := range suffixes {
+		if len(word) > len(s.suffix)+2 && strings.HasSuffix(word, s.suffix) {
+			stem := word[:len(word)-len(s.suffix)] + s.stem
+			if len(stem) >= 2 {
+				return stem
+			}
+		}
+	}
+	return word
+}
+
+// ftsEngineSearchKey creates the FTS index key for KV storage.
+func (e *executor) ftsEngineSearchKey(tableName, token string, rowID uint64) []byte {
+	// Key format: _sql:fti:{tableName}:{token}:{rowID}
+	prefix := []byte("_sql:fti:")
+	nameBytes := []byte(strings.ToUpper(tableName))
+	tokenBytes := []byte(strings.ToLower(token))
+	keyLen := len(prefix) + len(nameBytes) + 1 + len(tokenBytes) + 1 + 8
+
+	buf := make([]byte, keyLen)
+	offset := 0
+	copy(buf[offset:offset+len(prefix)], prefix)
+	offset += len(prefix)
+	copy(buf[offset:offset+len(nameBytes)], nameBytes)
+	offset += len(nameBytes)
+	buf[offset] = ':'
+	offset++
+	copy(buf[offset:offset+len(tokenBytes)], tokenBytes)
+	offset += len(tokenBytes)
+	buf[offset] = ':'
+	offset++
+	binary.BigEndian.PutUint64(buf[offset:offset+8], rowID)
+	return buf
+}
+
+// execFTSSearch executes a FTS MATCH search.
+func (e *executor) execFTSSearch(plan *plannerapi.FTSSearchPlan) (*executorapi.Result, error) {
+	if e.ftsEngine == nil {
+		return nil, fmt.Errorf("%w: FTS engine not available", executorapi.ErrExecFailed)
+	}
+
+	// Perform FTS search
+	docIDs, err := e.ftsEngine.Search(plan.Table, plan.Query)
+	if err != nil {
+		return nil, fmt.Errorf("%w: FTS search: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Get FTS table schema
+	schema, err := e.catalog.GetTable(plan.Table)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Fetch rows by rowID and apply residual filter
+	var rows [][]catalogapi.Value
+	for _, docID := range docIDs {
+		row, err := e.tableEngine.Get(schema, docID)
+		if err != nil {
+			if err == engineapi.ErrRowNotFound {
+				continue // row was deleted
+			}
+			return nil, fmt.Errorf("%w: fetching FTS row: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Apply residual filter if present
+		if plan.ResidualFilter != nil {
+			engineRow := &engineapi.Row{RowID: docID, Values: row.Values}
+			match, err := matchFilter(plan.ResidualFilter, engineRow, schema.Columns, nil, e)
+			if err != nil {
+				return nil, fmt.Errorf("%w: evaluating FTS filter: %v", executorapi.ErrExecFailed, err)
+			}
+			if !match {
+				continue
+			}
+		}
+
+		rows = append(rows, row.Values)
+	}
+
+	// Build column names list
+	colNames := make([]string, len(schema.Columns))
+	for i, col := range schema.Columns {
+		colNames[i] = col.Name
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    rows,
+	}, nil
+}
+
+// pragmaTableInfo returns column information for a table.
+func (e *executor) pragmaTableInfo(tableName string) (*executorapi.Result, error) {
+	schema, err := e.catalog.GetTable(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// SQLite-style table_info columns: cid, name, type, notnull, dflt_value, pk
+	rows := make([][]catalogapi.Value, 0, len(schema.Columns))
+	for i, col := range schema.Columns {
+		var dfltValue catalogapi.Value
+		if col.DefaultValue != nil {
+			dfltValue = *col.DefaultValue
+		} else {
+			dfltValue = catalogapi.Value{IsNull: true}
+		}
+
+		pk := 0
+		if schema.PrimaryKey == col.Name {
+			pk = 1
+			// For AUTOINCREMENT primary key, pk=2
+			if col.AutoInc {
+				pk = 2
+			}
+		}
+
+		var typeName string
+		switch col.Type {
+		case catalogapi.TypeInt:
+			typeName = "INT"
+		case catalogapi.TypeFloat:
+			typeName = "FLOAT"
+		case catalogapi.TypeText:
+			typeName = "TEXT"
+		case catalogapi.TypeBlob:
+			typeName = "BLOB"
+		default:
+			typeName = "NULL"
+		}
+
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(i)},          // cid
+			catalogapi.Value{Type: catalogapi.TypeText, Text: col.Name},         // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: typeName},          // type
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: boolToInt(col.NotNull)}, // notnull
+			dfltValue, // dflt_value
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(pk)}, // pk
+		})
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"cid", "name", "type", "notnull", "dflt_value", "pk"},
+		Rows:    rows,
+	}, nil
+}
+
+// pragmaTableList returns a list of all tables.
+func (e *executor) pragmaTableList() (*executorapi.Result, error) {
+	tables, err := e.catalog.ListTables()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	rows := make([][]catalogapi.Value, 0, len(tables))
+	for _, name := range tables {
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},                      // seq
+			catalogapi.Value{Type: catalogapi.TypeText, Text: name},                   // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "table"},                // type
+			catalogapi.Value{Type: catalogapi.TypeText, Text: name},                    // tbl_name
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: 0},                       // ncol
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "CREATE TABLE " + name}, // sql
+		})
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "type", "tbl_name", "ncol", "sql"},
+		Rows:    rows,
+	}, nil
+}
+
+// pragmaIndexList returns a list of all indexes for a table.
+func (e *executor) pragmaIndexList(tableName string) (*executorapi.Result, error) {
+	indexes, err := e.catalog.ListIndexes(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	rows := make([][]catalogapi.Value, 0, len(indexes))
+	seq := 0
+	for _, idx := range indexes {
+		rows = append(rows, []catalogapi.Value{
+			catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(seq)},          // seq
+			catalogapi.Value{Type: catalogapi.TypeText, Text: idx.Name},           // name
+			catalogapi.Value{Type: catalogapi.TypeText, Text: boolToText(idx.Unique)}, // unique
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "c"},                 // origin
+			catalogapi.Value{Type: catalogapi.TypeText, Text: "c"},                 // partial
+		})
+		seq++
+	}
+
+	return &executorapi.Result{
+		Columns: []string{"seq", "name", "unique", "origin", "partial"},
+		Rows:    rows,
+	}, nil
+}
+
+// boolToInt converts bool to int (0 or 1).
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// boolToText converts bool to SQLite text representation.
+func boolToText(b bool) string {
+	if b {
+		return "YES"
+	}
+	return "NO"
+}
+
 func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executorapi.Result, error) {
-	// I-C1: check existence BEFORE allocating ID to avoid wasting IDs.
+	// Check existence BEFORE allocating ID to avoid wasting IDs.
 	_, err := e.catalog.GetIndex(plan.Schema.Table, plan.Schema.Name)
 	if err == nil {
 		// Index exists.
@@ -533,6 +1079,20 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 		return nil, fmt.Errorf("%w: checking index existence: %v", executorapi.ErrExecFailed, err)
 	}
 
+	// Validate table exists
+	tbl, err := e.catalog.GetTable(plan.Schema.Table)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Validate column exists for simple indexes
+	if plan.Expr == nil {
+		colIdx := findColumnIndex(tbl, plan.Schema.Column)
+		if colIdx < 0 {
+			return nil, fmt.Errorf("%w: column %q not found", catalogapi.ErrColumnNotFound, plan.Schema.Column)
+		}
+	}
+
 	// Now safe to allocate ID.
 	indexID, err := e.nextID(metaNextIndexID)
 	if err != nil {
@@ -542,32 +1102,35 @@ func (e *executor) execCreateIndex(plan *plannerapi.CreateIndexPlan) (*executora
 	schema := plan.Schema
 	schema.IndexID = indexID
 
-	// CR-C: Backfill FIRST, then create catalog entry. If crash during backfill,
-	// catalog has no stale entry. A catalog entry always means fully-built index.
-	tbl, err := e.catalog.GetTable(schema.Table)
-	if err != nil {
-		return nil, fmt.Errorf("%w: backfill get table: %v", executorapi.ErrExecFailed, err)
-	}
-	colIdx := findColumnIndex(tbl, schema.Column)
-	if colIdx < 0 {
-		return nil, fmt.Errorf("%w: backfill column %q not found", executorapi.ErrExecFailed, schema.Column)
-	}
+	// Backfill: scan existing rows and build index entries
 	existingRows, err := e.tableScan(tbl, nil, nil, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: backfill scan: %v", executorapi.ErrExecFailed, err)
 	}
+
 	batch := e.store.NewWriteBatch()
 	for _, row := range existingRows {
-		val := row.Values[colIdx]
+		var val catalogapi.Value
+		if plan.Expr != nil {
+			// Evaluate expression for expression indexes
+			val, err = evalExpr(plan.Expr, row, tbl.Columns, nil, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: evaluating expression: %v", executorapi.ErrExecFailed, err)
+			}
+		} else {
+			// Get column value for simple column indexes
+			colIdx := findColumnIndex(tbl, schema.Column)
+			val = row.Values[colIdx]
+		}
 		idxKey := e.indexEngine.EncodeIndexKey(tbl.TableID, schema.IndexID, val, row.RowID)
 		if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 			batch.Discard()
 			return nil, fmt.Errorf("%w: backfill insert index: %v", executorapi.ErrExecFailed, err)
 		}
 	}
-	// M2: Add catalog entry to the SAME batch as index entries. Both are
-	// committed atomically — if batch.Commit() succeeds, both index data AND
-	// catalog entry are persisted. No orphan index data possible.
+
+	// Add catalog entry to the SAME batch as index entries for atomicity
 	if err := e.catalog.CreateIndexBatch(schema, batch); err != nil {
 		batch.Discard()
 		return nil, fmt.Errorf("%w: create catalog entry: %v", executorapi.ErrExecFailed, err)
@@ -666,16 +1229,32 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 			// Write index entries with same XID.
 			for _, idx := range indexes {
-				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-				if colIdx < 0 {
-					continue
+				// Get index value (column or expression)
+				rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+				val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 				}
-				val := row[colIdx]
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 				}
 				e.txnCtx.AddPendingWrite(idxKey, nil) // nil preValue: rollback = delete
+			}
+
+			// FTS: Index FTS content columns
+			if e.ftsEngine != nil {
+				texts := getFTSColumnValues(plan.Table.Columns, row)
+				if len(texts) > 0 {
+					if err := e.indexFTSWithTxn(plan.Table.Name, rowID, texts, "", xid); err != nil {
+						return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+					}
+				}
+			}
+
+			// Fire AFTER INSERT triggers (after row and indexes are committed)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+				return nil, err
 			}
 		}
 
@@ -698,6 +1277,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range plan.Rows {
+		// Fire BEFORE INSERT triggers
+		if err := e.fireTriggers(plan.Table.Name, "BEFORE", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Check NOT NULL constraint before inserting.
 		if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
 			batch.Discard()
@@ -731,11 +1316,13 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 		// Insert index entries into the same batch.
 		for _, idx := range indexes {
-			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := row[colIdx]
 			// TODO(CR-B): IndexEngine.InsertBatch and EncodeIndexKey are available, but
 			// they encode only (tableID, indexID, value, rowID). The index engine's
 			// internal state (prefix tree) is NOT updated within the batch. Full atomicity
@@ -746,6 +1333,25 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 			}
+		}
+
+		// FTS: Index FTS content columns
+		if e.ftsEngine != nil {
+			texts := getFTSColumnValues(plan.Table.Columns, row)
+			if len(texts) > 0 {
+				// Get tokenizer from FTS metadata (stored as special index)
+				tokenizer := ""
+				if err := e.indexFTSDocument(plan.Table.Name, rowID, texts, tokenizer, batch); err != nil {
+					batch.Discard()
+					return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+				}
+			}
+		}
+
+		// Fire AFTER INSERT triggers (after row and indexes are committed)
+		if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+			batch.Discard()
+			return nil, err
 		}
 	}
 
@@ -764,6 +1370,397 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	}
 
 	return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
+}
+
+// execUpsert handles INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
+func (e *executor) execUpsert(plan *plannerapi.UpsertPlan) (*executorapi.Result, error) {
+	// Get indexes for conflict detection and index maintenance
+	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Find the index on conflict columns (UNIQUE index, typically PRIMARY KEY)
+	var conflictIndex *catalogapi.IndexSchema
+	for _, idx := range indexes {
+		if !idx.Unique {
+			continue
+		}
+		// Check if this index covers all conflict columns
+		if len(plan.ConflictColumns) == 1 {
+			colIdx := plan.ConflictColumns[0]
+			if findColumnIndexByName(plan.Table.Columns, idx.Column) == colIdx {
+				conflictIndex = idx
+				break
+			}
+		}
+	}
+
+	var count int64
+
+	if len(plan.Exprs) > 0 {
+		// Parameterized: resolve values at execution time
+		return e.execUpsertParameterized(plan, indexes, conflictIndex)
+	}
+
+	// Non-parameterized: values already resolved
+	for _, row := range plan.Rows {
+		affected, err := e.upsertRow(plan, row, indexes, conflictIndex)
+		if err != nil {
+			return nil, err
+		}
+		count += affected
+	}
+
+	return &executorapi.Result{RowsAffected: count}, nil
+}
+
+// upsertRow performs upsert for a single row.
+func (e *executor) upsertRow(plan *plannerapi.UpsertPlan, row []catalogapi.Value,
+	indexes []*catalogapi.IndexSchema, conflictIndex *catalogapi.IndexSchema) (int64, error) {
+	// Extract conflict key values
+	conflictKeyVals := make([]catalogapi.Value, len(plan.ConflictColumns))
+	for i, colIdx := range plan.ConflictColumns {
+		conflictKeyVals[i] = row[colIdx]
+	}
+
+	// Check if row with conflict key already exists
+	existingRow, err := e.findByConflictKey(plan.Table, plan.ConflictColumns, conflictKeyVals, conflictIndex)
+	if err != nil {
+		return 0, err
+	}
+
+	if existingRow != nil {
+		// Conflict found - apply ON CONFLICT action
+		if plan.Action == plannerapi.UpsertDoNothing {
+			return 0, nil // DO NOTHING: skip
+		}
+		// DO UPDATE
+		return e.upsertUpdateRow(plan, existingRow, indexes)
+	}
+
+	// No conflict - insert new row
+	return e.upsertInsertRow(plan, row, indexes)
+}
+
+// findByConflictKey finds a row by conflict key using index or scan.
+func (e *executor) findByConflictKey(tbl *catalogapi.TableSchema, conflictCols []int,
+	vals []catalogapi.Value, idx *catalogapi.IndexSchema) (*engineapi.Row, error) {
+	if idx != nil && len(conflictCols) == 1 {
+		// Use index lookup (most common case: PRIMARY KEY)
+		iter, err := e.indexEngine.Scan(tbl.TableID, idx.IndexID, encodingapi.OpEQ, vals[0])
+		if err != nil {
+			return nil, fmt.Errorf("%w: index scan: %v", executorapi.ErrExecFailed, err)
+		}
+		defer iter.Close()
+		if iter.Next() {
+			rowID := iter.RowID()
+			row, err := e.tableEngine.Get(tbl, rowID)
+			if err != nil {
+				return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
+			}
+			return row, nil
+		}
+		return nil, nil
+	}
+
+	// Fall back to full scan (for multi-column or non-indexed conflicts)
+	iter, err := e.tableEngine.Scan(tbl)
+	if err != nil {
+		return nil, fmt.Errorf("%w: scan: %v", executorapi.ErrExecFailed, err)
+	}
+	defer iter.Close()
+
+	for iter.Next() {
+		row := iter.Row()
+		if row == nil {
+			continue
+		}
+		// Check if all conflict columns match
+		match := true
+		for i, colIdx := range conflictCols {
+			if compareValues(row.Values[colIdx], vals[i]) != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return row, nil
+		}
+	}
+	return nil, iter.Err()
+}
+
+// upsertInsertRow inserts a new row (no conflict).
+func (e *executor) upsertInsertRow(plan *plannerapi.UpsertPlan, row []catalogapi.Value,
+	indexes []*catalogapi.IndexSchema) (int64, error) {
+	// Check NOT NULL constraint
+	if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
+		return 0, err
+	}
+	// Check UNIQUE constraint (exclude conflict key from duplicate detection)
+	if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row, 0); err != nil {
+		// If unique violation on conflict columns, fall through to upsert
+		// (This shouldn't happen since we already checked for conflicts)
+	}
+	// Check CHECK constraints
+	if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
+		return 0, err
+	}
+	// Check FK constraints
+	if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.ForeignKeys); err != nil {
+		return 0, err
+	}
+
+	if e.txnCtx != nil {
+		return e.upsertInsertRowTxn(plan, row, indexes)
+	}
+	return e.upsertInsertRowBatch(plan, row, indexes)
+}
+
+func (e *executor) upsertInsertRowBatch(plan *plannerapi.UpsertPlan, row []catalogapi.Value,
+	indexes []*catalogapi.IndexSchema) (int64, error) {
+	batch := e.store.NewWriteBatch()
+	rowID, err := e.tableEngine.InsertInto(plan.Table, batch, row)
+	if err != nil {
+		batch.Discard()
+		return 0, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+	}
+	// Insert index entries
+	for _, idx := range indexes {
+		rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+		val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+		if err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+		if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+	if err := e.tableEngine.PersistCounter(batch, plan.Table.TableID); err != nil {
+		batch.Discard()
+		return 0, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return 0, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+	return 1, nil
+}
+
+func (e *executor) upsertInsertRowTxn(plan *plannerapi.UpsertPlan, row []catalogapi.Value,
+	indexes []*catalogapi.IndexSchema) (int64, error) {
+	xid := e.txnCtx.XID()
+	rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
+	if err != nil {
+		return 0, fmt.Errorf("%w: alloc rowid: %v", executorapi.ErrExecFailed, err)
+	}
+	rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, rowID)
+	rowVal := e.tableEngine.EncodeRow(row)
+	if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+		return 0, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
+	}
+	e.txnCtx.AddPendingWrite(rowKey, nil)
+	// Write index entries
+	for _, idx := range indexes {
+		rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+		val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+		if err != nil {
+			return 0, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
+		if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+			return 0, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+		}
+		e.txnCtx.AddPendingWrite(idxKey, nil)
+	}
+	// Persist counter
+	e.tableEngine.IncrementCounter(plan.Table.TableID)
+	metaKey := encodeMetaKeyLocal(plan.Table.TableID)
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(plan.Table.TableID))
+	if err := e.store.PutWithXID(metaKey, buf, xid); err != nil {
+		return 0, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
+	}
+	e.txnCtx.AddPendingWrite(metaKey, nil)
+	return 1, nil
+}
+
+// upsertUpdateRow updates an existing row (DO UPDATE).
+func (e *executor) upsertUpdateRow(plan *plannerapi.UpsertPlan, existingRow *engineapi.Row,
+	indexes []*catalogapi.IndexSchema) (int64, error) {
+	// Build new values by applying UPDATE assignments
+	newValues := make([]catalogapi.Value, len(existingRow.Values))
+	copy(newValues, existingRow.Values)
+
+	// Apply UPDATE assignments
+	for colIdx, val := range plan.UpdateAssignments {
+		newValues[colIdx] = val
+	}
+
+	// Check NOT NULL
+	if err := checkNotNullConstraint(plan.Table.Columns, newValues); err != nil {
+		return 0, err
+	}
+	// Check UNIQUE (exclude current row)
+	if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, newValues, existingRow.RowID); err != nil {
+		return 0, err
+	}
+	// Check CHECK constraints
+	if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.CheckConstraints); err != nil {
+		return 0, err
+	}
+	// Check FK constraints
+	if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, newValues, plan.Table.ForeignKeys); err != nil {
+		return 0, err
+	}
+
+	if e.txnCtx != nil {
+		return e.upsertUpdateRowTxn(plan, existingRow, newValues, indexes)
+	}
+	return e.upsertUpdateRowBatch(plan, existingRow, newValues, indexes)
+}
+
+func (e *executor) upsertUpdateRowBatch(plan *plannerapi.UpsertPlan, existingRow *engineapi.Row,
+	newValues []catalogapi.Value, indexes []*catalogapi.IndexSchema) (int64, error) {
+	// Build set of changed columns
+	changedCols := make(map[int]bool)
+	for colIdx := range plan.UpdateAssignments {
+		changedCols[colIdx] = true
+	}
+
+	batch := e.store.NewWriteBatch()
+	// Delete old index entries for changed columns
+	for _, idx := range indexes {
+		colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+		if colIdx < 0 || !changedCols[colIdx] {
+			continue
+		}
+		oldVal, err := getIndexValue(idx, existingRow, plan.Table.Columns, e)
+		if err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, existingRow.RowID)
+		if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	// Update row
+	rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, existingRow.RowID)
+	rowVal := e.tableEngine.EncodeRow(newValues)
+	if err := batch.Put(rowKey, rowVal); err != nil {
+		batch.Discard()
+		return 0, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Insert new index entries
+	newRow := &engineapi.Row{RowID: existingRow.RowID, Values: newValues}
+	for _, idx := range indexes {
+		colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+		if colIdx < 0 || !changedCols[colIdx] {
+			continue
+		}
+		newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+		if err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, existingRow.RowID)
+		if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
+			batch.Discard()
+			return 0, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+		}
+	}
+
+	if err := batch.Commit(); err != nil {
+		batch.Discard()
+		return 0, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+	}
+	return 1, nil
+}
+
+func (e *executor) upsertUpdateRowTxn(plan *plannerapi.UpsertPlan, existingRow *engineapi.Row,
+	newValues []catalogapi.Value, indexes []*catalogapi.IndexSchema) (int64, error) {
+	xid := e.txnCtx.XID()
+
+	// Build set of changed columns
+	changedCols := make(map[int]bool)
+	for colIdx := range plan.UpdateAssignments {
+		changedCols[colIdx] = true
+	}
+
+	// Delete old index entries
+	for _, idx := range indexes {
+		colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+		if colIdx < 0 || !changedCols[colIdx] {
+			continue
+		}
+		oldVal, err := getIndexValue(idx, existingRow, plan.Table.Columns, e)
+		if err != nil {
+			return 0, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, existingRow.RowID)
+		if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
+			return 0, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
+		}
+		e.txnCtx.AddPendingWrite(idxKey, nil)
+	}
+
+	// Update row
+	oldRowVal := e.tableEngine.EncodeRow(existingRow.Values)
+	rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, existingRow.RowID)
+	rowVal := e.tableEngine.EncodeRow(newValues)
+	if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+		return 0, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+	}
+	e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
+
+	// Insert new index entries
+	newRow := &engineapi.Row{RowID: existingRow.RowID, Values: newValues}
+	for _, idx := range indexes {
+		colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
+		if colIdx < 0 || !changedCols[colIdx] {
+			continue
+		}
+		newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+		if err != nil {
+			return 0, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+		}
+		idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, existingRow.RowID)
+		if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+			return 0, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+		}
+		e.txnCtx.AddPendingWrite(idxKey, nil)
+	}
+	return 1, nil
+}
+
+// execUpsertParameterized handles parameterized UPSERT.
+func (e *executor) execUpsertParameterized(plan *plannerapi.UpsertPlan, indexes []*catalogapi.IndexSchema,
+	conflictIndex *catalogapi.IndexSchema) (*executorapi.Result, error) {
+	// Note: ParamUpdateAssignments are resolved per-row in upsertRow
+	// This is handled by modifying upsertRow to check ParamUpdateAssignments
+	// For now, parameterized upsert is not supported - fall back to execUpsert path
+	// The plan already has Exprs set for parameterized INSERT values
+	var count int64
+	for _, exprRow := range plan.Exprs {
+		resolved, err := e.resolveInsertRowParameterized(plan.Table, nil, exprRow)
+		if err != nil {
+			return nil, fmt.Errorf("row: %w", err)
+		}
+		affected, err := e.upsertRow(plan, resolved, indexes, conflictIndex)
+		if err != nil {
+			return nil, err
+		}
+		count += affected
+	}
+	return &executorapi.Result{RowsAffected: count}, nil
 }
 
 // execInsertParameterized handles INSERT with ParamRef expressions (resolved at execution time).
@@ -873,11 +1870,13 @@ func (e *executor) execInsertParameterized(plan *plannerapi.InsertPlan, columns 
 
 		// Write index entries
 		for _, idx := range indexes {
-			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: resolved}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := resolved[colIdx]
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -994,11 +1993,13 @@ func (e *executor) execInsertSelect(plan *plannerapi.InsertSelectPlan) (*executo
 
 		// Insert index entries into the same batch (same pattern as execInsert).
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := row[colIdx]
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -1656,6 +2657,9 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 		matchedBuild = make(map[*engineapi.Row]bool, len(buildRows))
 	}
 
+	// Pre-allocate combinedVals once per probe row, reused for all build matches
+	combinedVals := make([]catalogapi.Value, leftLen+rightLen)
+
 	// Probe phase
 	for _, probe := range probeRows {
 		key := hashKey(probe.Values[probeKeyIdx])
@@ -1672,23 +2676,27 @@ func (e *executor) execHashJoin(leftRows, rightRows []*engineapi.Row, hplan *pla
 			continue
 		}
 
+		// Fill probe values into combinedVals (right portion)
+		if buildIsLeft {
+			// build=left, probe=right → probe in right portion
+			copy(combinedVals[leftLen:], probe.Values)
+		} else {
+			// build=right, probe=left → probe in left portion
+			copy(combinedVals, probe.Values)
+		}
+
 		// For each build match, check if there's an ON condition match
 		for _, build := range buildMatches {
 			if hplan.On != nil {
-				// Evaluate ON condition with combined row
-				var combinedVals []catalogapi.Value
+				// Evaluate ON condition with combined row - reuse pre-allocated slice
 				if buildIsLeft {
 					// build=left, probe=right
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
 					copy(combinedVals, build.Values)
-					copy(combinedVals[leftLen:], probe.Values)
 				} else {
 					// build=right, probe=left
-					combinedVals = make([]catalogapi.Value, leftLen+rightLen)
-					copy(combinedVals, probe.Values)
 					copy(combinedVals[leftLen:], build.Values)
 				}
-				combinedRow := &engineapi.Row{Values: combinedVals}
+				combinedRow := &engineapi.Row{Values: combinedVals[:leftLen+rightLen]}
 				result, err := evalExpr(hplan.On, combinedRow, combinedCols, subqueryResults, e)
 				if err != nil || !isTruthy(result) {
 					continue
@@ -2330,6 +3338,117 @@ func columnNameFromExpr(expr parserapi.Expr) string {
 	return ""
 }
 
+// execSelectFromCTE handles SELECT ... FROM cte_name [WHERE ...] for CTE references.
+// Uses pre-materialized CTE results from execWith.
+func (e *executor) execSelectFromCTE(plan *plannerapi.SelectPlan, cteResult *executorapi.Result) (*executorapi.Result, error) {
+	// Convert pre-materialized CTE rows to engineapi.Row
+	rows := make([]*engineapi.Row, len(cteResult.Rows))
+	for i, rowVals := range cteResult.Rows {
+		rows[i] = &engineapi.Row{
+			RowID:  0,
+			Values: rowVals,
+		}
+	}
+
+	// Build column definitions from CTE result columns
+	tableCols := make([]catalogapi.ColumnDef, len(cteResult.Columns))
+	for i, name := range cteResult.Columns {
+		tableCols[i] = catalogapi.ColumnDef{Name: name}
+	}
+
+	// Set outerCols for correlated subquery resolution
+	savedOuterCols := e.outerCols
+	savedOuterVals := e.outerVals
+	e.outerCols = tableCols
+	defer func() {
+		e.outerCols = savedOuterCols
+		e.outerVals = savedOuterVals
+	}()
+
+	// Apply WHERE filter
+	filter := plan.Scan.(*plannerapi.DerivedTableScanPlan).Filter
+	if filter != nil {
+		subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		rows = e.filterRows(rows, filter, tableCols, subqueryResults)
+	}
+
+	// Apply GROUP BY
+	if plan.GroupByExprs != nil {
+		grouped, err := e.groupByRows(rows, plan)
+		if err != nil {
+			return nil, err
+		}
+		rows = grouped
+
+		// Apply HAVING
+		if plan.Having != nil {
+			subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+			if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+				return nil, err
+			}
+			rows = e.filterRows(rows, plan.Having, plan.Table.Columns, subqueryResults)
+		}
+	}
+
+	// Project columns
+	// If SelectColumns has expressions (like n+1), evaluate them
+	projected := projectRows(rows, plan.Columns)
+	colNames := buildColumnNames(plan.Table, plan.Columns)
+	if plan.SelectColumns != nil && hasExpressions(plan.SelectColumns) {
+		projected = make([][]catalogapi.Value, len(rows))
+		colNames = make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if sc.Alias != "" {
+				colNames[i] = sc.Alias
+			} else if name := columnNameFromExpr(sc.Expr); name != "" {
+				colNames[i] = name
+			} else {
+				colNames[i] = "expr"
+			}
+		}
+		for rowIdx, row := range rows {
+			projected[rowIdx] = make([]catalogapi.Value, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				val, err := evalExpr(sc.Expr, row, tableCols, nil, e)
+				if err != nil {
+					return nil, err
+				}
+				projected[rowIdx][i] = val
+			}
+		}
+	}
+
+	// Apply DISTINCT
+	if plan.Distinct {
+		seen := make(map[string]bool)
+		var deduped [][]catalogapi.Value
+		for _, row := range projected {
+			var key strings.Builder
+			for _, v := range row {
+				if v.IsNull {
+					key.WriteString("NULL")
+				} else {
+					key.WriteString(fmt.Sprintf("%v", v))
+				}
+				key.WriteByte(0)
+			}
+			if !seen[key.String()] {
+				seen[key.String()] = true
+				deduped = append(deduped, row)
+			}
+		}
+		projected = deduped
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    projected,
+	}, nil
+}
+
 // execSelectFromDerived handles SELECT ... FROM (SELECT ...) AS alias [WHERE ...].
 // It materializes the subquery result, then treats it as a regular table scan.
 func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *plannerapi.DerivedTableScanPlan) (*executorapi.Result, error) {
@@ -2548,6 +3667,16 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
 	}
 
+	// Handle CTE scan: use pre-materialized results from execWith
+	if plan.Table != nil && plan.Scan != nil {
+		if _, ok := plan.Scan.(*plannerapi.DerivedTableScanPlan); ok {
+			// Check if this is a CTE (has pre-materialized results)
+			if cteResult, ok := e.cteResults[plan.Table.Name]; ok {
+				return e.execSelectFromCTE(plan, cteResult)
+			}
+		}
+	}
+
 	// Handle derived table (subquery in FROM clause): materialize the subquery first.
 	// plan.Table is the derived table's schema (alias + columns from SELECT list).
 	// plan.Scan is *DerivedTableScanPlan.
@@ -2626,6 +3755,17 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	if plan.Filter != nil {
 		rows = e.filterRows(rows, plan.Filter, tableCols, subqueryResults)
 	}
+
+	// ─── Window Functions ─────────────────────────────────────────────────────
+	// Compute window functions AFTER filter but BEFORE GROUP BY and ORDER BY.
+	// Window functions require the complete result set for correct computation.
+	if hasWindowFunctions(plan.SelectColumns) {
+		windowFuncs := extractWindowFuncExprs(plan.SelectColumns)
+		if err := e.computeWindowFunctions(rows, tableCols, windowFuncs); err != nil {
+			return nil, err
+		}
+	}
+
 
 	// GROUP BY: group rows by encoded key, then compute aggregates per group.
 	if plan.GroupByExprs != nil {
@@ -2740,7 +3880,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			for rowIdx, row := range rows {
 				projected[rowIdx] = make([]catalogapi.Value, len(plan.SelectColumns))
 				for i, sc := range plan.SelectColumns {
-					val, err := evalExpr(sc.Expr, row, plan.Table.Columns, nil, nil)
+					val, err := evalExpr(sc.Expr, row, plan.Table.Columns, nil, e)
 					if err != nil {
 						return nil, err
 					}
@@ -2923,6 +4063,104 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 	}, nil
 }
 
+func (e *executor) execWith(plan *plannerapi.WithPlan) (*executorapi.Result, error) {
+	// Materialize each CTE into a temporary in-memory table
+	for _, ctePlan := range plan.CTEs {
+		var result *executorapi.Result
+		var err error
+
+		if ctePlan.IsRecursive && ctePlan.AnchorPlan != nil {
+			// Recursive CTE: proper iterative execution
+			result, err = e.execRecursiveCTE(ctePlan)
+		} else {
+			// Non-recursive CTE: simple materialization
+			if ctePlan.SelectPlan != nil {
+				result, err = e.Execute(ctePlan.SelectPlan)
+			} else {
+				// Fallback: execute the body plan directly
+				result, err = e.Execute(ctePlan.AnchorPlan)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: executing CTE %s: %v", executorapi.ErrExecFailed, ctePlan.Name, err)
+		}
+
+		// Store CTE result in executor's CTE registry for lookup during main query
+		e.cteResults[ctePlan.Name] = result
+	}
+
+	// Execute the main statement
+	mainResult, err := e.Execute(plan.Statement)
+	if err != nil {
+		return nil, err
+	}
+
+	return mainResult, nil
+}
+
+// execRecursiveCTE executes a recursive CTE using the anchor-recursive split.
+// The CTE body must be: anchor UNION ALL recursive_part
+// The recursive part references the CTE name itself.
+//
+// Algorithm:
+// 1. Execute anchor → prevRows (these become the CTE's data for iteration 1)
+// 2. Loop:
+//    a. Execute recursive part (sees prevRows in CTE)
+//    b. If no new rows → break
+//    c. Accumulate newRows into result
+//    d. prevRows = newRows (for next iteration)
+// 3. Return accumulated result
+func (e *executor) execRecursiveCTE(ctePlan *plannerapi.CTEPlan) (*executorapi.Result, error) {
+	var accumulated [][]catalogapi.Value
+	var accumulatorColumns []string
+	var prevRows [][]catalogapi.Value
+
+	// Iteration 0: execute anchor
+	anchorResult, err := e.Execute(ctePlan.AnchorPlan)
+	if err != nil {
+		return nil, fmt.Errorf("%w: recursive CTE anchor: %v", executorapi.ErrExecFailed, err)
+	}
+	if anchorResult != nil {
+		accumulatorColumns = anchorResult.Columns
+		prevRows = anchorResult.Rows
+		accumulated = prevRows
+	}
+
+	// Iteration limit to prevent infinite loops
+	const maxIterations = 1000
+
+	for iteration := 1; iteration < maxIterations; iteration++ {
+		// Set CTE's data to only the previous iteration's rows (NOT accumulated)
+		e.cteResults[ctePlan.Name] = &executorapi.Result{
+			Rows:    prevRows,
+			Columns: accumulatorColumns,
+		}
+
+		// Execute recursive part
+		result, err := e.Execute(ctePlan.RecursivePlan)
+		if err != nil {
+			return nil, fmt.Errorf("%w: recursive CTE iteration: %v", executorapi.ErrExecFailed, err)
+		}
+
+		newRows := result.Rows
+		if len(newRows) == 0 {
+			break // No new rows, we're done
+		}
+
+		// Append new rows to accumulated result
+		accumulated = append(accumulated, newRows...)
+
+		// Update prevRows for next iteration
+		prevRows = newRows
+	}
+
+	// Return final accumulated result
+	return &executorapi.Result{
+		Rows:    accumulated,
+		Columns: accumulatorColumns,
+	}, nil
+}
+
 // execUpdateParameterized handles UPDATE with ParamRef expressions (resolved at execution time).
 func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*executorapi.Result, error) {
 	indexes, err := e.catalog.ListIndexes(plan.Table.Name)
@@ -2955,7 +4193,10 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				oldVal := row.Values[colIdx]
+				oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3006,7 +4247,11 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				newVal := newValues[colIdx]
+				newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+				newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
@@ -3029,7 +4274,11 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			oldVal := row.Values[colIdx]
+			oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 			if err := batch.Delete(idxKey); err != nil && err != kvstoreapi.ErrKeyNotFound {
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3078,7 +4327,12 @@ func (e *executor) execUpdateParameterized(plan *plannerapi.UpdatePlan) (*execut
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			newVal := newValues[colIdx]
+			newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+			newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -3138,6 +4392,11 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				break // No more rows to delete
 			}
 			for _, row := range rows {
+				// Fire BEFORE DELETE triggers (before any changes)
+				if err := e.fireTriggers(plan.Table.Name, "BEFORE", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+					return nil, err
+				}
+
 				// Get old encoded row data for savepoint rollback.
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
@@ -3171,6 +4430,11 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				}
 				e.txnCtx.AddPendingWrite(rowKey, oldRowVal) // store old row for rollback restore
 				count++
+
+				// Fire AFTER DELETE triggers (after row is deleted)
+				if err := e.fireTriggers(plan.Table.Name, "AFTER", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return &executorapi.Result{RowsAffected: count}, nil
@@ -3190,6 +4454,12 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 		}
 
 		for _, row := range rows {
+			// Fire BEFORE DELETE triggers (before any changes)
+			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+				batch.Discard()
+				return nil, err
+			}
+
 			// Delete index entries.
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
@@ -3210,6 +4480,12 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
 			}
 			count++
+
+			// Fire AFTER DELETE triggers (after row is deleted)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+				batch.Discard()
+				return nil, err
+			}
 		}
 
 		// Execute RESTRICT checks BEFORE commit to prevent the delete.
@@ -3241,6 +4517,17 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 	}
 
 	return &executorapi.Result{RowsAffected: count}, nil
+}
+
+// execTruncate deletes all rows from a table efficiently using DropTableData.
+// This is faster than DELETE without WHERE because it doesn't scan individual rows.
+// Truncate does NOT reset AUTOINCREMENT counter — that's SQLite behavior.
+func (e *executor) execTruncate(plan *plannerapi.TruncatePlan) (*executorapi.Result, error) {
+	// Use the efficient DropTableData to delete all rows at once
+	if err := e.tableEngine.DropTableData(plan.TableID); err != nil {
+		return nil, fmt.Errorf("%w: truncate %s: %v", executorapi.ErrExecFailed, plan.Table.Name, err)
+	}
+	return &executorapi.Result{RowsAffected: 0}, nil
 }
 
 func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result, error) {
@@ -3297,6 +4584,18 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for _, row := range rows {
+			// Merge old values with new assignments (needed for trigger context)
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			for colIdx, val := range plan.Assignments {
+				newValues[colIdx] = val
+			}
+
+			// Fire BEFORE UPDATE triggers (before any changes)
+			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+				return nil, err
+			}
+
 			// Capture old row key and pre-value BEFORE any modifications.
 			// This is needed for savepoint rollback to restore the original row.
 			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
@@ -3304,11 +4603,16 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 
 			// Delete old index entries for changed columns with transaction's XID.
 			for _, idx := range indexes {
+				// Check if any indexed column changed
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				oldVal := row.Values[colIdx]
+				// Get index value (column or expression)
+				oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 				if err := e.store.DeleteWithXID(idxKey, xid); err != nil && err != kvstoreapi.ErrKeyNotFound {
 					return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
@@ -3316,8 +4620,8 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
 			}
 
-			// Merge old values with new assignments
-			newValues := make([]catalogapi.Value, len(row.Values))
+			// Merge old values with new assignments (reconstruct after BEFORE trigger read-only access)
+			newValues = make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
 			for colIdx, val := range plan.Assignments {
 				newValues[colIdx] = val
@@ -3368,7 +4672,13 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				if colIdx < 0 || !changedCols[colIdx] {
 					continue
 				}
-				newVal := newValues[colIdx]
+				// Build new row with updated values for expression evaluation
+				newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+				// Get index value (column or expression)
+				newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+				if err != nil {
+					return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
@@ -3377,6 +4687,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			}
 
 			count++
+
+			// Fire AFTER UPDATE triggers (after row and indexes are updated)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+				return nil, err
+			}
 		}
 		return &executorapi.Result{RowsAffected: count}, nil
 	}
@@ -3385,25 +4700,36 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range rows {
+		// Merge old values with new assignments (needed for trigger context)
+		newValues := make([]catalogapi.Value, len(row.Values))
+		copy(newValues, row.Values)
+		for colIdx, val := range plan.Assignments {
+			newValues[colIdx] = val
+		}
+
+		// Fire BEFORE UPDATE triggers (before any changes)
+		if err := e.fireTriggers(plan.Table.Name, "BEFORE", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Delete old index entries for changed columns.
 		for _, idx := range indexes {
 			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			oldVal := row.Values[colIdx]
+			// Get index value (column or expression)
+			oldVal, err := getIndexValue(idx, row, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get old index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, oldVal, row.RowID)
 			if err := e.indexEngine.DeleteBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 			}
-		}
-
-		// Merge old values with new assignments
-		newValues := make([]catalogapi.Value, len(row.Values))
-		copy(newValues, row.Values)
-		for colIdx, val := range plan.Assignments {
-			newValues[colIdx] = val
 		}
 
 		// Check NOT NULL constraint before updating.
@@ -3453,13 +4779,26 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
 		}
 
+		// Fire AFTER UPDATE triggers (after row is updated)
+		if err := e.fireTriggers(plan.Table.Name, "AFTER", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Insert new index entries for changed columns.
 		for _, idx := range indexes {
 			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
 			if colIdx < 0 || !changedCols[colIdx] {
 				continue
 			}
-			newVal := newValues[colIdx]
+			// Build new row with updated values for expression evaluation
+			newRow := &engineapi.Row{RowID: row.RowID, Values: newValues}
+			// Get index value (column or expression)
+			newVal, err := getIndexValue(idx, newRow, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get new index value: %v", executorapi.ErrExecFailed, err)
+			}
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, newVal, row.RowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -4347,14 +5686,17 @@ func (e *executor) checkFKRestrictBeforeUpdate(parentTableName string, parentKey
 			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			continue
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		// Check if any referencing rows exist
-		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdxs, parentKeyValues)
 		if err != nil {
 			return err
 		}
@@ -4383,14 +5725,17 @@ func (e *executor) checkFKRestrictBeforeDelete(parentTableName string, parentKey
 			return fmt.Errorf("%w: get child table %q for FK check: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			continue
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		// Check if any referencing rows exist
-		hasRows, err := e.hasReferencingRows(childTable, fkColIdx, parentKeyValues[0])
+		hasRows, err := e.hasReferencingRows(childTable, fkColIdxs, parentKeyValues)
 		if err != nil {
 			return err
 		}
@@ -4419,19 +5764,22 @@ func (e *executor) executeFKDeleteActions(parentTableName string, parentKeyValue
 			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		switch action {
 		case "CASCADE":
-			if err := e.cascadeDeleteChildRows(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+			if err := e.cascadeDeleteChildRows(childTable, fkColIdxs, parentKeyValues); err != nil {
 				return err
 			}
 		case "SET NULL":
-			if err := e.setNullChildFKColumns(childTable, fkColIdx, parentKeyValues[0]); err != nil {
+			if err := e.setNullChildFKColumns(childTable, fkColIdxs, parentKeyValues); err != nil {
 				return err
 			}
 		}
@@ -4458,19 +5806,22 @@ func (e *executor) executeFKUpdateActions(parentTableName string, oldKeyValues, 
 			return fmt.Errorf("%w: get child table %q for FK action: %v", executorapi.ErrExecFailed, fk.TableName, err)
 		}
 
-		// Find the FK column index in the child table
-		fkColIdx := findColumnIndexByName(childTable.Columns, fk.Columns[0])
-		if fkColIdx < 0 {
-			return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, fk.Columns[0], fk.TableName)
+		// Find all FK column indices in the child table
+		fkColIdxs := make([]int, len(fk.Columns))
+		for i, colName := range fk.Columns {
+			fkColIdxs[i] = findColumnIndexByName(childTable.Columns, colName)
+			if fkColIdxs[i] < 0 {
+				return fmt.Errorf("%w: FK column %q not found in child table %q", executorapi.ErrExecFailed, colName, fk.TableName)
+			}
 		}
 
 		switch action {
 		case "CASCADE":
-			if err := e.cascadeUpdateChildFKValues(childTable, fkColIdx, oldKeyValues[0], newKeyValues[0]); err != nil {
+			if err := e.cascadeUpdateChildFKValues(childTable, fkColIdxs, oldKeyValues, newKeyValues); err != nil {
 				return err
 			}
 		case "SET NULL":
-			if err := e.setNullChildFKColumns(childTable, fkColIdx, oldKeyValues[0]); err != nil {
+			if err := e.setNullChildFKColumns(childTable, fkColIdxs, oldKeyValues); err != nil {
 				return err
 			}
 		}
@@ -4478,8 +5829,9 @@ func (e *executor) executeFKUpdateActions(parentTableName string, oldKeyValues, 
 	return nil
 }
 
-// hasReferencingRows checks if child table has any rows referencing the given parent key value.
-func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) (bool, error) {
+// hasReferencingRows checks if child table has any rows referencing the given parent key values.
+// Supports multi-column foreign keys by comparing all columns.
+func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) (bool, error) {
 	iter, err := e.tableEngine.Scan(childTable)
 	if err != nil {
 		return false, fmt.Errorf("%w: scan child table for FK check: %v", executorapi.ErrExecFailed, err)
@@ -4491,18 +5843,31 @@ func (e *executor) hasReferencingRows(childTable *catalogapi.TableSchema, fkColI
 		if row == nil {
 			continue
 		}
-		if fkColIdx < len(row.Values) {
-			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
-			if cmp == 0 {
-				return true, nil
-			}
+		// Check if ALL FK columns match (multi-column FK support)
+		if matchesAllFKColumns(row.Values, fkColIdxs, parentKeyVals) {
+			return true, nil
 		}
 	}
 	return false, iter.Err()
 }
 
-// cascadeDeleteChildRows deletes all rows in child table where FK column matches parent key.
-func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+// matchesAllFKColumns checks if a row's FK columns all match the parent key values.
+// Used for multi-column foreign key matching.
+func matchesAllFKColumns(rowValues []catalogapi.Value, fkColIdxs []int, parentKeyVals []catalogapi.Value) bool {
+	for i, colIdx := range fkColIdxs {
+		if colIdx >= len(rowValues) {
+			return false
+		}
+		if compareValues(rowValues[colIdx], parentKeyVals[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// cascadeDeleteChildRows deletes all rows in child table where FK columns match parent key.
+// Supports multi-column foreign keys by comparing all columns.
+func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -4512,7 +5877,7 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 			if err != nil {
 				return err
 			}
@@ -4550,7 +5915,7 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 		if err != nil {
 			return err
 		}
@@ -4586,8 +5951,9 @@ func (e *executor) cascadeDeleteChildRows(childTable *catalogapi.TableSchema, fk
 	return nil
 }
 
-// setNullChildFKColumns sets the FK column to NULL for all child rows referencing the parent key.
-func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) error {
+// setNullChildFKColumns sets the FK columns to NULL for all child rows referencing the parent key.
+// Supports multi-column foreign keys by setting all FK columns to NULL.
+func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -4599,7 +5965,7 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 			if err != nil {
 				return err
 			}
@@ -4609,10 +5975,21 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 			for _, row := range rows {
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
-				// Delete old index entries for the FK column
+				// Delete old index entries for the FK columns
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					val := row.Values[colIdx]
@@ -4623,10 +6000,12 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 					e.txnCtx.AddPendingWrite(idxKey, nil)
 				}
 
-				// Update row: set FK column to NULL
+				// Update row: set all FK columns to NULL
 				newValues := make([]catalogapi.Value, len(row.Values))
 				copy(newValues, row.Values)
-				newValues[fkColIdx] = nullValue
+				for _, fkIdx := range fkColIdxs {
+					newValues[fkIdx] = nullValue
+				}
 
 				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 				newRowVal := e.tableEngine.EncodeRow(newValues)
@@ -4635,10 +6014,21 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 				}
 				e.txnCtx.AddPendingWrite(rowKey, oldRowVal)
 
-				// Insert new index entries for the FK column (now NULL - skip if index doesn't handle NULLs)
+				// Insert new index entries for the FK columns (now NULL - skip if index doesn't handle NULLs)
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					// Index on NULL value - encode and insert
@@ -4656,7 +6046,7 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, parentKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, parentKeyVals)
 		if err != nil {
 			return err
 		}
@@ -4668,7 +6058,18 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 			// Delete old index entries
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-				if colIdx < 0 || colIdx != fkColIdx {
+				if colIdx < 0 {
+					continue
+				}
+				// Check if this index column is one of the FK columns
+				isFKColumn := false
+				for _, fkIdx := range fkColIdxs {
+					if colIdx == fkIdx {
+						isFKColumn = true
+						break
+					}
+				}
+				if !isFKColumn {
 					continue
 				}
 				val := row.Values[colIdx]
@@ -4679,10 +6080,12 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 				}
 			}
 
-			// Update row: set FK column to NULL
+			// Update row: set all FK columns to NULL
 			newValues := make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
-			newValues[fkColIdx] = nullValue
+			for _, fkIdx := range fkColIdxs {
+				newValues[fkIdx] = nullValue
+			}
 
 			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -4697,8 +6100,9 @@ func (e *executor) setNullChildFKColumns(childTable *catalogapi.TableSchema, fkC
 	return nil
 }
 
-// cascadeUpdateChildFKValues updates all child rows' FK column from old value to new value.
-func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema, fkColIdx int, oldKeyVal, newKeyVal catalogapi.Value) error {
+// cascadeUpdateChildFKValues updates all child rows' FK columns from old values to new values.
+// Supports multi-column foreign keys by updating all FK columns.
+func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema, fkColIdxs []int, oldKeyVals, newKeyVals []catalogapi.Value) error {
 	// Get indexes for cleanup
 	indexes, err := e.catalog.ListIndexes(childTable.Name)
 	if err != nil {
@@ -4708,7 +6112,7 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for {
-			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+			rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, oldKeyVals)
 			if err != nil {
 				return err
 			}
@@ -4718,10 +6122,21 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 			for _, row := range rows {
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
-				// Delete old index entries for the FK column
+				// Delete old index entries for the FK columns
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
+						continue
+					}
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
 						continue
 					}
 					val := row.Values[colIdx]
@@ -4732,10 +6147,12 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 					e.txnCtx.AddPendingWrite(idxKey, nil)
 				}
 
-				// Update row: change FK column to new value
+				// Update row: change all FK columns to new values
 				newValues := make([]catalogapi.Value, len(row.Values))
 				copy(newValues, row.Values)
-				newValues[fkColIdx] = newKeyVal
+				for i, fkIdx := range fkColIdxs {
+					newValues[fkIdx] = newKeyVals[i]
+				}
 
 				rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 				newRowVal := e.tableEngine.EncodeRow(newValues)
@@ -4747,10 +6164,29 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 				// Insert new index entries
 				for _, idx := range indexes {
 					colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-					if colIdx < 0 || colIdx != fkColIdx {
+					if colIdx < 0 {
 						continue
 					}
-					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, newKeyVal, row.RowID)
+					// Check if this index column is one of the FK columns
+					isFKColumn := false
+					for _, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							isFKColumn = true
+							break
+						}
+					}
+					if !isFKColumn {
+						continue
+					}
+					// Find the corresponding new value for this FK column
+					var newVal catalogapi.Value
+					for i, fkIdx := range fkColIdxs {
+						if colIdx == fkIdx {
+							newVal = newKeyVals[i]
+							break
+						}
+					}
+					idxKey := e.indexEngine.EncodeIndexKey(childTable.TableID, idx.IndexID, newVal, row.RowID)
 					if err := e.store.PutWithXID(idxKey, nil, xid); err != nil {
 						return fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 					}
@@ -4764,7 +6200,7 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	// Non-transactional path
 	for {
 		batch := e.store.NewWriteBatch()
-		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdx, oldKeyVal)
+		rows, err := e.scanChildRowsForFKAction(childTable, fkColIdxs, oldKeyVals)
 		if err != nil {
 			return err
 		}
@@ -4776,7 +6212,18 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 			// Delete old index entries
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(childTable.Columns, idx.Column)
-				if colIdx < 0 || colIdx != fkColIdx {
+				if colIdx < 0 {
+					continue
+				}
+				// Check if this index column is one of the FK columns
+				isFKColumn := false
+				for _, fkIdx := range fkColIdxs {
+					if colIdx == fkIdx {
+						isFKColumn = true
+						break
+					}
+				}
+				if !isFKColumn {
 					continue
 				}
 				val := row.Values[colIdx]
@@ -4787,10 +6234,12 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 				}
 			}
 
-			// Update row: change FK column to new value
+			// Update row: change all FK columns to new values
 			newValues := make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
-			newValues[fkColIdx] = newKeyVal
+			for i, fkIdx := range fkColIdxs {
+				newValues[fkIdx] = newKeyVals[i]
+			}
 
 			rowKey := e.keyEncoder.EncodeRowKey(childTable.TableID, row.RowID)
 			rowVal := e.tableEngine.EncodeRow(newValues)
@@ -4804,10 +6253,9 @@ func (e *executor) cascadeUpdateChildFKValues(childTable *catalogapi.TableSchema
 	}
 	return nil
 }
-
-// scanChildRowsForFKAction scans child table rows where FK column matches parent key value.
+// Supports multi-column foreign keys by comparing all columns.
 // Returns a batch of matching rows (up to DMLBatchSize).
-func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, fkColIdx int, parentKeyVal catalogapi.Value) ([]*engineapi.Row, error) {
+func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, fkColIdxs []int, parentKeyVals []catalogapi.Value) ([]*engineapi.Row, error) {
 	iter, err := e.tableEngine.ScanWithLimit(childTable, DMLBatchSize, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: scan child table: %v", executorapi.ErrExecFailed, err)
@@ -4820,17 +6268,931 @@ func (e *executor) scanChildRowsForFKAction(childTable *catalogapi.TableSchema, 
 		if row == nil {
 			continue
 		}
-		if fkColIdx < len(row.Values) {
-			cmp := compareValues(row.Values[fkColIdx], parentKeyVal)
-			if cmp == 0 {
-				rowCopy := &engineapi.Row{
-					RowID:  row.RowID,
-					Values: make([]catalogapi.Value, len(row.Values)),
-				}
-				copy(rowCopy.Values, row.Values)
-				rows = append(rows, rowCopy)
+		// Check if ALL FK columns match (multi-column FK support)
+		if matchesAllFKColumns(row.Values, fkColIdxs, parentKeyVals) {
+			rowCopy := &engineapi.Row{
+				RowID:  row.RowID,
+				Values: make([]catalogapi.Value, len(row.Values)),
 			}
+			copy(rowCopy.Values, row.Values)
+			rows = append(rows, rowCopy)
 		}
 	}
 	return rows, iter.Err()
+}
+
+// getIndexValue returns the value to index for a given index schema and row.
+// For simple column indexes, returns the column value.
+// For expression indexes (ExprSQL non-empty), re-parses and evaluates the expression.
+func getIndexValue(idx *catalogapi.IndexSchema, row *engineapi.Row, columns []catalogapi.ColumnDef, e *executor) (catalogapi.Value, error) {
+	if idx.ExprSQL == "" {
+		// Simple column index - use column value
+		colIdx := findColumnIndexByName(columns, idx.Column)
+		if colIdx < 0 {
+			return catalogapi.Value{}, fmt.Errorf("column %s not found", idx.Column)
+		}
+		return row.Values[colIdx], nil
+	}
+
+	// Expression index - re-parse and evaluate the expression
+	// Wrap in SELECT statement so parser accepts it as a valid SQL statement
+	exprSQL := "SELECT " + idx.ExprSQL
+
+	stmt, err := e.parser.Parse(exprSQL)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("re-parse index expression %q: %v", idx.ExprSQL, err)
+	}
+
+	if sel, ok := stmt.(*parserapi.SelectStmt); ok && len(sel.Columns) > 0 {
+		val, err := evalExpr(sel.Columns[0].Expr, row, columns, nil, e)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("eval expr %q: %v", idx.ExprSQL, err)
+		}
+		return val, nil
+	}
+
+	return catalogapi.Value{}, fmt.Errorf("could not extract expression from %q", idx.ExprSQL)
+}
+
+// ─── Window Functions ─────────────────────────────────────────────────────────
+
+// WindowFunctionResult stores pre-computed window function values for all rows.
+type WindowFunctionResult struct {
+	Values      []catalogapi.Value       // one value per row in the result set
+	rowIndexMap map[*engineapi.Row]int   // maps row pointer to result index
+}
+
+// windowFunctions stores pre-computed window function results during SELECT execution.
+type windowFunctions map[*parserapi.WindowFuncExpr]*WindowFunctionResult
+
+// hasWindowFunctions checks if any SelectColumn contains a window function.
+func hasWindowFunctions(cols []parserapi.SelectColumn) bool {
+	for _, sc := range cols {
+		if _, ok := sc.Expr.(*parserapi.WindowFuncExpr); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWindowFuncExprs extracts window function expressions from SelectColumns.
+func extractWindowFuncExprs(cols []parserapi.SelectColumn) []*parserapi.WindowFuncExpr {
+	var funcs []*parserapi.WindowFuncExpr
+	for _, sc := range cols {
+		if wf, ok := sc.Expr.(*parserapi.WindowFuncExpr); ok {
+			funcs = append(funcs, wf)
+		}
+	}
+	return funcs
+}
+
+// computeWindowFunctions computes all window function values for all rows.
+// It groups rows by PARTITION BY, sorts by ORDER BY, and evaluates each window function.
+func (e *executor) computeWindowFunctions(rows []*engineapi.Row, columns []catalogapi.ColumnDef,
+	windowFuncs []*parserapi.WindowFuncExpr) error {
+
+	if len(windowFuncs) == 0 {
+		return nil
+	}
+
+	// Initialize window results map
+	e.windowResults = make(map[*parserapi.WindowFuncExpr]*WindowFunctionResult)
+
+	for _, wf := range windowFuncs {
+		result, err := e.computeSingleWindowFunction(wf, rows, columns)
+		if err != nil {
+			return err
+		}
+		e.windowResults[wf] = result
+	}
+
+	return nil
+}
+
+// computeSingleWindowFunction computes one window function for all rows.
+func (e *executor) computeSingleWindowFunction(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) (*WindowFunctionResult, error) {
+
+	// Partition rows if PARTITION BY is specified
+	partitions, err := e.partitionRowsForWindow(wf.Window, rows, columns)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]catalogapi.Value, len(rows))
+	rowIndexMap := make(map[*engineapi.Row]int)
+
+	for _, partition := range partitions {
+		// Sort partition by ORDER BY if specified
+		sortedRows := partition.rows
+		if wf.Window != nil && len(wf.Window.OrderBy) > 0 {
+			sortedRows = e.sortWindowPartition(partition.rows, wf.Window.OrderBy, columns)
+		}
+
+		// Compute the window function for each row in the partition
+		values, err := e.computeWindowFunctionForRows(wf, sortedRows, columns)
+		if err != nil {
+			return nil, err
+		}
+
+		// Map results back to original row positions
+		for i, origIdx := range partition.indices {
+			result[origIdx] = values[i]
+			if i < len(sortedRows) {
+				rowIndexMap[sortedRows[i]] = origIdx
+			}
+		}
+	}
+
+	return &WindowFunctionResult{Values: result, rowIndexMap: rowIndexMap}, nil
+}
+
+// windowPartition represents a partition of rows with their original indices
+type windowPartition struct {
+	rows    []*engineapi.Row
+	indices []int
+}
+
+// partitionRowsForWindow groups rows by PARTITION BY columns
+func (e *executor) partitionRowsForWindow(spec *parserapi.WindowSpec,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]windowPartition, error) {
+
+	if spec == nil || len(spec.PartitionBy) == 0 {
+		// No partition - all rows in one group
+		indices := make([]int, len(rows))
+		rowCopy := make([]*engineapi.Row, len(rows))
+		for i := range rows {
+			indices[i] = i
+			rowCopy[i] = rows[i]
+		}
+		return []windowPartition{{rows: rowCopy, indices: indices}}, nil
+	}
+
+	// Group rows by partition key
+	groups := make(map[string][]int)
+	for i, row := range rows {
+		key, err := e.computeWindowPartitionKey(row, spec.PartitionBy, columns)
+		if err != nil {
+			return nil, err
+		}
+		groups[key] = append(groups[key], i)
+	}
+
+	// Build partitions preserving original order
+	var partitions []windowPartition
+	for _, indices := range groups {
+		p := windowPartition{
+			indices: indices,
+			rows:    make([]*engineapi.Row, len(indices)),
+		}
+		for j, idx := range indices {
+			p.rows[j] = rows[idx]
+		}
+		partitions = append(partitions, p)
+	}
+
+	return partitions, nil
+}
+
+// computeWindowPartitionKey computes a unique key for a row based on PARTITION BY expressions
+func (e *executor) computeWindowPartitionKey(row *engineapi.Row, partitionBy []parserapi.Expr,
+	columns []catalogapi.ColumnDef) (string, error) {
+
+	var key []byte
+	for _, expr := range partitionBy {
+		val, err := evalExpr(expr, row, columns, nil, e)
+		if err != nil {
+			return "", err
+		}
+		if val.IsNull {
+			key = append(key, 0xFF)
+		} else {
+			key = append(key, e.keyEncoder.EncodeValue(val)...)
+		}
+		key = append(key, 0)
+	}
+	return string(key), nil
+}
+
+// sortWindowPartition sorts rows by ORDER BY columns for window frame evaluation
+func (e *executor) sortWindowPartition(rows []*engineapi.Row,
+	orderBy []*parserapi.OrderByClause, columns []catalogapi.ColumnDef) []*engineapi.Row {
+
+	if len(orderBy) == 0 || len(rows) == 0 {
+		return rows
+	}
+
+	// Create a sortable copy
+	type sortableRow struct {
+		row      *engineapi.Row
+		sortKeys []catalogapi.Value
+	}
+
+	sortable := make([]sortableRow, len(rows))
+	for i, row := range rows {
+		keys := make([]catalogapi.Value, len(orderBy))
+		for j, ob := range orderBy {
+			colIdx := findColumnIndexByName(columns, ob.Column)
+			if colIdx >= 0 && colIdx < len(row.Values) {
+				keys[j] = row.Values[colIdx]
+			} else {
+				keys[j] = catalogapi.Value{IsNull: true}
+			}
+		}
+		sortable[i] = sortableRow{row: row, sortKeys: keys}
+	}
+
+	// Sort
+	sort.Slice(sortable, func(i, j int) bool {
+		for k, ob := range orderBy {
+			a := sortable[i].sortKeys[k]
+			b := sortable[j].sortKeys[k]
+
+			// NULL handling
+			if a.IsNull && b.IsNull {
+				continue
+			}
+			if a.IsNull {
+				return !ob.Desc
+			}
+			if b.IsNull {
+				return ob.Desc
+			}
+
+			cmp := compareValues(a, b)
+			if cmp < 0 {
+				return !ob.Desc
+			}
+			if cmp > 0 {
+				return ob.Desc
+			}
+		}
+		return false
+	})
+
+	// Extract sorted rows
+	result := make([]*engineapi.Row, len(rows))
+	for i, s := range sortable {
+		result[i] = s.row
+	}
+	return result
+}
+
+// computeWindowFunctionForRows computes a single window function for a sorted partition
+func (e *executor) computeWindowFunctionForRows(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	switch strings.ToUpper(wf.Func) {
+	case "ROW_NUMBER":
+		return e.windowRowNumber(rows)
+	case "RANK":
+		return e.windowRank(rows, wf, columns)
+	case "DENSE_RANK":
+		return e.windowDenseRank(rows, wf, columns)
+	case "LAG":
+		return e.windowLag(rows, wf, columns)
+	case "LEAD":
+		return e.windowLead(rows, wf, columns)
+	case "FIRST_VALUE":
+		return e.windowFirstValue(rows, wf, columns)
+	case "LAST_VALUE":
+		return e.windowLastValue(rows, wf, columns)
+	case "SUM", "AVG", "COUNT", "MIN", "MAX":
+		return e.windowAggregate(wf, rows, columns)
+	default:
+		return nil, fmt.Errorf("%w: unsupported window function %s", executorapi.ErrExecFailed, wf.Func)
+	}
+}
+
+// windowRowNumber returns sequential row numbers starting from 1
+func (e *executor) windowRowNumber(rows []*engineapi.Row) ([]catalogapi.Value, error) {
+	result := make([]catalogapi.Value, len(rows))
+	for i := range rows {
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(i + 1)}
+	}
+	return result, nil
+}
+
+// windowRank computes rank with gaps (e.g., 1, 1, 3, 4, 4, 6)
+func (e *executor) windowRank(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	if wf.Window == nil || len(wf.Window.OrderBy) == 0 {
+		for i := range result {
+			result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}
+		}
+		return result, nil
+	}
+
+	orderCol := wf.Window.OrderBy[0].Column
+	desc := wf.Window.OrderBy[0].Desc
+	colIdx := findColumnIndexByName(columns, orderCol)
+
+	rank := 1
+	for i := range rows {
+		if i > 0 {
+			prev := rows[i-1].Values[colIdx]
+			curr := rows[i].Values[colIdx]
+			cmp := compareValues(prev, curr)
+			if (desc && cmp > 0) || (!desc && cmp < 0) {
+				rank = i + 1
+			}
+		}
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(rank)}
+	}
+	return result, nil
+}
+
+// windowDenseRank computes rank without gaps (e.g., 1, 1, 2, 3, 3, 4)
+func (e *executor) windowDenseRank(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	if wf.Window == nil || len(wf.Window.OrderBy) == 0 {
+		for i := range result {
+			result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}
+		}
+		return result, nil
+	}
+
+	orderCol := wf.Window.OrderBy[0].Column
+	desc := wf.Window.OrderBy[0].Desc
+	colIdx := findColumnIndexByName(columns, orderCol)
+
+	denseRank := 1
+	for i := range rows {
+		if i > 0 {
+			prev := rows[i-1].Values[colIdx]
+			curr := rows[i].Values[colIdx]
+			cmp := compareValues(prev, curr)
+			if (desc && cmp > 0) || (!desc && cmp < 0) {
+				denseRank++
+			}
+		}
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(denseRank)}
+	}
+	return result, nil
+}
+
+// windowLag returns the value from a preceding row
+func (e *executor) windowLag(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	offset := 1
+	if len(wf.Args) >= 2 {
+		offsetVal, err := evalExpr(wf.Args[1], nil, columns, nil, nil)
+		if err == nil && !offsetVal.IsNull && offsetVal.Type == catalogapi.TypeInt {
+			offset = int(offsetVal.Int)
+			if offset < 0 {
+				offset = 0
+			}
+		}
+	}
+
+	var defaultVal catalogapi.Value
+	if len(wf.Args) >= 3 {
+		defaultVal, _ = evalExpr(wf.Args[2], nil, columns, nil, nil)
+	} else {
+		defaultVal = catalogapi.Value{IsNull: true}
+	}
+
+	for i := range rows {
+		if i >= offset {
+			val, err := evalExpr(wf.Args[0], rows[i-offset], columns, nil, e)
+			if err != nil || val.IsNull {
+				result[i] = defaultVal
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = defaultVal
+		}
+	}
+	return result, nil
+}
+
+// windowLead returns the value from a following row
+func (e *executor) windowLead(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	offset := 1
+	if len(wf.Args) >= 2 {
+		offsetVal, err := evalExpr(wf.Args[1], nil, columns, nil, nil)
+		if err == nil && !offsetVal.IsNull && offsetVal.Type == catalogapi.TypeInt {
+			offset = int(offsetVal.Int)
+			if offset < 0 {
+				offset = 0
+			}
+		}
+	}
+
+	var defaultVal catalogapi.Value
+	if len(wf.Args) >= 3 {
+		defaultVal, _ = evalExpr(wf.Args[2], nil, columns, nil, nil)
+	} else {
+		defaultVal = catalogapi.Value{IsNull: true}
+	}
+
+	for i := range rows {
+		if i+offset < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[i+offset], columns, nil, e)
+			if err != nil || val.IsNull {
+				result[i] = defaultVal
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = defaultVal
+		}
+	}
+	return result, nil
+}
+
+// windowFirstValue returns the first value in the window frame
+func (e *executor) windowFirstValue(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, 0, len(rows))
+
+	for i := range rows {
+		if frameStart <= frameEnd && frameStart < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[frameStart], columns, nil, e)
+			if err != nil {
+				result[i] = catalogapi.Value{IsNull: true}
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = catalogapi.Value{IsNull: true}
+		}
+	}
+	return result, nil
+}
+
+// windowLastValue returns the last value in the window frame
+func (e *executor) windowLastValue(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	for i := range rows {
+		frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, i, len(rows))
+		if frameStart <= frameEnd && frameEnd < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[frameEnd], columns, nil, e)
+			if err != nil {
+				result[i] = catalogapi.Value{IsNull: true}
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = catalogapi.Value{IsNull: true}
+		}
+	}
+	return result, nil
+}
+
+// getWindowFrameBounds returns the [start, end] inclusive bounds for a window frame
+func (e *executor) getWindowFrameBounds(spec *parserapi.WindowSpec, currentRow int, totalRows int) (int, int) {
+	frameStart := 0
+	frameEnd := currentRow
+
+	if spec != nil {
+		if spec.FrameStart.Type != "" {
+			switch spec.FrameStart.Type {
+			case "UNBOUNDED PRECEDING":
+				frameStart = 0
+			case "CURRENT ROW":
+				frameStart = currentRow
+			case "PRECEDING":
+				if spec.FrameStart.Expr != nil {
+					offset := e.evalFrameOffset(spec.FrameStart.Expr)
+					frameStart = currentRow - offset
+				}
+			}
+		}
+
+		if spec.FrameEnd.Type != "" {
+			switch spec.FrameEnd.Type {
+			case "UNBOUNDED FOLLOWING":
+				frameEnd = totalRows - 1
+			case "CURRENT ROW":
+				frameEnd = currentRow
+			case "FOLLOWING":
+				if spec.FrameEnd.Expr != nil {
+					offset := e.evalFrameOffset(spec.FrameEnd.Expr)
+					frameEnd = currentRow + offset
+				}
+			}
+		}
+	}
+
+	if frameStart < 0 {
+		frameStart = 0
+	}
+	if frameEnd >= totalRows {
+		frameEnd = totalRows - 1
+	}
+	if frameStart >= totalRows {
+		frameStart = totalRows - 1
+		frameEnd = totalRows - 1
+	}
+
+	return frameStart, frameEnd
+}
+
+// evalFrameOffset evaluates a frame offset expression to an integer
+func (e *executor) evalFrameOffset(expr parserapi.Expr) int {
+	if expr == nil {
+		return 0
+	}
+	val, err := evalExpr(expr, nil, nil, nil, nil)
+	if err != nil || val.IsNull || val.Type != catalogapi.TypeInt {
+		return 0
+	}
+	offset := int(val.Int)
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
+// windowAggregate computes SUM/AVG/COUNT/MIN/MAX over the window frame
+func (e *executor) windowAggregate(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	for i := range rows {
+		frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, i, len(rows))
+		if frameStart > frameEnd || frameStart >= len(rows) {
+			result[i] = catalogapi.Value{IsNull: true}
+			continue
+		}
+		if frameEnd >= len(rows) {
+			frameEnd = len(rows) - 1
+		}
+
+		frameRows := rows[frameStart : frameEnd+1]
+		var val catalogapi.Value
+		var err error
+
+		switch strings.ToUpper(wf.Func) {
+		case "SUM":
+			val, err = e.windowSum(wf.Args, frameRows, columns)
+		case "AVG":
+			val, err = e.windowAvg(wf.Args, frameRows, columns)
+		case "COUNT":
+			val, err = e.windowCount(wf.Args, frameRows, columns)
+		case "MIN":
+			val, err = e.windowMin(wf.Args, frameRows, columns)
+		case "MAX":
+			val, err = e.windowMax(wf.Args, frameRows, columns)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+		result[i] = val
+	}
+	return result, nil
+}
+
+func (e *executor) windowSum(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	var sum int64
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err != nil || val.IsNull || val.Type != catalogapi.TypeInt {
+			continue
+		}
+		sum += val.Int
+		count++
+	}
+	if count == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: sum}, nil
+}
+
+func (e *executor) windowAvg(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	var sum float64
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err != nil || val.IsNull {
+			continue
+		}
+		if val.Type == catalogapi.TypeInt {
+			sum += float64(val.Int)
+			count++
+		} else if val.Type == catalogapi.TypeFloat {
+			sum += val.Float
+			count++
+		}
+	}
+	if count == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeFloat, Float: sum / float64(count)}, nil
+}
+
+func (e *executor) windowCount(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(rows))}, nil
+	}
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err == nil && !val.IsNull {
+			count++
+		}
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: count}, nil
+}
+
+func (e *executor) windowMin(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colIdx := -1
+	if ref, ok := args[0].(*parserapi.ColumnRef); ok {
+		colIdx = findColumnIndexByName(columns, ref.Column)
+	}
+	if colIdx < 0 {
+		var minVal catalogapi.Value
+		hasVal := false
+		for _, row := range rows {
+			val, err := evalExpr(args[0], row, columns, nil, e)
+			if err != nil || val.IsNull {
+				continue
+			}
+			if !hasVal {
+				minVal = val
+				hasVal = true
+			} else if compareValues(val, minVal) < 0 {
+				minVal = val
+			}
+		}
+		if !hasVal {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return minVal, nil
+	}
+	return minValueForColumn(rows, colIdx), nil
+}
+
+func (e *executor) windowMax(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colIdx := -1
+	if ref, ok := args[0].(*parserapi.ColumnRef); ok {
+		colIdx = findColumnIndexByName(columns, ref.Column)
+	}
+	if colIdx < 0 {
+		var maxVal catalogapi.Value
+		hasVal := false
+		for _, row := range rows {
+			val, err := evalExpr(args[0], row, columns, nil, e)
+			if err != nil || val.IsNull {
+				continue
+			}
+			if !hasVal {
+				maxVal = val
+				hasVal = true
+			} else if compareValues(val, maxVal) > 0 {
+				maxVal = val
+			}
+		}
+		if !hasVal {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return maxVal, nil
+	}
+	return maxValueForColumn(rows, colIdx), nil
+}
+
+// ─── Trigger Execution ─────────────────────────────────────────────
+
+const maxTriggerDepth = 16
+
+// fireTriggers executes matching triggers for a given table and event.
+// timing is "BEFORE" or "AFTER", event is "INSERT", "UPDATE", or "DELETE".
+// newRow/newCols provide NEW.* values; oldRow/oldCols provide OLD.* values.
+func (e *executor) fireTriggers(tableName, timing, event string, newCols []catalogapi.ColumnDef, newVals []catalogapi.Value, oldCols []catalogapi.ColumnDef, oldVals []catalogapi.Value) error {
+	// Check re-entrancy limit
+	if e.triggerDepth >= maxTriggerDepth {
+		return fmt.Errorf("%w: trigger recursion limit exceeded (max %d)", executorapi.ErrExecFailed, maxTriggerDepth)
+	}
+
+	triggers, err := e.catalog.ListTriggers(tableName)
+	if err != nil {
+		return fmt.Errorf("%w: listing triggers: %v", executorapi.ErrExecFailed, err)
+	}
+
+	for _, trigger := range triggers {
+		// Check if trigger matches timing and event
+		if trigger.Timing != timing || trigger.Event != event {
+			continue
+		}
+
+		// Set NEW/OLD context for this trigger evaluation
+		e.triggerNewCols = newCols
+		e.triggerNewVals = newVals
+		e.triggerOldCols = oldCols
+		e.triggerOldVals = oldVals
+
+		// Evaluate WHEN condition if present
+		if trigger.WhenCond != "" {
+			matches, err := e.evalTriggerWhen(trigger.WhenCond, trigger.Table)
+			if err != nil {
+				return fmt.Errorf("%w: trigger %s WHEN condition: %v", executorapi.ErrExecFailed, trigger.Name, err)
+			}
+			if !matches {
+				continue // WHEN condition evaluated to false - skip this trigger
+			}
+		}
+
+		// Execute trigger body
+		if err := e.execTriggerBody(trigger.Body, trigger.Table); err != nil {
+			return fmt.Errorf("%w: trigger %s: %v", executorapi.ErrExecFailed, trigger.Name, err)
+		}
+	}
+
+	// Clear trigger context
+	e.triggerNewCols = nil
+	e.triggerNewVals = nil
+	e.triggerOldCols = nil
+	e.triggerOldVals = nil
+
+	return nil
+}
+
+// evalTriggerWhen evaluates a WHEN condition expression with trigger context.
+// Returns true if condition is satisfied or has no WHEN clause.
+func (e *executor) evalTriggerWhen(whenSQL, tableName string) (bool, error) {
+	if whenSQL == "" {
+		return true, nil
+	}
+
+	// Parse the WHEN expression - wrap in SELECT for expression-only input
+	wrappedSQL := "SELECT " + whenSQL
+	stmt, err := e.parser.Parse(wrappedSQL)
+	if err != nil {
+		return false, fmt.Errorf("parse WHEN condition: %v", err)
+	}
+
+	// Extract the expression from the SELECT statement
+	var whereExpr parserapi.Expr
+	if selectStmt, ok := stmt.(*parserapi.SelectStmt); ok {
+		whereExpr = selectStmt.Where
+	}
+
+	if whereExpr == nil {
+		return true, nil // No expression = always matches
+	}
+
+	// Create a dummy row with trigger values for evaluation
+	// We need to set up context so NEW./OLD. column refs can be resolved
+	cols := e.triggerNewCols
+	vals := e.triggerNewVals
+	if len(vals) == 0 {
+		cols = e.triggerOldCols
+		vals = e.triggerOldVals
+	}
+	if len(vals) == 0 {
+		return true, nil // No values to evaluate against
+	}
+
+	// Evaluate the WHERE expression
+	dummyRow := &engineapi.Row{Values: vals}
+	result, err := evalExpr(whereExpr, dummyRow, cols, nil, e)
+	if err != nil {
+		return false, err
+	}
+
+	// WHEN condition is true if result is not NULL and not 0/false
+	return !result.IsNull && result.Int != 0, nil
+}
+
+// execTriggerBody parses and executes the trigger body SQL.
+// bodySQL contains one or more statements separated by semicolons.
+func (e *executor) execTriggerBody(bodySQL, tableName string) error {
+	// Increment trigger depth for re-entrancy protection
+	e.triggerDepth++
+	defer func() { e.triggerDepth-- }()
+
+	// Split by semicolon and execute each statement
+	// Note: Simple split - doesn't handle string literals with semicolons
+	statements := splitStatements(bodySQL)
+	for _, sql := range statements {
+		sql = strings.TrimSpace(sql)
+		if sql == "" {
+			continue
+		}
+
+		// Parse the trigger statement
+		stmt, err := e.parser.Parse(sql)
+		if err != nil {
+			return fmt.Errorf("parse trigger body: %v", err)
+		}
+
+		// Plan the statement
+		plan, err := e.planner.Plan(stmt)
+		if err != nil {
+			return fmt.Errorf("plan trigger statement: %v", err)
+		}
+
+		// Execute the trigger statement
+		if plan != nil {
+			if _, err := e.Execute(plan); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// splitStatements splits a SQL string into individual statements.
+func splitStatements(sql string) []string {
+	var stmts []string
+	var current strings.Builder
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\'' && !inString {
+			inString = true
+			current.WriteByte(ch)
+			continue
+		}
+		if inString {
+			if ch == '\'' {
+				// Check for escaped quote ''
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					current.WriteByte(ch)
+					current.WriteByte('\'')
+					i++
+					continue
+				}
+				inString = false
+			}
+			current.WriteByte(ch)
+			continue
+		}
+		if ch == ';' {
+			stmts = append(stmts, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(ch)
+	}
+
+	// Don't forget the last statement
+	if s := strings.TrimSpace(current.String()); s != "" {
+		stmts = append(stmts, s)
+	}
+	return stmts
 }

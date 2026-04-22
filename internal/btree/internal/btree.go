@@ -484,7 +484,14 @@ func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
 
 func (t *bTree) resolveValue(v *btreeapi.Value) ([]byte, error) {
 	if v.BlobID > 0 && t.blobs != nil {
-		return t.blobs.ReadBlob(v.BlobID)
+		data, err := t.blobs.ReadBlob(v.BlobID)
+		if err != nil {
+			// Blob not found — entry is effectively deleted or vacuum freed the blob
+			// before the entry was physically removed from the tree.
+			// Return btreeapi.ErrKeyNotFound so callers handle it as "not found".
+			return nil, btreeapi.ErrKeyNotFound
+		}
+		return data, nil
 	}
 	return cloneBytes(v.Inline), nil
 }

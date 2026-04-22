@@ -583,3 +583,911 @@ func TestTableEngine_InsertNegativePK(t *testing.T) {
 		t.Fatalf("expected ErrRowNotFound for rowID 0, got %v", err)
 	}
 }
+
+// ─── FTS Engine Tests ───────────────────────────────────────────────
+
+func TestFTSEngine_NewFTSEngine(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+	if fts == nil {
+		t.Fatal("expected non-nil FTSEngine")
+	}
+	var _ engineapi.FTSEngine = fts
+}
+
+func TestFTSEngine_IndexDocument(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	err := fts.IndexDocument("users", 1, []string{"Hello world", "SQL database engine"}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument failed: %v", err)
+	}
+	err = fts.IndexDocument("users", 2, []string{"World of databases"}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument doc 2 failed: %v", err)
+	}
+
+	docIDs, err := fts.Search("users", "world")
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(docIDs) != 2 {
+		t.Errorf("expected 2 docIDs for 'world', got %d: %v", len(docIDs), docIDs)
+	}
+
+	docIDs, err = fts.Search("users", "hello")
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(docIDs) != 1 || docIDs[0] != 1 {
+		t.Errorf("expected [1] for 'hello', got %v", docIDs)
+	}
+
+	docIDs, err = fts.Search("users", "nonexistent")
+	if err != nil {
+		t.Fatalf("Search for nonexistent failed: %v", err)
+	}
+	if len(docIDs) != 0 {
+		t.Errorf("expected 0 docIDs for nonexistent, got %d", len(docIDs))
+	}
+}
+
+func TestFTSEngine_IndexDocument_EmptyTexts(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	err := fts.IndexDocument("users", 1, []string{}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument with empty texts failed: %v", err)
+	}
+	err = fts.IndexDocument("users", 2, []string{"", "   ", ""}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument with whitespace-only texts failed: %v", err)
+	}
+	docIDs, err := fts.Search("users", "anything")
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(docIDs) != 0 {
+		t.Errorf("expected 0 docIDs for empty docs, got %d", len(docIDs))
+	}
+}
+
+func TestFTSEngine_IndexDocument_WithPorterStemmer(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	// Index with porter stemmer
+	err := fts.IndexDocument("posts", 1, []string{"running", "databases"}, "porter")
+	if err != nil {
+		t.Fatalf("IndexDocument with porter failed: %v", err)
+	}
+
+	// Porter stemmer stems "running" -> "runn" (not "run")
+	// Search for the stemmed form
+	docIDs, err := fts.Search("posts", "runn")
+	if err != nil {
+		t.Fatalf("Search for 'runn' failed: %v", err)
+	}
+	if len(docIDs) != 1 || docIDs[0] != 1 {
+		t.Errorf("expected [1] for 'runn' (stemmed from 'running'), got %v", docIDs)
+	}
+
+	// Verify non-existent queries return empty
+	docIDs, err = fts.Search("posts", "nonexistent")
+	if err != nil {
+		t.Fatalf("Search for nonexistent failed: %v", err)
+	}
+	if len(docIDs) != 0 {
+		t.Errorf("expected 0 for nonexistent, got %d", len(docIDs))
+	}
+}
+
+func TestFTSEngine_RemoveDocument(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	err := fts.IndexDocument("users", 1, []string{"Hello world"}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument doc 1 failed: %v", err)
+	}
+	err = fts.IndexDocument("users", 2, []string{"Hello database"}, "")
+	if err != nil {
+		t.Fatalf("IndexDocument doc 2 failed: %v", err)
+	}
+
+	docIDs, err := fts.Search("users", "hello")
+	if err != nil {
+		t.Fatalf("Search before remove failed: %v", err)
+	}
+	if len(docIDs) != 2 {
+		t.Fatalf("expected 2 docIDs before remove, got %d", len(docIDs))
+	}
+
+	err = fts.RemoveDocument("users", 1, []string{"Hello world"}, "")
+	if err != nil {
+		t.Fatalf("RemoveDocument failed: %v", err)
+	}
+	docIDs, err = fts.Search("users", "hello")
+	if err != nil {
+		t.Fatalf("Search after remove failed: %v", err)
+	}
+	if len(docIDs) != 1 || docIDs[0] != 2 {
+		t.Errorf("expected [2] after remove, got %v", docIDs)
+	}
+}
+
+func TestFTSEngine_Search_AND(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("docs", 1, []string{"SQL database"}, "")
+	fts.IndexDocument("docs", 2, []string{"NoSQL database"}, "")
+	fts.IndexDocument("docs", 3, []string{"SQL server"}, "")
+
+	docIDs, err := fts.Search("docs", "SQL AND database")
+	if err != nil {
+		t.Fatalf("Search AND failed: %v", err)
+	}
+	if len(docIDs) != 1 || docIDs[0] != 1 {
+		t.Errorf("expected [1] for SQL AND database, got %v", docIDs)
+	}
+}
+
+func TestFTSEngine_Search_OR(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("docs", 1, []string{"SQL database"}, "")
+	fts.IndexDocument("docs", 2, []string{"NoSQL database"}, "")
+	fts.IndexDocument("docs", 3, []string{"SQL server"}, "")
+
+	docIDs, err := fts.Search("docs", "SQL OR server")
+	if err != nil {
+		t.Fatalf("Search OR failed: %v", err)
+	}
+	if len(docIDs) != 2 {
+		t.Errorf("expected 2 docIDs for SQL OR server, got %d: %v", len(docIDs), docIDs)
+	}
+}
+
+func TestFTSEngine_Search_NOT(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("docs", 1, []string{"SQL database"}, "")
+	fts.IndexDocument("docs", 2, []string{"NoSQL database"}, "")
+
+	docIDs, err := fts.Search("docs", "database NOT SQL")
+	if err != nil {
+		t.Fatalf("Search NOT failed: %v", err)
+	}
+	if len(docIDs) != 1 || docIDs[0] != 2 {
+		t.Errorf("expected [2] for database NOT SQL, got %v", docIDs)
+	}
+}
+
+func TestFTSEngine_Search_EmptyQuery(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("docs", 1, []string{"SQL"}, "")
+
+	docIDs, err := fts.Search("docs", "")
+	if err != nil {
+		t.Fatalf("Search empty failed: %v", err)
+	}
+	if docIDs != nil && len(docIDs) != 0 {
+		t.Errorf("expected empty/nil for empty query, got %v", docIDs)
+	}
+
+	docIDs, err = fts.Search("docs", "   ")
+	if err != nil {
+		t.Fatalf("Search whitespace failed: %v", err)
+	}
+}
+
+func TestFTSEngine_DropFTSData(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("users", 1, []string{"Alice data"}, "")
+	fts.IndexDocument("users", 2, []string{"Bob data"}, "")
+	fts.IndexDocument("posts", 1, []string{"Post content"}, "")
+
+	err := fts.DropFTSData("users")
+	if err != nil {
+		t.Fatalf("DropFTSData failed: %v", err)
+	}
+
+	docIDs, err := fts.Search("users", "alice")
+	if err != nil {
+		t.Fatalf("Search users after drop failed: %v", err)
+	}
+	if len(docIDs) != 0 {
+		t.Errorf("expected 0 docIDs for users after drop, got %d", len(docIDs))
+	}
+
+	docIDs, err = fts.Search("posts", "post")
+	if err != nil {
+		t.Fatalf("Search posts after drop failed: %v", err)
+	}
+	if len(docIDs) != 1 {
+		t.Errorf("expected 1 docID for posts, got %d", len(docIDs))
+	}
+}
+
+func TestFTSEngine_CaseInsensitive(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	fts.IndexDocument("docs", 1, []string{"Hello WORLD"}, "")
+
+	docIDs, err := fts.Search("docs", "HELLO")
+	if err != nil {
+		t.Fatalf("Search uppercase failed: %v", err)
+	}
+	if len(docIDs) != 1 {
+		t.Errorf("expected 1 for HELLO, got %d", len(docIDs))
+	}
+
+	docIDs, err = fts.Search("docs", "world")
+	if err != nil {
+		t.Fatalf("Search lowercase failed: %v", err)
+	}
+	if len(docIDs) != 1 {
+		t.Errorf("expected 1 for world, got %d", len(docIDs))
+	}
+}
+
+func TestFTSEngine_Tokenize(t *testing.T) {
+	store := openTestStore(t)
+	fts := NewFTSEngine(store)
+
+	// Test that alphanumeric tokens work correctly
+	texts := []string{"Hello world", "SQL database"}
+	err := fts.IndexDocument("docs", 1, texts, "")
+	if err != nil {
+		t.Fatalf("IndexDocument failed: %v", err)
+	}
+
+	// Single term searches should work
+	docIDs, _ := fts.Search("docs", "hello")
+	if len(docIDs) != 1 {
+		t.Errorf("expected 'hello' to match doc 1, got %d", len(docIDs))
+	}
+	docIDs, _ = fts.Search("docs", "world")
+	if len(docIDs) != 1 {
+		t.Errorf("expected 'world' to match doc 1, got %d", len(docIDs))
+	}
+	docIDs, _ = fts.Search("docs", "sql")
+	if len(docIDs) != 1 {
+		t.Errorf("expected 'sql' to match doc 1, got %d", len(docIDs))
+	}
+	docIDs, _ = fts.Search("docs", "database")
+	if len(docIDs) != 1 {
+		t.Errorf("expected 'database' to match doc 1, got %d", len(docIDs))
+	}
+
+	// Non-existent term
+	docIDs, _ = fts.Search("docs", "nonexistent")
+	if len(docIDs) != 0 {
+		t.Errorf("expected 0 for nonexistent, got %d", len(docIDs))
+	}
+}
+
+// ─── TableEngine Batch API Tests ────────────────────────────────────
+
+func TestTableEngine_InsertInto(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTable()
+
+	batch := store.NewWriteBatch()
+	values := []catalogapi.Value{intVal(1), textVal("Alice"), intVal(30)}
+	rowID, err := te.InsertInto(table, batch, values)
+	if err != nil {
+		t.Fatalf("InsertInto failed: %v", err)
+	}
+	if rowID != 1 {
+		t.Errorf("expected rowID 1, got %d", rowID)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	row, err := te.Get(table, rowID)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if row.Values[1].Text != "Alice" {
+		t.Errorf("expected name=Alice, got %q", row.Values[1].Text)
+	}
+}
+
+func TestTableEngine_InsertInto_AutoIncrement(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTable()
+
+	for i := 0; i < 3; i++ {
+		batch := store.NewWriteBatch()
+		values := []catalogapi.Value{intVal(0), textVal("user"), intVal(20)}
+		rowID, err := te.InsertInto(table, batch, values)
+		if err != nil {
+			t.Fatalf("InsertInto %d failed: %v", i, err)
+		}
+		if err := batch.Commit(); err != nil {
+			t.Fatalf("Commit %d failed: %v", i, err)
+		}
+		if rowID == 0 {
+			t.Errorf("expected non-zero rowID, got 0")
+		}
+	}
+}
+
+func TestTableEngine_InsertInto_WithPK(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTableWithPK()
+
+	batch := store.NewWriteBatch()
+	values := []catalogapi.Value{intVal(100), textVal("Bob"), intVal(25)}
+	rowID, err := te.InsertInto(table, batch, values)
+	if err != nil {
+		t.Fatalf("InsertInto with PK failed: %v", err)
+	}
+	if rowID != 100 {
+		t.Errorf("expected rowID=100 from PK, got %d", rowID)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	row, _ := te.Get(table, 100)
+	if row.Values[1].Text != "Bob" {
+		t.Errorf("expected Bob, got %q", row.Values[1].Text)
+	}
+}
+
+func TestTableEngine_InsertInto_DuplicatePK(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTableWithPK()
+
+	batch1 := store.NewWriteBatch()
+	_, err := te.InsertInto(table, batch1, []catalogapi.Value{intVal(1), textVal("A"), intVal(1)})
+	if err != nil {
+		t.Fatalf("First InsertInto failed: %v", err)
+	}
+	if err := batch1.Commit(); err != nil {
+		t.Fatalf("First commit failed: %v", err)
+	}
+
+	batch2 := store.NewWriteBatch()
+	_, err = te.InsertInto(table, batch2, []catalogapi.Value{intVal(1), textVal("B"), intVal(2)})
+	if err != engineapi.ErrDuplicateKey {
+		t.Errorf("expected ErrDuplicateKey, got %v", err)
+	}
+	batch2.Discard()
+}
+
+func TestTableEngine_InsertInto_NegativePK(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTableWithPK()
+
+	batch := store.NewWriteBatch()
+	_, err := te.InsertInto(table, batch, []catalogapi.Value{intVal(-5), textVal("Bad"), intVal(99)})
+	if err == nil {
+		t.Fatal("expected error for negative PK, got nil")
+	}
+	batch.Discard()
+}
+
+func TestTableEngine_DeleteFrom(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTable()
+
+	rowID, _ := te.Insert(table, []catalogapi.Value{intVal(0), textVal("Alice"), intVal(30)})
+
+	batch := store.NewWriteBatch()
+	err := te.DeleteFrom(table, batch, rowID)
+	if err != nil {
+		t.Fatalf("DeleteFrom failed: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	_, err = te.Get(table, rowID)
+	if err != engineapi.ErrRowNotFound {
+		t.Errorf("expected ErrRowNotFound, got %v", err)
+	}
+}
+
+func TestTableEngine_UpdateIn(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTable()
+
+	rowID, _ := te.Insert(table, []catalogapi.Value{intVal(0), textVal("Alice"), intVal(30)})
+
+	batch := store.NewWriteBatch()
+	newValues := []catalogapi.Value{intVal(0), textVal("Alice Updated"), intVal(31)}
+	err := te.UpdateIn(table, batch, rowID, newValues)
+	if err != nil {
+		t.Fatalf("UpdateIn failed: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	row, _ := te.Get(table, rowID)
+	if row.Values[1].Text != "Alice Updated" {
+		t.Errorf("expected Alice Updated, got %q", row.Values[1].Text)
+	}
+}
+
+func TestTableEngine_ScanWithLimit(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	for i := 0; i < 10; i++ {
+		te.Insert(table, []catalogapi.Value{intVal(int64(i)), textVal("user"), intVal(int64(20 + i))})
+	}
+
+	iter, err := te.ScanWithLimit(table, 3, 0)
+	if err != nil {
+		t.Fatalf("ScanWithLimit failed: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 3 {
+		t.Errorf("expected 3 rows with limit=3, got %d", count)
+	}
+
+	iter, err = te.ScanWithLimit(table, 5, 3)
+	if err != nil {
+		t.Fatalf("ScanWithLimit with offset failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 5 {
+		t.Errorf("expected 5 rows with limit=5 offset=3, got %d", count)
+	}
+
+	iter, err = te.ScanWithLimit(table, 5, 20)
+	if err != nil {
+		t.Fatalf("ScanWithLimit offset beyond data failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("expected 0 rows when offset beyond data, got %d", count)
+	}
+}
+
+// ─── TableEngine Counter Tests ──────────────────────────────────────
+
+func TestTableEngine_CounterOperations(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	counter := te.NextRowID(table.TableID)
+	if counter != 0 {
+		t.Errorf("expected initial counter=0, got %d", counter)
+	}
+
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	counter = te.NextRowID(table.TableID)
+	if counter != 2 {
+		t.Errorf("expected counter=2 after 1 insert, got %d", counter)
+	}
+
+	got := te.GetCounter(table.TableID)
+	if got != counter {
+		t.Errorf("GetCounter=%d, NextRowID=%d", got, counter)
+	}
+}
+
+func TestTableEngine_IncrementCounter(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	te.IncrementCounter(table.TableID)
+	te.IncrementCounter(table.TableID)
+
+	counter := te.GetCounter(table.TableID)
+	if counter != 2 {
+		t.Errorf("expected counter=2 after 2 increments, got %d", counter)
+	}
+
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	counter = te.GetCounter(table.TableID)
+	if counter != 3 {
+		t.Errorf("expected counter=3 after insert, got %d", counter)
+	}
+}
+
+func TestTableEngine_AllocRowID(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	id1, err := te.AllocRowID(table.TableID)
+	if err != nil {
+		t.Fatalf("AllocRowID 1 failed: %v", err)
+	}
+	if id1 != 1 {
+		t.Errorf("expected first AllocRowID=1, got %d", id1)
+	}
+
+	id2, err := te.AllocRowID(table.TableID)
+	if err != nil {
+		t.Fatalf("AllocRowID 2 failed: %v", err)
+	}
+	if id2 != 2 {
+		t.Errorf("expected second AllocRowID=2, got %d", id2)
+	}
+
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	id3, _ := te.AllocRowID(table.TableID)
+	if id3 != 3 {
+		t.Errorf("expected third AllocRowID=3, got %d", id3)
+	}
+}
+
+func TestTableEngine_PersistCounter(t *testing.T) {
+	te, _, store := newTestEngines(t)
+	table := testTable()
+
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("B"), intVal(2)})
+
+	counter := te.GetCounter(table.TableID)
+	if counter != 3 {
+		t.Errorf("expected counter=3, got %d", counter)
+	}
+
+	// Force counter to load from KV before persisting.
+	_, err := te.AllocRowID(table.TableID)
+	if err != nil {
+		t.Fatalf("AllocRowID failed: %v", err)
+	}
+
+	batch := store.NewWriteBatch()
+	err = te.PersistCounter(batch, table.TableID)
+	if err != nil {
+		t.Fatalf("PersistCounter failed: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// New engine reads persisted counter from KV.
+	encoder := encoding.NewKeyEncoder()
+	codec := encoding.NewRowCodec()
+	te2 := NewTableEngine(store, encoder, codec)
+
+	// Verify counter is NOT loaded yet (lazy load)
+	counter2 := te2.GetCounter(table.TableID)
+	if counter2 != 0 {
+		t.Errorf("expected counter=0 (not loaded yet), got %d", counter2)
+	}
+
+	// Trigger lazy load from KV by calling AllocRowID
+	id, err := te2.AllocRowID(table.TableID)
+	if err != nil {
+		t.Fatalf("AllocRowID failed: %v", err)
+	}
+	// PersistCounter persisted 3, so AllocRowID returns 3 and increments to 4
+	if id != 3 {
+		t.Errorf("expected AllocRowID=3 (persisted value), got %d", id)
+	}
+
+	counter3 := te2.GetCounter(table.TableID)
+	if counter3 != 4 {
+		t.Errorf("expected counter=4 after AllocRowID, got %d", counter3)
+	}
+}
+
+func TestTableEngine_EncodeRow(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+
+	values := []catalogapi.Value{intVal(42), textVal("test"), intVal(99)}
+	encoded := te.EncodeRow(values)
+	if len(encoded) == 0 {
+		t.Error("expected non-empty encoded row")
+	}
+
+	codec := encoding.NewRowCodec()
+	cols := []catalogapi.ColumnDef{
+		{Name: "id", Type: catalogapi.TypeInt},
+		{Name: "name", Type: catalogapi.TypeText},
+		{Name: "age", Type: catalogapi.TypeInt},
+	}
+	decoded, err := codec.DecodeRow(encoded, cols)
+	if err != nil {
+		t.Fatalf("DecodeRow failed: %v", err)
+	}
+	if decoded[0].Int != 42 || decoded[1].Text != "test" || decoded[2].Int != 99 {
+		t.Errorf("decoded values mismatch: %v", decoded)
+	}
+}
+
+// ─── IndexEngine Batch API Tests ────────────────────────────────────
+
+func TestIndexEngine_BatchInsert(t *testing.T) {
+	_, ie, store := newTestEngines(t)
+
+	idx := &catalogapi.IndexSchema{Name: "idx_age", Table: "users", Column: "age"}
+	tableID := uint32(1)
+	indexID := uint32(1)
+
+	batch := store.NewWriteBatch()
+	key := ie.EncodeIndexKey(tableID, indexID, intVal(25), 1)
+	err := ie.InsertBatch(key, batch)
+	if err != nil {
+		t.Fatalf("InsertBatch failed: %v", err)
+	}
+	key2 := ie.EncodeIndexKey(tableID, indexID, intVal(30), 2)
+	err = ie.InsertBatch(key2, batch)
+	if err != nil {
+		t.Fatalf("InsertBatch 2 failed: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	iter, err := ie.Scan(tableID, indexID, encodingapi.OpEQ, intVal(25))
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 1 {
+		t.Errorf("expected 1 entry for age=25, got %d", count)
+	}
+	_ = idx
+}
+
+func TestIndexEngine_BatchDelete(t *testing.T) {
+	_, ie, store := newTestEngines(t)
+
+	idx := &catalogapi.IndexSchema{Name: "idx_age", Table: "users", Column: "age"}
+	tableID := uint32(1)
+	indexID := uint32(1)
+
+	ie.Insert(idx, tableID, indexID, intVal(25), 1)
+	ie.Insert(idx, tableID, indexID, intVal(25), 2)
+
+	batch := store.NewWriteBatch()
+	key := ie.EncodeIndexKey(tableID, indexID, intVal(25), 1)
+	err := ie.DeleteBatch(key, batch)
+	if err != nil {
+		t.Fatalf("DeleteBatch failed: %v", err)
+	}
+	key2 := ie.EncodeIndexKey(tableID, indexID, intVal(25), 2)
+	err = ie.DeleteBatch(key2, batch)
+	if err != nil {
+		t.Fatalf("DeleteBatch 2 failed: %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	iter, err := ie.Scan(tableID, indexID, encodingapi.OpEQ, intVal(25))
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("expected 0 entries after batch delete, got %d", count)
+	}
+}
+
+func TestIndexEngine_EncodeIndexKey(t *testing.T) {
+	_, ie, _ := newTestEngines(t)
+
+	key := ie.EncodeIndexKey(1, 2, intVal(42), 99)
+	if len(key) == 0 {
+		t.Error("expected non-empty key")
+	}
+
+	key2 := ie.EncodeIndexKey(1, 2, intVal(43), 99)
+	if string(key) == string(key2) {
+		t.Error("different values should produce different keys")
+	}
+
+	key3 := ie.EncodeIndexKey(1, 2, intVal(42), 100)
+	if string(key) == string(key3) {
+		t.Error("different rowIDs should produce different keys")
+	}
+}
+
+// ─── IndexEngine Scan Boundary Tests ───────────────────────────────
+
+func TestIndexEngine_Scan_AllBoundaryCases(t *testing.T) {
+	_, ie, _ := newTestEngines(t)
+
+	idx := &catalogapi.IndexSchema{Name: "idx_age", Table: "users", Column: "age"}
+	tableID := uint32(1)
+	indexID := uint32(1)
+
+	for i, age := range []int64{10, 20, 30, 40, 50} {
+		ie.Insert(idx, tableID, indexID, intVal(age), uint64(i+1))
+	}
+
+	iter, err := ie.Scan(tableID, indexID, encodingapi.OpGT, intVal(50))
+	if err != nil {
+		t.Fatalf("Scan GT max failed: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("GT 50: expected 0, got %d", count)
+	}
+
+	iter, err = ie.Scan(tableID, indexID, encodingapi.OpLT, intVal(10))
+	if err != nil {
+		t.Fatalf("Scan LT min failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("LT 10: expected 0, got %d", count)
+	}
+
+	iter, err = ie.Scan(tableID, indexID, encodingapi.OpLE, intVal(10))
+	if err != nil {
+		t.Fatalf("Scan LE min failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 1 {
+		t.Errorf("LE 10: expected 1, got %d", count)
+	}
+
+	iter, err = ie.Scan(tableID, indexID, encodingapi.OpGE, intVal(50))
+	if err != nil {
+		t.Fatalf("Scan GE max failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 1 {
+		t.Errorf("GE 50: expected 1, got %d", count)
+	}
+
+	iter, err = ie.Scan(tableID, indexID, encodingapi.OpEQ, intVal(99))
+	if err != nil {
+		t.Fatalf("Scan EQ nonexistent failed: %v", err)
+	}
+	count = 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("EQ 99: expected 0, got %d", count)
+	}
+}
+
+// ─── RowIterator Tests ───────────────────────────────────────────────
+
+func TestRowIterator_Empty(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	iter, err := te.Scan(table)
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if iter.Next() {
+		t.Error("expected no rows on empty scan")
+	}
+	if err := iter.Err(); err != nil {
+		t.Errorf("unexpected error on empty scan: %v", err)
+	}
+	iter.Close()
+}
+
+func TestRowIterator_KeyAndValue(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+	table := testTable()
+
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	te.Insert(table, []catalogapi.Value{intVal(0), textVal("B"), intVal(2)})
+
+	iter, _ := te.Scan(table)
+	defer iter.Close()
+
+	count := 0
+	for iter.Next() {
+		row := iter.Row()
+		if row == nil {
+			t.Error("expected non-nil row")
+		}
+		if row.RowID == 0 {
+			t.Error("expected non-zero rowID")
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 rows, got %d", count)
+	}
+}
+
+// ─── TableEngine Error Cases ────────────────────────────────────────
+
+func TestTableEngine_TableIDNotSet(t *testing.T) {
+	te, _, _ := newTestEngines(t)
+
+	noIDTable := &catalogapi.TableSchema{
+		Name: "notable",
+		Columns: []catalogapi.ColumnDef{
+			{Name: "id", Type: catalogapi.TypeInt},
+		},
+	}
+
+	_, err := te.Insert(noIDTable, []catalogapi.Value{intVal(1)})
+	if err != engineapi.ErrTableIDNotSet {
+		t.Errorf("expected ErrTableIDNotSet for Insert, got %v", err)
+	}
+
+	_, err = te.Get(noIDTable, 1)
+	if err != engineapi.ErrTableIDNotSet {
+		t.Errorf("expected ErrTableIDNotSet for Get, got %v", err)
+	}
+
+	_, err = te.Scan(noIDTable)
+	if err != engineapi.ErrTableIDNotSet {
+		t.Errorf("expected ErrTableIDNotSet for Scan, got %v", err)
+	}
+
+	err = te.Delete(noIDTable, 1)
+	if err != engineapi.ErrTableIDNotSet {
+		t.Errorf("expected ErrTableIDNotSet for Delete, got %v", err)
+	}
+
+	err = te.Update(noIDTable, 1, []catalogapi.Value{intVal(1)})
+	if err != engineapi.ErrTableIDNotSet {
+		t.Errorf("expected ErrTableIDNotSet for Update, got %v", err)
+	}
+}
+
+func TestIndexEngine_TableIDNotSet(t *testing.T) {
+	_, ie, _ := newTestEngines(t)
+
+	iter, err := ie.Scan(0, 0, encodingapi.OpEQ, intVal(1))
+	if err != nil {
+		t.Fatalf("Scan with zero IDs should not error: %v", err)
+	}
+	count := 0
+	for iter.Next() {
+		count++
+	}
+	iter.Close()
+	if count != 0 {
+		t.Errorf("expected 0 results for zero IDs, got %d", count)
+	}
+}

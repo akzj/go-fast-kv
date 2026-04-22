@@ -138,6 +138,44 @@ const (
 	TokNoAction       TokenType = 112 // NO ACTION
 	TokRestrict       TokenType = 113 // RESTRICT
 	TokParam          TokenType = 114 // $1, $2, ... positional parameter
+	TokTruncate       TokenType = 115 // TRUNCATE
+	TokConflict       TokenType = 116 // CONFLICT (for ON CONFLICT)
+	TokNothing        TokenType = 117 // NOTHING (for DO NOTHING)
+	TokWith           TokenType = 118 // WITH (for CTE)
+	TokRecursive      TokenType = 119 // RECURSIVE (for CTE)
+	TokOver           TokenType = 130 // OVER (window function)
+	TokRowNumber      TokenType = 131 // ROW_NUMBER
+	TokRank           TokenType = 132 // RANK
+	TokDenseRank      TokenType = 133 // DENSE_RANK
+	TokPartition      TokenType = 134 // PARTITION
+	TokFirstValue     TokenType = 135 // FIRST_VALUE
+	TokLastValue      TokenType = 136 // LAST_VALUE
+	TokLag            TokenType = 137 // LAG
+	TokLead           TokenType = 138 // LEAD
+	TokRows           TokenType = 139 // ROWS (window frame)
+	TokRange          TokenType = 140 // RANGE (window frame)
+	TokUnbounded      TokenType = 141 // UNBOUNDED (window frame)
+	TokCurrent        TokenType = 142 // CURRENT (window frame)
+	TokFollowing      TokenType = 143 // FOLLOWING (window frame)
+	TokJsonExtract    TokenType = 144 // JSON_EXTRACT
+	TokJsonSet        TokenType = 145 // JSON_SET
+	TokJsonInsert     TokenType = 146 // JSON_INSERT
+	TokJsonRemove     TokenType = 147 // JSON_REMOVE
+	TokJsonType       TokenType = 148 // JSON_TYPE
+	TokPragma        TokenType = 149 // PRAGMA
+	TokTrigger       TokenType = 150 // TRIGGER
+	TokBefore        TokenType = 151 // BEFORE
+	TokAfter         TokenType = 152 // AFTER
+	TokForEachRow    TokenType = 153 // FOR EACH ROW
+	TokBeginTrigger  TokenType = 154 // BEGIN (trigger body)
+	TokEndTrigger    TokenType = 155 // END (trigger body)
+	TokVirtual       TokenType = 156 // VIRTUAL (for CREATE VIRTUAL TABLE)
+	TokUsing         TokenType = 157 // USING
+	TokMatch         TokenType = 158 // MATCH (for FTS MATCH expression)
+	TokView          TokenType = 162 // VIEW (for CREATE VIEW, DROP VIEW)
+	TokFTS5          TokenType = 159 // FTS5
+	TokFTS4          TokenType = 160 // FTS4
+	TokFTS3          TokenType = 161 // FTS3
 )
 
 // Token represents a single lexical token.
@@ -186,17 +224,20 @@ type DropTableStmt struct {
 	Table    string
 	IfExists bool
 }
-
-func (*DropTableStmt) stmtNode() {}
-
-// CreateIndexStmt: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column)
+// CreateIndexStmt: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column | expr)
+// When Column is non-empty, it's a simple column index.
+// When Expr is non-nil, it's an expression index.
 type CreateIndexStmt struct {
 	Index       string
 	Table       string
-	Column      string
+	Column      string  // simple column name (for backward compat)
+	Expr        Expr    // expression for expression index (e.g., LOWER(email), col1+col2)
 	Unique      bool
 	IfNotExists bool
 }
+func (*DropTableStmt) stmtNode() {}
+
+
 
 func (*CreateIndexStmt) stmtNode() {}
 
@@ -209,14 +250,33 @@ type DropIndexStmt struct {
 
 func (*DropIndexStmt) stmtNode() {}
 
+// CreateViewStmt: CREATE VIEW view_name AS select_statement
+type CreateViewStmt struct {
+	Name      string // view name
+	QuerySQL  string // raw SQL text for re-parsing
+	Select    Statement // the parsed SELECT statement (for validation)
+}
+
+func (*CreateViewStmt) stmtNode() {}
+
+// DropViewStmt: DROP VIEW [IF EXISTS] view_name
+type DropViewStmt struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropViewStmt) stmtNode() {}
+
 // AlterTableStmt: ALTER TABLE t ADD COLUMN col TYPE [NOT NULL] [UNIQUE]
 //                 ALTER TABLE t DROP COLUMN col
 //                 ALTER TABLE t RENAME COLUMN old TO new
+//                 ALTER TABLE t RENAME TO new_name
 type AlterTableStmt struct {
 	Table       string
 	Operation   AlterOp
-	Column      string       // column name (for ADD, DROP, RENAME)
-	ColumnNew   string       // new column name (for RENAME)
+	Column      string       // column name (for ADD, DROP, RENAME COLUMN)
+	ColumnNew   string       // new column name (for RENAME COLUMN)
+	TableNew    string       // new table name (for RENAME TO)
 	TypeName    string       // column type (for ADD)
 	NotNull     bool         // NOT NULL constraint (for ADD)
 	Unique      bool         // UNIQUE constraint (for ADD)
@@ -229,6 +289,7 @@ const (
 	AlterAddColumn    AlterOp = 0 // ADD COLUMN
 	AlterDropColumn   AlterOp = 1 // DROP COLUMN
 	AlterRenameColumn AlterOp = 2 // RENAME COLUMN
+	AlterRenameTable  AlterOp = 3 // RENAME TO
 )
 
 func (*AlterTableStmt) stmtNode() {}
@@ -236,12 +297,31 @@ func (*AlterTableStmt) stmtNode() {}
 // ─── DML Statements ───────────────────────────────────────────────
 
 // InsertStmt: INSERT INTO table [(col1, col2)] VALUES (v1, v2), ...
+//   INSERT ... ON CONFLICT (col) DO UPDATE SET col=val
+//   INSERT ... ON CONFLICT DO NOTHING
 type InsertStmt struct {
-	Table      string
-	Columns    []string   // optional column list
-	Values     [][]Expr   // multiple rows
-	SelectStmt *SelectStmt // SELECT subquery for INSERT ... SELECT
+	Table           string
+	Columns         []string       // optional column list
+	Values          [][]Expr      // multiple rows
+	SelectStmt      *SelectStmt    // SELECT subquery for INSERT ... SELECT
+	OnConflict      *OnConflictClause // ON CONFLICT clause for UPSERT
 }
+
+// OnConflictClause represents the ON CONFLICT (UPSERT) clause.
+type OnConflictClause struct {
+	ConflictColumns []string          // columns for conflict detection (e.g., id for PRIMARY KEY)
+	Action          ConflictAction     // DO NOTHING or DO UPDATE
+	// For DO UPDATE:
+	UpdateColumns  []string           // column names to update
+	UpdateValues   []Expr             // new values for UPDATE SET
+}
+
+type ConflictAction int
+
+const (
+	ConflictDoNothing ConflictAction = 0 // DO NOTHING
+	ConflictDoUpdate  ConflictAction = 1 // DO UPDATE SET col=val
+)
 
 func (*InsertStmt) stmtNode() {}
 
@@ -280,6 +360,24 @@ type SelectStmt struct {
 }
 
 func (*SelectStmt) stmtNode() {}
+
+// CTEClause represents a Common Table Expression (WITH ... AS ...).
+type CTEClause struct {
+	Name       string    // CTE name, e.g., "temp" in "WITH temp AS (...)"
+	SelectStmt Statement // the subquery defining this CTE (can be SelectStmt or UnionStmt)
+	IsRecursive bool     // true for "WITH RECURSIVE"
+}
+
+func (*CTEClause) exprNode() {} // CTE is used as a statement wrapper
+
+// WithStmt represents a WITH clause wrapping a main statement.
+// The WITH clause contains one or more CTE definitions.
+type WithStmt struct {
+	CTEs      []*CTEClause // CTE definitions
+	Statement Statement    // the main statement (usually SelectStmt)
+}
+
+func (*WithStmt) stmtNode() {}
 
 // LockMode represents the lock mode for SELECT ... FOR UPDATE.
 type LockMode int
@@ -379,6 +477,13 @@ type DeleteStmt struct {
 }
 
 func (*DeleteStmt) stmtNode() {}
+
+// TruncateStmt: TRUNCATE TABLE t
+type TruncateStmt struct {
+	Table string
+}
+
+func (*TruncateStmt) stmtNode() {}
 
 // UpdateStmt: UPDATE table SET col1=val1, ... [WHERE expr]
 type UpdateStmt struct {
@@ -489,6 +594,14 @@ type StringFuncExpr struct {
 
 func (*StringFuncExpr) exprNode() {}
 
+// JsonFuncExpr represents JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE
+type JsonFuncExpr struct {
+	Func  string   // "JSON_EXTRACT", "JSON_SET", "JSON_INSERT", "JSON_REMOVE", "JSON_TYPE"
+	Args  []Expr   // arguments: json, path [, value...]
+}
+
+func (*JsonFuncExpr) exprNode() {}
+
 // CastExpr: CAST(expr AS type) performs type conversion.
 type CastExpr struct {
 	Expr     Expr  // the expression to cast
@@ -509,6 +622,31 @@ type AggregateCallExpr struct {
 }
 
 func (*AggregateCallExpr) exprNode() {}
+
+// WindowSpec: OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ...)
+type WindowSpec struct {
+	PartitionBy []Expr      // PARTITION BY expressions (nil = all rows)
+	OrderBy     []*OrderByClause // ORDER BY within window (nil = no ordering)
+	FrameStart  FrameBound // ROWS/RANGE start (UNBOUNDED PRECEDING, CURRENT ROW, etc.)
+	FrameEnd    FrameBound // ROWS/RANGE end
+	FrameMode   string     // "ROWS" or "RANGE" (empty = default)
+}
+
+// FrameBound: UNBOUNDED PRECEDING, CURRENT ROW, expr PRECEDING, expr FOLLOWING
+type FrameBound struct {
+	Type string // "UNBOUNDED PRECEDING", "CURRENT ROW", "PRECEDING", "FOLLOWING"
+	Expr Expr   // numeric expression for PRECEDING/FOLLOWING (nil for keywords)
+}
+
+// WindowFuncExpr: window function call with OVER clause
+// Examples: ROW_NUMBER() OVER (...), SUM(x) OVER (PARTITION BY y ORDER BY z)
+type WindowFuncExpr struct {
+	Func   string       // "ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", etc.
+	Args   []Expr       // Arguments (empty for ROW_NUMBER, RANK; 1 for SUM, LAG, etc.)
+	Window *WindowSpec  // nil means no OVER clause (shouldn't happen after parsing)
+}
+
+func (*WindowFuncExpr) exprNode() {}
 
 // DefaultExpr: DEFAULT keyword in INSERT VALUES (resolves to column's default value)
 type DefaultExpr struct{}
@@ -589,6 +727,66 @@ type ExplainStmt struct {
 }
 
 func (*ExplainStmt) stmtNode() {}
+
+// PragmaStmt represents a PRAGMA command.
+// Syntax: PRAGMA name [= value]
+type PragmaStmt struct {
+	Name  string       // pragma name: "database_list", "table_info", "index_list", etc.
+	Arg   string       // optional argument: table name, value, etc.
+	Value Expr         // optional value to SET (for PRAGMA name = value)
+}
+
+func (*PragmaStmt) stmtNode() {}
+
+// ─── FTS Statements ───────────────────────────────────────────────
+
+// CreateFTSStmt: CREATE VIRTUAL TABLE name USING fts5(col1, col2, ...) [tokenize='porter']
+type CreateFTSStmt struct {
+	Name           string   // table name
+	Columns        []string // column names
+	Tokenize       string   // tokenizer: "", "porter", "simple"
+	FTSVersion     string   // "fts5", "fts4", "fts3"
+	IfNotExists    bool
+}
+
+func (*CreateFTSStmt) stmtNode() {}
+
+// DropFTSStmt: DROP TABLE name (FTS tables use same DROP TABLE syntax)
+type DropFTSStmt struct {
+	Table    string
+	IfExists bool
+}
+
+func (*DropFTSStmt) stmtNode() {}
+
+// MatchExpr: expression for FTS MATCH operator
+// e.g., 'sql AND database' in: WHERE table MATCH 'sql AND database'
+type MatchExpr struct {
+	Table  string // optional table qualifier (e.g., "articles" in "articles.MATCH")
+	Query  string // FTS query string
+}
+
+func (*MatchExpr) exprNode() {}
+
+// TriggerStmt: CREATE TRIGGER name [BEFORE|AFTER] [INSERT|UPDATE|DELETE] ON table [WHEN condition] BEGIN ... END
+type TriggerStmt struct {
+	Name      string       // trigger name
+	Timing    string       // "BEFORE" or "AFTER"
+	Event     string       // "INSERT", "UPDATE", "DELETE"
+	Table     string       // target table name
+	WhenCond  Expr         // nil if no WHEN clause
+	Body      []Statement  // trigger body statements
+}
+
+func (*TriggerStmt) stmtNode() {}
+
+// DropTriggerStmt: DROP TRIGGER [IF EXISTS] name
+type DropTriggerStmt struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropTriggerStmt) stmtNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 

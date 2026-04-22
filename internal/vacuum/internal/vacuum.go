@@ -357,13 +357,25 @@ func (v *vacuumer) processLeaf(
 ) (int, []blobstoreapi.WALEntry, error) {
 	clog := v.txnMgr.CLOG()
 
-	// First pass: identify which entries to remove and handle aborted-creator restoration
+	// Catalog key prefix - vacuum skips catalog entries to protect metadata
+	const catalogPrefix = "_sql:"
+
+	// First pass: identify which entries to remove.
+	// NOTE: We collect blob IDs to free but DO NOT free them yet.
+	// We free them AFTER rewriting the node to ensure entries are physically
+	// removed before their blobs are freed.
 	removed := 0
-	var blobEntries []blobstoreapi.WALEntry
+	var blobsToFree []blobstoreapi.BlobID // BlobIDs to free AFTER node rewrite
 	keep := make([]bool, len(node.Entries))
 
 	for i := range node.Entries {
 		e := &node.Entries[i]
+
+		// SKIP catalog entries - vacuum must not process metadata
+		if len(e.Key) >= len(catalogPrefix) && string(e.Key[:len(catalogPrefix)]) == catalogPrefix {
+			keep[i] = true
+			continue
+		}
 
 		// Case 1: Committed delete/overwrite
 		if e.TxnMax != math.MaxUint64 &&
@@ -371,10 +383,9 @@ func (v *vacuumer) processLeaf(
 			clog.Get(e.TxnMax) == txnapi.TxnCommitted {
 			keep[i] = false
 			removed++
-			// Free blob if any
+			// Collect blob ID to free (will free AFTER node rewrite)
 			if e.Value.BlobID > 0 {
-				entry := v.blobStore.Delete(e.Value.BlobID)
-				blobEntries = append(blobEntries, entry)
+				blobsToFree = append(blobsToFree, e.Value.BlobID)
 			}
 			continue
 		}
@@ -383,13 +394,11 @@ func (v *vacuumer) processLeaf(
 		if clog.Get(e.TxnMin) == txnapi.TxnAborted {
 			keep[i] = false
 			removed++
-			// Free blob if any
+			// Collect blob ID to free (will free AFTER node rewrite)
 			if e.Value.BlobID > 0 {
-				entry := v.blobStore.Delete(e.Value.BlobID)
-				blobEntries = append(blobEntries, entry)
+				blobsToFree = append(blobsToFree, e.Value.BlobID)
 			}
 			// Restore previous version's TxnMax if it was overwritten by this aborted txn
-			// Look for a previous version with same key where TxnMax == e.TxnMin
 			for j := range node.Entries {
 				if j == i {
 					continue
@@ -410,11 +419,7 @@ func (v *vacuumer) processLeaf(
 	// Case 3: Duplicate committed versions — safety net for the concurrent Put
 	// bug (H4) where two writers could both create entries with TxnMax=∞.
 	// For each key with multiple committed TxnMax=∞ entries, keep only the
-	// one with the highest TxnMin (most recent writer). This handles any
-	// pre-existing data created before the btree fix was applied.
-	//
-	// Algorithm: build a map of key → best entry index (highest committed TxnMin
-	// with TxnMax=∞). Then mark all other same-key TxnMax=∞ entries as removed.
+	// one with the highest TxnMin (most recent writer).
 	type bestEntry struct {
 		index  int
 		txnMin uint64
@@ -425,6 +430,10 @@ func (v *vacuumer) processLeaf(
 			continue
 		}
 		e := &node.Entries[i]
+		// SKIP catalog entries
+		if len(e.Key) >= len(catalogPrefix) && string(e.Key[:len(catalogPrefix)]) == catalogPrefix {
+			continue
+		}
 		if e.TxnMax != math.MaxUint64 {
 			continue
 		}
@@ -439,18 +448,18 @@ func (v *vacuumer) processLeaf(
 				// Current entry is newer — remove the previous best
 				keep[prev.index] = false
 				removed++
+				// Collect blob ID to free (will free AFTER node rewrite)
 				if node.Entries[prev.index].Value.BlobID > 0 {
-					entry := v.blobStore.Delete(node.Entries[prev.index].Value.BlobID)
-					blobEntries = append(blobEntries, entry)
+					blobsToFree = append(blobsToFree, node.Entries[prev.index].Value.BlobID)
 				}
 				bestMap[keyStr] = bestEntry{index: i, txnMin: e.TxnMin}
 			} else {
 				// Previous best is newer — remove current entry
 				keep[i] = false
 				removed++
+				// Collect blob ID to free (will free AFTER node rewrite)
 				if e.Value.BlobID > 0 {
-					entry := v.blobStore.Delete(e.Value.BlobID)
-					blobEntries = append(blobEntries, entry)
+					blobsToFree = append(blobsToFree, e.Value.BlobID)
 				}
 			}
 		} else {
@@ -462,7 +471,7 @@ func (v *vacuumer) processLeaf(
 		return 0, nil, nil
 	}
 
-	// Build new entry list
+	// Build new entry list (physically remove dead entries from node)
 	newEntries := make([]btreeapi.LeafEntry, 0, len(node.Entries)-removed)
 	for i, e := range node.Entries {
 		if keep[i] {
@@ -471,6 +480,14 @@ func (v *vacuumer) processLeaf(
 	}
 	node.Entries = newEntries
 	node.Count = uint16(len(newEntries))
+
+	// NOW free blobs — entries are physically removed from the tree.
+	// This ensures no reader can find an entry with a freed blob.
+	var blobEntries []blobstoreapi.WALEntry
+	for _, blobID := range blobsToFree {
+		entry := v.blobStore.Delete(blobID)
+		blobEntries = append(blobEntries, entry)
+	}
 
 	// Note: caller (Run) handles WritePage under the page lock.
 	return removed, blobEntries, nil

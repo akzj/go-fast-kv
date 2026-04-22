@@ -30,8 +30,8 @@ func setupExplainTest(t *testing.T) (parserapi.Parser, plannerapi.Planner, execu
 	tbl := engine.NewTableEngine(store, enc, codec)
 	idx := engine.NewIndexEngine(store, enc)
 	p := parser.New()
-	pl := planner.New(cat)
-	exec := executor.New(store, cat, tbl, idx, pl, p)
+	pl := planner.New(cat, p)
+	exec := executor.New(store, cat, tbl, idx, nil, pl, p)
 	return p, pl, exec, cat
 }
 

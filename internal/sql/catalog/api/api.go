@@ -48,56 +48,89 @@ var ErrIndexExists = sqlerrors.ErrIndexExists("")
 // ErrColumnNotFound is returned when a column does not exist in a table.
 var ErrColumnNotFound = sqlerrors.ErrColumnNotFound("", "")
 
+// ErrTriggerNotFound is returned when a trigger does not exist.
+var ErrTriggerNotFound = sqlerrors.ErrTriggerNotFound("")
+
+// ErrTriggerExists is returned when trying to create a trigger that already exists.
+var ErrTriggerExists = sqlerrors.ErrTriggerExists("")
+
+// ErrViewNotFound is returned when a view does not exist.
+var ErrViewNotFound = sqlerrors.ErrViewNotFound("")
+
+// ErrViewExists is returned when trying to create a view that already exists.
+var ErrViewExists = sqlerrors.ErrViewExists("")
+
 // ─── Schema Types ─────────────────────────────────────────────────
 
 // TableSchema describes a table's structure.
 type TableSchema struct {
-	Name              string
-	Columns           []ColumnDef
-	PrimaryKey        string // column name, optional
-	TableID           uint32 // persistent ID for key encoding (assigned at CREATE TABLE)
-	CheckConstraints  []CheckConstraint  // table-level CHECK constraints
-	ForeignKeys       []ForeignKeySchema // foreign key constraints
+	Name             string            `json:"N,omitempty"`
+	Columns          []ColumnDef       `json:"C,omitempty"`
+	PrimaryKey      string            `json:"P,omitempty"`
+	TableID         uint32           `json:"I,omitempty"`
+	CheckConstraints []CheckConstraint `json:"CC,omitempty"`
+	ForeignKeys      []ForeignKeySchema `json:"FK,omitempty"`
 }
 
 // ColumnDef describes a single column in a table.
 type ColumnDef struct {
-	Table        string // table name for qualified column lookups
-	Name         string
-	Type         Type
-	NotNull      bool          // NOT NULL constraint
-	DefaultValue *Value        // DEFAULT value, nil if not specified
-	AutoInc      bool          // AUTOINCREMENT flag — column gets auto-generated integer IDs
-	Check        *CheckConstraint // column-level CHECK constraint; nil if not specified
+	Table        string           `json:"T,omitempty"`
+	Name         string           `json:"N,omitempty"`
+	Type         Type             `json:"Y,omitempty"`
+	NotNull      bool             `json:"NN,omitempty"`
+	DefaultValue *Value           `json:"D,omitempty"`
+	AutoInc      bool             `json:"AI,omitempty"`
+	Check        *CheckConstraint `json:"C,omitempty"`
 }
 
 // CheckConstraint represents a CHECK constraint (column-level or table-level).
 // RawSQL stores the original expression text for the executor to evaluate.
 type CheckConstraint struct {
-	Name   string // optional name, currently unused but reserved for future
-	RawSQL string // the expression text, e.g. "price > 0"
+	Name   string `json:"N,omitempty"`
+	RawSQL string `json:"R,omitempty"`
 }
 
 // ForeignKeySchema describes a FOREIGN KEY constraint.
 type ForeignKeySchema struct {
-	Name              string
-	TableName         string   // name of the table this FK belongs to (child table)
-	Columns           []string // column names in this table
-	ReferencedTable   string   // referenced table name
-	ReferencedColumns []string // column names in referenced table
-	OnDelete          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
-	OnUpdate          string   // referential action: "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"
+	Name            string   `json:"N,omitempty"`
+	TableName       string   `json:"T,omitempty"`
+	Columns        []string `json:"C,omitempty"`
+	ReferencedTable string   `json:"RT,omitempty"`
+	ReferencedColumns []string `json:"RC,omitempty"`
+	OnDelete       string   `json:"OD,omitempty"`
+	OnUpdate       string   `json:"OU,omitempty"`
 }
 
-// IndexSchema describes an index on a table.
+
+// IndexSchema describes an index on a table (column or expression).
 type IndexSchema struct {
-	Name    string
-	Table   string
-	Column  string // indexed column
-	Unique  bool
-	IndexID uint32 // persistent ID for key encoding (assigned at CREATE INDEX)
+	Name    string `json:"N,omitempty"`
+	Table  string `json:"T,omitempty"`
+	Column string `json:"C,omitempty"` // column name (for simple index)
+	Unique bool   `json:"U,omitempty"`
+	IndexID uint32 `json:"I,omitempty"`
+	// ExprSQL stores the serialized expression for expression indexes.
+	// e.g., "LOWER(email)" for CREATE INDEX idx ON t(LOWER(email)).
+	// Empty for simple column indexes.
+	ExprSQL string `json:"E,omitempty"`
 }
 
+// TriggerSchema describes a trigger on a table.
+type TriggerSchema struct {
+	Name     string `json:"N,omitempty"`
+	Table    string `json:"T,omitempty"`
+	Timing   string `json:"M,omitempty"` // "BEFORE", "AFTER", "INSTEAD OF"
+	Event    string `json:"E,omitempty"` // "INSERT", "UPDATE", "DELETE"
+	WhenCond string `json:"W,omitempty"` // WHEN condition expression (or "")
+	Body     string `json:"B,omitempty"` // trigger body SQL
+}
+
+// ViewSchema describes a view's definition.
+type ViewSchema struct {
+	Name      string `json:"N,omitempty"`
+	QuerySQL  string `json:"Q,omitempty"` // original SELECT SQL
+	CreatedAt int64  `json:"T,omitempty"` // creation timestamp
+}
 // ─── Interfaces ────────────────────────────────────────────────────
 
 // CatalogManager manages table and index metadata.
@@ -149,4 +182,40 @@ type CatalogManager interface {
 	// AlterTable modifies a table's schema.
 	// Returns ErrTableNotFound if the table does not exist.
 	AlterTable(schema TableSchema) error
+
+	// RenameTable renames a table.
+	// Returns ErrTableNotFound if the table does not exist.
+	// Returns ErrTableExists if the new name already exists.
+	RenameTable(oldName, newName string) error
+
+	// CreateTrigger creates a trigger.
+	// Returns an error if the trigger already exists.
+	CreateTrigger(schema TriggerSchema) error
+
+	// GetTrigger returns a trigger by name.
+	// Returns ErrTriggerNotFound if the trigger does not exist.
+	GetTrigger(triggerName string) (*TriggerSchema, error)
+
+	// DropTrigger removes a trigger.
+	// Returns ErrTriggerNotFound if the trigger does not exist.
+	DropTrigger(triggerName string) error
+
+	// ListTriggers returns all triggers for a given table.
+	// Returns an empty slice (not error) if the table has no triggers.
+	ListTriggers(tableName string) ([]TriggerSchema, error)
+
+	// CreateView creates a view.
+	// Returns ErrViewExists if the view already exists.
+	CreateView(schema ViewSchema) error
+
+	// GetView returns a view by name (case-insensitive).
+	// Returns ErrViewNotFound if the view does not exist.
+	GetView(name string) (*ViewSchema, error)
+
+	// DropView removes a view.
+	// Returns ErrViewNotFound if the view does not exist.
+	DropView(name string) error
+
+	// ListViews returns all view names.
+	ListViews() ([]string, error)
 }

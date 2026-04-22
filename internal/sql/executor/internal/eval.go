@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -54,6 +55,10 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		}
 		walkExpr(e.Start, fn)
 		walkExpr(e.Len, fn)
+	case *parserapi.JsonFuncExpr:
+		for _, arg := range e.Args {
+			walkExpr(arg, fn)
+		}
 	case *parserapi.CaseExpr:
 		for _, w := range e.Whens {
 			walkExpr(w.Cond, fn)
@@ -98,6 +103,22 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalLikeExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.AggregateCallExpr:
 		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, node.Func)
+	case *parserapi.WindowFuncExpr:
+		// Look up pre-computed window function value from windowResults
+		result, exists := ex.windowResults[node]
+		if !exists || result == nil || len(result.Values) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: window function %s() not yet computed", executorapi.ErrExecFailed, node.Func)
+		}
+		// Find the index of this row in the result
+		idx, ok := result.rowIndexMap[row]
+		if !ok {
+			// Fallback: iterate to find row pointer match (should be rare)
+			for j := range result.Values {
+				return result.Values[j], nil
+			}
+			return catalogapi.Value{}, fmt.Errorf("%w: window function %s() row not found", executorapi.ErrExecFailed, node.Func)
+		}
+		return result.Values[idx], nil
 	case *parserapi.BetweenExpr:
 		return evalBetweenExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.InExpr:
@@ -108,6 +129,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalNullIfExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.StringFuncExpr:
 		return evalStringFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.JsonFuncExpr:
+		return evalJsonFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CastExpr:
 		return evalCastExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
@@ -136,7 +159,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 }
 
 // evalColumnRef looks up a column value from the row.
-// e provides access to outerCols/outerVals for correlated subquery resolution.
+// e provides access to outerCols/outerVals for correlated subquery resolution,
+// and triggerNewCols/triggerNewVals/OLD for row-level trigger references.
 func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catalogapi.ColumnDef, e *executor) (catalogapi.Value, error) {
 	upper := strings.ToUpper(ref.Column)
 	upperTable := strings.ToUpper(ref.Table)
@@ -182,9 +206,25 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 		return catalogapi.Value{}, false
 	}
 
-	// Try current table columns first
-	if val, ok := findIn(columns, row.Values); ok {
-		return val, nil
+	// Try current table columns first (skip if row is nil)
+	if row != nil {
+		if val, ok := findIn(columns, row.Values); ok {
+			return val, nil
+		}
+	}
+
+	// Try NEW. reference for INSERT/UPDATE triggers
+	if upperTable == "NEW" && e != nil {
+		if val, ok := findIn(e.triggerNewCols, e.triggerNewVals); ok {
+			return val, nil
+		}
+	}
+
+	// Try OLD. reference for UPDATE/DELETE triggers
+	if upperTable == "OLD" && e != nil {
+		if val, ok := findIn(e.triggerOldCols, e.triggerOldVals); ok {
+			return val, nil
+		}
 	}
 
 	// Fall back to outer columns for correlated subqueries
@@ -1113,4 +1153,681 @@ func evalExistsExpr(expr *parserapi.ExistsExpr, row *engineapi.Row, columns []ca
 		return intVal(1), nil
 	}
 	return intVal(0), nil
+}
+
+// evalJsonFuncExpr evaluates JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE.
+func evalJsonFuncExpr(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch expr.Func {
+	case "JSON_EXTRACT":
+		return evalJsonExtract(expr, row, columns, subqueryResults, ex)
+	case "JSON_TYPE":
+		return evalJsonType(expr, row, columns, subqueryResults, ex)
+	case "JSON_SET":
+		return evalJsonSet(expr, row, columns, subqueryResults, ex)
+	case "JSON_INSERT":
+		return evalJsonInsert(expr, row, columns, subqueryResults, ex)
+	case "JSON_REMOVE":
+		return evalJsonRemove(expr, row, columns, subqueryResults, ex)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown JSON function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// evalJsonExtract evaluates JSON_EXTRACT(json, path).
+// Extracts a value from JSON based on the path.
+// Paths use SQLite syntax: $.name, $.a.b, $[0], $[1].name
+func evalJsonExtract(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate JSON document
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if jsonVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT requires text argument for JSON document", executorapi.ErrExecFailed)
+	}
+	// Evaluate path
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if pathVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT path must be text", executorapi.ErrExecFailed)
+	}
+
+	// Navigate to the path and return the raw JSON
+	result, err := jsonNavigate(jsonVal.Text, pathVal.Text)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: string(result)}, nil
+}
+
+// jsonNavigate extracts a value from JSON based on a path.
+// Supports SQLite JSON paths: $.name, $.a.b, $[0], $[1].name, $
+func jsonNavigate(jsonStr, path string) (json.RawMessage, error) {
+	// Parse JSON
+	var doc interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %v", err)
+	}
+
+	// Parse path: strip leading $, then split by . and []
+	path = strings.TrimPrefix(path, "$")
+	if path == "" {
+		// Just $, return the whole document
+		return json.Marshal(doc)
+	}
+
+	// Navigate through path segments
+	current := doc
+	for len(path) > 0 {
+		if path[0] == '.' {
+			// Object access: .key
+			path = path[1:]
+			if len(path) == 0 {
+				return nil, fmt.Errorf("invalid path: expected key name after '.'")
+			}
+			// Find the key name (until [ or . or end)
+			end := 0
+			for end < len(path) && path[end] != '[' && path[end] != '.' {
+				end++
+			}
+			key := path[:end]
+			path = path[end:]
+
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("path error: expected object, got %T", current)
+			}
+			val, ok := m[key]
+			if !ok {
+				return nil, nil // Path not found
+			}
+			current = val
+
+		} else if path[0] == '[' {
+			// Array access: [index]
+			path = path[1:]
+			if len(path) == 0 || path[0] == ']' {
+				return nil, fmt.Errorf("invalid path: expected index after '['")
+			}
+			// Parse index
+			end := 0
+			for end < len(path) && path[end] != ']' {
+				end++
+			}
+			if end > len(path) {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			idxStr := path[:end]
+			path = path[end:]
+			if path == "" || path[0] != ']' {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			path = path[1:] // consume ']'
+
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("path error: expected array, got %T", current)
+			}
+			idx := 0
+			for _, c := range idxStr {
+				if c < '0' || c > '9' {
+					return nil, fmt.Errorf("invalid path: expected integer index")
+				}
+				idx = idx*10 + int(c-'0')
+			}
+			if idx < 0 || idx >= len(arr) {
+				return nil, nil // Index out of range
+			}
+			current = arr[idx]
+
+		} else {
+			return nil, fmt.Errorf("invalid path: expected '.' or '[', got %c", path[0])
+		}
+	}
+
+	return json.Marshal(current)
+}
+
+// jsonPathSegment represents a single segment in a JSON path.
+type jsonPathSegment struct {
+	Key     string // For object access: .key
+	Index   int    // For array access: [index]
+	IsArray bool   // True if this is an array index access
+}
+
+// parseJsonPath parses a SQLite JSON path into segments.
+// Supports: $.name, $.a.b, $[0], $[1].name
+func parseJsonPath(path string) ([]jsonPathSegment, error) {
+	path = strings.TrimPrefix(path, "$")
+	if path == "" {
+		return nil, nil // Just $, empty path
+	}
+
+	var segments []jsonPathSegment
+	for len(path) > 0 {
+		if path[0] == '.' {
+			path = path[1:]
+			if len(path) == 0 {
+				return nil, fmt.Errorf("invalid path: expected key name after '.'")
+			}
+			end := 0
+			for end < len(path) && path[end] != '[' && path[end] != '.' {
+				end++
+			}
+			segments = append(segments, jsonPathSegment{Key: path[:end]})
+			path = path[end:]
+		} else if path[0] == '[' {
+			path = path[1:]
+			if len(path) == 0 || path[0] == ']' {
+				return nil, fmt.Errorf("invalid path: expected index after '['")
+			}
+			end := 0
+			for end < len(path) && path[end] != ']' {
+				end++
+			}
+			if end > len(path) {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			idxStr := path[:end]
+			path = path[end:]
+			if path == "" || path[0] != ']' {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			path = path[1:] // consume ']'
+
+			idx := 0
+			for _, c := range idxStr {
+				if c < '0' || c > '9' {
+					return nil, fmt.Errorf("invalid path: expected integer index")
+				}
+				idx = idx*10 + int(c-'0')
+			}
+			segments = append(segments, jsonPathSegment{Index: idx, IsArray: true})
+		} else {
+			return nil, fmt.Errorf("invalid path: expected '.' or '[', got %c", path[0])
+		}
+	}
+	return segments, nil
+}
+
+// jsonSet sets a value at the given path, creating the path if it doesn't exist.
+// JSON_SET('{"name":"Alice"}', '$.name', 'Bob') → {"name":"Bob"}
+// JSON_SET('{"name":"Alice"}', '$.age', 30) → {"name":"Alice","age":30}
+func jsonSet(jsonStr string, path string, value interface{}) (string, error) {
+	var doc interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+		return "", fmt.Errorf("invalid JSON: %v", err)
+	}
+
+	segments, err := parseJsonPath(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Navigate to parent of target path
+	current := doc
+	for i := 0; i < len(segments)-1; i++ {
+		seg := segments[i]
+		if seg.IsArray {
+			arr, ok := current.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected array at segment %d", i)
+			}
+			if seg.Index < 0 || seg.Index >= len(arr) {
+				return "", fmt.Errorf("path error: index %d out of range", seg.Index)
+			}
+			current = arr[seg.Index]
+		} else {
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected object at segment %d", i)
+			}
+			val, ok := m[seg.Key]
+			if !ok {
+				// Create intermediate object
+				m[seg.Key] = make(map[string]interface{})
+				val = m[seg.Key]
+			}
+			current = val
+		}
+	}
+
+	// Set the value at the final segment
+	if len(segments) == 0 {
+		// Path is just $, replace the whole document
+		doc = convertToJSONValue(value)
+	} else {
+		last := segments[len(segments)-1]
+		if last.IsArray {
+			arr, ok := current.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected array at final segment")
+			}
+			// Extend array if needed
+			for len(arr) <= last.Index {
+				arr = append(arr, nil)
+			}
+			arr[last.Index] = convertToJSONValue(value)
+		} else {
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected object at final segment")
+			}
+			m[last.Key] = convertToJSONValue(value)
+		}
+	}
+
+	result, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal result: %v", err)
+	}
+	return string(result), nil
+}
+
+// jsonInsert inserts a value at the given path only if the path doesn't exist.
+// JSON_INSERT('{"name":"Alice"}', '$.name', 'Bob') → {"name":"Alice"} (no change)
+// JSON_INSERT('{"name":"Alice"}', '$.age', 30) → {"name":"Alice","age":30}
+func jsonInsert(jsonStr string, path string, value interface{}) (string, error) {
+	var doc interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+		return "", fmt.Errorf("invalid JSON: %v", err)
+	}
+
+	segments, err := parseJsonPath(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Navigate to target
+	current := doc
+	for i := 0; i < len(segments); i++ {
+		seg := segments[i]
+		if seg.IsArray {
+			arr, ok := current.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected array at segment %d", i)
+			}
+			if seg.Index < 0 || seg.Index >= len(arr) {
+				// Path doesn't exist, insert it
+				if i == len(segments)-1 {
+					// Extend array if needed and insert
+					for len(arr) <= seg.Index {
+						arr = append(arr, nil)
+					}
+					arr[seg.Index] = convertToJSONValue(value)
+				} else {
+					return "", fmt.Errorf("path error: intermediate index %d out of range", seg.Index)
+				}
+				return string(mustMarshal(doc)), nil
+			}
+			if i == len(segments)-1 {
+				// Path exists, don't modify
+				return jsonStr, nil
+			}
+			current = arr[seg.Index]
+		} else {
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected object at segment %d", i)
+			}
+			val, ok := m[seg.Key]
+			if !ok {
+				// Path doesn't exist, insert it
+				m[seg.Key] = convertToJSONValue(value)
+				return string(mustMarshal(doc)), nil
+			}
+			if i == len(segments)-1 {
+				// Path exists, don't modify
+				return jsonStr, nil
+			}
+			current = val
+		}
+	}
+
+	// Path is just $, replace the whole document
+	return jsonStr, nil
+}
+
+// jsonRemove removes a value at the given path.
+// JSON_REMOVE('{"name":"Alice","age":30}', '$.age') → {"name":"Alice"}
+func jsonRemove(jsonStr string, path string) (string, error) {
+	var doc interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+		return "", fmt.Errorf("invalid JSON: %v", err)
+	}
+
+	segments, err := parseJsonPath(path)
+	if err != nil {
+		return "", err
+	}
+
+	if len(segments) == 0 {
+		return "", fmt.Errorf("path error: cannot remove root $")
+	}
+
+	// For array removal, we need to track parent pointers
+	// Use a copy of doc that we'll mutate
+	docCopy := doc
+
+	// Navigate to parent of target, tracking parent pointers for arrays
+	type parentInfo struct {
+		Parent interface{}
+		Key    string
+		Index  int
+		IsArray bool
+	}
+	
+	if len(segments) == 1 {
+		// Direct child of root
+		last := segments[0]
+		if last.IsArray {
+			arr, ok := docCopy.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected array at root")
+			}
+			if last.Index < 0 || last.Index >= len(arr) {
+				return "", fmt.Errorf("path error: index %d out of range", last.Index)
+			}
+			docCopy = append(arr[:last.Index], arr[last.Index+1:]...)
+		} else {
+			m, ok := docCopy.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected object at root")
+			}
+			delete(m, last.Key)
+		}
+	} else {
+		// Navigate to parent of target
+		current := docCopy
+		for i := 0; i < len(segments)-1; i++ {
+			seg := segments[i]
+			if seg.IsArray {
+				arr, ok := current.([]interface{})
+				if !ok {
+					return "", fmt.Errorf("path error: expected array at segment %d", i)
+				}
+				if seg.Index < 0 || seg.Index >= len(arr) {
+					return "", fmt.Errorf("path error: index %d out of range", seg.Index)
+				}
+				current = arr[seg.Index]
+			} else {
+				m, ok := current.(map[string]interface{})
+				if !ok {
+					return "", fmt.Errorf("path error: expected object at segment %d", i)
+				}
+				val, ok := m[seg.Key]
+				if !ok {
+					return "", fmt.Errorf("path error: key %s not found", seg.Key)
+				}
+				current = val
+			}
+		}
+
+		// Remove the value at the final segment
+		last := segments[len(segments)-1]
+		if last.IsArray {
+			arr, ok := current.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected array at final segment")
+			}
+			if last.Index < 0 || last.Index >= len(arr) {
+				return "", fmt.Errorf("path error: index %d out of range", last.Index)
+			}
+			arr = append(arr[:last.Index], arr[last.Index+1:]...)
+		} else {
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("path error: expected object at final segment")
+			}
+			delete(m, last.Key)
+		}
+	}
+
+	result, err := json.Marshal(docCopy)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal result: %v", err)
+	}
+	return string(result), nil
+}
+
+// convertToJSONValue converts a Go value to a JSON-serializable value.
+func convertToJSONValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case int:
+		return float64(val)
+	case int8:
+		return float64(val)
+	case int16:
+		return float64(val)
+	case int32:
+		return float64(val)
+	case int64:
+		return float64(val)
+	case uint:
+		return float64(val)
+	case uint8:
+		return float64(val)
+	case uint16:
+		return float64(val)
+	case uint32:
+		return float64(val)
+	case uint64:
+		return float64(val)
+	case float32:
+		return float64(val)
+	case float64:
+		return val
+	case bool:
+		return val
+	case string:
+		return val
+	case nil:
+		return nil
+	default:
+		return val
+	}
+}
+
+// mustMarshal is a helper that panics on marshal error.
+func mustMarshal(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// evalJsonSet evaluates JSON_SET(json, path, value).
+func evalJsonSet(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 3 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_SET requires 3 arguments", executorapi.ErrExecFailed)
+	}
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	value, err := evalExpr(expr.Args[2], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+
+	result, err := jsonSet(jsonVal.Text, pathVal.Text, extractInterfaceValue(value))
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: result}, nil
+}
+
+// evalJsonInsert evaluates JSON_INSERT(json, path, value).
+func evalJsonInsert(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 3 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_INSERT requires 3 arguments", executorapi.ErrExecFailed)
+	}
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	value, err := evalExpr(expr.Args[2], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+
+	result, err := jsonInsert(jsonVal.Text, pathVal.Text, extractInterfaceValue(value))
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: result}, nil
+}
+
+// evalJsonRemove evaluates JSON_REMOVE(json, path).
+func evalJsonRemove(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_REMOVE requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+
+	result, err := jsonRemove(jsonVal.Text, pathVal.Text)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: result}, nil
+}
+
+// extractInterfaceValue extracts a Go value from a catalogapi.Value.
+func extractInterfaceValue(v catalogapi.Value) interface{} {
+	if v.IsNull {
+		return nil
+	}
+	switch v.Type {
+	case catalogapi.TypeInt:
+		return v.Int
+	case catalogapi.TypeFloat:
+		return v.Float
+	case catalogapi.TypeText:
+		return v.Text
+	case catalogapi.TypeBlob:
+		return v.Blob
+	}
+	return v.Text
+}// evalJsonType evaluates JSON_TYPE(json, path).
+// Returns the type of the value at the given path.
+// Returns: null, integer, real, text, blob, array, object
+func evalJsonType(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate JSON document
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if jsonVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE requires text argument for JSON document", executorapi.ErrExecFailed)
+	}
+	// Evaluate path
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if pathVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE path must be text", executorapi.ErrExecFailed)
+	}
+
+	// Navigate to get the value
+	raw, err := jsonNavigate(jsonVal.Text, pathVal.Text)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	if raw == nil {
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+	}
+
+	// Determine the type
+	var val interface{}
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+	}
+
+	typeName := "null"
+	switch v := val.(type) {
+	case nil:
+		typeName = "null"
+	case bool:
+		typeName = "integer" // SQLite uses integer for boolean
+	case float64:
+		// Check if it's actually an integer
+		if v == floatValue(int64(v)) {
+			typeName = "integer"
+		} else {
+			typeName = "real"
+		}
+	case string:
+		typeName = "text"
+	case []interface{}:
+		typeName = "array"
+	case map[string]interface{}:
+		typeName = "object"
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: typeName}, nil
+}
+
+// floatValue checks if a float64 is exactly representable as an int64.
+func floatValue(i int64) float64 {
+	return float64(i)
 }
