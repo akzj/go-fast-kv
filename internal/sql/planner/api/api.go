@@ -243,6 +243,22 @@ type ExceptPlan struct {
 
 func (*ExceptPlan) planNode() {}
 
+// WithPlan represents a WITH clause (CTE - Common Table Expressions).
+// The executor materializes each CTE and uses it in the main statement.
+type WithPlan struct {
+	CTEs      []*CTEPlan // CTE definitions with their execution plans
+	Statement Plan      // the main statement plan
+}
+
+func (*WithPlan) planNode() {}
+
+// CTEPlan represents a single CTE definition with its execution plan.
+type CTEPlan struct {
+	Name       string // CTE name, e.g., "temp"
+	SelectPlan *SelectPlan // the subquery plan for this CTE
+	IsRecursive bool       // true for WITH RECURSIVE
+}
+
 // ─── EXPLAIN Plan ──────────────────────────────────────────────────
 
 // ExplainPlan wraps an inner plan for EXPLAIN output.
@@ -305,6 +321,8 @@ func planDescription(plan Plan) string {
 		return "INTERSECT"
 	case *ExceptPlan:
 		return "EXCEPT"
+	case *WithPlan:
+		return "WITH"
 	case *InsertSelectPlan:
 		return fmt.Sprintf("INSERT INTO %s SELECT ...", p.Table.Name)
 	default:

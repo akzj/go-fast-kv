@@ -47,6 +47,8 @@ type executor struct {
 	txnCtx txnapi.TxnContext
 	// params holds positional parameter values ($1, $2, ...) for prepared statements
 	params []catalogapi.Value
+	// cteResults stores materialized CTE results by name for WITH clause execution
+	cteResults map[string]*executorapi.Result
 }
 
 // New creates a new Executor.
@@ -61,6 +63,7 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
 		parser:      parser,
+		cteResults:  make(map[string]*executorapi.Result),
 	}
 }
 
@@ -165,6 +168,8 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		return e.execExcept(p)
 	case *plannerapi.ExplainPlan:
 		return e.execExplain(p)
+	case *plannerapi.WithPlan:
+		return e.execWith(p)
 	case *plannerapi.AlterTablePlan:
 		return e.execAlterTable(p)
 	default:
@@ -247,6 +252,8 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		return e.execExcept(p)
 	case *plannerapi.ExplainPlan:
 		return e.execExplain(p)
+	case *plannerapi.WithPlan:
+		return e.execWith(p)
 	case *plannerapi.AlterTablePlan:
 		return e.execAlterTable(p)
 	default:
@@ -2760,6 +2767,93 @@ func columnNameFromExpr(expr parserapi.Expr) string {
 	return ""
 }
 
+// execSelectFromCTE handles SELECT ... FROM cte_name [WHERE ...] for CTE references.
+// Uses pre-materialized CTE results from execWith.
+func (e *executor) execSelectFromCTE(plan *plannerapi.SelectPlan, cteResult *executorapi.Result) (*executorapi.Result, error) {
+	// Convert pre-materialized CTE rows to engineapi.Row
+	rows := make([]*engineapi.Row, len(cteResult.Rows))
+	for i, rowVals := range cteResult.Rows {
+		rows[i] = &engineapi.Row{
+			RowID:  0,
+			Values: rowVals,
+		}
+	}
+
+	// Build column definitions from CTE result columns
+	tableCols := make([]catalogapi.ColumnDef, len(cteResult.Columns))
+	for i, name := range cteResult.Columns {
+		tableCols[i] = catalogapi.ColumnDef{Name: name}
+	}
+
+	// Set outerCols for correlated subquery resolution
+	savedOuterCols := e.outerCols
+	savedOuterVals := e.outerVals
+	e.outerCols = tableCols
+	defer func() {
+		e.outerCols = savedOuterCols
+		e.outerVals = savedOuterVals
+	}()
+
+	// Apply WHERE filter
+	filter := plan.Scan.(*plannerapi.DerivedTableScanPlan).Filter
+	if filter != nil {
+		subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+		if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+			return nil, err
+		}
+		rows = e.filterRows(rows, filter, tableCols, subqueryResults)
+	}
+
+	// Apply GROUP BY
+	if plan.GroupByExprs != nil {
+		grouped, err := e.groupByRows(rows, plan)
+		if err != nil {
+			return nil, err
+		}
+		rows = grouped
+
+		// Apply HAVING
+		if plan.Having != nil {
+			subqueryResults := make(map[*parserapi.SubqueryExpr]interface{})
+			if err := e.precomputeSubqueries(plan, subqueryResults); err != nil {
+				return nil, err
+			}
+			rows = e.filterRows(rows, plan.Having, plan.Table.Columns, subqueryResults)
+		}
+	}
+
+	// Project columns
+	projected := projectRows(rows, plan.Columns)
+	colNames := buildColumnNames(plan.Table, plan.Columns)
+
+	// Apply DISTINCT
+	if plan.Distinct {
+		seen := make(map[string]bool)
+		var deduped [][]catalogapi.Value
+		for _, row := range projected {
+			var key strings.Builder
+			for _, v := range row {
+				if v.IsNull {
+					key.WriteString("NULL")
+				} else {
+					key.WriteString(fmt.Sprintf("%v", v))
+				}
+				key.WriteByte(0)
+			}
+			if !seen[key.String()] {
+				seen[key.String()] = true
+				deduped = append(deduped, row)
+			}
+		}
+		projected = deduped
+	}
+
+	return &executorapi.Result{
+		Columns: colNames,
+		Rows:    projected,
+	}, nil
+}
+
 // execSelectFromDerived handles SELECT ... FROM (SELECT ...) AS alias [WHERE ...].
 // It materializes the subquery result, then treats it as a regular table scan.
 func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *plannerapi.DerivedTableScanPlan) (*executorapi.Result, error) {
@@ -2976,6 +3070,16 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			vals[i] = val
 		}
 		return &executorapi.Result{Columns: names, Rows: [][]catalogapi.Value{vals}}, nil
+	}
+
+	// Handle CTE scan: use pre-materialized results from execWith
+	if plan.Table != nil && plan.Scan != nil {
+		if _, ok := plan.Scan.(*plannerapi.DerivedTableScanPlan); ok {
+			// Check if this is a CTE (has pre-materialized results)
+			if cteResult, ok := e.cteResults[plan.Table.Name]; ok {
+				return e.execSelectFromCTE(plan, cteResult)
+			}
+		}
 	}
 
 	// Handle derived table (subquery in FROM clause): materialize the subquery first.
@@ -3351,6 +3455,45 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 		Rows:    result,
 		Columns: leftResult.Columns,
 	}, nil
+}
+
+func (e *executor) execWith(plan *plannerapi.WithPlan) (*executorapi.Result, error) {
+	// Materialize each CTE into a temporary in-memory table
+	for _, ctePlan := range plan.CTEs {
+		result, err := e.Execute(ctePlan.SelectPlan)
+		if err != nil {
+			return nil, fmt.Errorf("%w: executing CTE %s: %v", executorapi.ErrExecFailed, ctePlan.Name, err)
+		}
+
+		// Create a temporary table for this CTE (or update if recursive)
+		// For recursive CTEs, we iteratively add new rows until no new rows appear
+		if ctePlan.IsRecursive {
+			// Recursive CTE: iterate until result stabilizes
+			prevCount := -1
+			for {
+				cteResult, err := e.Execute(ctePlan.SelectPlan)
+				if err != nil {
+					return nil, fmt.Errorf("%w: executing recursive CTE %s: %v", executorapi.ErrExecFailed, ctePlan.Name, err)
+				}
+				if cteResult != nil && len(cteResult.Rows) == prevCount {
+					break // No new rows, done
+				}
+				prevCount = len(cteResult.Rows)
+			}
+		}
+
+		// Store CTE result in executor's CTE registry for lookup during main query
+		// The main query's planner will have been updated to reference this CTE
+		e.cteResults[ctePlan.Name] = result
+	}
+
+	// Execute the main statement
+	mainResult, err := e.Execute(plan.Statement)
+	if err != nil {
+		return nil, err
+	}
+
+	return mainResult, nil
 }
 
 // execUpdateParameterized handles UPDATE with ParamRef expressions (resolved at execution time).

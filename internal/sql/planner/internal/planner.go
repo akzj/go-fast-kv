@@ -16,6 +16,8 @@ var _ plannerapi.Planner = (*planner)(nil)
 
 type planner struct {
 	catalog catalogapi.CatalogManager
+	// cteSchemas holds CTE schemas indexed by name, populated during WithStmt planning
+	cteSchemas map[string]*catalogapi.TableSchema
 }
 
 // New creates a new Planner backed by the given catalog.
@@ -57,6 +59,8 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planIntersect(s)
 	case *parserapi.ExceptStmt:
 		return p.planExcept(s)
+	case *parserapi.WithStmt:
+		return p.planWith(s)
 	// Transaction control statements — nil plan signals "transaction control"
 	// to sql.DB.Exec(), which manages the transaction lifecycle.
 	case *parserapi.BeginStmt:
@@ -605,6 +609,57 @@ func (p *planner) planExcept(s *parserapi.ExceptStmt) (plannerapi.Plan, error) {
 	return &plannerapi.ExceptPlan{Left: leftPlan, Right: rightPlan}, nil
 }
 
+func (p *planner) planWith(s *parserapi.WithStmt) (plannerapi.Plan, error) {
+	// Build CTE schemas from the SELECT list of each CTE
+	// These are needed by the planner to resolve column references
+	p.cteSchemas = make(map[string]*catalogapi.TableSchema)
+	ctePlans := make([]*plannerapi.CTEPlan, len(s.CTEs))
+	for i, cte := range s.CTEs {
+		selectPlan, err := p.planSelect(cte.SelectStmt)
+		if err != nil {
+			p.cteSchemas = nil // clean up
+			return nil, fmt.Errorf("planning CTE %s: %w", cte.Name, err)
+		}
+
+		// Build the CTE schema from the SelectStmt's projection
+		schema := &catalogapi.TableSchema{
+			Name: cte.Name,
+		}
+		for _, col := range cte.SelectStmt.Columns {
+			colDef := catalogapi.ColumnDef{Name: col.Alias}
+			// Try to infer type from expression (rough guess for now)
+			if _, ok := col.Expr.(*parserapi.StarExpr); ok {
+				colDef.Type = catalogapi.TypeBlob // placeholder
+			} else {
+				colDef.Type = catalogapi.TypeBlob
+			}
+			schema.Columns = append(schema.Columns, colDef)
+		}
+		p.cteSchemas[cte.Name] = schema
+
+		ctePlans[i] = &plannerapi.CTEPlan{
+			Name:        cte.Name,
+			SelectPlan:  selectPlan,
+			IsRecursive: cte.IsRecursive,
+		}
+	}
+
+	// Plan the main statement (with cteSchemas set)
+	mainPlan, err := p.Plan(s.Statement)
+	if err != nil {
+		p.cteSchemas = nil // clean up
+		return nil, fmt.Errorf("planning main statement: %w", err)
+	}
+
+	// Clean up CTE schemas after planning
+	p.cteSchemas = nil
+
+	return &plannerapi.WithPlan{
+		CTEs:      ctePlans,
+		Statement: mainPlan,
+	}, nil
+}
+
 func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan, error) {
 	// Handle derived table (subquery in FROM clause)
 	if stmt.DerivedTable != nil {
@@ -660,18 +715,49 @@ func (p *planner) planSelect(stmt *parserapi.SelectStmt) (*plannerapi.SelectPlan
 		}, nil
 	}
 
-	// Single-table SELECT
-	tbl, err := p.catalog.GetTable(stmt.Table)
-	if err != nil {
-		if err == catalogapi.ErrTableNotFound {
-			return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+	// Single-table SELECT — check if it's a CTE first
+	var tbl *catalogapi.TableSchema
+	isCTE := false
+	if p.cteSchemas != nil {
+		if cteSchema, ok := p.cteSchemas[stmt.Table]; ok {
+			tbl = cteSchema
+			isCTE = true
 		}
-		return nil, err
+	}
+	if tbl == nil {
+		var err error
+		tbl, err = p.catalog.GetTable(stmt.Table)
+		if err != nil {
+			if err == catalogapi.ErrTableNotFound {
+				return nil, fmt.Errorf("%w: %s", plannerapi.ErrTableNotFound, stmt.Table)
+			}
+			return nil, err
+		}
 	}
 
 	colIndices, err := p.resolveSelectColumns(tbl, stmt.Columns, stmt.GroupBy)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle CTE as a derived table (materialized at execution time)
+	if isCTE {
+		// Create a DerivedTableScanPlan for CTE — executor will resolve from cteResults
+		return &plannerapi.SelectPlan{
+			Table:         tbl,
+			Scan:          &plannerapi.DerivedTableScanPlan{Schema: tbl, Filter: stmt.Where},
+			Columns:       colIndices,
+			SelectColumns: stmt.Columns,
+			Filter:        nil, // Filter applied by execSelectFromDerived
+			GroupByExprs:  stmt.GroupBy,
+			Having:        stmt.Having,
+			OrderBy:       nil, // TODO: handle ORDER BY for CTEs
+			Limit:         -1,
+			Offset:        -1,
+			Distinct:      stmt.Distinct,
+			LockMode:      stmt.LockMode,
+			LockWait:      stmt.LockWait,
+		}, nil
 	}
 
 	scan, residualFilter, err := p.planScan(tbl, stmt.Where)

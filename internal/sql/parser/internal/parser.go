@@ -69,6 +69,8 @@ func (p *parser) parseStatement() (api.Statement, error) {
 		return p.parseInsert()
 	case api.TokSelect:
 		return p.parseSelect()
+	case api.TokWith:
+		return p.parseWith()
 	case api.TokDelete:
 		return p.parseDelete()
 	case api.TokUpdate:
@@ -1091,6 +1093,92 @@ func (p *parser) parseExplain() (api.Statement, error) {
 }
 
 // ─── SELECT ───────────────────────────────────────────────────────
+
+// parseWith handles WITH clause (CTE - Common Table Expressions).
+// Syntax: WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...) SELECT ...
+//        WITH RECURSIVE cte AS (...) SELECT ...
+func (p *parser) parseWith() (api.Statement, error) {
+	p.advance() // consume WITH
+
+	isRecursive := false
+	// Check for RECURSIVE keyword
+	if p.cur.Type == api.TokRecursive || strings.ToUpper(p.cur.Literal) == "RECURSIVE" {
+		isRecursive = true
+		p.advance() // consume RECURSIVE
+	}
+
+	// Parse one or more CTE definitions separated by comma
+	var ctes []*api.CTEClause
+	for {
+		// Parse CTE name
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected CTE name")
+		}
+		cteName := p.cur.Literal
+		p.advance()
+
+		// Expect AS
+		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+			return nil, p.errorf("expected AS after CTE name")
+		}
+		p.advance()
+
+		// Expect '('
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after AS")
+		}
+		p.advance() // consume '('
+
+		// Parse the CTE's SELECT statement
+		subq, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+
+		// Expect ')'
+		if p.cur.Type != api.TokRParen {
+			return nil, p.errorf("expected ) after CTE definition")
+		}
+		p.advance() // consume ')'
+
+		ctes = append(ctes, &api.CTEClause{
+			Name:        cteName,
+			SelectStmt:  subq.(*api.SelectStmt),
+			IsRecursive: isRecursive,
+		})
+
+		// Check for comma (more CTEs) or end
+		if p.cur.Type == api.TokComma {
+			p.advance() // consume ','
+			continue
+		}
+		break
+	}
+
+	// Parse the main statement (usually SELECT)
+	var mainStmt api.Statement
+	var err error
+	switch {
+	case p.cur.Type == api.TokSelect:
+		mainStmt, err = p.parseSelect()
+	case p.cur.Type == api.TokInsert:
+		mainStmt, err = p.parseInsert()
+	case p.cur.Type == api.TokUpdate:
+		mainStmt, err = p.parseUpdate()
+	case p.cur.Type == api.TokDelete:
+		mainStmt, err = p.parseDelete()
+	default:
+		return nil, p.errorf("expected SELECT/INSERT/UPDATE/DELETE after CTE definition")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.WithStmt{
+		CTEs:      ctes,
+		Statement: mainStmt,
+	}, nil
+}
 
 func (p *parser) parseSelect() (api.Statement, error) {
 	p.advance() // consume SELECT

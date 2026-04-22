@@ -108,6 +108,8 @@ var keywords = map[string]api.TokenType{
 	"RESTRICT":      api.TokRestrict,
 	"CONFLICT":      api.TokConflict,
 	"DO":            api.TokIdent, // handled specially
+	"WITH":          api.TokWith,
+	"RECURSIVE":     api.TokRecursive,
 }
 
 // lexer tokenizes SQL input.

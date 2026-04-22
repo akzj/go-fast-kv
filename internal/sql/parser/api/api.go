@@ -141,6 +141,8 @@ const (
 	TokTruncate       TokenType = 115 // TRUNCATE
 	TokConflict       TokenType = 116 // CONFLICT (for ON CONFLICT)
 	TokNothing        TokenType = 117 // NOTHING (for DO NOTHING)
+	TokWith           TokenType = 118 // WITH (for CTE)
+	TokRecursive      TokenType = 119 // RECURSIVE (for CTE)
 )
 
 // Token represents a single lexical token.
@@ -308,6 +310,24 @@ type SelectStmt struct {
 }
 
 func (*SelectStmt) stmtNode() {}
+
+// CTEClause represents a Common Table Expression (WITH ... AS ...).
+type CTEClause struct {
+	Name       string       // CTE name, e.g., "temp" in "WITH temp AS (...)"
+	SelectStmt *SelectStmt  // the subquery defining this CTE
+	IsRecursive bool        // true for "WITH RECURSIVE"
+}
+
+func (*CTEClause) exprNode() {} // CTE is used as a statement wrapper
+
+// WithStmt represents a WITH clause wrapping a main statement.
+// The WITH clause contains one or more CTE definitions.
+type WithStmt struct {
+	CTEs      []*CTEClause // CTE definitions
+	Statement Statement    // the main statement (usually SelectStmt)
+}
+
+func (*WithStmt) stmtNode() {}
 
 // LockMode represents the lock mode for SELECT ... FOR UPDATE.
 type LockMode int
