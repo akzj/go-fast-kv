@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
@@ -726,6 +727,173 @@ func ftsColumnsToSchema(columns []string) []catalogapi.ColumnDef {
 	return cols
 }
 
+// isFTSColumn returns true if the column is an FTS content column (not rowid).
+func isFTSColumn(col catalogapi.ColumnDef) bool {
+	return col.Name != "rowid" && col.Type == catalogapi.TypeText
+}
+
+// getFTSColumnValues extracts TEXT column values from a row for FTS indexing.
+func getFTSColumnValues(columns []catalogapi.ColumnDef, values []catalogapi.Value) []string {
+	var texts []string
+	for i, col := range columns {
+		if isFTSColumn(col) && i < len(values) {
+			if !values[i].IsNull {
+				texts = append(texts, values[i].Text)
+			}
+		}
+	}
+	return texts
+}
+
+// indexFTSDocument adds a document to the FTS inverted index using a WriteBatch.
+func (e *executor) indexFTSDocument(tableName string, rowID uint64, texts []string, tokenizer string, batch kvstoreapi.WriteBatch) error {
+	if e.ftsEngine == nil {
+		return nil
+	}
+	// Get tokens from FTS engine's tokenize function
+	// We need to tokenize and store directly in KV
+	tokens := e.tokenizeTexts(texts, tokenizer)
+	for _, token := range tokens {
+		key := e.ftsEngineSearchKey(tableName, token, rowID)
+		if err := batch.Put(key, []byte{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexFTSWithTxn indexes a document in a transaction context.
+func (e *executor) indexFTSWithTxn(tableName string, rowID uint64, texts []string, tokenizer string, xid uint64) error {
+	if e.ftsEngine == nil {
+		return nil
+	}
+	tokens := e.tokenizeTexts(texts, tokenizer)
+	for _, token := range tokens {
+		key := e.ftsEngineSearchKey(tableName, token, rowID)
+		if err := e.store.PutWithXID(key, []byte{}, xid); err != nil {
+			return err
+		}
+		e.txnCtx.AddPendingWrite(key, nil)
+	}
+	return nil
+}
+
+// tokenizeTexts tokenizes multiple text values.
+func (e *executor) tokenizeTexts(texts []string, tokenizer string) []string {
+	var tokens []string
+	tokenMap := make(map[string]struct{})
+
+	for _, text := range texts {
+		if text == "" {
+			continue
+		}
+		words := simpleTokenizeFTS(text)
+		for _, word := range words {
+			if word == "" {
+				continue
+			}
+			// Apply stemmer if requested
+			if tokenizer == "porter" {
+				word = porterStemFTS(word)
+			}
+			if word != "" {
+				tokenMap[word] = struct{}{}
+			}
+		}
+	}
+
+	for token := range tokenMap {
+		tokens = append(tokens, token)
+	}
+	return tokens
+}
+
+// simpleTokenizeFTS splits text on whitespace and strips punctuation.
+func simpleTokenizeFTS(text string) []string {
+	var words []string
+	var word strings.Builder
+
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			if word.Len() > 0 {
+				words = append(words, word.String())
+				word.Reset()
+			}
+			continue
+		}
+		// Keep alphanumeric characters
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			word.WriteRune(unicode.ToLower(r))
+		}
+		// Skip punctuation
+	}
+
+	if word.Len() > 0 {
+		words = append(words, word.String())
+	}
+	return words
+}
+
+// porterStemFTS is a simple porter stemmer.
+func porterStemFTS(word string) string {
+	if len(word) <= 3 {
+		return word
+	}
+
+	suffixes := []struct {
+		suffix string
+		stem   string
+	}{
+		{"ational", "ate"}, {"tional", "tion"}, {"enci", "ence"},
+		{"anci", "ance"}, {"izer", "ize"}, {"ation", "ate"},
+		{"alism", "al"}, {"iveness", "ive"}, {"fulness", "ful"},
+		{"ousness", "ous"}, {"aliti", "al"}, {"iviti", "ive"},
+		{"biliti", "ble"}, {"alli", "al"}, {"entli", "ent"},
+		{"eli", "e"}, {"ousli", "ous"}, {"ement", ""},
+		{"ment", ""}, {"ent", ""}, {"ness", ""},
+		{"ful", ""}, {"less", ""}, {"able", ""},
+		{"ible", ""}, {"al", ""}, {"ive", ""},
+		{"ous", ""}, {"ant", ""}, {"ence", ""},
+		{"ance", ""}, {"er", ""}, {"ic", ""},
+		{"ing", ""}, {"ion", ""}, {"ed", ""},
+		{"es", ""}, {"ly", ""},
+	}
+
+	for _, s := range suffixes {
+		if len(word) > len(s.suffix)+2 && strings.HasSuffix(word, s.suffix) {
+			stem := word[:len(word)-len(s.suffix)] + s.stem
+			if len(stem) >= 2 {
+				return stem
+			}
+		}
+	}
+	return word
+}
+
+// ftsEngineSearchKey creates the FTS index key for KV storage.
+func (e *executor) ftsEngineSearchKey(tableName, token string, rowID uint64) []byte {
+	// Key format: _sql:fti:{tableName}:{token}:{rowID}
+	prefix := []byte("_sql:fti:")
+	nameBytes := []byte(strings.ToUpper(tableName))
+	tokenBytes := []byte(strings.ToLower(token))
+	keyLen := len(prefix) + len(nameBytes) + 1 + len(tokenBytes) + 1 + 8
+
+	buf := make([]byte, keyLen)
+	offset := 0
+	copy(buf[offset:offset+len(prefix)], prefix)
+	offset += len(prefix)
+	copy(buf[offset:offset+len(nameBytes)], nameBytes)
+	offset += len(nameBytes)
+	buf[offset] = ':'
+	offset++
+	copy(buf[offset:offset+len(tokenBytes)], tokenBytes)
+	offset += len(tokenBytes)
+	buf[offset] = ':'
+	offset++
+	binary.BigEndian.PutUint64(buf[offset:offset+8], rowID)
+	return buf
+}
+
 // execFTSSearch executes a FTS MATCH search.
 func (e *executor) execFTSSearch(plan *plannerapi.FTSSearchPlan) (*executorapi.Result, error) {
 	if e.ftsEngine == nil {
@@ -1082,6 +1250,16 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				e.txnCtx.AddPendingWrite(idxKey, nil) // nil preValue: rollback = delete
 			}
 
+			// FTS: Index FTS content columns
+			if e.ftsEngine != nil {
+				texts := getFTSColumnValues(plan.Table.Columns, row)
+				if len(texts) > 0 {
+					if err := e.indexFTSWithTxn(plan.Table.Name, rowID, texts, "", xid); err != nil {
+						return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+					}
+				}
+			}
+
 			// Fire AFTER INSERT triggers (after row and indexes are committed)
 			if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
 				return nil, err
@@ -1162,6 +1340,19 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
+			}
+		}
+
+		// FTS: Index FTS content columns
+		if e.ftsEngine != nil {
+			texts := getFTSColumnValues(plan.Table.Columns, row)
+			if len(texts) > 0 {
+				// Get tokenizer from FTS metadata (stored as special index)
+				tokenizer := ""
+				if err := e.indexFTSDocument(plan.Table.Name, rowID, texts, tokenizer, batch); err != nil {
+					batch.Discard()
+					return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+				}
 			}
 		}
 
