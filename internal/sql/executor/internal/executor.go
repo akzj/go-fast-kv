@@ -760,11 +760,13 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 
 		// Insert index entries into the same batch.
 		for _, idx := range indexes {
-			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := row[colIdx]
 			// TODO(CR-B): IndexEngine.InsertBatch and EncodeIndexKey are available, but
 			// they encode only (tableID, indexID, value, rowID). The index engine's
 			// internal state (prefix tree) is NOT updated within the batch. Full atomicity
@@ -902,11 +904,13 @@ func (e *executor) execInsertParameterized(plan *plannerapi.InsertPlan, columns 
 
 		// Write index entries
 		for _, idx := range indexes {
-			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: resolved}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := resolved[colIdx]
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -1023,11 +1027,13 @@ func (e *executor) execInsertSelect(plan *plannerapi.InsertSelectPlan) (*executo
 
 		// Insert index entries into the same batch (same pattern as execInsert).
 		for _, idx := range indexes {
-			colIdx := findColumnIndex(plan.Table, idx.Column)
-			if colIdx < 0 {
-				continue
+			// Get index value (column or expression)
+			rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
+			val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
+			if err != nil {
+				batch.Discard()
+				return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 			}
-			val := row[colIdx]
 			idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
 			if err := e.indexEngine.InsertBatch(idxKey, batch); err != nil {
 				batch.Discard()
@@ -4937,7 +4943,11 @@ func getIndexValue(idx *catalogapi.IndexSchema, row *engineapi.Row, columns []ca
 	}
 
 	if sel, ok := stmt.(*parserapi.SelectStmt); ok && len(sel.Columns) > 0 {
-		return evalExpr(sel.Columns[0].Expr, row, columns, nil, e)
+		val, err := evalExpr(sel.Columns[0].Expr, row, columns, nil, e)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("eval expr %q: %v", idx.ExprSQL, err)
+		}
+		return val, nil
 	}
 
 	return catalogapi.Value{}, fmt.Errorf("could not extract expression from %q", idx.ExprSQL)

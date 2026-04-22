@@ -2467,3 +2467,32 @@ func TestExec_IndexNestedLoopJoin(t *testing.T) {
 		}
 	})
 }
+
+
+func TestExec_UpdateWithExpressionIndex(t *testing.T) {
+	env := newTestEnv(t)
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+	env.execSQL(t, "CREATE INDEX idx_lower_email ON users (LOWER(email))")
+	env.execSQL(t, "INSERT INTO users VALUES (1, 'Test@Example.COM')")
+
+	// Verify LOWER expression works in SELECT
+	r := env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(r.Rows) != 1 {
+		t.Errorf("expected 1 row before update, got %d", len(r.Rows))
+	}
+
+	// UPDATE - should update both table and expression index
+	env.execSQL(t, "UPDATE users SET email = 'New@Example.com' WHERE id = 1")
+
+	// Query using expression index - should find the updated row
+	r = env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'new@example.com'")
+	if len(r.Rows) != 1 {
+		t.Errorf("expected 1 row after update, got %d", len(r.Rows))
+	}
+
+	// Verify old value is gone
+	r = env.execSQL(t, "SELECT id FROM users WHERE LOWER(email) = 'test@example.com'")
+	if len(r.Rows) != 0 {
+		t.Errorf("expected 0 rows for old value, got %d", len(r.Rows))
+	}
+}
