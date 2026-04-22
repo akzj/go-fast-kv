@@ -83,6 +83,43 @@ Drops a table only if it exists (no error if it doesn't).
 DROP TABLE IF EXISTS table_name
 ```
 
+### ALTER TABLE
+
+Modify an existing table's structure.
+
+```sql
+ALTER TABLE t ADD COLUMN c TYPE          -- 添加列
+ALTER TABLE t DROP COLUMN c               -- 删除列
+ALTER TABLE t RENAME COLUMN old TO new    -- 重命名列
+ALTER TABLE t RENAME TO new_name          -- 重命名表
+```
+
+**Supported operations:**
+
+| Operation | Description |
+|-----------|-------------|
+| `ADD COLUMN` | Add a new column with specified type |
+| `DROP COLUMN` | Remove a column from the table |
+| `RENAME COLUMN` | Rename an existing column |
+| `RENAME TO` | Rename the entire table |
+
+**Examples:**
+```sql
+-- Add a new column
+ALTER TABLE users ADD COLUMN email TEXT
+
+-- Drop a column
+ALTER TABLE users DROP COLUMN email
+
+-- Rename a column
+ALTER TABLE users RENAME COLUMN name TO full_name
+
+-- Rename the table
+ALTER TABLE users RENAME TO customers
+```
+
+---
+
 ### Constraints
 
 Constraints enforce data integrity rules on tables.
