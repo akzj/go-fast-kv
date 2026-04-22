@@ -49,6 +49,7 @@ type executor struct {
 	params []catalogapi.Value
 	// cteResults stores materialized CTE results by name for WITH clause execution
 	cteResults map[string]*executorapi.Result
+	windowResults map[*parserapi.WindowFuncExpr]*WindowFunctionResult
 }
 
 // New creates a new Executor.
@@ -63,7 +64,8 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		keyEncoder:  encoding.NewKeyEncoder(),
 		planner:     planner,
 		parser:      parser,
-		cteResults:  make(map[string]*executorapi.Result),
+		cteResults:   make(map[string]*executorapi.Result),
+		windowResults: make(map[*parserapi.WindowFuncExpr]*WindowFunctionResult),
 	}
 }
 
@@ -3161,6 +3163,17 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		rows = e.filterRows(rows, plan.Filter, tableCols, subqueryResults)
 	}
 
+	// ─── Window Functions ─────────────────────────────────────────────────────
+	// Compute window functions AFTER filter but BEFORE GROUP BY and ORDER BY.
+	// Window functions require the complete result set for correct computation.
+	if hasWindowFunctions(plan.SelectColumns) {
+		windowFuncs := extractWindowFuncExprs(plan.SelectColumns)
+		if err := e.computeWindowFunctions(rows, tableCols, windowFuncs); err != nil {
+			return nil, err
+		}
+	}
+
+
 	// GROUP BY: group rows by encoded key, then compute aggregates per group.
 	if plan.GroupByExprs != nil {
 		grouped, err := e.groupByRows(rows, plan)
@@ -3274,7 +3287,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 			for rowIdx, row := range rows {
 				projected[rowIdx] = make([]catalogapi.Value, len(plan.SelectColumns))
 				for i, sc := range plan.SelectColumns {
-					val, err := evalExpr(sc.Expr, row, plan.Table.Columns, nil, nil)
+					val, err := evalExpr(sc.Expr, row, plan.Table.Columns, nil, e)
 					if err != nil {
 						return nil, err
 					}
@@ -5489,4 +5502,698 @@ func getIndexValue(idx *catalogapi.IndexSchema, row *engineapi.Row, columns []ca
 	}
 
 	return catalogapi.Value{}, fmt.Errorf("could not extract expression from %q", idx.ExprSQL)
+}
+
+// ─── Window Functions ─────────────────────────────────────────────────────────
+
+// WindowFunctionResult stores pre-computed window function values for all rows.
+type WindowFunctionResult struct {
+	Values      []catalogapi.Value       // one value per row in the result set
+	rowIndexMap map[*engineapi.Row]int   // maps row pointer to result index
+}
+
+// windowFunctions stores pre-computed window function results during SELECT execution.
+type windowFunctions map[*parserapi.WindowFuncExpr]*WindowFunctionResult
+
+// hasWindowFunctions checks if any SelectColumn contains a window function.
+func hasWindowFunctions(cols []parserapi.SelectColumn) bool {
+	for _, sc := range cols {
+		if _, ok := sc.Expr.(*parserapi.WindowFuncExpr); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWindowFuncExprs extracts window function expressions from SelectColumns.
+func extractWindowFuncExprs(cols []parserapi.SelectColumn) []*parserapi.WindowFuncExpr {
+	var funcs []*parserapi.WindowFuncExpr
+	for _, sc := range cols {
+		if wf, ok := sc.Expr.(*parserapi.WindowFuncExpr); ok {
+			funcs = append(funcs, wf)
+		}
+	}
+	return funcs
+}
+
+// computeWindowFunctions computes all window function values for all rows.
+// It groups rows by PARTITION BY, sorts by ORDER BY, and evaluates each window function.
+func (e *executor) computeWindowFunctions(rows []*engineapi.Row, columns []catalogapi.ColumnDef,
+	windowFuncs []*parserapi.WindowFuncExpr) error {
+
+	if len(windowFuncs) == 0 {
+		return nil
+	}
+
+	// Initialize window results map
+	e.windowResults = make(map[*parserapi.WindowFuncExpr]*WindowFunctionResult)
+
+	for _, wf := range windowFuncs {
+		result, err := e.computeSingleWindowFunction(wf, rows, columns)
+		if err != nil {
+			return err
+		}
+		e.windowResults[wf] = result
+	}
+
+	return nil
+}
+
+// computeSingleWindowFunction computes one window function for all rows.
+func (e *executor) computeSingleWindowFunction(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) (*WindowFunctionResult, error) {
+
+	// Partition rows if PARTITION BY is specified
+	partitions, err := e.partitionRowsForWindow(wf.Window, rows, columns)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]catalogapi.Value, len(rows))
+	rowIndexMap := make(map[*engineapi.Row]int)
+
+	for _, partition := range partitions {
+		// Sort partition by ORDER BY if specified
+		sortedRows := partition.rows
+		if wf.Window != nil && len(wf.Window.OrderBy) > 0 {
+			sortedRows = e.sortWindowPartition(partition.rows, wf.Window.OrderBy, columns)
+		}
+
+		// Compute the window function for each row in the partition
+		values, err := e.computeWindowFunctionForRows(wf, sortedRows, columns)
+		if err != nil {
+			return nil, err
+		}
+
+		// Map results back to original row positions
+		for i, origIdx := range partition.indices {
+			result[origIdx] = values[i]
+			if i < len(sortedRows) {
+				rowIndexMap[sortedRows[i]] = origIdx
+			}
+		}
+	}
+
+	return &WindowFunctionResult{Values: result, rowIndexMap: rowIndexMap}, nil
+}
+
+// windowPartition represents a partition of rows with their original indices
+type windowPartition struct {
+	rows    []*engineapi.Row
+	indices []int
+}
+
+// partitionRowsForWindow groups rows by PARTITION BY columns
+func (e *executor) partitionRowsForWindow(spec *parserapi.WindowSpec,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]windowPartition, error) {
+
+	if spec == nil || len(spec.PartitionBy) == 0 {
+		// No partition - all rows in one group
+		indices := make([]int, len(rows))
+		rowCopy := make([]*engineapi.Row, len(rows))
+		for i := range rows {
+			indices[i] = i
+			rowCopy[i] = rows[i]
+		}
+		return []windowPartition{{rows: rowCopy, indices: indices}}, nil
+	}
+
+	// Group rows by partition key
+	groups := make(map[string][]int)
+	for i, row := range rows {
+		key, err := e.computeWindowPartitionKey(row, spec.PartitionBy, columns)
+		if err != nil {
+			return nil, err
+		}
+		groups[key] = append(groups[key], i)
+	}
+
+	// Build partitions preserving original order
+	var partitions []windowPartition
+	for _, indices := range groups {
+		p := windowPartition{
+			indices: indices,
+			rows:    make([]*engineapi.Row, len(indices)),
+		}
+		for j, idx := range indices {
+			p.rows[j] = rows[idx]
+		}
+		partitions = append(partitions, p)
+	}
+
+	return partitions, nil
+}
+
+// computeWindowPartitionKey computes a unique key for a row based on PARTITION BY expressions
+func (e *executor) computeWindowPartitionKey(row *engineapi.Row, partitionBy []parserapi.Expr,
+	columns []catalogapi.ColumnDef) (string, error) {
+
+	var key []byte
+	for _, expr := range partitionBy {
+		val, err := evalExpr(expr, row, columns, nil, e)
+		if err != nil {
+			return "", err
+		}
+		if val.IsNull {
+			key = append(key, 0xFF)
+		} else {
+			key = append(key, e.keyEncoder.EncodeValue(val)...)
+		}
+		key = append(key, 0)
+	}
+	return string(key), nil
+}
+
+// sortWindowPartition sorts rows by ORDER BY columns for window frame evaluation
+func (e *executor) sortWindowPartition(rows []*engineapi.Row,
+	orderBy []*parserapi.OrderByClause, columns []catalogapi.ColumnDef) []*engineapi.Row {
+
+	if len(orderBy) == 0 || len(rows) == 0 {
+		return rows
+	}
+
+	// Create a sortable copy
+	type sortableRow struct {
+		row      *engineapi.Row
+		sortKeys []catalogapi.Value
+	}
+
+	sortable := make([]sortableRow, len(rows))
+	for i, row := range rows {
+		keys := make([]catalogapi.Value, len(orderBy))
+		for j, ob := range orderBy {
+			colIdx := findColumnIndexByName(columns, ob.Column)
+			if colIdx >= 0 && colIdx < len(row.Values) {
+				keys[j] = row.Values[colIdx]
+			} else {
+				keys[j] = catalogapi.Value{IsNull: true}
+			}
+		}
+		sortable[i] = sortableRow{row: row, sortKeys: keys}
+	}
+
+	// Sort
+	sort.Slice(sortable, func(i, j int) bool {
+		for k, ob := range orderBy {
+			a := sortable[i].sortKeys[k]
+			b := sortable[j].sortKeys[k]
+
+			// NULL handling
+			if a.IsNull && b.IsNull {
+				continue
+			}
+			if a.IsNull {
+				return !ob.Desc
+			}
+			if b.IsNull {
+				return ob.Desc
+			}
+
+			cmp := compareValues(a, b)
+			if cmp < 0 {
+				return !ob.Desc
+			}
+			if cmp > 0 {
+				return ob.Desc
+			}
+		}
+		return false
+	})
+
+	// Extract sorted rows
+	result := make([]*engineapi.Row, len(rows))
+	for i, s := range sortable {
+		result[i] = s.row
+	}
+	return result
+}
+
+// computeWindowFunctionForRows computes a single window function for a sorted partition
+func (e *executor) computeWindowFunctionForRows(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	switch strings.ToUpper(wf.Func) {
+	case "ROW_NUMBER":
+		return e.windowRowNumber(rows)
+	case "RANK":
+		return e.windowRank(rows, wf, columns)
+	case "DENSE_RANK":
+		return e.windowDenseRank(rows, wf, columns)
+	case "LAG":
+		return e.windowLag(rows, wf, columns)
+	case "LEAD":
+		return e.windowLead(rows, wf, columns)
+	case "FIRST_VALUE":
+		return e.windowFirstValue(rows, wf, columns)
+	case "LAST_VALUE":
+		return e.windowLastValue(rows, wf, columns)
+	case "SUM", "AVG", "COUNT", "MIN", "MAX":
+		return e.windowAggregate(wf, rows, columns)
+	default:
+		return nil, fmt.Errorf("%w: unsupported window function %s", executorapi.ErrExecFailed, wf.Func)
+	}
+}
+
+// windowRowNumber returns sequential row numbers starting from 1
+func (e *executor) windowRowNumber(rows []*engineapi.Row) ([]catalogapi.Value, error) {
+	result := make([]catalogapi.Value, len(rows))
+	for i := range rows {
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(i + 1)}
+	}
+	return result, nil
+}
+
+// windowRank computes rank with gaps (e.g., 1, 1, 3, 4, 4, 6)
+func (e *executor) windowRank(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	if wf.Window == nil || len(wf.Window.OrderBy) == 0 {
+		for i := range result {
+			result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}
+		}
+		return result, nil
+	}
+
+	orderCol := wf.Window.OrderBy[0].Column
+	desc := wf.Window.OrderBy[0].Desc
+	colIdx := findColumnIndexByName(columns, orderCol)
+
+	rank := 1
+	for i := range rows {
+		if i > 0 {
+			prev := rows[i-1].Values[colIdx]
+			curr := rows[i].Values[colIdx]
+			cmp := compareValues(prev, curr)
+			if (desc && cmp > 0) || (!desc && cmp < 0) {
+				rank = i + 1
+			}
+		}
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(rank)}
+	}
+	return result, nil
+}
+
+// windowDenseRank computes rank without gaps (e.g., 1, 1, 2, 3, 3, 4)
+func (e *executor) windowDenseRank(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	if wf.Window == nil || len(wf.Window.OrderBy) == 0 {
+		for i := range result {
+			result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}
+		}
+		return result, nil
+	}
+
+	orderCol := wf.Window.OrderBy[0].Column
+	desc := wf.Window.OrderBy[0].Desc
+	colIdx := findColumnIndexByName(columns, orderCol)
+
+	denseRank := 1
+	for i := range rows {
+		if i > 0 {
+			prev := rows[i-1].Values[colIdx]
+			curr := rows[i].Values[colIdx]
+			cmp := compareValues(prev, curr)
+			if (desc && cmp > 0) || (!desc && cmp < 0) {
+				denseRank++
+			}
+		}
+		result[i] = catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(denseRank)}
+	}
+	return result, nil
+}
+
+// windowLag returns the value from a preceding row
+func (e *executor) windowLag(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	offset := 1
+	if len(wf.Args) >= 2 {
+		offsetVal, err := evalExpr(wf.Args[1], nil, columns, nil, nil)
+		if err == nil && !offsetVal.IsNull && offsetVal.Type == catalogapi.TypeInt {
+			offset = int(offsetVal.Int)
+			if offset < 0 {
+				offset = 0
+			}
+		}
+	}
+
+	var defaultVal catalogapi.Value
+	if len(wf.Args) >= 3 {
+		defaultVal, _ = evalExpr(wf.Args[2], nil, columns, nil, nil)
+	} else {
+		defaultVal = catalogapi.Value{IsNull: true}
+	}
+
+	for i := range rows {
+		if i >= offset {
+			val, err := evalExpr(wf.Args[0], rows[i-offset], columns, nil, e)
+			if err != nil || val.IsNull {
+				result[i] = defaultVal
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = defaultVal
+		}
+	}
+	return result, nil
+}
+
+// windowLead returns the value from a following row
+func (e *executor) windowLead(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	offset := 1
+	if len(wf.Args) >= 2 {
+		offsetVal, err := evalExpr(wf.Args[1], nil, columns, nil, nil)
+		if err == nil && !offsetVal.IsNull && offsetVal.Type == catalogapi.TypeInt {
+			offset = int(offsetVal.Int)
+			if offset < 0 {
+				offset = 0
+			}
+		}
+	}
+
+	var defaultVal catalogapi.Value
+	if len(wf.Args) >= 3 {
+		defaultVal, _ = evalExpr(wf.Args[2], nil, columns, nil, nil)
+	} else {
+		defaultVal = catalogapi.Value{IsNull: true}
+	}
+
+	for i := range rows {
+		if i+offset < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[i+offset], columns, nil, e)
+			if err != nil || val.IsNull {
+				result[i] = defaultVal
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = defaultVal
+		}
+	}
+	return result, nil
+}
+
+// windowFirstValue returns the first value in the window frame
+func (e *executor) windowFirstValue(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, 0, len(rows))
+
+	for i := range rows {
+		if frameStart <= frameEnd && frameStart < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[frameStart], columns, nil, e)
+			if err != nil {
+				result[i] = catalogapi.Value{IsNull: true}
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = catalogapi.Value{IsNull: true}
+		}
+	}
+	return result, nil
+}
+
+// windowLastValue returns the last value in the window frame
+func (e *executor) windowLastValue(rows []*engineapi.Row, wf *parserapi.WindowFuncExpr,
+	columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 || len(wf.Args) == 0 {
+		return result, nil
+	}
+
+	for i := range rows {
+		frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, i, len(rows))
+		if frameStart <= frameEnd && frameEnd < len(rows) {
+			val, err := evalExpr(wf.Args[0], rows[frameEnd], columns, nil, e)
+			if err != nil {
+				result[i] = catalogapi.Value{IsNull: true}
+			} else {
+				result[i] = val
+			}
+		} else {
+			result[i] = catalogapi.Value{IsNull: true}
+		}
+	}
+	return result, nil
+}
+
+// getWindowFrameBounds returns the [start, end] inclusive bounds for a window frame
+func (e *executor) getWindowFrameBounds(spec *parserapi.WindowSpec, currentRow int, totalRows int) (int, int) {
+	frameStart := 0
+	frameEnd := currentRow
+
+	if spec != nil {
+		if spec.FrameStart.Type != "" {
+			switch spec.FrameStart.Type {
+			case "UNBOUNDED PRECEDING":
+				frameStart = 0
+			case "CURRENT ROW":
+				frameStart = currentRow
+			case "PRECEDING":
+				if spec.FrameStart.Expr != nil {
+					offset := e.evalFrameOffset(spec.FrameStart.Expr)
+					frameStart = currentRow - offset
+				}
+			}
+		}
+
+		if spec.FrameEnd.Type != "" {
+			switch spec.FrameEnd.Type {
+			case "UNBOUNDED FOLLOWING":
+				frameEnd = totalRows - 1
+			case "CURRENT ROW":
+				frameEnd = currentRow
+			case "FOLLOWING":
+				if spec.FrameEnd.Expr != nil {
+					offset := e.evalFrameOffset(spec.FrameEnd.Expr)
+					frameEnd = currentRow + offset
+				}
+			}
+		}
+	}
+
+	if frameStart < 0 {
+		frameStart = 0
+	}
+	if frameEnd >= totalRows {
+		frameEnd = totalRows - 1
+	}
+	if frameStart >= totalRows {
+		frameStart = totalRows - 1
+		frameEnd = totalRows - 1
+	}
+
+	return frameStart, frameEnd
+}
+
+// evalFrameOffset evaluates a frame offset expression to an integer
+func (e *executor) evalFrameOffset(expr parserapi.Expr) int {
+	if expr == nil {
+		return 0
+	}
+	val, err := evalExpr(expr, nil, nil, nil, nil)
+	if err != nil || val.IsNull || val.Type != catalogapi.TypeInt {
+		return 0
+	}
+	offset := int(val.Int)
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
+// windowAggregate computes SUM/AVG/COUNT/MIN/MAX over the window frame
+func (e *executor) windowAggregate(wf *parserapi.WindowFuncExpr,
+	rows []*engineapi.Row, columns []catalogapi.ColumnDef) ([]catalogapi.Value, error) {
+
+	result := make([]catalogapi.Value, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+
+	for i := range rows {
+		frameStart, frameEnd := e.getWindowFrameBounds(wf.Window, i, len(rows))
+		if frameStart > frameEnd || frameStart >= len(rows) {
+			result[i] = catalogapi.Value{IsNull: true}
+			continue
+		}
+		if frameEnd >= len(rows) {
+			frameEnd = len(rows) - 1
+		}
+
+		frameRows := rows[frameStart : frameEnd+1]
+		var val catalogapi.Value
+		var err error
+
+		switch strings.ToUpper(wf.Func) {
+		case "SUM":
+			val, err = e.windowSum(wf.Args, frameRows, columns)
+		case "AVG":
+			val, err = e.windowAvg(wf.Args, frameRows, columns)
+		case "COUNT":
+			val, err = e.windowCount(wf.Args, frameRows, columns)
+		case "MIN":
+			val, err = e.windowMin(wf.Args, frameRows, columns)
+		case "MAX":
+			val, err = e.windowMax(wf.Args, frameRows, columns)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+		result[i] = val
+	}
+	return result, nil
+}
+
+func (e *executor) windowSum(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	var sum int64
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err != nil || val.IsNull || val.Type != catalogapi.TypeInt {
+			continue
+		}
+		sum += val.Int
+		count++
+	}
+	if count == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: sum}, nil
+}
+
+func (e *executor) windowAvg(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	var sum float64
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err != nil || val.IsNull {
+			continue
+		}
+		if val.Type == catalogapi.TypeInt {
+			sum += float64(val.Int)
+			count++
+		} else if val.Type == catalogapi.TypeFloat {
+			sum += val.Float
+			count++
+		}
+	}
+	if count == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeFloat, Float: sum / float64(count)}, nil
+}
+
+func (e *executor) windowCount(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(rows))}, nil
+	}
+	var count int64
+	for _, row := range rows {
+		val, err := evalExpr(args[0], row, columns, nil, e)
+		if err == nil && !val.IsNull {
+			count++
+		}
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: count}, nil
+}
+
+func (e *executor) windowMin(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colIdx := -1
+	if ref, ok := args[0].(*parserapi.ColumnRef); ok {
+		colIdx = findColumnIndexByName(columns, ref.Column)
+	}
+	if colIdx < 0 {
+		var minVal catalogapi.Value
+		hasVal := false
+		for _, row := range rows {
+			val, err := evalExpr(args[0], row, columns, nil, e)
+			if err != nil || val.IsNull {
+				continue
+			}
+			if !hasVal {
+				minVal = val
+				hasVal = true
+			} else if compareValues(val, minVal) < 0 {
+				minVal = val
+			}
+		}
+		if !hasVal {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return minVal, nil
+	}
+	return minValueForColumn(rows, colIdx), nil
+}
+
+func (e *executor) windowMax(args []parserapi.Expr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if len(args) == 0 {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colIdx := -1
+	if ref, ok := args[0].(*parserapi.ColumnRef); ok {
+		colIdx = findColumnIndexByName(columns, ref.Column)
+	}
+	if colIdx < 0 {
+		var maxVal catalogapi.Value
+		hasVal := false
+		for _, row := range rows {
+			val, err := evalExpr(args[0], row, columns, nil, e)
+			if err != nil || val.IsNull {
+				continue
+			}
+			if !hasVal {
+				maxVal = val
+				hasVal = true
+			} else if compareValues(val, maxVal) > 0 {
+				maxVal = val
+			}
+		}
+		if !hasVal {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return maxVal, nil
+	}
+	return maxValueForColumn(rows, colIdx), nil
 }

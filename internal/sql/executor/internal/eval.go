@@ -99,7 +99,21 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 	case *parserapi.AggregateCallExpr:
 		return catalogapi.Value{}, fmt.Errorf("%w: aggregate %s() must be used in a GROUP BY context", executorapi.ErrExecFailed, node.Func)
 	case *parserapi.WindowFuncExpr:
-		return catalogapi.Value{}, fmt.Errorf("%w: window function %s() not yet implemented", executorapi.ErrExecFailed, node.Func)
+		// Look up pre-computed window function value from windowResults
+		result, exists := ex.windowResults[node]
+		if !exists || result == nil || len(result.Values) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: window function %s() not yet computed", executorapi.ErrExecFailed, node.Func)
+		}
+		// Find the index of this row in the result
+		idx, ok := result.rowIndexMap[row]
+		if !ok {
+			// Fallback: iterate to find row pointer match (should be rare)
+			for j := range result.Values {
+				return result.Values[j], nil
+			}
+			return catalogapi.Value{}, fmt.Errorf("%w: window function %s() row not found", executorapi.ErrExecFailed, node.Func)
+		}
+		return result.Values[idx], nil
 	case *parserapi.BetweenExpr:
 		return evalBetweenExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.InExpr:

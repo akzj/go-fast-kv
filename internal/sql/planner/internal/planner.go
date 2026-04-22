@@ -1094,6 +1094,9 @@ func (p *planner) resolveSelectColumnsFromDerived(cols []parserapi.SelectColumn,
 		case *parserapi.CastExpr:
 			// CastExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
+		case *parserapi.WindowFuncExpr:
+			// WindowFuncExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		default:
 			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)
 		}
@@ -1867,6 +1870,9 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 			indices[i] = -1
 		case *parserapi.CastExpr:
 			// CastExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
+		case *parserapi.WindowFuncExpr:
+			// WindowFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		default:
 			return nil, fmt.Errorf("%w: SELECT expression must be a column reference or aggregate", plannerapi.ErrUnsupportedExpr)

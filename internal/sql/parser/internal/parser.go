@@ -2193,6 +2193,7 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 
 	case api.TokMax, api.TokMin, api.TokCount, api.TokSum, api.TokAvg:
 		// Aggregate function: MAX(expr), COUNT(*), etc.
+		// Also supports OVER clause for window functions: SUM(x) OVER (...)
 		funcName := p.cur.Literal
 		p.advance() // consume function name
 		// expect '('
@@ -2211,6 +2212,15 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			arg = args[0] // nil for COUNT(*)
 		} else if len(args) > 1 {
 			return nil, p.errorf("%s requires at most one argument", funcName)
+		}
+		// Check for OVER clause (window function)
+		if p.cur.Type == api.TokOver {
+			p.advance() // consume OVER
+			window, err := p.parseWindowSpec()
+			if err != nil {
+				return nil, err
+			}
+			return &api.WindowFuncExpr{Func: strings.ToUpper(funcName), Args: args, Window: window}, nil
 		}
 		return &api.AggregateCallExpr{Func: strings.ToUpper(funcName), Arg: arg}, nil
 
