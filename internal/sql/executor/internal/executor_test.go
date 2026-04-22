@@ -2618,3 +2618,147 @@ func TestExec_UpdateWithExpressionIndex(t *testing.T) {
 		t.Errorf("expected 0 rows for old value, got %d", len(r.Rows))
 	}
 }
+
+func TestExec_CreateAndDropTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create table first
+	env.execSQL(t, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, updated_at TEXT)")
+
+	// Create a trigger
+	env.execSQL(t, "CREATE TRIGGER update_ts AFTER UPDATE ON users BEGIN UPDATE users SET updated_at = 'changed' WHERE id = new.id; END")
+
+	// Verify trigger exists in catalog
+	triggers, err := env.cat.ListTriggers("users")
+	if err != nil {
+		t.Fatalf("ListTriggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("expected 1 trigger, got %d", len(triggers))
+	}
+	if triggers[0].Name != "UPDATE_TS" {
+		t.Errorf("trigger name = %q, want %q", triggers[0].Name, "UPDATE_TS")
+	}
+	if triggers[0].Timing != "AFTER" {
+		t.Errorf("timing = %q, want %q", triggers[0].Timing, "AFTER")
+	}
+	if triggers[0].Event != "UPDATE" {
+		t.Errorf("event = %q, want %q", triggers[0].Event, "UPDATE")
+	}
+
+	// Drop the trigger
+	env.execSQL(t, "DROP TRIGGER update_ts")
+
+	// Verify trigger is gone
+	triggers, err = env.cat.ListTriggers("users")
+	if err != nil {
+		t.Fatalf("ListTriggers after drop: %v", err)
+	}
+	if len(triggers) != 0 {
+		t.Errorf("expected 0 triggers after drop, got %d", len(triggers))
+	}
+}
+
+func TestExec_InsertTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create source and audit tables
+	env.execSQL(t, "CREATE TABLE source (id INT PRIMARY KEY, value TEXT)")
+	env.execSQL(t, "CREATE TABLE audit (id INT, action TEXT, value TEXT)")
+
+	// Create INSERT trigger
+	env.execSQL(t, "CREATE TRIGGER log_insert AFTER INSERT ON source BEGIN INSERT INTO audit VALUES (new.id, 'INSERT', new.value); END")
+
+	// Insert a row
+	env.execSQL(t, "INSERT INTO source VALUES (1, 'test')")
+
+	// Verify audit log was created by trigger
+	result := env.execSQL(t, "SELECT action, value FROM audit WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 audit row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "INSERT" {
+		t.Errorf("action = %q, want %q", result.Rows[0][0].Text, "INSERT")
+	}
+	if result.Rows[0][1].Text != "test" {
+		t.Errorf("value = %q, want %q", result.Rows[0][1].Text, "test")
+	}
+}
+
+func TestExec_UpdateTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create tables
+	env.execSQL(t, "CREATE TABLE items (id INT PRIMARY KEY, quantity INT, status TEXT)")
+	env.execSQL(t, "CREATE TABLE stock_log (item_id INT, old_qty INT, new_qty INT)")
+
+	// Create UPDATE trigger that logs changes
+	env.execSQL(t, "CREATE TRIGGER log_quantity AFTER UPDATE ON items BEGIN INSERT INTO stock_log VALUES (old.id, old.quantity, new.quantity); END")
+
+	// Insert initial data
+	env.execSQL(t, "INSERT INTO items VALUES (1, 100, 'active')")
+
+	// Update the quantity
+	env.execSQL(t, "UPDATE items SET quantity = 50 WHERE id = 1")
+
+	// Verify stock log was created by trigger
+	result := env.execSQL(t, "SELECT old_qty, new_qty FROM stock_log WHERE item_id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 stock_log row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Int != 100 {
+		t.Errorf("old_qty = %d, want 100", result.Rows[0][0].Int)
+	}
+	if result.Rows[0][1].Int != 50 {
+		t.Errorf("new_qty = %d, want 50", result.Rows[0][1].Int)
+	}
+}
+
+func TestExec_DeleteTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create tables
+	env.execSQL(t, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT)")
+	env.execSQL(t, "CREATE TABLE deleted_log (id INT, name TEXT)")
+
+	// Create DELETE trigger
+	env.execSQL(t, "CREATE TRIGGER archive_delete AFTER DELETE ON products BEGIN INSERT INTO deleted_log VALUES (old.id, old.name); END")
+
+	// Insert data
+	env.execSQL(t, "INSERT INTO products VALUES (1, 'Widget')")
+
+	// Delete the product
+	env.execSQL(t, "DELETE FROM products WHERE id = 1")
+
+	// Verify deleted row was logged
+	result := env.execSQL(t, "SELECT name FROM deleted_log WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 deleted_log row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "Widget" {
+		t.Errorf("name = %q, want %q", result.Rows[0][0].Text, "Widget")
+	}
+}
+
+func TestExec_BeforeTrigger(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create table with a constraint enforced by trigger
+	env.execSQL(t, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)")
+	env.execSQL(t, "CREATE TABLE blocked_orders (id INT, reason TEXT)")
+
+	// BEFORE trigger that cancels high-value orders
+	env.execSQL(t, "CREATE TRIGGER cancel_high_value BEFORE INSERT ON orders WHEN new.amount > 1000 BEGIN INSERT INTO blocked_orders VALUES (new.id, 'exceeded limit'); END")
+
+	// Insert a high-value order (should be blocked)
+	env.execSQL(t, "INSERT INTO orders VALUES (1, 5000)")
+
+	// Verify order was blocked by trigger
+	result := env.execSQL(t, "SELECT reason FROM blocked_orders WHERE id = 1")
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 blocked_orders row, got %d", len(result.Rows))
+	}
+	if result.Rows[0][0].Text != "exceeded limit" {
+		t.Errorf("reason = %q, want %q", result.Rows[0][0].Text, "exceeded limit")
+	}
+}

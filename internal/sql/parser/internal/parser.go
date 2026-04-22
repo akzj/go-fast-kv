@@ -911,7 +911,7 @@ func (p *parser) parseCreateTrigger() (api.Statement, error) {
 	}
 
 	// Optional WHEN condition
-	if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "WHEN" {
+	if p.cur.Type == api.TokWhen || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "WHEN") {
 		p.advance()
 		cond, err := p.parseExpr()
 		if err != nil {
@@ -921,7 +921,7 @@ func (p *parser) parseCreateTrigger() (api.Statement, error) {
 	}
 
 	// BEGIN ... END block
-	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "BEGIN" {
+	if p.cur.Type != api.TokBegin && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "BEGIN") {
 		return nil, p.errorf("expected BEGIN after trigger definition")
 	}
 	p.advance() // consume BEGIN
@@ -930,7 +930,7 @@ func (p *parser) parseCreateTrigger() (api.Statement, error) {
 	var body []api.Statement
 	for {
 		// Check for END keyword
-		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END" {
+		if p.cur.Type == api.TokEnd || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END") {
 			break
 		}
 		if p.cur.Type == api.TokEOF {
@@ -954,7 +954,7 @@ func (p *parser) parseCreateTrigger() (api.Statement, error) {
 	}
 
 	// Consume END
-	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "END" {
+	if p.cur.Type != api.TokEnd && !(p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "END") {
 		return nil, p.errorf("expected END at end of trigger body")
 	}
 	p.advance()

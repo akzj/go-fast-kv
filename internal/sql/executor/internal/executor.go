@@ -56,6 +56,8 @@ type executor struct {
 	triggerNewVals []catalogapi.Value
 	triggerOldCols []catalogapi.ColumnDef
 	triggerOldVals []catalogapi.Value
+	// triggerDepth prevents infinite recursion from nested triggers
+	triggerDepth int
 }
 
 // New creates a new Executor.
@@ -6566,10 +6568,17 @@ func (e *executor) windowMax(args []parserapi.Expr, rows []*engineapi.Row, colum
 
 // ─── Trigger Execution ─────────────────────────────────────────────
 
+const maxTriggerDepth = 16
+
 // fireTriggers executes matching triggers for a given table and event.
 // timing is "BEFORE" or "AFTER", event is "INSERT", "UPDATE", or "DELETE".
 // newRow/newCols provide NEW.* values; oldRow/oldCols provide OLD.* values.
 func (e *executor) fireTriggers(tableName, timing, event string, newCols []catalogapi.ColumnDef, newVals []catalogapi.Value, oldCols []catalogapi.ColumnDef, oldVals []catalogapi.Value) error {
+	// Check re-entrancy limit
+	if e.triggerDepth >= maxTriggerDepth {
+		return fmt.Errorf("%w: trigger recursion limit exceeded (max %d)", executorapi.ErrExecFailed, maxTriggerDepth)
+	}
+
 	triggers, err := e.catalog.ListTriggers(tableName)
 	if err != nil {
 		return fmt.Errorf("%w: listing triggers: %v", executorapi.ErrExecFailed, err)
@@ -6616,20 +6625,25 @@ func (e *executor) fireTriggers(tableName, timing, event string, newCols []catal
 // evalTriggerWhen evaluates a WHEN condition expression with trigger context.
 // Returns true if condition is satisfied or has no WHEN clause.
 func (e *executor) evalTriggerWhen(whenSQL, tableName string) (bool, error) {
-	// Parse the WHEN expression
-	stmt, err := e.parser.Parse(whenSQL)
+	if whenSQL == "" {
+		return true, nil
+	}
+
+	// Parse the WHEN expression - wrap in SELECT for expression-only input
+	wrappedSQL := "SELECT " + whenSQL
+	stmt, err := e.parser.Parse(wrappedSQL)
 	if err != nil {
 		return false, fmt.Errorf("parse WHEN condition: %v", err)
 	}
 
-	// Extract the expression from the statement (SELECT column FROM table WHERE <expr>)
+	// Extract the expression from the SELECT statement
 	var whereExpr parserapi.Expr
 	if selectStmt, ok := stmt.(*parserapi.SelectStmt); ok {
 		whereExpr = selectStmt.Where
 	}
 
 	if whereExpr == nil {
-		return true, nil // No WHERE = always matches
+		return true, nil // No expression = always matches
 	}
 
 	// Create a dummy row with trigger values for evaluation
@@ -6658,6 +6672,10 @@ func (e *executor) evalTriggerWhen(whenSQL, tableName string) (bool, error) {
 // execTriggerBody parses and executes the trigger body SQL.
 // bodySQL contains one or more statements separated by semicolons.
 func (e *executor) execTriggerBody(bodySQL, tableName string) error {
+	// Increment trigger depth for re-entrancy protection
+	e.triggerDepth++
+	defer func() { e.triggerDepth-- }()
+
 	// Split by semicolon and execute each statement
 	// Note: Simple split - doesn't handle string literals with semicolons
 	statements := splitStatements(bodySQL)

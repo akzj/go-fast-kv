@@ -32,6 +32,9 @@ func resolveExprToValue(expr parserapi.Expr) (catalogapi.Value, error) {
 	switch e := expr.(type) {
 	case *parserapi.Literal:
 		return e.Value, nil
+	case *parserapi.ColumnRef:
+		// Column refs are resolved at execution time for triggers
+		return catalogapi.Value{IsNull: true}, nil
 	case *parserapi.UnaryExpr:
 		if e.Op == parserapi.UnaryMinus {
 			inner, err := resolveExprToValue(e.Operand)

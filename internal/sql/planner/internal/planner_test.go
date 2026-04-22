@@ -686,10 +686,11 @@ func TestPlan_Update(t *testing.T) {
 	}
 }
 
-func TestPlan_UpdateRejectColumnRef(t *testing.T) {
+func TestPlan_UpdateColumnRef(t *testing.T) {
 	p := setupPlanner(t)
 
-	// UPDATE USERS SET NAME = AGE → should fail (Phase 1: literals only)
+	// UPDATE USERS SET NAME = AGE → allowed for trigger context (NEW./OLD. refs)
+	// Note: ColumnRef is now allowed for trigger body execution
 	stmt := &parserapi.UpdateStmt{
 		Table: "USERS",
 		Assignments: []parserapi.Assignment{
@@ -697,12 +698,12 @@ func TestPlan_UpdateRejectColumnRef(t *testing.T) {
 		},
 	}
 
-	_, err := p.Plan(stmt)
-	if err == nil {
-		t.Fatal("expected error for column ref in SET")
+	plan, err := p.Plan(stmt)
+	if err != nil {
+		t.Fatalf("unexpected error for column ref in SET (now allowed for triggers): %v", err)
 	}
-	if !errors.Is(err, plannerapi.ErrUnsupportedExpr) {
-		t.Errorf("expected ErrUnsupportedExpr, got: %v", err)
+	if plan == nil {
+		t.Fatal("expected plan, got nil")
 	}
 }
 

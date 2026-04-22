@@ -206,9 +206,11 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 		return catalogapi.Value{}, false
 	}
 
-	// Try current table columns first
-	if val, ok := findIn(columns, row.Values); ok {
-		return val, nil
+	// Try current table columns first (skip if row is nil)
+	if row != nil {
+		if val, ok := findIn(columns, row.Values); ok {
+			return val, nil
+		}
 	}
 
 	// Try NEW. reference for INSERT/UPDATE triggers

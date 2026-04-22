@@ -416,11 +416,16 @@ func (p *planner) planInsert(stmt *parserapi.InsertStmt) (plannerapi.Plan, error
 		}, nil
 	}
 
-	// Check if any expression contains a ParamRef (needs execution-time resolution)
+	// Check if any expression contains a ParamRef or ColumnRef (needs execution-time resolution)
+	// ColumnRef is needed for trigger context (NEW.col, OLD.col references)
 	hasParams := false
 	for _, exprRow := range stmt.Values {
 		for _, expr := range exprRow {
 			if _, ok := expr.(*parserapi.ParamRef); ok {
+				hasParams = true
+				break
+			}
+			if _, ok := expr.(*parserapi.ColumnRef); ok {
 				hasParams = true
 				break
 			}
@@ -1607,10 +1612,15 @@ func (p *planner) planUpdate(stmt *parserapi.UpdateStmt) (*plannerapi.UpdatePlan
 		return nil, err
 	}
 
-	// Check if any assignment contains a ParamRef (needs execution-time resolution)
+	// Check if any assignment contains a ParamRef or ColumnRef (needs execution-time resolution)
+	// ColumnRef is needed for trigger context (NEW.col, OLD.col references)
 	hasParams := false
 	for _, a := range stmt.Assignments {
 		if _, ok := a.Value.(*parserapi.ParamRef); ok {
+			hasParams = true
+			break
+		}
+		if _, ok := a.Value.(*parserapi.ColumnRef); ok {
 			hasParams = true
 			break
 		}
