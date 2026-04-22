@@ -117,20 +117,9 @@ func (e *executor) Execute(plan plannerapi.Plan) (*executorapi.Result, error) {
 // ExecuteWithTxn dispatches a plan to the appropriate handler with transaction context.
 // txnCtx provides row-level locking for SELECT FOR UPDATE.
 // If txnCtx is nil, behaves like Execute (no row locking).
+// All errors are returned gracefully — no panic/recover in the happy path.
 func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext) (*executorapi.Result, error) {
-	// Set transaction context for row locking
 	e.txnCtx = txnCtx
-	// Panic recovery: rollback transaction and re-panic so caller knows.
-	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
-	defer func() {
-		if r := recover(); r != nil {
-			if e.txnCtx != nil {
-				e.txnCtx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	// Ensure cleanup on any exit path — runs after panic recovery.
 	defer func() {
 		e.txnCtx = nil
 	}()
@@ -146,6 +135,16 @@ func (e *executor) ExecuteWithTxn(plan plannerapi.Plan, txnCtx txnapi.TxnContext
 		}
 	}
 
+	result, err := e.executePlan(plan)
+	if err != nil && txnCtx != nil {
+		txnCtx.Rollback()
+	}
+	return result, err
+}
+
+// executePlan dispatches a plan to the appropriate handler. Extracted from
+// ExecuteWithTxn/ExecuteWithTxnAndParams to avoid code duplication.
+func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error) {
 	switch p := plan.(type) {
 	case *plannerapi.CreateTablePlan:
 		return e.execCreateTable(p)
@@ -208,27 +207,14 @@ func (e *executor) ExecuteWithParams(plan plannerapi.Plan, params []catalogapi.V
 }
 
 // ExecuteWithTxnAndParams executes a plan with transaction context and positional parameters.
+// All errors are returned gracefully — no panic/recover in the happy path.
 func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.TxnContext, params []catalogapi.Value) (*executorapi.Result, error) {
-	// Set params for this execution
 	e.params = params
-	// Panic recovery: rollback transaction and re-panic so caller knows.
-	// Deferred in LIFO order, so this runs BEFORE the nil assignment below.
-	defer func() {
-		if r := recover(); r != nil {
-			if txnCtx != nil {
-				txnCtx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	// Ensure cleanup on any exit path — runs after panic recovery.
+	e.txnCtx = txnCtx
 	defer func() {
 		e.txnCtx = nil
 		e.params = nil
 	}()
-
-	// Set transaction context for row locking
-	e.txnCtx = txnCtx
 
 	// Register the transaction's snapshot in readSnaps so all Get/Scan calls
 	// within this transaction use the same snapshot.
@@ -240,59 +226,11 @@ func (e *executor) ExecuteWithTxnAndParams(plan plannerapi.Plan, txnCtx txnapi.T
 		}
 	}
 
-	switch p := plan.(type) {
-	case *plannerapi.CreateTablePlan:
-		return e.execCreateTable(p)
-	case *plannerapi.DropTablePlan:
-		return e.execDropTable(p)
-	case *plannerapi.CreateIndexPlan:
-		return e.execCreateIndex(p)
-	case *plannerapi.DropIndexPlan:
-		return e.execDropIndex(p)
-	case *plannerapi.InsertPlan:
-		return e.execInsert(p)
-	case *plannerapi.UpsertPlan:
-		return e.execUpsert(p)
-	case *plannerapi.InsertSelectPlan:
-		return e.execInsertSelect(p)
-	case *plannerapi.SelectPlan:
-		if p.Join != nil {
-			return e.execJoinSelect(p)
-		}
-		return e.execSelect(p)
-	case *plannerapi.JoinPlan:
-		return e.execJoin(p)
-	case *plannerapi.DeletePlan:
-		return e.execDelete(p)
-	case *plannerapi.TruncatePlan:
-		return e.execTruncate(p)
-	case *plannerapi.UpdatePlan:
-		return e.execUpdate(p)
-	case *plannerapi.UnionPlan:
-		return e.execUnion(p)
-	case *plannerapi.IntersectPlan:
-		return e.execIntersect(p)
-	case *plannerapi.ExceptPlan:
-		return e.execExcept(p)
-	case *plannerapi.ExplainPlan:
-		return e.execExplain(p)
-	case *plannerapi.WithPlan:
-		return e.execWith(p)
-	case *plannerapi.AlterTablePlan:
-		return e.execAlterTable(p)
-	case *plannerapi.PragmaPlan:
-		return e.execPragma(p)
-	case *plannerapi.CreateTriggerPlan:
-		return e.execCreateTrigger(p)
-	case *plannerapi.DropTriggerPlan:
-		return e.execDropTrigger(p)
-	case *plannerapi.CreateFTSPlan:
-		return e.execCreateFTS(p)
-	case *plannerapi.FTSSearchPlan:
-		return e.execFTSSearch(p)
-	default:
-		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
+	result, err := e.executePlan(plan)
+	if err != nil && txnCtx != nil {
+		txnCtx.Rollback()
 	}
+	return result, err
 }
 
 // ─── Row Locking Helpers ──────────────────────────────────────────
