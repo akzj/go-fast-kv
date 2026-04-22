@@ -148,3 +148,36 @@ go test ./... -bench=. -benchtime=100ms > benchmark_$(date +%Y%m%d).txt
 # 对比上次结果
 diff benchmark_20240422.txt benchmark_20240423.txt
 ```
+
+---
+
+## P18 性能基线 (2024-04-23)
+
+### KVStore 基准测试 (SyncNone 模式)
+
+| 操作 | 数据量 | 耗时 | 备注 |
+|------|--------|------|------|
+| Put SeqWrite | 100 keys | 5.7ms/op | ~175K ops/s |
+| Put SeqWrite | 1k keys | 127ms/op | ~7.9K ops/s |
+| Put SeqWrite | 10k keys | 1.27s/op | B-tree 分裂瓶颈 |
+| Put RandWrite | 100 keys | 5.5ms/op | - |
+| Put RandWrite | 1k keys | 130ms/op | - |
+| Get SeqRead | 100 keys | 1.9ms/op | - |
+| Get RandRead | 100 keys | 1.1ms/op | ~909K ops/s |
+| WriteBatch | 1k keys | 104ms/op | 比 Put 快 18% |
+| Scan | 100 keys | 0.055ms/op | 高效 |
+| ConcurrentWrite (8) | 8 goroutines | 0.18ms/op | - |
+
+### 瓶颈分析
+
+- **10k keys Put: 1.27s/op** — 树高增加导致多层级分裂
+- 根因: B-tree 分裂级联，每层 WritePage 累积
+- 非 WAL fsync 瓶颈 (已使用 SyncNone)
+- WriteBatch 比 Put 快 18% (共享 WAL batch)
+
+### 解决方向
+
+1. **Page 池化复用** — 减少 AllocPage 开销
+2. **延迟刷盘** — 批量 WritePage 到磁盘
+3. **LSM-tree 切换** — 批量 compactions
+
