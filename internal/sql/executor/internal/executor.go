@@ -2825,8 +2825,32 @@ func (e *executor) execSelectFromCTE(plan *plannerapi.SelectPlan, cteResult *exe
 	}
 
 	// Project columns
+	// If SelectColumns has expressions (like n+1), evaluate them
 	projected := projectRows(rows, plan.Columns)
 	colNames := buildColumnNames(plan.Table, plan.Columns)
+	if plan.SelectColumns != nil && hasExpressions(plan.SelectColumns) {
+		projected = make([][]catalogapi.Value, len(rows))
+		colNames = make([]string, len(plan.SelectColumns))
+		for i, sc := range plan.SelectColumns {
+			if sc.Alias != "" {
+				colNames[i] = sc.Alias
+			} else if name := columnNameFromExpr(sc.Expr); name != "" {
+				colNames[i] = name
+			} else {
+				colNames[i] = "expr"
+			}
+		}
+		for rowIdx, row := range rows {
+			projected[rowIdx] = make([]catalogapi.Value, len(plan.SelectColumns))
+			for i, sc := range plan.SelectColumns {
+				val, err := evalExpr(sc.Expr, row, tableCols, nil, e)
+				if err != nil {
+					return nil, err
+				}
+				projected[rowIdx][i] = val
+			}
+		}
+	}
 
 	// Apply DISTINCT
 	if plan.Distinct {
@@ -3473,30 +3497,26 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 func (e *executor) execWith(plan *plannerapi.WithPlan) (*executorapi.Result, error) {
 	// Materialize each CTE into a temporary in-memory table
 	for _, ctePlan := range plan.CTEs {
-		result, err := e.Execute(ctePlan.SelectPlan)
+		var result *executorapi.Result
+		var err error
+
+		if ctePlan.IsRecursive && ctePlan.AnchorPlan != nil {
+			// Recursive CTE: proper iterative execution
+			result, err = e.execRecursiveCTE(ctePlan)
+		} else {
+			// Non-recursive CTE: simple materialization
+			if ctePlan.SelectPlan != nil {
+				result, err = e.Execute(ctePlan.SelectPlan)
+			} else {
+				// Fallback: execute the body plan directly
+				result, err = e.Execute(ctePlan.AnchorPlan)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("%w: executing CTE %s: %v", executorapi.ErrExecFailed, ctePlan.Name, err)
 		}
 
-		// Create a temporary table for this CTE (or update if recursive)
-		// For recursive CTEs, we iteratively add new rows until no new rows appear
-		if ctePlan.IsRecursive {
-			// Recursive CTE: iterate until result stabilizes
-			prevCount := -1
-			for {
-				cteResult, err := e.Execute(ctePlan.SelectPlan)
-				if err != nil {
-					return nil, fmt.Errorf("%w: executing recursive CTE %s: %v", executorapi.ErrExecFailed, ctePlan.Name, err)
-				}
-				if cteResult != nil && len(cteResult.Rows) == prevCount {
-					break // No new rows, done
-				}
-				prevCount = len(cteResult.Rows)
-			}
-		}
-
 		// Store CTE result in executor's CTE registry for lookup during main query
-		// The main query's planner will have been updated to reference this CTE
 		e.cteResults[ctePlan.Name] = result
 	}
 
@@ -3507,6 +3527,69 @@ func (e *executor) execWith(plan *plannerapi.WithPlan) (*executorapi.Result, err
 	}
 
 	return mainResult, nil
+}
+
+// execRecursiveCTE executes a recursive CTE using the anchor-recursive split.
+// The CTE body must be: anchor UNION ALL recursive_part
+// The recursive part references the CTE name itself.
+//
+// Algorithm:
+// 1. Execute anchor → prevRows (these become the CTE's data for iteration 1)
+// 2. Loop:
+//    a. Execute recursive part (sees prevRows in CTE)
+//    b. If no new rows → break
+//    c. Accumulate newRows into result
+//    d. prevRows = newRows (for next iteration)
+// 3. Return accumulated result
+func (e *executor) execRecursiveCTE(ctePlan *plannerapi.CTEPlan) (*executorapi.Result, error) {
+	var accumulated [][]catalogapi.Value
+	var accumulatorColumns []string
+	var prevRows [][]catalogapi.Value
+
+	// Iteration 0: execute anchor
+	anchorResult, err := e.Execute(ctePlan.AnchorPlan)
+	if err != nil {
+		return nil, fmt.Errorf("%w: recursive CTE anchor: %v", executorapi.ErrExecFailed, err)
+	}
+	if anchorResult != nil {
+		accumulatorColumns = anchorResult.Columns
+		prevRows = anchorResult.Rows
+		accumulated = prevRows
+	}
+
+	// Iteration limit to prevent infinite loops
+	const maxIterations = 1000
+
+	for iteration := 1; iteration < maxIterations; iteration++ {
+		// Set CTE's data to only the previous iteration's rows (NOT accumulated)
+		e.cteResults[ctePlan.Name] = &executorapi.Result{
+			Rows:    prevRows,
+			Columns: accumulatorColumns,
+		}
+
+		// Execute recursive part
+		result, err := e.Execute(ctePlan.RecursivePlan)
+		if err != nil {
+			return nil, fmt.Errorf("%w: recursive CTE iteration: %v", executorapi.ErrExecFailed, err)
+		}
+
+		newRows := result.Rows
+		if len(newRows) == 0 {
+			break // No new rows, we're done
+		}
+
+		// Append new rows to accumulated result
+		accumulated = append(accumulated, newRows...)
+
+		// Update prevRows for next iteration
+		prevRows = newRows
+	}
+
+	// Return final accumulated result
+	return &executorapi.Result{
+		Rows:    accumulated,
+		Columns: accumulatorColumns,
+	}, nil
 }
 
 // execUpdateParameterized handles UPDATE with ParamRef expressions (resolved at execution time).

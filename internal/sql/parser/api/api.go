@@ -327,9 +327,9 @@ func (*SelectStmt) stmtNode() {}
 
 // CTEClause represents a Common Table Expression (WITH ... AS ...).
 type CTEClause struct {
-	Name       string       // CTE name, e.g., "temp" in "WITH temp AS (...)"
-	SelectStmt *SelectStmt  // the subquery defining this CTE
-	IsRecursive bool        // true for "WITH RECURSIVE"
+	Name       string    // CTE name, e.g., "temp" in "WITH temp AS (...)"
+	SelectStmt Statement // the subquery defining this CTE (can be SelectStmt or UnionStmt)
+	IsRecursive bool     // true for "WITH RECURSIVE"
 }
 
 func (*CTEClause) exprNode() {} // CTE is used as a statement wrapper

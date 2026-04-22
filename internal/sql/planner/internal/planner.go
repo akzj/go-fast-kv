@@ -615,21 +615,25 @@ func (p *planner) planWith(s *parserapi.WithStmt) (plannerapi.Plan, error) {
 	p.cteSchemas = make(map[string]*catalogapi.TableSchema)
 	ctePlans := make([]*plannerapi.CTEPlan, len(s.CTEs))
 	for i, cte := range s.CTEs {
-		selectPlan, err := p.planSelect(cte.SelectStmt)
-		if err != nil {
-			p.cteSchemas = nil // clean up
-			return nil, fmt.Errorf("planning CTE %s: %w", cte.Name, err)
+		// Build the CTE schema from the SelectStmt's projection
+		// For UnionStmt, get columns from the left side (anchor)
+		var selectCols []parserapi.SelectColumn
+		switch stmt := cte.SelectStmt.(type) {
+		case *parserapi.SelectStmt:
+			selectCols = stmt.Columns
+		case *parserapi.UnionStmt:
+			if leftSelect, ok := stmt.Left.(*parserapi.SelectStmt); ok {
+				selectCols = leftSelect.Columns
+			}
 		}
 
-		// Build the CTE schema from the SelectStmt's projection
 		schema := &catalogapi.TableSchema{
 			Name: cte.Name,
 		}
-		for _, col := range cte.SelectStmt.Columns {
+		for _, col := range selectCols {
 			colDef := catalogapi.ColumnDef{Name: col.Alias}
-			// Try to infer type from expression (rough guess for now)
 			if _, ok := col.Expr.(*parserapi.StarExpr); ok {
-				colDef.Type = catalogapi.TypeBlob // placeholder
+				colDef.Type = catalogapi.TypeBlob
 			} else {
 				colDef.Type = catalogapi.TypeBlob
 			}
@@ -637,10 +641,34 @@ func (p *planner) planWith(s *parserapi.WithStmt) (plannerapi.Plan, error) {
 		}
 		p.cteSchemas[cte.Name] = schema
 
+		// Plan the CTE body (can be SelectStmt or UnionStmt)
+		cteBodyPlan, err := p.Plan(cte.SelectStmt)
+		if err != nil {
+			p.cteSchemas = nil
+			return nil, fmt.Errorf("planning CTE %s: %w", cte.Name, err)
+		}
+
+		// For recursive CTEs, split anchor and recursive parts from UNION ALL
+		var anchorPlan, recursivePlan plannerapi.Plan
+		if cte.IsRecursive {
+			// Check if the body is a UnionPlan with UNION ALL
+			if unionPlan, ok := cteBodyPlan.(*plannerapi.UnionPlan); ok && unionPlan.UnionAll {
+				anchorPlan = unionPlan.Left
+				recursivePlan = unionPlan.Right
+			} else {
+				// Fallback: treat entire body as anchor (no self-reference)
+				anchorPlan = cteBodyPlan
+				recursivePlan = nil
+			}
+		}
+
+		// Store the full body plan in SelectPlan (used for anchor execution in non-recursive CTE)
 		ctePlans[i] = &plannerapi.CTEPlan{
-			Name:        cte.Name,
-			SelectPlan:  selectPlan,
-			IsRecursive: cte.IsRecursive,
+			Name:          cte.Name,
+			SelectPlan:    cteBodyPlan,
+			IsRecursive:   cte.IsRecursive,
+			AnchorPlan:    anchorPlan,
+			RecursivePlan: recursivePlan,
 		}
 	}
 

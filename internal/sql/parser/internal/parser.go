@@ -1143,7 +1143,7 @@ func (p *parser) parseWith() (api.Statement, error) {
 
 		ctes = append(ctes, &api.CTEClause{
 			Name:        cteName,
-			SelectStmt:  subq.(*api.SelectStmt),
+			SelectStmt:  subq, // can be SelectStmt or UnionStmt
 			IsRecursive: isRecursive,
 		})
 

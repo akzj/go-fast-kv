@@ -254,9 +254,13 @@ func (*WithPlan) planNode() {}
 
 // CTEPlan represents a single CTE definition with its execution plan.
 type CTEPlan struct {
-	Name       string // CTE name, e.g., "temp"
-	SelectPlan *SelectPlan // the subquery plan for this CTE
-	IsRecursive bool       // true for WITH RECURSIVE
+	Name        string      // CTE name, e.g., "temp"
+	SelectPlan  Plan        // original full plan (for non-recursive or anchor reference)
+	IsRecursive bool        // true for WITH RECURSIVE
+
+	// For recursive CTEs: split anchor and recursive parts from UNION ALL
+	AnchorPlan    Plan       // anchor query plan (left side of UNION ALL) — SELECT 1 as n
+	RecursivePlan Plan       // recursive query plan (right side of UNION ALL) — SELECT n+1 FROM cnt WHERE n<10
 }
 
 // ─── EXPLAIN Plan ──────────────────────────────────────────────────
