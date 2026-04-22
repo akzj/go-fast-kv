@@ -124,6 +124,11 @@ var keywords = map[string]api.TokenType{
 	"UNBOUNDED":     api.TokUnbounded,
 	"CURRENT":       api.TokCurrent,
 	"FOLLOWING":     api.TokFollowing,
+	"JSON_EXTRACT":  api.TokJsonExtract,
+	"JSON_SET":      api.TokJsonSet,
+	"JSON_INSERT":   api.TokJsonInsert,
+	"JSON_REMOVE":   api.TokJsonRemove,
+	"JSON_TYPE":     api.TokJsonType,
 }
 
 // lexer tokenizes SQL input.

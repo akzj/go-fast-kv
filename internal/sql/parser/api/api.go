@@ -157,6 +157,11 @@ const (
 	TokUnbounded      TokenType = 141 // UNBOUNDED (window frame)
 	TokCurrent        TokenType = 142 // CURRENT (window frame)
 	TokFollowing      TokenType = 143 // FOLLOWING (window frame)
+	TokJsonExtract    TokenType = 144 // JSON_EXTRACT
+	TokJsonSet        TokenType = 145 // JSON_SET
+	TokJsonInsert     TokenType = 146 // JSON_INSERT
+	TokJsonRemove     TokenType = 147 // JSON_REMOVE
+	TokJsonType       TokenType = 148 // JSON_TYPE
 )
 
 // Token represents a single lexical token.
@@ -557,6 +562,14 @@ type StringFuncExpr struct {
 }
 
 func (*StringFuncExpr) exprNode() {}
+
+// JsonFuncExpr represents JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE
+type JsonFuncExpr struct {
+	Func  string   // "JSON_EXTRACT", "JSON_SET", "JSON_INSERT", "JSON_REMOVE", "JSON_TYPE"
+	Args  []Expr   // arguments: json, path [, value...]
+}
+
+func (*JsonFuncExpr) exprNode() {}
 
 // CastExpr: CAST(expr AS type) performs type conversion.
 type CastExpr struct {

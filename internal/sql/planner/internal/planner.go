@@ -1116,6 +1116,9 @@ func (p *planner) resolveSelectColumnsFromDerived(cols []parserapi.SelectColumn,
 		case *parserapi.StringFuncExpr:
 			// StringFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
+		case *parserapi.JsonFuncExpr:
+			// JsonFuncExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
 		case *parserapi.NullIfExpr:
 			// NullIfExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
@@ -1892,6 +1895,9 @@ func (p *planner) resolveSelectColumns(tbl *catalogapi.TableSchema, cols []parse
 			indices[i] = -1
 		case *parserapi.StringFuncExpr:
 			// StringFuncExpr is evaluated by the executor; set -1 as sentinel.
+			indices[i] = -1
+		case *parserapi.JsonFuncExpr:
+			// JsonFuncExpr is evaluated by the executor; set -1 as sentinel.
 			indices[i] = -1
 		case *parserapi.NullIfExpr:
 			// NullIfExpr is evaluated by the executor; set -1 as sentinel.

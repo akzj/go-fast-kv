@@ -2001,6 +2001,16 @@ func isStringFunc(name string) bool {
 	}
 }
 
+// isJsonFunc returns true for JSON function names (case-insensitive).
+func isJsonFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "JSON_EXTRACT", "JSON_SET", "JSON_INSERT", "JSON_REMOVE", "JSON_TYPE":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseFunctionArgs parses a comma-separated list of expressions inside parentheses.
 // For COUNT(*), the '*' is represented as a nil Expr (AggregateCallExpr.Arg == nil).
 // The opening '(' has already been consumed by the caller.
@@ -2412,6 +2422,23 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		p.advance() // consume ')'
 		return &api.StringFuncExpr{Func: strings.ToUpper(funcName), Args: args}, nil
 
+	case api.TokJsonExtract, api.TokJsonSet, api.TokJsonInsert, api.TokJsonRemove, api.TokJsonType:
+		// JSON_EXTRACT(json, path), JSON_SET(json, path, value), JSON_INSERT(json, path, value),
+		// JSON_REMOVE(json, path), JSON_TYPE(json, path)
+		funcName := p.cur.Literal
+		p.advance() // consume keyword
+		if p.cur.Type != api.TokLParen {
+			return nil, p.errorf("expected ( after %s", funcName)
+		}
+		p.advance() // consume '('
+		args, err := p.parseFunctionArgs()
+		if err != nil {
+			return nil, err
+		}
+		// p.cur is now ')'
+		p.advance() // consume ')'
+		return &api.JsonFuncExpr{Func: strings.ToUpper(funcName), Args: args}, nil
+
 	case api.TokIdent:
 		name := p.cur.Literal
 		p.advance()
@@ -2450,6 +2477,10 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 				}
 				// Other string functions: all use standard (arg1, arg2, ...) syntax
 				return &api.StringFuncExpr{Func: upperName, Args: args}, nil
+			}
+			// JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE
+			if isJsonFunc(name) {
+				return &api.JsonFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
 			}
 			// Unknown function — treat as column reference for backward compatibility
 			return &api.ColumnRef{Column: name}, nil

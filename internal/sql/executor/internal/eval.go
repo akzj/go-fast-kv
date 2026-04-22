@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -54,6 +55,10 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		}
 		walkExpr(e.Start, fn)
 		walkExpr(e.Len, fn)
+	case *parserapi.JsonFuncExpr:
+		for _, arg := range e.Args {
+			walkExpr(arg, fn)
+		}
 	case *parserapi.CaseExpr:
 		for _, w := range e.Whens {
 			walkExpr(w.Cond, fn)
@@ -124,6 +129,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalNullIfExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.StringFuncExpr:
 		return evalStringFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.JsonFuncExpr:
+		return evalJsonFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CastExpr:
 		return evalCastExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
@@ -1129,4 +1136,220 @@ func evalExistsExpr(expr *parserapi.ExistsExpr, row *engineapi.Row, columns []ca
 		return intVal(1), nil
 	}
 	return intVal(0), nil
+}
+
+// evalJsonFuncExpr evaluates JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE.
+func evalJsonFuncExpr(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch expr.Func {
+	case "JSON_EXTRACT":
+		return evalJsonExtract(expr, row, columns, subqueryResults, ex)
+	case "JSON_TYPE":
+		return evalJsonType(expr, row, columns, subqueryResults, ex)
+	case "JSON_SET", "JSON_INSERT", "JSON_REMOVE":
+		return catalogapi.Value{}, fmt.Errorf("%w: %s not yet implemented", executorapi.ErrExecFailed, expr.Func)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown JSON function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// evalJsonExtract evaluates JSON_EXTRACT(json, path).
+// Extracts a value from JSON based on the path.
+// Paths use SQLite syntax: $.name, $.a.b, $[0], $[1].name
+func evalJsonExtract(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate JSON document
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if jsonVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT requires text argument for JSON document", executorapi.ErrExecFailed)
+	}
+	// Evaluate path
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if pathVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_EXTRACT path must be text", executorapi.ErrExecFailed)
+	}
+
+	// Navigate to the path and return the raw JSON
+	result, err := jsonNavigate(jsonVal.Text, pathVal.Text)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: string(result)}, nil
+}
+
+// jsonNavigate extracts a value from JSON based on a path.
+// Supports SQLite JSON paths: $.name, $.a.b, $[0], $[1].name, $
+func jsonNavigate(jsonStr, path string) (json.RawMessage, error) {
+	// Parse JSON
+	var doc interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %v", err)
+	}
+
+	// Parse path: strip leading $, then split by . and []
+	path = strings.TrimPrefix(path, "$")
+	if path == "" {
+		// Just $, return the whole document
+		return json.Marshal(doc)
+	}
+
+	// Navigate through path segments
+	current := doc
+	for len(path) > 0 {
+		if path[0] == '.' {
+			// Object access: .key
+			path = path[1:]
+			if len(path) == 0 {
+				return nil, fmt.Errorf("invalid path: expected key name after '.'")
+			}
+			// Find the key name (until [ or . or end)
+			end := 0
+			for end < len(path) && path[end] != '[' && path[end] != '.' {
+				end++
+			}
+			key := path[:end]
+			path = path[end:]
+
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("path error: expected object, got %T", current)
+			}
+			val, ok := m[key]
+			if !ok {
+				return nil, nil // Path not found
+			}
+			current = val
+
+		} else if path[0] == '[' {
+			// Array access: [index]
+			path = path[1:]
+			if len(path) == 0 || path[0] == ']' {
+				return nil, fmt.Errorf("invalid path: expected index after '['")
+			}
+			// Parse index
+			end := 0
+			for end < len(path) && path[end] != ']' {
+				end++
+			}
+			if end > len(path) {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			idxStr := path[:end]
+			path = path[end:]
+			if path == "" || path[0] != ']' {
+				return nil, fmt.Errorf("invalid path: missing ']'")
+			}
+			path = path[1:] // consume ']'
+
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("path error: expected array, got %T", current)
+			}
+			idx := 0
+			for _, c := range idxStr {
+				if c < '0' || c > '9' {
+					return nil, fmt.Errorf("invalid path: expected integer index")
+				}
+				idx = idx*10 + int(c-'0')
+			}
+			if idx < 0 || idx >= len(arr) {
+				return nil, nil // Index out of range
+			}
+			current = arr[idx]
+
+		} else {
+			return nil, fmt.Errorf("invalid path: expected '.' or '[', got %c", path[0])
+		}
+	}
+
+	return json.Marshal(current)
+}
+
+// evalJsonType evaluates JSON_TYPE(json, path).
+// Returns the type of the value at the given path.
+// Returns: null, integer, real, text, blob, array, object
+func evalJsonType(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate JSON document
+	jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if jsonVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if jsonVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE requires text argument for JSON document", executorapi.ErrExecFailed)
+	}
+	// Evaluate path
+	pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if pathVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if pathVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: JSON_TYPE path must be text", executorapi.ErrExecFailed)
+	}
+
+	// Navigate to get the value
+	raw, err := jsonNavigate(jsonVal.Text, pathVal.Text)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
+	}
+	if raw == nil {
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+	}
+
+	// Determine the type
+	var val interface{}
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+	}
+
+	typeName := "null"
+	switch v := val.(type) {
+	case nil:
+		typeName = "null"
+	case bool:
+		typeName = "integer" // SQLite uses integer for boolean
+	case float64:
+		// Check if it's actually an integer
+		if v == floatValue(int64(v)) {
+			typeName = "integer"
+		} else {
+			typeName = "real"
+		}
+	case string:
+		typeName = "text"
+	case []interface{}:
+		typeName = "array"
+	case map[string]interface{}:
+		typeName = "object"
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: typeName}, nil
+}
+
+// floatValue checks if a float64 is exactly representable as an int64.
+func floatValue(i int64) float64 {
+	return float64(i)
 }
