@@ -204,39 +204,93 @@ func TestExec_JsonType(t *testing.T) {
 		}
 	})
 }
-
-// TestExec_JsonFuncNotImplemented tests that unimplemented JSON functions return proper errors.
-func TestExec_JsonFuncNotImplemented(t *testing.T) {
+// TestExec_JsonSetInsertRemove tests JSON_SET, JSON_INSERT, and JSON_REMOVE functions.
+func TestExec_JsonSetInsertRemove(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.store.Close()
 
 	env.execSQL(t, "CREATE TABLE t (id INT PRIMARY KEY, js TEXT)")
 
-	t.Run("json_set_not_implemented", func(t *testing.T) {
+	t.Run("json_set_update_existing", func(t *testing.T) {
 		env.execSQL(t, "DELETE FROM t")
-		_, err := env.execSQLErr(t, "SELECT JSON_SET('{\"a\":1}', '$.a', 2)")
-		if err == nil {
-			t.Error("JSON_SET should return error 'not yet implemented'")
+		result := env.execSQL(t, "SELECT JSON_SET('{\"a\":1}', '$.a', 2)")
+		if result.Rows[0][0].Text != `{"a":2}` {
+			t.Errorf("JSON_SET = %q, want %q", result.Rows[0][0].Text, `{"a":2}`)
 		}
 	})
 
-	t.Run("json_insert_not_implemented", func(t *testing.T) {
+	t.Run("json_set_add_new_key", func(t *testing.T) {
 		env.execSQL(t, "DELETE FROM t")
-		_, err := env.execSQLErr(t, "SELECT JSON_INSERT('{\"a\":1}', '$.b', 2)")
-		if err == nil {
-			t.Error("JSON_INSERT should return error 'not yet implemented'")
+		result := env.execSQL(t, "SELECT JSON_SET('{\"a\":1}', '$.b', 2)")
+		if result.Rows[0][0].Text != `{"a":1,"b":2}` {
+			t.Errorf("JSON_SET = %q, want %q", result.Rows[0][0].Text, `{"a":1,"b":2}`)
 		}
 	})
 
-	t.Run("json_remove_not_implemented", func(t *testing.T) {
+	t.Run("json_set_nested_path", func(t *testing.T) {
 		env.execSQL(t, "DELETE FROM t")
-		_, err := env.execSQLErr(t, "SELECT JSON_REMOVE('{\"a\":1}', '$.a')")
-		if err == nil {
-			t.Error("JSON_REMOVE should return error 'not yet implemented'")
+		result := env.execSQL(t, "SELECT JSON_SET('{\"user\":{\"name\":\"Alice\"}}', '$.user.name', 'Bob')")
+		if result.Rows[0][0].Text != `{"user":{"name":"Bob"}}` {
+			t.Errorf("JSON_SET = %q, want %q", result.Rows[0][0].Text, `{"user":{"name":"Bob"}}`)
+		}
+	})
+
+	t.Run("json_set_array_element", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_SET('[1,2,3]', '$[1]', 20)")
+		if result.Rows[0][0].Text != `[1,20,3]` {
+			t.Errorf("JSON_SET = %q, want %q", result.Rows[0][0].Text, `[1,20,3]`)
+		}
+	})
+
+	t.Run("json_insert_existing_key_no_change", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_INSERT('{\"a\":1}', '$.a', 2)")
+		if result.Rows[0][0].Text != `{"a":1}` {
+			t.Errorf("JSON_INSERT = %q, want %q", result.Rows[0][0].Text, `{"a":1}`)
+		}
+	})
+
+	t.Run("json_insert_new_key", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_INSERT('{\"a\":1}', '$.b', 2)")
+		if result.Rows[0][0].Text != `{"a":1,"b":2}` {
+			t.Errorf("JSON_INSERT = %q, want %q", result.Rows[0][0].Text, `{"a":1,"b":2}`)
+		}
+	})
+
+	t.Run("json_remove_existing_key", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_REMOVE('{\"a\":1,\"b\":2}', '$.b')")
+		if result.Rows[0][0].Text != `{"a":1}` {
+			t.Errorf("JSON_REMOVE = %q, want %q", result.Rows[0][0].Text, `{"a":1}`)
+		}
+	})
+
+	t.Run("json_remove_array_element", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_REMOVE('[1,2,3]', '$[1]')")
+		if result.Rows[0][0].Text != `[1,3]` {
+			t.Errorf("JSON_REMOVE = %q, want %q", result.Rows[0][0].Text, `[1,3]`)
+		}
+	})
+
+	t.Run("json_set_null_json", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_SET(NULL, '$.a', 1)")
+		if !result.Rows[0][0].IsNull {
+			t.Errorf("JSON_SET with NULL should return NULL")
+		}
+	})
+
+	t.Run("json_remove_null_json", func(t *testing.T) {
+		env.execSQL(t, "DELETE FROM t")
+		result := env.execSQL(t, "SELECT JSON_REMOVE(NULL, '$.a')")
+		if !result.Rows[0][0].IsNull {
+			t.Errorf("JSON_REMOVE with NULL should return NULL")
 		}
 	})
 }
-
 // TestExec_JsonFuncWithColumns tests JSON functions applied to table columns.
 func TestExec_JsonFuncWithColumns(t *testing.T) {
 	env := newTestEnv(t)
