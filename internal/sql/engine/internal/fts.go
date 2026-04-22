@@ -225,6 +225,32 @@ type queryToken struct {
 }
 
 // tokenizeQuery splits a query string into tokens preserving operators.
+// isWordBoundary checks if position i in query is a word boundary (start of a word)
+func isWordBoundary(query string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	return unicode.IsSpace(rune(query[i-1]))
+}
+
+// isOperatorPrefix checks if query at position i starts with operator op
+// and is followed by space or end of string (word boundary after)
+func isOperatorPrefix(query string, i int, op string) bool {
+	remaining := strings.ToUpper(query[i:])
+	// Must start with the operator
+	if !strings.HasPrefix(remaining, op) {
+		return false
+	}
+	// Check what follows the operator
+	afterPos := i + len(op)
+	// After can be: end of string, space, or operator-ending quote
+	if afterPos >= len(query) {
+		return true // operator at end
+	}
+	after := rune(query[afterPos])
+	return unicode.IsSpace(after) || after == '"'
+}
+
 func tokenizeQuery(query string) []queryToken {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -236,9 +262,6 @@ func tokenizeQuery(query string) []queryToken {
 	// Operators: AND, OR, NOT (case-insensitive).
 	// Terms: anything else, stripped of surrounding quotes.
 
-	// First, split by operators while preserving them.
-	// Match: word1 AND word2 OR word3 NOT word4
-	// Split the query around operators
 	inQuote := false
 	partStart := 0
 	for i := 0; i <= len(query); i++ {
@@ -253,9 +276,8 @@ func tokenizeQuery(query string) []queryToken {
 		}
 
 		if !inQuote && i < len(query) {
-			// Check if we're at an operator
-			remaining := strings.ToUpper(query[i:])
-			if strings.HasPrefix(remaining, "AND ") || strings.HasPrefix(remaining, "AND") {
+			// AND: must be a standalone word
+			if isWordBoundary(query, i) && isOperatorPrefix(query, i, "AND") {
 				// Extract the part before this operator
 				if i > partStart {
 					part := strings.TrimSpace(query[partStart:i])
@@ -275,7 +297,8 @@ func tokenizeQuery(query string) []queryToken {
 				i-- // compensate
 				continue
 			}
-			if strings.HasPrefix(remaining, "OR ") || strings.HasPrefix(remaining, "OR") {
+			// OR: must be a standalone word
+			if isWordBoundary(query, i) && isOperatorPrefix(query, i, "OR") {
 				if i > partStart {
 					part := strings.TrimSpace(query[partStart:i])
 					part = strings.Trim(part, "\"")
@@ -293,7 +316,8 @@ func tokenizeQuery(query string) []queryToken {
 				i-- // compensate
 				continue
 			}
-			if strings.HasPrefix(remaining, "NOT ") || strings.HasPrefix(remaining, "NOT") {
+			// NOT: must be a standalone word
+			if isWordBoundary(query, i) && isOperatorPrefix(query, i, "NOT") {
 				if i > partStart {
 					part := strings.TrimSpace(query[partStart:i])
 					part = strings.Trim(part, "\"")
