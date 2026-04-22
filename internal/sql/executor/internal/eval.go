@@ -159,7 +159,8 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 }
 
 // evalColumnRef looks up a column value from the row.
-// e provides access to outerCols/outerVals for correlated subquery resolution.
+// e provides access to outerCols/outerVals for correlated subquery resolution,
+// and triggerNewCols/triggerNewVals/OLD for row-level trigger references.
 func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catalogapi.ColumnDef, e *executor) (catalogapi.Value, error) {
 	upper := strings.ToUpper(ref.Column)
 	upperTable := strings.ToUpper(ref.Table)
@@ -208,6 +209,20 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 	// Try current table columns first
 	if val, ok := findIn(columns, row.Values); ok {
 		return val, nil
+	}
+
+	// Try NEW. reference for INSERT/UPDATE triggers
+	if upperTable == "NEW" && e != nil {
+		if val, ok := findIn(e.triggerNewCols, e.triggerNewVals); ok {
+			return val, nil
+		}
+	}
+
+	// Try OLD. reference for UPDATE/DELETE triggers
+	if upperTable == "OLD" && e != nil {
+		if val, ok := findIn(e.triggerOldCols, e.triggerOldVals); ok {
+			return val, nil
+		}
 	}
 
 	// Fall back to outer columns for correlated subqueries

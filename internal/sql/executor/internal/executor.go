@@ -50,6 +50,12 @@ type executor struct {
 	// cteResults stores materialized CTE results by name for WITH clause execution
 	cteResults map[string]*executorapi.Result
 	windowResults map[*parserapi.WindowFuncExpr]*WindowFunctionResult
+	// For trigger support - NEW and OLD row contexts for row-level triggers
+	// NEW holds the new row values (for INSERT/UPDATE); OLD holds old values (for UPDATE/DELETE)
+	triggerNewCols []catalogapi.ColumnDef
+	triggerNewVals []catalogapi.Value
+	triggerOldCols []catalogapi.ColumnDef
+	triggerOldVals []catalogapi.Value
 }
 
 // New creates a new Executor.
@@ -921,6 +927,11 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				}
 				e.txnCtx.AddPendingWrite(idxKey, nil) // nil preValue: rollback = delete
 			}
+
+			// Fire AFTER INSERT triggers (after row and indexes are committed)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+				return nil, err
+			}
 		}
 
 		// Persist counter with transaction's XID.
@@ -942,6 +953,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range plan.Rows {
+		// Fire BEFORE INSERT triggers
+		if err := e.fireTriggers(plan.Table.Name, "BEFORE", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Check NOT NULL constraint before inserting.
 		if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
 			batch.Discard()
@@ -992,6 +1009,12 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 			}
+		}
+
+		// Fire AFTER INSERT triggers (after row and indexes are committed)
+		if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+			batch.Discard()
+			return nil, err
 		}
 	}
 
@@ -4032,6 +4055,11 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				break // No more rows to delete
 			}
 			for _, row := range rows {
+				// Fire BEFORE DELETE triggers (before any changes)
+				if err := e.fireTriggers(plan.Table.Name, "BEFORE", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+					return nil, err
+				}
+
 				// Get old encoded row data for savepoint rollback.
 				oldRowVal := e.tableEngine.EncodeRow(row.Values)
 
@@ -4065,6 +4093,11 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				}
 				e.txnCtx.AddPendingWrite(rowKey, oldRowVal) // store old row for rollback restore
 				count++
+
+				// Fire AFTER DELETE triggers (after row is deleted)
+				if err := e.fireTriggers(plan.Table.Name, "AFTER", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return &executorapi.Result{RowsAffected: count}, nil
@@ -4084,6 +4117,12 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 		}
 
 		for _, row := range rows {
+			// Fire BEFORE DELETE triggers (before any changes)
+			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+				batch.Discard()
+				return nil, err
+			}
+
 			// Delete index entries.
 			for _, idx := range indexes {
 				colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
@@ -4104,6 +4143,12 @@ func (e *executor) execDelete(plan *plannerapi.DeletePlan) (*executorapi.Result,
 				return nil, fmt.Errorf("%w: delete: %v", executorapi.ErrExecFailed, err)
 			}
 			count++
+
+			// Fire AFTER DELETE triggers (after row is deleted)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "DELETE", nil, nil, plan.Table.Columns, row.Values); err != nil {
+				batch.Discard()
+				return nil, err
+			}
 		}
 
 		// Execute RESTRICT checks BEFORE commit to prevent the delete.
@@ -4202,6 +4247,18 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for _, row := range rows {
+			// Merge old values with new assignments (needed for trigger context)
+			newValues := make([]catalogapi.Value, len(row.Values))
+			copy(newValues, row.Values)
+			for colIdx, val := range plan.Assignments {
+				newValues[colIdx] = val
+			}
+
+			// Fire BEFORE UPDATE triggers (before any changes)
+			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+				return nil, err
+			}
+
 			// Capture old row key and pre-value BEFORE any modifications.
 			// This is needed for savepoint rollback to restore the original row.
 			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, row.RowID)
@@ -4226,8 +4283,8 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				e.txnCtx.AddPendingWrite(idxKey, nil) // index rollback = delete
 			}
 
-			// Merge old values with new assignments
-			newValues := make([]catalogapi.Value, len(row.Values))
+			// Merge old values with new assignments (reconstruct after BEFORE trigger read-only access)
+			newValues = make([]catalogapi.Value, len(row.Values))
 			copy(newValues, row.Values)
 			for colIdx, val := range plan.Assignments {
 				newValues[colIdx] = val
@@ -4293,6 +4350,11 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 			}
 
 			count++
+
+			// Fire AFTER UPDATE triggers (after row and indexes are updated)
+			if err := e.fireTriggers(plan.Table.Name, "AFTER", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+				return nil, err
+			}
 		}
 		return &executorapi.Result{RowsAffected: count}, nil
 	}
@@ -4301,6 +4363,19 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 	batch := e.store.NewWriteBatch()
 
 	for _, row := range rows {
+		// Merge old values with new assignments (needed for trigger context)
+		newValues := make([]catalogapi.Value, len(row.Values))
+		copy(newValues, row.Values)
+		for colIdx, val := range plan.Assignments {
+			newValues[colIdx] = val
+		}
+
+		// Fire BEFORE UPDATE triggers (before any changes)
+		if err := e.fireTriggers(plan.Table.Name, "BEFORE", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+			batch.Discard()
+			return nil, err
+		}
+
 		// Delete old index entries for changed columns.
 		for _, idx := range indexes {
 			colIdx := findColumnIndexByName(plan.Table.Columns, idx.Column)
@@ -4318,13 +4393,6 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 				batch.Discard()
 				return nil, fmt.Errorf("%w: index delete: %v", executorapi.ErrExecFailed, err)
 			}
-		}
-
-		// Merge old values with new assignments
-		newValues := make([]catalogapi.Value, len(row.Values))
-		copy(newValues, row.Values)
-		for colIdx, val := range plan.Assignments {
-			newValues[colIdx] = val
 		}
 
 		// Check NOT NULL constraint before updating.
@@ -4372,6 +4440,12 @@ func (e *executor) execUpdate(plan *plannerapi.UpdatePlan) (*executorapi.Result,
 		if err := e.tableEngine.UpdateIn(plan.Table, batch, row.RowID, newValues); err != nil {
 			batch.Discard()
 			return nil, fmt.Errorf("%w: update: %v", executorapi.ErrExecFailed, err)
+		}
+
+		// Fire AFTER UPDATE triggers (after row is updated)
+		if err := e.fireTriggers(plan.Table.Name, "AFTER", "UPDATE", plan.Table.Columns, newValues, plan.Table.Columns, row.Values); err != nil {
+			batch.Discard()
+			return nil, err
 		}
 
 		// Insert new index entries for changed columns.
@@ -6488,4 +6562,177 @@ func (e *executor) windowMax(args []parserapi.Expr, rows []*engineapi.Row, colum
 		return maxVal, nil
 	}
 	return maxValueForColumn(rows, colIdx), nil
+}
+
+// ─── Trigger Execution ─────────────────────────────────────────────
+
+// fireTriggers executes matching triggers for a given table and event.
+// timing is "BEFORE" or "AFTER", event is "INSERT", "UPDATE", or "DELETE".
+// newRow/newCols provide NEW.* values; oldRow/oldCols provide OLD.* values.
+func (e *executor) fireTriggers(tableName, timing, event string, newCols []catalogapi.ColumnDef, newVals []catalogapi.Value, oldCols []catalogapi.ColumnDef, oldVals []catalogapi.Value) error {
+	triggers, err := e.catalog.ListTriggers(tableName)
+	if err != nil {
+		return fmt.Errorf("%w: listing triggers: %v", executorapi.ErrExecFailed, err)
+	}
+
+	for _, trigger := range triggers {
+		// Check if trigger matches timing and event
+		if trigger.Timing != timing || trigger.Event != event {
+			continue
+		}
+
+		// Set NEW/OLD context for this trigger evaluation
+		e.triggerNewCols = newCols
+		e.triggerNewVals = newVals
+		e.triggerOldCols = oldCols
+		e.triggerOldVals = oldVals
+
+		// Evaluate WHEN condition if present
+		if trigger.WhenCond != "" {
+			matches, err := e.evalTriggerWhen(trigger.WhenCond, trigger.Table)
+			if err != nil {
+				return fmt.Errorf("%w: trigger %s WHEN condition: %v", executorapi.ErrExecFailed, trigger.Name, err)
+			}
+			if !matches {
+				continue // WHEN condition evaluated to false - skip this trigger
+			}
+		}
+
+		// Execute trigger body
+		if err := e.execTriggerBody(trigger.Body, trigger.Table); err != nil {
+			return fmt.Errorf("%w: trigger %s: %v", executorapi.ErrExecFailed, trigger.Name, err)
+		}
+	}
+
+	// Clear trigger context
+	e.triggerNewCols = nil
+	e.triggerNewVals = nil
+	e.triggerOldCols = nil
+	e.triggerOldVals = nil
+
+	return nil
+}
+
+// evalTriggerWhen evaluates a WHEN condition expression with trigger context.
+// Returns true if condition is satisfied or has no WHEN clause.
+func (e *executor) evalTriggerWhen(whenSQL, tableName string) (bool, error) {
+	// Parse the WHEN expression
+	stmt, err := e.parser.Parse(whenSQL)
+	if err != nil {
+		return false, fmt.Errorf("parse WHEN condition: %v", err)
+	}
+
+	// Extract the expression from the statement (SELECT column FROM table WHERE <expr>)
+	var whereExpr parserapi.Expr
+	if selectStmt, ok := stmt.(*parserapi.SelectStmt); ok {
+		whereExpr = selectStmt.Where
+	}
+
+	if whereExpr == nil {
+		return true, nil // No WHERE = always matches
+	}
+
+	// Create a dummy row with trigger values for evaluation
+	// We need to set up context so NEW./OLD. column refs can be resolved
+	cols := e.triggerNewCols
+	vals := e.triggerNewVals
+	if len(vals) == 0 {
+		cols = e.triggerOldCols
+		vals = e.triggerOldVals
+	}
+	if len(vals) == 0 {
+		return true, nil // No values to evaluate against
+	}
+
+	// Evaluate the WHERE expression
+	dummyRow := &engineapi.Row{Values: vals}
+	result, err := evalExpr(whereExpr, dummyRow, cols, nil, e)
+	if err != nil {
+		return false, err
+	}
+
+	// WHEN condition is true if result is not NULL and not 0/false
+	return !result.IsNull && result.Int != 0, nil
+}
+
+// execTriggerBody parses and executes the trigger body SQL.
+// bodySQL contains one or more statements separated by semicolons.
+func (e *executor) execTriggerBody(bodySQL, tableName string) error {
+	// Split by semicolon and execute each statement
+	// Note: Simple split - doesn't handle string literals with semicolons
+	statements := splitStatements(bodySQL)
+	for _, sql := range statements {
+		sql = strings.TrimSpace(sql)
+		if sql == "" {
+			continue
+		}
+
+		// Parse the trigger statement
+		stmt, err := e.parser.Parse(sql)
+		if err != nil {
+			return fmt.Errorf("parse trigger body: %v", err)
+		}
+
+		// Plan the statement
+		plan, err := e.planner.Plan(stmt)
+		if err != nil {
+			return fmt.Errorf("plan trigger statement: %v", err)
+		}
+
+		// Execute the trigger statement
+		if plan != nil {
+			if _, err := e.Execute(plan); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// splitStatements splits a SQL string into individual statements.
+func splitStatements(sql string) []string {
+	var stmts []string
+	var current strings.Builder
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\'' && !inString {
+			inString = true
+			current.WriteByte(ch)
+			continue
+		}
+		if inString {
+			if ch == '\'' {
+				// Check for escaped quote ''
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					current.WriteByte(ch)
+					current.WriteByte('\'')
+					i++
+					continue
+				}
+				inString = false
+			}
+			current.WriteByte(ch)
+			continue
+		}
+		if ch == ';' {
+			stmts = append(stmts, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(ch)
+	}
+
+	// Don't forget the last statement
+	if s := strings.TrimSpace(current.String()); s != "" {
+		stmts = append(stmts, s)
+	}
+	return stmts
 }
