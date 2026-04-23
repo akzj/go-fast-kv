@@ -191,12 +191,17 @@ func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64)
 	// entry as superseded — otherwise both entries retain TxnMax=∞ and vacuum
 	// can never reclaim the "losing" version. The MVCC visibility rules and
 	// abort-restoration in vacuum handle all commit/abort orderings correctly.
-	// Linear search: find entry with matching key and TxnMax == Infinity
-	// Binary search would be O(log n) but n is small (32-64 entries typical)
-	// so linear search with bytes.Equal shortcut is faster in practice
-	for i := range leaf.Entries {
+	//
+	// Binary search to find key range, then linear within the (small) range.
+	lo := sort.Search(len(leaf.Entries), func(i int) bool {
+		return bytes.Compare(leaf.Entries[i].Key, key) >= 0
+	})
+	for i := lo; i < len(leaf.Entries); i++ {
 		e := &leaf.Entries[i]
-		if bytes.Equal(e.Key, key) && e.TxnMax == btreeapi.TxnMaxInfinity {
+		if !bytes.Equal(e.Key, key) {
+			break
+		}
+		if e.TxnMax == btreeapi.TxnMaxInfinity {
 			e.TxnMax = txnID
 			break
 		}
@@ -227,16 +232,13 @@ func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64)
 }
 
 func (t *bTree) findInsertPos(leaf *btreeapi.Node, key []byte, txnMin uint64) int {
-	for i, e := range leaf.Entries {
-		cmp := bytes.Compare(key, e.Key)
-		if cmp < 0 {
-			return i
+	return sort.Search(len(leaf.Entries), func(i int) bool {
+		cmp := bytes.Compare(key, leaf.Entries[i].Key)
+		if cmp != 0 {
+			return cmp < 0
 		}
-		if cmp == 0 && txnMin > e.TxnMin {
-			return i
-		}
-	}
-	return len(leaf.Entries)
+		return txnMin > leaf.Entries[i].TxnMin
+	})
 }
 
 // ─── Search (§3.8.2 search phase) ──────────────────────────────────
