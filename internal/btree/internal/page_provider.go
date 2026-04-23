@@ -206,14 +206,15 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 // ReadPage reads and deserializes a node from the given PageID.
 //
 // Returns a shared pointer from the hot node cache or LRU cache.
-// The returned node must NOT be mutated by the caller.
-// Use ReadPageForWrite when mutation is intended (e.g., under WLock).
+// Mutation is safe under WLock because split functions use three-index
+// slices to decouple left/right node backing arrays.
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
 	startNs := time.Now().UnixNano()
 	p.pageReads.Add(1)
 
-	// Hot node cache: return shared pointer for read-only access.
-	// Callers that need to mutate must use ReadPageForWrite instead.
+	// Hot node cache: return shared pointer directly (zero-copy).
+	// Safe because split functions use three-index slices to prevent
+	// backing array sharing between left/right nodes after split.
 	p.hotMu.Lock()
 	if node, ok := p.hotNodes[pageID]; ok {
 		p.hotMu.Unlock()
@@ -253,17 +254,6 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 	return node, nil
 }
 
-// ReadPageForWrite reads a node and returns a deep clone safe for mutation.
-// Must be used when the caller intends to modify the node (e.g., under WLock
-// before calling WritePage). This prevents concurrent mutation races where
-// multiple goroutines share the same *Node pointer from the hotNodes cache.
-func (p *RealPageProvider) ReadPageForWrite(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
-	node, err := p.ReadPage(pageID)
-	if err != nil {
-		return nil, err
-	}
-	return cloneNode(node), nil
-}
 
 // ReadPageUncached reads directly from the underlying PageStore without
 // going through the LRU cache. No cloneNode is performed.

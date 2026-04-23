@@ -353,13 +353,8 @@ type PageProvider interface {
 
 	// ReadPage reads and deserializes a node from the given PageID.
 	// The returned node may be a shared cached pointer — callers must
-	// not modify it. Use ReadPageForWrite when mutation is intended.
+	// not modify it unless they hold an exclusive write lock on the page.
 	ReadPage(pageID pagestoreapi.PageID) (*Node, error)
-
-	// ReadPageForWrite reads a node and returns a deep clone safe for
-	// mutation. Must be used when the caller intends to modify the node
-	// (e.g., under a write lock before WritePage).
-	ReadPageForWrite(pageID pagestoreapi.PageID) (*Node, error)
 
 	// WritePage serializes and writes a node to the given PageID.
 	WritePage(pageID pagestoreapi.PageID, node *Node) error

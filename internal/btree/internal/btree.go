@@ -123,7 +123,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 	// Phase 2: Write-lock the leaf
 	leafPID := path[len(path)-1]
 	t.pageLocks.WLock(leafPID)
-	leaf, err := t.pages.ReadPageForWrite(leafPID)
+	leaf, err := t.pages.ReadPage(leafPID)
 	if err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
@@ -135,7 +135,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
-		leaf, err = t.pages.ReadPageForWrite(leafPID)
+		leaf, err = t.pages.ReadPage(leafPID)
 		if err != nil {
 			t.pageLocks.WUnlock(leafPID)
 			return err
@@ -301,7 +301,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	for i := len(path) - 1; i >= 0; i-- {
 		parentPID := path[i]
 		t.pageLocks.WLock(parentPID)
-		parent, err := t.pages.ReadPageForWrite(parentPID)
+		parent, err := t.pages.ReadPage(parentPID)
 		if err != nil {
 			t.pageLocks.WUnlock(parentPID)
 			return err
@@ -313,7 +313,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 			t.pageLocks.WUnlock(parentPID)
 			parentPID = nextPID
 			t.pageLocks.WLock(parentPID)
-			parent, err = t.pages.ReadPageForWrite(parentPID)
+			parent, err = t.pages.ReadPage(parentPID)
 			if err != nil {
 				t.pageLocks.WUnlock(parentPID)
 				return err
@@ -419,7 +419,9 @@ func (t *bTree) splitLeafNode(node *btreeapi.Node) (splitKey []byte, right *btre
 		Entries: cloneLeafEntries(entries[mid:]),
 		Count:   uint16(len(entries) - mid),
 	}
-	node.Entries = entries[:mid]
+	// Three-index slice: cap=len forces append to always allocate a new
+	// backing array, preventing shared-memory corruption after split.
+	node.Entries = entries[:mid:mid]
 	node.Count = uint16(mid)
 	return splitKey, right
 }
@@ -434,8 +436,11 @@ func (t *bTree) splitInternalNode(node *btreeapi.Node) (splitKey []byte, right *
 		Children: cloneUint64Slice(node.Children[mid+1:]),
 		Count:    uint16(len(node.Keys) - mid - 1),
 	}
-	node.Keys = node.Keys[:mid]
-	node.Children = node.Children[:mid+1]
+	// Three-index slice: cap=len forces append to always allocate a new
+	// backing array, preventing shared-memory corruption between left and
+	// right nodes after split.
+	node.Keys = node.Keys[:mid:mid]
+	node.Children = node.Children[:mid+1 : mid+1]
 	node.Count = uint16(mid)
 	return splitKey, right
 }
@@ -539,7 +544,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	// Phase 2: Write-lock the leaf
 	leafPID := path[len(path)-1]
 	t.pageLocks.WLock(leafPID)
-	leaf, err := t.pages.ReadPageForWrite(leafPID)
+	leaf, err := t.pages.ReadPage(leafPID)
 	if err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
@@ -551,7 +556,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
-		leaf, err = t.pages.ReadPageForWrite(leafPID)
+		leaf, err = t.pages.ReadPage(leafPID)
 		if err != nil {
 			t.pageLocks.WUnlock(leafPID)
 			return err
