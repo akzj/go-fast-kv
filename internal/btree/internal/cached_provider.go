@@ -45,13 +45,12 @@ func (p *CachedMemPageProvider) ReadPage(pageID uint64) (*Page, error) {
 }
 
 // ReadPageForWrite returns a clone of the page, safe for in-place mutation.
-// Uses pooled buffers to reduce GC pressure.
 func (p *CachedMemPageProvider) ReadPageForWrite(pageID uint64) (*Page, error) {
 	page, err := p.ReadPage(pageID)
 	if err != nil {
 		return nil, err
 	}
-	return page.ClonePooled(), nil
+	return page.Clone(), nil
 }
 
 // ReadPageUncached is identical to ReadPage (no cache to bypass).
@@ -60,13 +59,9 @@ func (p *CachedMemPageProvider) ReadPageUncached(pageID uint64) (*Page, error) {
 }
 
 // WritePage stores the page directly (no serialize).
-// Releases old page's pooled buffer (if any) before replacing.
 func (p *CachedMemPageProvider) WritePage(pageID uint64, page *Page) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if old, ok := p.pages[pageID]; ok && old != nil {
-		old.ReleaseToPool()
-	}
 	p.pages[pageID] = page
 	if pageID >= p.nextPID {
 		p.nextPID = pageID + 1
