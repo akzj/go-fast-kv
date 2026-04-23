@@ -13,6 +13,16 @@ import (
 	segmentapi "github.com/akzj/go-fast-kv/internal/segment/api"
 )
 
+// pageRecordPool reuses PageRecordSize (4108-byte) buffers for Write.
+// Each Write allocates a record buffer to prepend pageID + append CRC;
+// pooling eliminates ~4.8 GB of allocations per 1M writes.
+var pageRecordPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, pagestoreapi.PageRecordSize)
+		return &b
+	},
+}
+
 var (
 	_ pagestoreapi.PageStore         = (*pageStore)(nil)
 	_ pagestoreapi.PageStoreRecovery = (*pageStore)(nil)
@@ -169,7 +179,9 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 	// Look up old mapping before overwriting (needed for stats decrement).
 	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
 
-	record := make([]byte, pagestoreapi.PageRecordSize)
+	bp := pageRecordPool.Get().(*[]byte)
+	defer pageRecordPool.Put(bp)
+	record := *bp
 	binary.BigEndian.PutUint64(record[:8], pageID)
 	copy(record[8:8+pagestoreapi.PageSize], data)
 	checksum := crc32.ChecksumIEEE(record[:8+pagestoreapi.PageSize])
