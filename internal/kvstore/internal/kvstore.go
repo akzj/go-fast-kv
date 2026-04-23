@@ -320,9 +320,15 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		PageLocks() *lock.PageRWLocks
 	}
 	if plp, ok := tree.(pageLockerProvider); ok {
+		// Pass the same provider for both cached reads and uncached reads.
+		// RealPageProvider implements ReadPage (with LRU cache + cloneNode)
+		// and ReadPageUncached (bypasses cache, no clone). Vacuum uses
+		// ReadPageUncached for leaf scans to avoid cloneNode allocations.
+		uncached := provider // ReadPageUncached is supported by RealPageProvider
 		s.vacuum = vacuum.New(
 			tree.RootPageID,
 			provider,
+			uncached,
 			tm,
 			bs,
 			w,

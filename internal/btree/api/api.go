@@ -348,10 +348,17 @@ type PageProvider interface {
 	AllocPage() pagestoreapi.PageID
 
 	// ReadPage reads and deserializes a node from the given PageID.
+	// The returned node may be cached — callers must not modify it.
 	ReadPage(pageID pagestoreapi.PageID) (*Node, error)
 
 	// WritePage serializes and writes a node to the given PageID.
 	WritePage(pageID pagestoreapi.PageID, node *Node) error
+
+	// ReadPageUncached reads directly from the underlying store without
+	// going through the LRU cache. No cloneNode is performed.
+	// The caller must hold the appropriate page lock.
+	// Implementations without a cache can simply delegate to ReadPage.
+	ReadPageUncached(pageID pagestoreapi.PageID) (*Node, error)
 }
 
 // ─── Config ─────────────────────────────────────────────────────────

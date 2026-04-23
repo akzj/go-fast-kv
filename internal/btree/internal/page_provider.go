@@ -231,6 +231,20 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 	return node, nil
 }
 
+// ReadPageUncached reads directly from the underlying PageStore without
+// going through the LRU cache. No cloneNode is performed.
+//
+// This is used by vacuum to scan leaf pages without triggering clone allocations.
+// The caller must hold the appropriate page lock (ensured by vacuum's per-page
+// write locks acquired before calling this method).
+func (p *RealPageProvider) ReadPageUncached(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
+	data, err := p.store.Read(pageID)
+	if err != nil {
+		return nil, fmt.Errorf("realpage: uncached read page %d: %w", pageID, err)
+	}
+	return p.serializer.Deserialize(data)
+}
+
 // WritePage serializes and writes a node to the given PageID.
 // After a successful write, the cache is updated with the new node
 // so subsequent reads see the latest version without hitting disk.
