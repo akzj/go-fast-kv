@@ -205,23 +205,26 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 
 // ReadPage reads and deserializes a node from the given PageID.
 //
-// Hot node cache optimization: on first access, the original (non-cloned) node
-// is stored in hotNodes. Subsequent reads return directly from hotNodes — zero
-// allocation, zero deserialize. This eliminates the cloneNode overhead on
-// repeated accesses to hot internal nodes.
+// Hot node cache: on first access, the original node is stored in hotNodes.
+// Subsequent reads return a CLONE from hotNodes to prevent concurrent mutation
+// races (multiple goroutines sharing the same *Node pointer). The clone cost
+// (~200-500 bytes per node) is far cheaper than the 4KB serialize+pread path.
 //
-// Falls back to LRU cache for nodes not in hotNodes (e.g., nodes evicted from
-// hotNodes to manage memory).
+// Falls back to LRU cache for nodes not in hotNodes (the LRU cache also
+// returns clones).
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
 	startNs := time.Now().UnixNano()
 	p.pageReads.Add(1)
 
-	// Hot node cache: zero-copy on repeated accesses.
+	// Hot node cache: return a CLONE to prevent concurrent mutation races.
+	// Without cloning, multiple goroutines can hold the same *Node pointer
+	// and race on slice headers (Keys, Children, Entries) during mutations
+	// like insertInternalEntry, causing "slice bounds out of range" panics.
 	p.hotMu.Lock()
 	if node, ok := p.hotNodes[pageID]; ok {
 		p.hotMu.Unlock()
 		p.pageCacheHits.Add(1)
-		return node, nil
+		return cloneNode(node), nil
 	}
 	p.hotMu.Unlock()
 
