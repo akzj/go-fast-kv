@@ -191,6 +191,9 @@ func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64)
 	// entry as superseded — otherwise both entries retain TxnMax=∞ and vacuum
 	// can never reclaim the "losing" version. The MVCC visibility rules and
 	// abort-restoration in vacuum handle all commit/abort orderings correctly.
+	// Linear search: find entry with matching key and TxnMax == Infinity
+	// Binary search would be O(log n) but n is small (32-64 entries typical)
+	// so linear search with bytes.Equal shortcut is faster in practice
 	for i := range leaf.Entries {
 		e := &leaf.Entries[i]
 		if bytes.Equal(e.Key, key) && e.TxnMax == btreeapi.TxnMaxInfinity {
