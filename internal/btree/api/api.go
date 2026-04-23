@@ -114,6 +114,10 @@ type Node struct {
 	// Internal node fields:
 	Keys     [][]byte               // separator keys
 	Children []pagestoreapi.PageID  // child PageIDs, len(Children) == len(Keys) + 1
+
+	// DataRef holds the original serialized data buffer to keep zero-copy
+	// slices valid. Must be retained for lifetime of this Node.
+	DataRef []byte
 }
 
 // ─── Serialization ──────────────────────────────────────────────────

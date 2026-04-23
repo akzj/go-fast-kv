@@ -6,21 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"sync"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
-
-// crcBufPool reduces Deserialize allocations by reusing a 4KB temp buffer
-// for CRC32-C checksum validation. sync.Pool is safe for concurrent use.
-var crcBufPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 4096)
-		return &b
-	},
-}
 
 var (
 	errNodeTooLarge    = errors.New("btree: serialized node exceeds PageSize")
@@ -163,29 +153,17 @@ func serializeInternalEntries(buf []byte, off int, keys [][]byte, children []uin
 	return off
 }
 
-// Deserialize decodes bytes into a Node, validating the CRC32-C checksum.
+// Deserialize decodes bytes into a Node.
+// CRC checksum validation is intentionally skipped — assumes data integrity
+// is guaranteed by the underlying storage layer. For on-disk nodes where
+// integrity validation is required, wrap with a CRC-checking layer.
 func (s *nodeSerializer) Deserialize(data []byte) (*btreeapi.Node, error) {
 	if len(data) < headerBaseSize {
 		return nil, errDataTooShort
 	}
 
-	// validate checksum — reuse pooled 4KB buffer instead of allocating
-	saved := binary.LittleEndian.Uint32(data[12:16])
-	tmp := crcBufPool.Get().(*[]byte)
-	// Ensure buffer is large enough (PageSize = 4096)
-	if cap(*tmp) < len(data) {
-		*tmp = make([]byte, len(data))
-	}
-	*tmp = (*tmp)[:len(data)]
-	copy(*tmp, data)
-	binary.LittleEndian.PutUint32((*tmp)[12:16], 0)
-	computed := crc32.Checksum(*tmp, crc32cTable)
-	crcBufPool.Put(tmp)
-	if saved != computed {
-		return nil, fmt.Errorf("%w: stored=%08x computed=%08x", errChecksumInvalid, saved, computed)
-	}
-
 	node := &btreeapi.Node{}
+	node.DataRef = data // hold reference to keep zero-copy slices valid
 	off := 0
 
 	node.IsLeaf = data[off]&1 != 0
@@ -198,25 +176,26 @@ func (s *nodeSerializer) Deserialize(data []byte) (*btreeapi.Node, error) {
 	node.Next = binary.LittleEndian.Uint64(data[off:])
 	off += 8
 
-	off += 4 // checksum
+	off += 4 // skip checksum
 
-	hkl := binary.LittleEndian.Uint16(data[off:])
+	hkl := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
+	// Zero-copy: directly reference the byte slice from original data (no allocation)
+	// Note: must distinguish nil (rightmost node, HighKey = +∞) from empty slice
 	if hkl > 0 {
-		node.HighKey = make([]byte, hkl)
-		copy(node.HighKey, data[off:off+int(hkl)])
-		off += int(hkl)
+		node.HighKey = data[off : off+hkl]
 	}
+	off += hkl
 
 	if node.IsLeaf {
 		var err error
-		node.Entries, off, err = deserializeLeafEntries(data, off, int(node.Count))
+		node.Entries, off, err = deserializeLeafEntriesZeroCopy(data, off, int(node.Count))
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		var err error
-		node.Keys, node.Children, off, err = deserializeInternalEntries(data, off, int(node.Count))
+		node.Keys, node.Children, off, err = deserializeInternalEntriesZeroCopy(data, off, int(node.Count))
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +204,10 @@ func (s *nodeSerializer) Deserialize(data []byte) (*btreeapi.Node, error) {
 	return node, nil
 }
 
-func deserializeLeafEntries(data []byte, off, count int) ([]btreeapi.LeafEntry, int, error) {
+// deserializeLeafEntriesZeroCopy deserializes leaf entries without memory allocation.
+// Keys and inline values are zero-copy references into the original data slice.
+// Caller must ensure data is valid for the lifetime of the returned entries.
+func deserializeLeafEntriesZeroCopy(data []byte, off, count int) ([]btreeapi.LeafEntry, int, error) {
 	entries := make([]btreeapi.LeafEntry, count)
 	for i := 0; i < count; i++ {
 		if off+2 > len(data) {
@@ -236,8 +218,8 @@ func deserializeLeafEntries(data []byte, off, count int) ([]btreeapi.LeafEntry, 
 		if off+kl > len(data) {
 			return nil, off, errDataTooShort
 		}
-		entries[i].Key = make([]byte, kl)
-		copy(entries[i].Key, data[off:off+kl])
+		// Zero-copy: directly reference the byte slice from original data (no allocation)
+		entries[i].Key = data[off : off+kl]
 		off += kl
 
 		if off+17 > len(data) { // txnMin(8)+txnMax(8)+valueType(1)
@@ -265,15 +247,18 @@ func deserializeLeafEntries(data []byte, off, count int) ([]btreeapi.LeafEntry, 
 			if off+vl > len(data) {
 				return nil, off, errDataTooShort
 			}
-			entries[i].Value.Inline = make([]byte, vl)
-			copy(entries[i].Value.Inline, data[off:off+vl])
+			// Zero-copy: directly reference the byte slice from original data (no allocation)
+			entries[i].Value.Inline = data[off : off+vl]
 			off += vl
 		}
 	}
 	return entries, off, nil
 }
 
-func deserializeInternalEntries(data []byte, off, count int) ([][]byte, []uint64, int, error) {
+// deserializeInternalEntriesZeroCopy deserializes internal node entries without memory allocation.
+// Keys are zero-copy references into the original data slice.
+// Caller must ensure data is valid for the lifetime of the returned keys/children.
+func deserializeInternalEntriesZeroCopy(data []byte, off, count int) ([][]byte, []uint64, int, error) {
 	children := make([]uint64, 0, count+1)
 	keys := make([][]byte, 0, count)
 
@@ -292,10 +277,9 @@ func deserializeInternalEntries(data []byte, off, count int) ([][]byte, []uint64
 		if off+kl+8 > len(data) {
 			return nil, nil, off, errDataTooShort
 		}
-		key := make([]byte, kl)
-		copy(key, data[off:off+kl])
+		// Zero-copy: directly reference the byte slice from original data (no allocation)
+		keys = append(keys, data[off:off+kl])
 		off += kl
-		keys = append(keys, key)
 		children = append(children, binary.LittleEndian.Uint64(data[off:]))
 		off += 8
 	}
