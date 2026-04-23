@@ -12,6 +12,17 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 )
 
+// serializeBufPool reuses PageSize (4096-byte) buffers for node serialization.
+// Each WritePage serializes a node into a 4KB buffer that is passed to
+// pageStore.Write then discarded; pooling eliminates ~4.1 GB of allocations
+// per 1M writes.
+var serializeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, btreeapi.PageSize)
+		return &b
+	},
+}
+
 // ─── Page Cache (LRU) ──────────────────────────────────────────────
 
 // pageCache is a thread-safe LRU cache for deserialized B-tree nodes.
@@ -271,11 +282,14 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.
 	startNs := time.Now().UnixNano()
 	p.pageWrites.Add(1)
 
-	data, err := p.serializer.Serialize(node)
-	if err != nil {
+	bp := serializeBufPool.Get().(*[]byte)
+	data := *bp
+	if err := p.serializer.(*nodeSerializer).SerializeInto(node, data); err != nil {
+		serializeBufPool.Put(bp)
 		return fmt.Errorf("realpage: serialize page %d: %w", pageID, err)
 	}
 	entry, err := p.store.Write(pageID, data)
+	serializeBufPool.Put(bp)
 	if err != nil {
 		return fmt.Errorf("realpage: write page %d: %w", pageID, err)
 	}

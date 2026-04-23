@@ -62,6 +62,29 @@ func (s *nodeSerializer) Serialize(node *btreeapi.Node) ([]byte, error) {
 	}
 
 	buf := make([]byte, btreeapi.PageSize)
+	s.serializeInto(node, buf)
+	return buf, nil
+}
+
+// SerializeInto encodes a Node into the provided buffer (must be >= PageSize).
+// Returns an error if the serialized node exceeds PageSize.
+// The buffer is zeroed in the used region and written in-place.
+func (s *nodeSerializer) SerializeInto(node *btreeapi.Node, buf []byte) error {
+	needed := s.SerializedSize(node)
+	if needed > btreeapi.PageSize {
+		return fmt.Errorf("%w: need %d bytes", errNodeTooLarge, needed)
+	}
+	// Clear the buffer — pool buffers may have stale data from previous use.
+	// Only need to clear up to PageSize since that's all we write.
+	for i := range buf[:btreeapi.PageSize] {
+		buf[i] = 0
+	}
+	s.serializeInto(node, buf)
+	return nil
+}
+
+// serializeInto is the shared serialization logic used by both Serialize and SerializeInto.
+func (s *nodeSerializer) serializeInto(node *btreeapi.Node, buf []byte) {
 	off := 0
 
 	// flags
@@ -88,12 +111,10 @@ func (s *nodeSerializer) Serialize(node *btreeapi.Node) ([]byte, error) {
 	off += len(node.HighKey)
 
 	if node.IsLeaf {
-		off = serializeLeafEntries(buf, off, node.Entries)
+		serializeLeafEntries(buf, off, node.Entries)
 	} else {
-		off = serializeInternalEntries(buf, off, node.Keys, node.Children)
+		serializeInternalEntries(buf, off, node.Keys, node.Children)
 	}
-
-	return buf, nil
 }
 
 func serializeLeafEntries(buf []byte, off int, entries []btreeapi.LeafEntry) int {
