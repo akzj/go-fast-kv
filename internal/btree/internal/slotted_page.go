@@ -742,6 +742,42 @@ func (p *Page) UsedBytes() int {
 	return p.slotArrayEnd() + (btreeapi.PageSize - p.freeEnd())
 }
 
+// ─── Validation ─────────────────────────────────────────────────────
+
+// Validate checks page structural integrity. Returns nil if valid.
+func (p *Page) Validate() error {
+	count := p.Count()
+	freeEnd := p.freeEnd()
+	slotStart := p.slotArrayStart()
+	slotEnd := slotStart + count*2
+
+	if freeEnd < slotEnd {
+		return fmt.Errorf("freeEnd=%d < slotEnd=%d", freeEnd, slotEnd)
+	}
+	if freeEnd > btreeapi.PageSize {
+		return fmt.Errorf("freeEnd=%d > PageSize", freeEnd)
+	}
+
+	for i := 0; i < count; i++ {
+		off := p.slotOffset(i)
+		if off < slotEnd || off >= btreeapi.PageSize {
+			return fmt.Errorf("slot[%d]=%d out of range [%d, %d)", i, off, slotEnd, btreeapi.PageSize)
+		}
+		if p.IsLeaf() {
+			kl := int(binary.LittleEndian.Uint16(p.data[off:]))
+			if kl > btreeapi.MaxKeySize || kl <= 0 {
+				return fmt.Errorf("slot[%d] at off=%d: invalid keyLen=%d", i, off, kl)
+			}
+			cellEnd := off + 2 + kl + 8 + 8 + 1 // min cell size (keyLen+key+txnMin+txnMax+valueType)
+			if cellEnd > btreeapi.PageSize {
+				return fmt.Errorf("slot[%d] at off=%d: cellEnd=%d > PageSize (kl=%d)", i, off, cellEnd, kl)
+			}
+		}
+	}
+	return nil
+}
+
+
 // ─── Page ↔ Node Conversion ────────────────────────────────────────
 
 // PageToNode converts a slotted *Page to a *btreeapi.Node for backward

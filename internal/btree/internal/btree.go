@@ -163,6 +163,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		// Set up B-link pointers
 		right.SetNext(leaf.Next())
 		leaf.SetNext(rightPID)
+
 		// right inherits original HighKey, left gets splitKey
 		rightHK := leaf.HighKey()
 		if rightHK != nil {
@@ -274,9 +275,12 @@ func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 		}
 
 		depth++
-		path = append(path, currentPID)
 
-		// B-link right-link correction
+		// B-link right-link correction — BEFORE appending to path.
+		// If the key is beyond this page's HighKey, the page was split
+		// concurrently and we must follow the right link. Do NOT append
+		// the stale page to the path, otherwise propagateSplit would
+		// treat a leaf sibling as an internal parent.
 		if page.HighKey() != nil && bytes.Compare(key, page.HighKey()) >= 0 && page.Next() != 0 {
 			nextPID := page.Next()
 			t.pageLocks.RUnlock(currentPID)
@@ -284,6 +288,9 @@ func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 			currentPID = nextPID
 			continue
 		}
+
+		// This is the correct page for this key — append to path
+		path = append(path, currentPID)
 
 		if page.IsLeaf() {
 			t.pageLocks.RUnlock(currentPID)
