@@ -23,6 +23,15 @@ var pageRecordPool = sync.Pool{
 	},
 }
 
+// compactRecordPool reuses MaxPageRecordSize (4110-byte) buffers for
+// WriteCompact and ReadCompact. Eliminates a per-call allocation.
+var compactRecordPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, pagestoreapi.MaxPageRecordSize)
+		return &b
+	},
+}
+
 var (
 	_ pagestoreapi.PageStore         = (*pageStore)(nil)
 	_ pagestoreapi.PageStoreRecovery = (*pageStore)(nil)
@@ -377,7 +386,8 @@ func (ps *pageStore) WriteCompact(pageID pagestoreapi.PageID, compactData []byte
 	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
 
 	// Build record: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
-	record := make([]byte, recordLen)
+	bp := compactRecordPool.Get().(*[]byte)
+	record := (*bp)[:recordLen]
 	binary.BigEndian.PutUint64(record[:8], pageID)
 	binary.BigEndian.PutUint16(record[8:10], uint16(dataLen))
 	copy(record[10:10+dataLen], compactData)
@@ -388,10 +398,13 @@ func (ps *pageStore) WriteCompact(pageID pagestoreapi.PageID, compactData []byte
 	vaddr, err := ps.segMgr.Append(record)
 	if err == segmentapi.ErrSegmentFull {
 		if rotErr := ps.segMgr.Rotate(); rotErr != nil {
+			compactRecordPool.Put(bp)
 			return pagestoreapi.WALEntry{}, fmt.Errorf("pagestore: rotate on full: %w", rotErr)
 		}
 		vaddr, err = ps.segMgr.Append(record)
 	}
+	// Append has copied the data; safe to return buffer to pool.
+	compactRecordPool.Put(bp)
 	if err != nil {
 		return pagestoreapi.WALEntry{}, err
 	}

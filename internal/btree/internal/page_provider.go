@@ -21,6 +21,15 @@ var walCollectorPool = sync.Pool{
 	},
 }
 
+// compactBufPool reuses buffers for SerializeCompactInto. Max compact size
+// equals PageSize (4096 bytes). Pooling eliminates a per-WritePage allocation.
+var compactBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, btreeapi.PageSize)
+		return &b
+	},
+}
+
 // ─── Page Cache (LRU) ──────────────────────────────────────────────
 
 // pageCache is a thread-safe LRU cache for B-tree pages.
@@ -244,9 +253,13 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) err
 	startNs := time.Now().UnixNano()
 	p.pageWrites.Add(1)
 
-	// Serialize compact: only used bytes (no free gap).
-	compactData := page.SerializeCompact()
+	// Serialize compact into pooled buffer to avoid per-call allocation.
+	bp := compactBufPool.Get().(*[]byte)
+	buf := *bp
+	n := page.SerializeCompactInto(buf)
+	compactData := buf[:n]
 	entry, err := p.store.WriteCompact(pageID, compactData)
+	compactBufPool.Put(bp)
 	if err != nil {
 		return fmt.Errorf("realpage: write page %d: %w", pageID, err)
 	}

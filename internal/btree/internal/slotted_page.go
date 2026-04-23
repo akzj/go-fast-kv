@@ -912,6 +912,52 @@ func (p *Page) SerializeCompact() []byte {
 	return buf
 }
 
+// SerializeCompactInto writes the compact serialization into the provided buffer
+// and returns the number of bytes written. The buffer must be at least
+// CompactSize() bytes. This avoids allocating a new buffer per call.
+func (p *Page) SerializeCompactInto(buf []byte) int {
+	slotEnd := p.slotArrayEnd()
+	freeEnd := p.freeEnd()
+	cellBytes := btreeapi.PageSize - freeEnd
+
+	compactSize := slotEnd + cellBytes
+	if compactSize <= 0 {
+		compactSize = slotEnd
+	}
+
+	// 1. Copy header + slot array
+	copy(buf[:slotEnd], p.data[:slotEnd])
+
+	// 2. Copy cell content area (from freeEnd to end of page)
+	if cellBytes > 0 {
+		copy(buf[slotEnd:], p.data[freeEnd:btreeapi.PageSize])
+	}
+
+	// 3. Compute gap = freeEnd - slotEnd (the eliminated free space)
+	gap := freeEnd - slotEnd
+
+	// 4. Adjust freeEnd in compact header to slotEnd (no gap)
+	binary.LittleEndian.PutUint16(buf[offFreeEnd:], uint16(slotEnd))
+
+	// 5. Adjust slot offsets: each slot offset -= gap
+	count := int(binary.LittleEndian.Uint16(buf[offCount:]))
+	saStart := p.slotArrayStart()
+	for i := 0; i < count; i++ {
+		off := saStart + i*2
+		oldOff := int(binary.LittleEndian.Uint16(buf[off:]))
+		binary.LittleEndian.PutUint16(buf[off:], uint16(oldOff-gap))
+	}
+
+	// 6. Adjust highKeyOff
+	hkOff := int(binary.LittleEndian.Uint16(buf[offHighKeyOff:]))
+	if hkOff != 0 {
+		binary.LittleEndian.PutUint16(buf[offHighKeyOff:], uint16(hkOff-gap))
+	}
+
+	return compactSize
+}
+
+
 // CompactSize returns the number of bytes SerializeCompact would produce,
 // without allocating. Useful for sizing record buffers.
 func (p *Page) CompactSize() int {
