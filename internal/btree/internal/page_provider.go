@@ -123,6 +123,12 @@ type RealPageProvider struct {
 	serializer btreeapi.NodeSerializer
 	cache      *pageCache // LRU cache for deserialized nodes
 
+	// Hot node cache: stores original (non-cloned) nodes for zero-copy reads.
+	// ReadPage returns directly from hotNodes on hit — no cloneNode allocation.
+	// Protected by hotMu to allow concurrent read-only access.
+	hotMu    sync.Mutex
+	hotNodes map[pagestoreapi.PageID]*btreeapi.Node
+
 	// Per-operation WAL entry collectors, keyed by goroutine ID.
 	collectors sync.Map // map[int64]*WALCollector
 
@@ -154,6 +160,7 @@ func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageP
 		store:      store,
 		serializer: NewNodeSerializer(),
 		cache:      newPageCache(cacheSize),
+		hotNodes:   make(map[pagestoreapi.PageID]*btreeapi.Node),
 	}
 }
 
@@ -197,13 +204,28 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 }
 
 // ReadPage reads and deserializes a node from the given PageID.
-// The LRU cache is checked first; on miss the page is read from
-// the PageStore, deserialized, cached, and returned.
+//
+// Hot node cache optimization: on first access, the original (non-cloned) node
+// is stored in hotNodes. Subsequent reads return directly from hotNodes — zero
+// allocation, zero deserialize. This eliminates the cloneNode overhead on
+// repeated accesses to hot internal nodes.
+//
+// Falls back to LRU cache for nodes not in hotNodes (e.g., nodes evicted from
+// hotNodes to manage memory).
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
 	startNs := time.Now().UnixNano()
 	p.pageReads.Add(1)
 
-	// Fast path: cache hit — return a clone.
+	// Hot node cache: zero-copy on repeated accesses.
+	p.hotMu.Lock()
+	if node, ok := p.hotNodes[pageID]; ok {
+		p.hotMu.Unlock()
+		p.pageCacheHits.Add(1)
+		return node, nil
+	}
+	p.hotMu.Unlock()
+
+	// Fallback: LRU cache (returns a clone).
 	if node, ok := p.cache.Get(pageID); ok {
 		p.pageCacheHits.Add(1)
 		return node, nil
@@ -219,7 +241,10 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 		return nil, fmt.Errorf("realpage: deserialize page %d: %w", pageID, err)
 	}
 
-	// Populate cache (stores a clone internally).
+	// Populate both caches.
+	p.hotMu.Lock()
+	p.hotNodes[pageID] = node
+	p.hotMu.Unlock()
 	p.cache.Put(pageID, node)
 
 	// Track latency (cache miss includes disk I/O).
@@ -227,7 +252,7 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 	p.readLatencyNanos.Add(uint64(latencyNs))
 	p.readLatencyCount.Add(1)
 
-	// Return the original — the cache holds its own clone.
+	// Return the original — hotNodes holds it without cloning.
 	return node, nil
 }
 
@@ -246,8 +271,11 @@ func (p *RealPageProvider) ReadPageUncached(pageID pagestoreapi.PageID) (*btreea
 }
 
 // WritePage serializes and writes a node to the given PageID.
-// After a successful write, the cache is updated with the new node
-// so subsequent reads see the latest version without hitting disk.
+// After a successful write, both caches are updated so subsequent reads
+// see the latest version without hitting disk.
+//
+// Hot node cache is updated directly (no clone) to maintain zero-copy reads.
+// LRU cache stores a clone for eviction safety.
 //
 // If a collector is registered for the current goroutine (via RegisterCollector),
 // the WAL entry is appended to that collector. Otherwise, it falls back to the
@@ -265,7 +293,12 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.
 		return fmt.Errorf("realpage: write page %d: %w", pageID, err)
 	}
 
-	// Update cache with the new version (stores a clone internally).
+	// Update both caches with the new version.
+	// hotNodes: direct store (zero-copy)
+	p.hotMu.Lock()
+	p.hotNodes[pageID] = node
+	p.hotMu.Unlock()
+	// cache: stores a clone for eviction safety.
 	p.cache.Put(pageID, node)
 
 	// Track write latency (includes serialization + disk I/O).
