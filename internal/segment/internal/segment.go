@@ -349,6 +349,41 @@ func (sm *segmentManager) Append(data []byte) (segmentapi.VAddr, error) {
 	}, nil
 }
 
+// Reserve reserves `size` bytes in the active segment's mmap and returns
+// the VAddr and a direct slice into the mmap'd region.
+// The caller writes directly into the returned slice.
+// The slice is only valid until the next Rotate() or Close() call.
+//
+// Returns ErrSegmentFull if there's not enough space.
+// Returns an error if the active segment is not mmap'd.
+func (sm *segmentManager) Reserve(size int) (segmentapi.VAddr, []byte, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.closed {
+		return segmentapi.VAddr{}, nil, segmentapi.ErrClosed
+	}
+
+	needed := sm.active.size + int64(size)
+	if needed > sm.maxSize {
+		return segmentapi.VAddr{}, nil, segmentapi.ErrSegmentFull
+	}
+
+	// Only works with mmap'd active segment.
+	if sm.active.data == nil {
+		return segmentapi.VAddr{}, nil, fmt.Errorf("segment: reserve requires mmap'd active segment")
+	}
+
+	offset := sm.active.size
+	slice := sm.active.data[offset : offset+int64(size)]
+	sm.active.size += int64(size)
+
+	return segmentapi.VAddr{
+		SegmentID: sm.active.id,
+		Offset:    uint32(offset),
+	}, slice, nil
+}
+
 func (sm *segmentManager) ReadAt(addr segmentapi.VAddr, size uint32) ([]byte, error) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()

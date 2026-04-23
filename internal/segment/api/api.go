@@ -109,6 +109,19 @@ type SegmentManager interface {
 	// durability before acknowledging to the WAL.
 	Append(data []byte) (VAddr, error)
 
+	// Reserve reserves `size` bytes in the active segment and returns
+	// the VAddr plus a direct slice into the mmap'd region. The caller
+	// writes directly into the returned slice, eliminating intermediate
+	// buffer copies. The slice is valid until the next Rotate() or Close().
+	//
+	// Returns ErrSegmentFull if there is not enough space.
+	// Returns an error if the active segment is not mmap'd.
+	//
+	// Thread safety: Reserve acquires the same lock as Append. The caller
+	// must finish writing into the returned slice before releasing control
+	// (i.e., before any concurrent Rotate or Close can proceed).
+	Reserve(size int) (VAddr, []byte, error)
+
 	// ReadAt reads exactly `size` bytes starting at the given VAddr.
 	//
 	// Returns ErrInvalidVAddr if:

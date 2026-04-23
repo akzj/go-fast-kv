@@ -259,6 +259,10 @@ func (m *mockSegmentManagerForDelete) Close() error { return nil }
 
 func (m *mockSegmentManagerForDelete) StorageDir() string { return "" }
 
+func (m *mockSegmentManagerForDelete) Reserve(size int) (segmentapi.VAddr, []byte, error) {
+	return segmentapi.VAddr{}, nil, fmt.Errorf("reserve not supported in mock")
+}
+
 func (m *mockSegmentManagerForDelete) WasRemoved(segID uint32) bool {
 	return m.removedSegments[segID]
 }
