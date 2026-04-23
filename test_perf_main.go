@@ -4,6 +4,7 @@ import (
     "fmt"
     "math/rand"
     "os"
+    "runtime"
     "time"
     
     tkvstore "github.com/akzj/go-fast-kv/internal/kvstore"
@@ -11,8 +12,11 @@ import (
 )
 
 func main() {
-    const N = 100000
+    const N = 1000000
     fmt.Printf("=== Performance Test: %d operations ===\n", N)
+    
+    // Limit GC
+    runtime.GC()
     
     // Clean up
     os.RemoveAll("/tmp/kv_perf_test")
@@ -49,8 +53,9 @@ func main() {
         if err := s.Put(keys[i], values[i]); err != nil {
             panic(err)
         }
-        if (i+1)%20000 == 0 {
+        if (i+1)%100000 == 0 {
             fmt.Printf("Written: %d / %d\n", i+1, N)
+            runtime.GC()
         }
     }
     writeDur := time.Since(start)
@@ -65,8 +70,9 @@ func main() {
         if err == nil && v != nil {
             hits++
         }
-        if (i+1)%20000 == 0 {
+        if (i+1)%100000 == 0 {
             fmt.Printf("Read: %d / %d\n", i+1, N)
+            runtime.GC()
         }
     }
     readDur := time.Since(start)

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -431,15 +430,17 @@ func (sm *segmentManager) Rotate() error {
 		f.Close()
 		return fmt.Errorf("segment: stat old segment: %w", err)
 	}
-	if info.Size() > 0 {
-		data, mmapErr := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
-		if mmapErr != nil {
-			log.Printf("segment: mmap sealed seg %d: %v — falling back to ReadAt", oldActive.id, mmapErr)
-		} else {
-			unix.Madvise(data, unix.MADV_SEQUENTIAL)
-			oldActive.data = data
-		}
-	}
+	// mmap disabled — always use ReadAt
+	// if info.Size() > 0 {
+	//     data, mmapErr := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
+	//     if mmapErr != nil {
+	//         log.Printf("segment: mmap sealed seg %d: %v — falling back to ReadAt", oldActive.id, mmapErr)
+	//     } else {
+	//         unix.Madvise(data, unix.MADV_SEQUENTIAL)
+	//         oldActive.data = data
+	//     }
+	// }
+	oldActive.data = nil // ensure ReadAt is used
 	oldActive.file = f
 	oldActive.size = info.Size()
 	oldActive.sealed = true
