@@ -185,11 +185,20 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 	return p.store.Alloc()
 }
 
+// latencySampleRate controls how often we measure time.Now() for latency
+// tracking. time.Now() costs ~25ns; sampling every 64th call reduces this
+// overhead from ~100ns/op to ~1.5ns/op on the hot path.
+const latencySampleRate = 64
+
 // ReadPage reads a page from the given PageID.
 // Returns a shared pointer from the hot page cache or LRU cache.
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
-	startNs := time.Now().UnixNano()
-	p.pageReads.Add(1)
+	readCount := p.pageReads.Add(1)
+	sampleLatency := readCount%latencySampleRate == 0
+	var startNs int64
+	if sampleLatency {
+		startNs = time.Now().UnixNano()
+	}
 
 	// Hot page cache: return shared pointer directly (zero-copy).
 	p.hotMu.Lock()
@@ -219,10 +228,12 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 	p.hotMu.Unlock()
 	p.cache.Put(pageID, page)
 
-	// Track latency (cache miss includes disk I/O).
-	latencyNs := time.Now().UnixNano() - startNs
-	p.readLatencyNanos.Add(uint64(latencyNs))
-	p.readLatencyCount.Add(1)
+	// Track latency (sampled — cache miss includes disk I/O).
+	if sampleLatency {
+		latencyNs := time.Now().UnixNano() - startNs
+		p.readLatencyNanos.Add(uint64(latencyNs) * latencySampleRate)
+		p.readLatencyCount.Add(latencySampleRate)
+	}
 
 	return page, nil
 }
@@ -250,8 +261,12 @@ func (p *RealPageProvider) ReadPageUncached(pageID pagestoreapi.PageID) (*Page, 
 // WritePage writes a page to the given PageID using compact serialization.
 // Only the used bytes are written to disk, reducing I/O by ~50-90%.
 func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) error {
-	startNs := time.Now().UnixNano()
-	p.pageWrites.Add(1)
+	writeCount := p.pageWrites.Add(1)
+	sampleLatency := writeCount%latencySampleRate == 0
+	var startNs int64
+	if sampleLatency {
+		startNs = time.Now().UnixNano()
+	}
 
 	// Serialize compact into pooled buffer to avoid per-call allocation.
 	bp := compactBufPool.Get().(*[]byte)
@@ -270,10 +285,12 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) err
 	p.hotMu.Unlock()
 	p.cache.Put(pageID, page)
 
-	// Track write latency.
-	latencyNs := time.Now().UnixNano() - startNs
-	p.writeLatencyNanos.Add(uint64(latencyNs))
-	p.writeLatencyCount.Add(1)
+	// Track write latency (sampled).
+	if sampleLatency {
+		latencyNs := time.Now().UnixNano() - startNs
+		p.writeLatencyNanos.Add(uint64(latencyNs) * latencySampleRate)
+		p.writeLatencyCount.Add(latencySampleRate)
+	}
 
 	// Route WAL entry to per-operation collector or shared buffer.
 	gid := goid.Get()
