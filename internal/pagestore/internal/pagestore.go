@@ -466,16 +466,20 @@ func (ps *pageStore) ReadCompact(pageID pagestoreapi.PageID) ([]byte, error) {
 		return ps.readLegacy(pageID, packed)
 	}
 
-	// Single read: exactly recordLen bytes.
+	// Single read: exactly recordLen bytes using pooled buffer.
 	addr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
-	raw, err := ps.segMgr.ReadAt(addr, uint32(recordLen))
+	bp := compactRecordPool.Get().(*[]byte)
+	raw := (*bp)[:recordLen]
+	err := ps.segMgr.ReadAtInto(addr, raw)
 	if err != nil {
+		compactRecordPool.Put(bp)
 		return nil, err
 	}
 
 	// Parse: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
 	dataLen := int(binary.BigEndian.Uint16(raw[8:10]))
 	if 10+dataLen+4 != int(recordLen) {
+		compactRecordPool.Put(bp)
 		return nil, fmt.Errorf("pagestore: record length mismatch: header says %d, vaddr says %d",
 			10+dataLen+4, recordLen)
 	}
@@ -484,13 +488,15 @@ func (ps *pageStore) ReadCompact(pageID pagestoreapi.PageID) ([]byte, error) {
 	expected := binary.BigEndian.Uint32(raw[10+dataLen:])
 	actual := crc32.ChecksumIEEE(raw[:10+dataLen])
 	if expected != actual {
+		compactRecordPool.Put(bp)
 		return nil, fmt.Errorf("%w: pageID=%d expected=0x%08x actual=0x%08x",
 			pagestoreapi.ErrChecksumMismatch, pageID, expected, actual)
 	}
 
-	// Extract compact data.
+	// Extract compact data (must copy out before returning buffer to pool).
 	compactData := make([]byte, dataLen)
 	copy(compactData, raw[10:10+dataLen])
+	compactRecordPool.Put(bp)
 
 	// Cache the compact data.
 	if ps.cache != nil {
