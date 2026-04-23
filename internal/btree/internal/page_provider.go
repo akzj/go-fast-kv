@@ -1,34 +1,16 @@
 package internal
 
 import (
-	"bytes"
 	"container/list"
 	"fmt"
-	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
+	"github.com/akzj/go-fast-kv/internal/goid"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 )
-
-// ─── goroutineID ────────────────────────────────────────────────────
-
-// goroutineID returns the current goroutine's numeric ID.
-// Used to route WAL entries to per-operation collectors.
-// Cost: ~200ns — acceptable for functions that do disk I/O.
-func goroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// buf looks like "goroutine 123 [running]:\n..."
-	s := buf[:n]
-	s = s[len("goroutine "):]
-	s = s[:bytes.IndexByte(s, ' ')]
-	id, _ := strconv.ParseInt(string(s), 10, 64)
-	return id
-}
 
 // ─── Page Cache (LRU) ──────────────────────────────────────────────
 
@@ -180,7 +162,7 @@ func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageP
 //	tree.Put(key, value, xid)  // WritePage routes entries to collector
 //	entries := collector.PageEntries
 func (p *RealPageProvider) RegisterCollector() (*WALCollector, func()) {
-	gid := goroutineID()
+	gid := goid.Get()
 	c := &WALCollector{}
 	p.collectors.Store(gid, c)
 	return c, func() { p.collectors.Delete(gid) }
@@ -192,7 +174,7 @@ func (p *RealPageProvider) RegisterCollector() (*WALCollector, func()) {
 //
 // Returns nil if no collector is registered for the current goroutine.
 func (p *RealPageProvider) CollectAndClear() []pagestoreapi.WALEntry {
-	gid := goroutineID()
+	gid := goid.Get()
 	if c, ok := p.collectors.LoadAndDelete(gid); ok {
 		collector := c.(*WALCollector)
 		entries := make([]pagestoreapi.WALEntry, len(collector.PageEntries))
@@ -312,7 +294,7 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.
 	p.writeLatencyCount.Add(1)
 
 	// Route WAL entry to per-operation collector or shared buffer.
-	gid := goroutineID()
+	gid := goid.Get()
 	if c, ok := p.collectors.Load(gid); ok {
 		collector := c.(*WALCollector)
 		collector.PageEntries = append(collector.PageEntries, entry)

@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/akzj/go-fast-kv/internal/goid"
 	lsmapi "github.com/akzj/go-fast-kv/internal/lsm/api"
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 	walapi "github.com/akzj/go-fast-kv/internal/wal/api"
@@ -71,26 +71,9 @@ var lsmWALCollectors sync.Map // map[int64]*[]walapi.Record
 var lsmWALCollectorMu sync.Map // map[int64]*sync.Mutex — one mutex per goroutine for collector access
 
 // goroutineID returns the current goroutine's numeric ID.
+// Delegates to the fast assembly-based goid package (<1ns vs ~700ns).
 func goroutineID() int64 {
-	var buf [32]byte
-	n := runtime.Stack(buf[:], false)
-	// The format is "goroutine N ..." — extract the number.
-	for i := 0; i < n; i++ {
-		if buf[i] == 'g' && i+8 < n && string(buf[i:i+8]) == "goroutine" {
-			j := i + 9
-			for j < n && buf[j] >= '0' && buf[j] <= '9' {
-				j++
-			}
-			if j > i+9 {
-				id := int64(0)
-				for k := i + 9; k < j; k++ {
-					id = id*10 + int64(buf[k]-'0')
-				}
-				return id
-			}
-		}
-	}
-	return 0
+	return goid.Get()
 }
 
 // getOrCreateCollectorMu returns the mutex for the given goroutine ID,

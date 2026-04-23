@@ -17,7 +17,6 @@
 package internal
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +35,7 @@ import (
 	"github.com/akzj/go-fast-kv/internal/btree"
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	gcapi "github.com/akzj/go-fast-kv/internal/gc/api"
+	"github.com/akzj/go-fast-kv/internal/goid"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	"github.com/akzj/go-fast-kv/internal/lock"
 	lsm "github.com/akzj/go-fast-kv/internal/lsm"
@@ -62,20 +61,10 @@ const (
 	defaultInlineThreshold = 256
 )
 
-// ─── goroutineID ────────────────────────────────────────────────────
-
 // goroutineID returns the current goroutine's numeric ID.
-// Used to route WAL entries to per-operation collectors in blobWriterAdapter.
-// Cost: ~200ns — acceptable for functions that do disk I/O.
+// Delegates to the fast assembly-based goid package (<1ns vs ~700ns).
 func goroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// buf looks like "goroutine 123 [running]:\n..."
-	s := buf[:n]
-	s = s[len("goroutine "):]
-	s = s[:bytes.IndexByte(s, ' ')]
-	id, _ := strconv.ParseInt(string(s), 10, 64)
-	return id
+	return goid.Get()
 }
 
 // store implements kvstoreapi.Store.
