@@ -12,17 +12,6 @@ import (
 	pagestoreapi "github.com/akzj/go-fast-kv/internal/pagestore/api"
 )
 
-// serializeBufPool reuses PageSize (4096-byte) buffers for node serialization.
-// Each WritePage serializes a node into a 4KB buffer that is passed to
-// pageStore.Write then discarded; pooling eliminates ~4.1 GB of allocations
-// per 1M writes.
-var serializeBufPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, btreeapi.PageSize)
-		return &b
-	},
-}
-
 // walCollectorPool reuses WALCollector objects. Each Put/Delete operation
 // registers a collector (~1.9M objects per 1M writes); pooling avoids
 // repeated heap allocation.
@@ -295,14 +284,12 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, node *btreeapi.
 	startNs := time.Now().UnixNano()
 	p.pageWrites.Add(1)
 
-	bp := serializeBufPool.Get().(*[]byte)
-	data := *bp
-	if err := p.serializer.(*nodeSerializer).SerializeInto(node, data); err != nil {
-		serializeBufPool.Put(bp)
-		return fmt.Errorf("realpage: serialize page %d: %w", pageID, err)
-	}
-	entry, err := p.store.Write(pageID, data)
-	serializeBufPool.Put(bp)
+	// Zero-copy path: serialize directly into segment mmap via WriteDirect.
+	// The serializeFn receives a 4096-byte slice pointing into the mmap region.
+	serializer := p.serializer.(*nodeSerializer)
+	entry, err := p.store.WriteDirect(pageID, func(buf []byte) error {
+		return serializer.SerializeInto(node, buf)
+	})
 	if err != nil {
 		return fmt.Errorf("realpage: write page %d: %w", pageID, err)
 	}
