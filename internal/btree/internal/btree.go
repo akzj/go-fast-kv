@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -279,10 +280,14 @@ func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 }
 
 func findChild(node *btreeapi.Node, key []byte) uint64 {
-	for i, k := range node.Keys {
-		if bytes.Compare(key, k) < 0 {
-			return node.Children[i]
-		}
+	// Binary search: find first index where key < keys[i], then return children[i].
+	// For n keys, there are n+1 children. When key >= all keys, i == n, so we
+	// return the last child (children[len(children)-1]).
+	i := sort.Search(len(node.Keys), func(i int) bool {
+		return bytes.Compare(key, node.Keys[i]) < 0
+	})
+	if i < len(node.Children) {
+		return node.Children[i]
 	}
 	return node.Children[len(node.Children)-1]
 }
