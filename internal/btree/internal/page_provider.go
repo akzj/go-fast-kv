@@ -205,26 +205,20 @@ func (p *RealPageProvider) AllocPage() pagestoreapi.PageID {
 
 // ReadPage reads and deserializes a node from the given PageID.
 //
-// Hot node cache: on first access, the original node is stored in hotNodes.
-// Subsequent reads return a CLONE from hotNodes to prevent concurrent mutation
-// races (multiple goroutines sharing the same *Node pointer). The clone cost
-// (~200-500 bytes per node) is far cheaper than the 4KB serialize+pread path.
-//
-// Falls back to LRU cache for nodes not in hotNodes (the LRU cache also
-// returns clones).
+// Returns a shared pointer from the hot node cache or LRU cache.
+// The returned node must NOT be mutated by the caller.
+// Use ReadPageForWrite when mutation is intended (e.g., under WLock).
 func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
 	startNs := time.Now().UnixNano()
 	p.pageReads.Add(1)
 
-	// Hot node cache: return a CLONE to prevent concurrent mutation races.
-	// Without cloning, multiple goroutines can hold the same *Node pointer
-	// and race on slice headers (Keys, Children, Entries) during mutations
-	// like insertInternalEntry, causing "slice bounds out of range" panics.
+	// Hot node cache: return shared pointer for read-only access.
+	// Callers that need to mutate must use ReadPageForWrite instead.
 	p.hotMu.Lock()
 	if node, ok := p.hotNodes[pageID]; ok {
 		p.hotMu.Unlock()
 		p.pageCacheHits.Add(1)
-		return cloneNode(node), nil
+		return node, nil
 	}
 	p.hotMu.Unlock()
 
@@ -257,6 +251,18 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*btreeapi.Node,
 
 	// Return the original — hotNodes holds it without cloning.
 	return node, nil
+}
+
+// ReadPageForWrite reads a node and returns a deep clone safe for mutation.
+// Must be used when the caller intends to modify the node (e.g., under WLock
+// before calling WritePage). This prevents concurrent mutation races where
+// multiple goroutines share the same *Node pointer from the hotNodes cache.
+func (p *RealPageProvider) ReadPageForWrite(pageID pagestoreapi.PageID) (*btreeapi.Node, error) {
+	node, err := p.ReadPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return cloneNode(node), nil
 }
 
 // ReadPageUncached reads directly from the underlying PageStore without

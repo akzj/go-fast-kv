@@ -51,6 +51,13 @@ func (m *MemPageProvider) ReadPageUncached(pageID uint64) (*btreeapi.Node, error
 	return m.ReadPage(pageID)
 }
 
+// ReadPageForWrite returns a deep clone of the node safe for mutation.
+// MemPageProvider deserializes fresh each time, so the result is already
+// independent — but we clone for interface contract consistency.
+func (m *MemPageProvider) ReadPageForWrite(pageID uint64) (*btreeapi.Node, error) {
+	return m.ReadPage(pageID)
+}
+
 // WritePage serializes and writes a node to the given PageID.
 func (m *MemPageProvider) WritePage(pageID uint64, node *btreeapi.Node) error {
 	data, err := m.serializer.Serialize(node)

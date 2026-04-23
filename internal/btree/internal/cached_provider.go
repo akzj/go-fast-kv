@@ -51,6 +51,17 @@ func (p *CachedMemPageProvider) ReadPageUncached(pageID uint64) (*btreeapi.Node,
 	return p.ReadPage(pageID)
 }
 
+// ReadPageForWrite returns a deep clone of the cached node safe for mutation.
+// CachedMemPageProvider stores shared pointers, so cloning is essential to
+// prevent concurrent mutation races.
+func (p *CachedMemPageProvider) ReadPageForWrite(pageID uint64) (*btreeapi.Node, error) {
+	node, err := p.ReadPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return cloneNode(node), nil
+}
+
 // WritePage stores the node directly (no Serialize).
 func (p *CachedMemPageProvider) WritePage(pageID uint64, node *btreeapi.Node) error {
 	p.mu.Lock()
