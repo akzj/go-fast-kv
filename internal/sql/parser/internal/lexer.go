@@ -61,7 +61,7 @@ var keywords = map[string]api.TokenType{
 	"UNIQUE":  api.TokUnique,
 	"IF":       api.TokIf,
 	"EXISTS":   api.TokExists,
-	"AS":       api.TokIdent, // also a keyword but handled as alias separator in SELECT
+	"AS":       api.TokAs, // also a keyword but handled as alias separator in SELECT
 	"OFFSET":   api.TokOffset,
 	"COALESCE": api.TokCoalesce,
 	"CASE":     api.TokCase,

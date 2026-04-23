@@ -17,7 +17,6 @@
 package internal
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +35,7 @@ import (
 	"github.com/akzj/go-fast-kv/internal/btree"
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 	gcapi "github.com/akzj/go-fast-kv/internal/gc/api"
+	"github.com/akzj/go-fast-kv/internal/goid"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	"github.com/akzj/go-fast-kv/internal/lock"
 	lsm "github.com/akzj/go-fast-kv/internal/lsm"
@@ -62,20 +61,10 @@ const (
 	defaultInlineThreshold = 256
 )
 
-// ─── goroutineID ────────────────────────────────────────────────────
-
 // goroutineID returns the current goroutine's numeric ID.
-// Used to route WAL entries to per-operation collectors in blobWriterAdapter.
-// Cost: ~200ns — acceptable for functions that do disk I/O.
+// Delegates to the fast assembly-based goid package (<1ns vs ~700ns).
 func goroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// buf looks like "goroutine 123 [running]:\n..."
-	s := buf[:n]
-	s = s[len("goroutine "):]
-	s = s[:bytes.IndexByte(s, ' ')]
-	id, _ := strconv.ParseInt(string(s), 10, 64)
-	return id
+	return goid.Get()
 }
 
 // store implements kvstoreapi.Store.
@@ -320,9 +309,15 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		PageLocks() *lock.PageRWLocks
 	}
 	if plp, ok := tree.(pageLockerProvider); ok {
+		// Pass the same provider for both cached reads and uncached reads.
+		// RealPageProvider implements ReadPage (with LRU cache + cloneNode)
+		// and ReadPageUncached (bypasses cache, no clone). Vacuum uses
+		// ReadPageUncached for leaf scans to avoid cloneNode allocations.
+		uncached := provider // ReadPageUncached is supported by RealPageProvider
 		s.vacuum = vacuum.New(
 			tree.RootPageID,
 			provider,
+			uncached,
 			tm,
 			bs,
 			w,
@@ -1620,7 +1615,43 @@ func (wb *writeBatch) DeleteWithXID(key []byte, txnID uint64) error {
 // GetMetrics returns a snapshot of current operational metrics.
 // Zero blocking — all fields are populated atomically from lock-free data structures.
 func (s *store) GetMetrics() *kvstoreapi.Metrics {
-	// Update background status from vacuum goroutine flags.
+	// Wire page provider stats (RealPageProvider).
+	stats := s.provider.GetStats()
+	s.metrics.UpdatePageStats(struct {
+		PageReads     uint64
+		PageWrites    uint64
+		PageCacheHits uint64
+		PageAlloc     uint64
+		ReadLatNs     uint64
+		ReadCount     uint64
+		WriteLatNs    uint64
+		WriteCount    uint64
+	}{
+		PageReads:     stats.PageReads,
+		PageWrites:    stats.PageWrites,
+		PageCacheHits: stats.PageCacheHits,
+		PageAlloc:     stats.PageAlloc,
+		ReadLatNs:     stats.ReadLatencyNanos,
+		ReadCount:     stats.ReadLatencyCount,
+		WriteLatNs:    stats.WriteLatencyNanos,
+		WriteCount:    stats.WriteLatencyCount,
+	})
+
+	// Wire B-tree stats via interface method.
+	treeStats := s.tree.GetStats()
+	s.metrics.UpdateBTreeStats(struct {
+		SplitCount      uint64
+		SearchDepthSum  uint64
+		SearchCount     uint64
+		RightSiblingNav uint64
+	}{
+		SplitCount:      treeStats.SplitCount,
+		SearchDepthSum:  treeStats.SearchDepthSum,
+		SearchCount:     treeStats.SearchCount,
+		RightSiblingNav: treeStats.RightSiblingNavs,
+	})
+
+	// Collect metrics with updated stats.
 	m := s.metrics.collect()
 
 	// Update GC status from trigger flags.

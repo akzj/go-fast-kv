@@ -171,6 +171,7 @@ const (
 	TokEndTrigger    TokenType = 155 // END (trigger body)
 	TokVirtual       TokenType = 156 // VIRTUAL (for CREATE VIRTUAL TABLE)
 	TokUsing         TokenType = 157 // USING
+	TokAs            TokenType = 163 // AS (for CTAS, CAST, etc.)
 	TokMatch         TokenType = 158 // MATCH (for FTS MATCH expression)
 	TokView          TokenType = 162 // VIEW (for CREATE VIEW, DROP VIEW)
 	TokFTS5          TokenType = 159 // FTS5
@@ -200,12 +201,14 @@ type Expr interface {
 // ─── DDL Statements ───────────────────────────────────────────────
 
 // CreateTableStmt: CREATE TABLE [IF NOT EXISTS] name (col1 type1, ...)
+//   or CTAS: CREATE TABLE name AS SELECT ...
 type CreateTableStmt struct {
 	Table       string
 	Columns     []ColumnDef
 	PrimaryKey  string // optional: column name
 	IfNotExists bool
 	ForeignKeys []ForeignKey
+	SelectStmt *SelectStmt // CTAS: AS SELECT ... (nil for regular CREATE TABLE)
 }
 
 // ForeignKey represents a parsed FOREIGN KEY constraint (table-level or column-level).

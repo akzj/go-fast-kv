@@ -212,9 +212,14 @@ func (noopPageLocker) WLock(uint64)   {}
 func (noopPageLocker) WUnlock(uint64) {}
 
 func (env *testEnv) newVacuum() vacuumapi.Vacuum {
+	// Pass the same provider for both cached reads and uncached reads.
+	// RealPageProvider implements ReadPage (with LRU cache + cloneNode)
+	// and ReadPageUncached (bypasses cache, no clone). Vacuum uses
+	// ReadPageUncached for leaf scans.
 	return New(
 		env.tree.RootPageID,
 		env.provider,
+		env.provider, // uncachedPages — RealPageProvider supports ReadPageUncached
 		env.txnMgr,
 		env.blobStore,
 		env.wal,

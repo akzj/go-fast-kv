@@ -360,11 +360,14 @@ func (p *parser) parseCreateView() (api.Statement, error) {
 	viewName := p.cur.Literal
 	p.advance()
 
-	// AS keyword
-	if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+	// AS keyword — TokAs needs advance; TokIdent "AS" needs advance
+	if p.cur.Type == api.TokAs {
+		p.advance()
+	} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+		p.advance()
+	} else {
 		return nil, p.errorf("expected AS after view name")
 	}
-	p.advance()
 
 	// Capture raw SELECT SQL text BEFORE parsing
 	if p.cur.Type != api.TokSelect {
@@ -434,6 +437,20 @@ func (p *parser) parseCreateTable() (api.Statement, error) {
 	}
 	stmt.Table = p.cur.Literal
 	p.advance()
+
+	// CTAS: CREATE TABLE t AS SELECT ... (no column definitions)
+	if p.cur.Type == api.TokAs {
+		p.advance()
+		if p.cur.Type != api.TokSelect {
+			return nil, p.errorf("AS must be followed by SELECT")
+		}
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		stmt.SelectStmt = sel.(*api.SelectStmt)
+		return stmt, nil
+	}
 
 	// ( column definitions )
 	if err := p.expect(api.TokLParen); err != nil {
@@ -519,6 +536,23 @@ func (p *parser) parseCreateTable() (api.Statement, error) {
 	if err := p.expect(api.TokRParen); err != nil {
 		return nil, err
 	}
+
+	// CTAS: CREATE TABLE t AS SELECT ...
+	if p.cur.Type == api.TokAs {
+		p.advance()
+		if p.cur.Type == api.TokSelect {
+			selectStmt, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			sel, ok := selectStmt.(*api.SelectStmt)
+			if !ok {
+				return nil, p.errorf("AS must be followed by SELECT")
+			}
+			stmt.SelectStmt = sel
+		}
+	}
+
 	return stmt, nil
 }
 
@@ -863,6 +897,7 @@ func (p *parser) parseCreateIndex(unique bool) (api.Statement, error) {
 	if err := p.expect(api.TokRParen); err != nil {
 		return nil, err
 	}
+
 	return stmt, nil
 }
 
@@ -1479,7 +1514,12 @@ func (p *parser) parseWith() (api.Statement, error) {
 		p.advance()
 
 		// Expect AS
-		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+		// AS keyword — TokAs is already consumed by lexer; TokIdent "AS" needs advance
+		if p.cur.Type == api.TokAs {
+			// no-op: lexer already produced TokAs
+		} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+			p.advance()
+		} else {
 			return nil, p.errorf("expected AS after CTE name")
 		}
 		p.advance()
@@ -1563,8 +1603,15 @@ func (p *parser) parseSelect() (api.Statement, error) {
 			}
 			col := api.SelectColumn{Expr: expr}
 			// Optional AS [alias] — supports both "SELECT id AS alias" and "SELECT id alias"
-			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+			if p.cur.Type == api.TokAs {
+				p.advance() // consume TokAs (already produced by lexer)
+				if p.cur.Type != api.TokIdent {
+					return nil, p.errorf("expected alias name after AS")
+				}
+				col.Alias = p.cur.Literal
 				p.advance()
+			} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+				p.advance() // consume AS identifier
 				if p.cur.Type != api.TokIdent {
 					return nil, p.errorf("expected alias name after AS")
 				}
@@ -1600,10 +1647,12 @@ func (p *parser) parseSelect() (api.Statement, error) {
 			}
 			p.advance() // consume ')'
 
-			// Parse alias: [AS] alias
+			// Parse alias: [AS] alias — TokAs means alias follows; TokIdent "AS" needs advance
 			alias := ""
-			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
-				p.advance()
+			if p.cur.Type == api.TokAs {
+				p.advance() // consume TokAs (not consumed by lexer), then alias follows
+			} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+				p.advance() // consume AS identifier, then alias name follows
 			}
 			if p.cur.Type == api.TokIdent {
 				alias = p.cur.Literal
@@ -1886,7 +1935,15 @@ func (p *parser) parseSubquerySelect() (*api.SelectStmt, error) {
 				return nil, err
 			}
 			col := api.SelectColumn{Expr: expr}
-			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+			// Optional AS [alias] — TokAs means alias follows; TokIdent "AS" needs advance
+			if p.cur.Type == api.TokAs {
+				p.advance() // consume TokAs
+				if p.cur.Type != api.TokIdent {
+					return nil, p.errorf("expected alias name after AS")
+				}
+				col.Alias = p.cur.Literal
+				p.advance()
+			} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
 				p.advance()
 				if p.cur.Type != api.TokIdent {
 					return nil, p.errorf("expected alias name after AS")
@@ -2497,8 +2554,8 @@ func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
 			p.advance()
 			continue
 		}
-		// FROM terminates function args (e.g., SELECT myfunc(id) FROM t)
-		if p.cur.Type == api.TokFrom {
+		// FROM and AS terminate function args (e.g., COUNT(*) FROM t, COUNT(*) AS alias)
+		if p.cur.Type == api.TokFrom || p.cur.Type == api.TokAs {
 			break
 		}
 		return nil, p.errorf("expected , or ) in function args, got %s", p.cur.Literal)
@@ -2762,10 +2819,14 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if p.cur.Type != api.TokIdent || strings.ToUpper(p.cur.Literal) != "AS" {
+		// AS keyword — TokAs needs advance; TokIdent "AS" needs advance
+		if p.cur.Type == api.TokAs {
+			p.advance()
+		} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+			p.advance()
+		} else {
 			return nil, p.errorf("expected AS after CAST expression")
 		}
-		p.advance() // consume AS
 		// Parse target type name
 		var typeName string
 		switch p.cur.Type {

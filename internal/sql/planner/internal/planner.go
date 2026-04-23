@@ -30,6 +30,9 @@ func New(catalog catalogapi.CatalogManager, parser parserapi.Parser) *planner {
 func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 	switch s := stmt.(type) {
 	case *parserapi.CreateTableStmt:
+		if s.SelectStmt != nil {
+			return p.planCreateTableAsSelect(s)
+		}
 		return p.planCreateTable(s)
 	case *parserapi.DropTableStmt:
 		return p.planDropTable(s)
@@ -201,6 +204,51 @@ func convertForeignKeys(fks []parserapi.ForeignKey, tableName string, tableCols 
 		})
 	}
 	return result
+}
+
+// planCreateTableAsSelect plans: CREATE TABLE t AS SELECT ...
+// Columns are inferred from the SELECT statement.
+func (p *planner) planCreateTableAsSelect(stmt *parserapi.CreateTableStmt) (*plannerapi.CreateTableAsSelectPlan, error) {
+	// Plan the SELECT subquery first to infer column types.
+	selPlan, err := p.Plan(stmt.SelectStmt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Infer column names from the SELECT statement's column list.
+	// Use the raw parser SelectColumns to get alias names.
+	var cols []catalogapi.ColumnDef
+	for i, col := range stmt.SelectStmt.Columns {
+		colName := col.Alias
+		if colName == "" {
+			// No alias: try to extract from expression (ColumnRef → column name).
+			if ref, ok := col.Expr.(*parserapi.ColumnRef); ok {
+				colName = ref.Column
+			} else {
+				colName = fmt.Sprintf("col_%d", i+1)
+			}
+		}
+		// All CTAS columns default to BLOB type; type inference from SELECT expressions
+		// would require expression evaluation, which is not available at planning time.
+		cols = append(cols, catalogapi.ColumnDef{
+			Name: colName,
+			Type: catalogapi.TypeBlob,
+		})
+	}
+
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("CTAS requires a SELECT with at least one column")
+	}
+
+	return &plannerapi.CreateTableAsSelectPlan{
+		Schema: catalogapi.TableSchema{
+			Name:     stmt.Table,
+			Columns:  cols,
+		},
+		IfNotExists:     stmt.IfNotExists,
+		SelectPlan:      selPlan,
+		SelectStatement: stmt.SelectStmt,
+	}, nil
 }
 
 func (p *planner) planDropTable(stmt *parserapi.DropTableStmt) (*plannerapi.DropTablePlan, error) {

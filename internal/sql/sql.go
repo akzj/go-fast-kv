@@ -26,12 +26,10 @@
 package sql
 
 import (
-	"bytes"
 	"fmt"
-	"runtime"
-	"strconv"
 	"sync"
 
+	"github.com/akzj/go-fast-kv/internal/goid"
 	kvstoreapi "github.com/akzj/go-fast-kv/internal/kvstore/api"
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
@@ -57,15 +55,9 @@ type Result = executorapi.Result
 type Value = catalogapi.Value
 
 // goroutineID returns the current goroutine's numeric ID.
-// Used to track per-goroutine active transaction contexts.
+// Delegates to the fast assembly-based goid package (<1ns vs ~700ns).
 func goroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	s := buf[:n]
-	s = s[len("goroutine "):]
-	s = s[:bytes.IndexByte(s, ' ')]
-	id, _ := strconv.ParseInt(string(s), 10, 64)
-	return id
+	return goid.Get()
 }
 
 // ─── DB ─────────────────────────────────────────────────────────────

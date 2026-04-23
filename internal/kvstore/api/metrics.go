@@ -36,4 +36,22 @@ type Metrics struct {
 	PageCacheUsed uint64
 	MemTableUsed  uint64
 	WALSizeBytes  uint64
+
+	// Page-level operation statistics for B-tree analysis.
+	// These help identify query path issues (e.g., sequential scan vs hierarchical lookup).
+	PageReads     uint64 // Total page read operations (from disk or cache)
+	PageWrites    uint64 // Total page write operations
+	PageCacheHits uint64 // Page cache hits (LRU cache)
+	PageCacheMiss uint64 // Page cache misses (required disk I/O)
+	PageSplits    uint64 // Leaf node split count (high value → frequent splits → bottleneck)
+	PageAlloc     uint64 // Page allocation count
+
+	// Page I/O latency in microseconds (99th percentile).
+	// High values indicate disk I/O bottleneck.
+	PageReadLatencyP99  uint64
+	PageWriteLatencyP99 uint64
+
+	// B-tree traversal statistics.
+	BTreeSearchDepth       uint64 // Average search depth (higher = deeper tree = more I/O per operation)
+	RightSiblingTraversals uint64 // B-link correction traversals (high value = many splits during insert)
 }

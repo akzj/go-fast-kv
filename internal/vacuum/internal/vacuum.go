@@ -28,7 +28,8 @@ var _ vacuumapi.Vacuum = (*vacuumer)(nil)
 // vacuumer implements vacuumapi.Vacuum.
 type vacuumer struct {
 	rootPageIDFn      func() uint64
-	pages             btreeapi.PageProvider
+	pages             btreeapi.PageProvider  // used for WritePage + cached ReadPage
+	uncachedPages     btreeapi.PageProvider  // bypasses LRU cache for read-heavy vacuum scans
 	txnMgr            txnapi.TxnManager
 	blobStore         blobstoreapi.BlobStore
 	wal               walapi.WAL
@@ -66,6 +67,7 @@ type vacuumer struct {
 func New(
 	rootPageIDFn func() uint64,
 	pages btreeapi.PageProvider,
+	uncachedPages btreeapi.PageProvider,
 	txnMgr txnapi.TxnManager,
 	blobStore blobstoreapi.BlobStore,
 	wal walapi.WAL,
@@ -76,6 +78,7 @@ func New(
 	return &vacuumer{
 		rootPageIDFn:      rootPageIDFn,
 		pages:             pages,
+		uncachedPages:     uncachedPages,
 		txnMgr:            txnMgr,
 		blobStore:         blobStore,
 		wal:               wal,
@@ -123,7 +126,7 @@ func (v *vacuumer) Run() (*vacuumapi.VacuumStats, error) {
 		// from modifying the page while we analyze and potentially rewrite it.
 		v.pageLocks.WLock(leafPID)
 
-		node, err := v.pages.ReadPage(leafPID)
+		node, err := v.uncachedPages.ReadPageUncached(leafPID)
 		if err != nil {
 			v.pageLocks.WUnlock(leafPID)
 			return nil, err
@@ -250,7 +253,7 @@ func (v *vacuumer) RunIncremental(targetPages int) (*vacuumapi.VacuumStats, erro
 	for leafPID != 0 && pagesProcessed < targetPages {
 		v.pageLocks.WLock(leafPID)
 
-		node, err := v.pages.ReadPage(leafPID)
+		node, err := v.uncachedPages.ReadPageUncached(leafPID)
 		if err != nil {
 			v.pageLocks.WUnlock(leafPID)
 			return nil, err

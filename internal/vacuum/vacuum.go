@@ -17,6 +17,7 @@ import (
 func New(
 	rootPageIDFn func() uint64,
 	pages btreeapi.PageProvider,
+	uncachedPages btreeapi.PageProvider,
 	txnMgr txnapi.TxnManager,
 	blobStore blobstoreapi.BlobStore,
 	wal walapi.WAL,
@@ -24,5 +25,5 @@ func New(
 	registerCollector func() (*[]pagestoreapi.WALEntry, func()),
 	pageLocks vacuumapi.PageLocker,
 ) vacuumapi.Vacuum {
-	return internal.New(rootPageIDFn, pages, txnMgr, blobStore, wal, segSync, registerCollector, pageLocks)
+	return internal.New(rootPageIDFn, pages, uncachedPages, txnMgr, blobStore, wal, segSync, registerCollector, pageLocks)
 }

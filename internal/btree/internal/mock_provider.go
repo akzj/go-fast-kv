@@ -45,6 +45,12 @@ func (m *MemPageProvider) ReadPage(pageID uint64) (*btreeapi.Node, error) {
 	return m.serializer.Deserialize(data)
 }
 
+// ReadPageUncached reads directly without cache.
+// MemPageProvider has no cache, so this is identical to ReadPage.
+func (m *MemPageProvider) ReadPageUncached(pageID uint64) (*btreeapi.Node, error) {
+	return m.ReadPage(pageID)
+}
+
 // WritePage serializes and writes a node to the given PageID.
 func (m *MemPageProvider) WritePage(pageID uint64, node *btreeapi.Node) error {
 	data, err := m.serializer.Serialize(node)

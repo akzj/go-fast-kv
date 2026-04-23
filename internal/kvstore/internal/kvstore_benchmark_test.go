@@ -52,6 +52,16 @@ func BenchmarkKVStore_Put_SeqWrite_1k(b *testing.B) {
 		for j := 0; j < 1000; j++ {
 			s.Put(keyFor(j), valueFor(j))
 		}
+		// Print metrics after benchmark
+		m := s.GetMetrics()
+		hitRate := 0.0
+		if m.PageReads > 0 {
+			hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+		}
+		fmt.Printf("1k: PageReads=%d PageWrites=%d PageSplits=%d BTreeSearchDepth=%d\n",
+			m.PageReads, m.PageWrites, m.PageSplits, m.BTreeSearchDepth)
+		fmt.Printf("     PageReadsPerOp=%.1f SplitsPerOp=%.2f CacheHits=%d HitRate=%.1f%%\n",
+			float64(m.PageReads)/1000.0, float64(m.PageSplits)/1000.0, m.PageCacheHits, hitRate)
 	}
 }
 
@@ -61,6 +71,12 @@ func BenchmarkKVStore_Put_SeqWrite_10k(b *testing.B) {
 		for j := 0; j < 10000; j++ {
 			s.Put(keyFor(j), valueFor(j))
 		}
+		// Print metrics after benchmark
+		m := s.GetMetrics()
+		fmt.Printf("Metrics: PageReads=%d PageWrites=%d PageCacheHits=%d PageSplits=%d PageAlloc=%d BTreeSearchDepth=%d RightSiblingTraversals=%d\n",
+			m.PageReads, m.PageWrites, m.PageCacheHits, m.PageSplits, m.PageAlloc, m.BTreeSearchDepth, m.RightSiblingTraversals)
+		fmt.Printf("Latency: PutP50=%0.2fμs PutP90=%0.2fμs PutP99=%0.2fμs\n",
+			m.PutLatencyP50, m.PutLatencyP90, m.PutLatencyP99)
 	}
 }
 
@@ -126,6 +142,13 @@ func BenchmarkKVStore_Get_SeqRead_1k(b *testing.B) {
 			s.Get(keyFor(j))
 		}
 	}
+	m := s.GetMetrics()
+	hitRate := 0.0
+	if m.PageReads > 0 {
+		hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+	}
+	fmt.Printf("Get: PageReads=%d PageCacheHits=%d HitRate=%.1f%%\n",
+		m.PageReads, m.PageCacheHits, hitRate)
 }
 
 // ─── 4. Random Read Benchmarks ───────────────────────────────────────
@@ -176,6 +199,13 @@ func BenchmarkKVStore_Get_RandRead_1k(b *testing.B) {
 			s.Get(keys[indices[j]])
 		}
 	}
+	m := s.GetMetrics()
+	hitRate := 0.0
+	if m.PageReads > 0 {
+		hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+	}
+	fmt.Printf("GetRand: PageReads=%d PageCacheHits=%d HitRate=%.1f%%\n",
+		m.PageReads, m.PageCacheHits, hitRate)
 }
 
 // ─── 5. Batch Write Benchmarks ───────────────────────────────────────
@@ -395,6 +425,28 @@ func BenchmarkKVStore_Mixed_50_50_100(b *testing.B) {
 		wb.Commit()
 		for j := 0; j < 50; j++ {
 			s.Get(keyFor(j))
+		}
+	}
+}
+// BenchmarkKVStore_Put_SeqWrite_1k_NoVacuum measures allocations without vacuum.
+func BenchmarkKVStore_Put_SeqWrite_1k_NoVacuum(b *testing.B) {
+	dir := b.TempDir()
+	s, err := Open(kvstoreapi.Config{
+		Dir:                 dir,
+		SyncMode:            kvstoreapi.SyncNone,
+		AutoVacuumThreshold: 0, // disable vacuum
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keyFor(i)
+		val := []byte(fmt.Sprintf("v%08d", i))
+		if err := s.Put(key, val); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

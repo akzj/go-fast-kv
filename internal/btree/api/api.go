@@ -114,6 +114,10 @@ type Node struct {
 	// Internal node fields:
 	Keys     [][]byte               // separator keys
 	Children []pagestoreapi.PageID  // child PageIDs, len(Children) == len(Keys) + 1
+
+	// DataRef holds the original serialized data buffer to keep zero-copy
+	// slices valid. Must be retained for lifetime of this Node.
+	DataRef []byte
 }
 
 // ─── Serialization ──────────────────────────────────────────────────
@@ -251,6 +255,9 @@ type BTree interface {
 	// Close releases resources held by the BTree.
 	Close() error
 
+	// GetStats returns B-tree operation statistics for metrics/bottleneck analysis.
+	GetStats() BTreeStats
+
 	// NewBulkLoader creates a BulkLoader for efficient bulk loading.
 	// Entries should be sorted by key before calling Build(), or the loader
 	// will sort them automatically.
@@ -264,6 +271,14 @@ type BTree interface {
 	// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID
 	// for MVCC mode. All loaded entries will have the given TxnMin.
 	NewBulkLoaderWithTxn(mode BulkMode, txnID uint64) BulkLoader
+}
+
+// BTreeStats holds B-tree traversal statistics for bottleneck analysis.
+type BTreeStats struct {
+	SearchDepthSum       uint64 // Total search depth across all operations
+	SearchCount          uint64 // Number of search operations
+	RightSiblingNavs     uint64 // B-link correction traversals
+	SplitCount           uint64 // Total leaf node splits
 }
 
 // ─── BulkLoader ─────────────────────────────────────────────────────
@@ -337,10 +352,17 @@ type PageProvider interface {
 	AllocPage() pagestoreapi.PageID
 
 	// ReadPage reads and deserializes a node from the given PageID.
+	// The returned node may be cached — callers must not modify it.
 	ReadPage(pageID pagestoreapi.PageID) (*Node, error)
 
 	// WritePage serializes and writes a node to the given PageID.
 	WritePage(pageID pagestoreapi.PageID, node *Node) error
+
+	// ReadPageUncached reads directly from the underlying store without
+	// going through the LRU cache. No cloneNode is performed.
+	// The caller must hold the appropriate page lock.
+	// Implementations without a cache can simply delegate to ReadPage.
+	ReadPageUncached(pageID pagestoreapi.PageID) (*Node, error)
 }
 
 // ─── Config ─────────────────────────────────────────────────────────
