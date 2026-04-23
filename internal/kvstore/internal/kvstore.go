@@ -101,11 +101,12 @@ type store struct {
 	// when threshold is crossed, cleans up, and exits. Self-triggers
 	// if more garbage accumulated during the pass.
 	vacuumTrigger struct {
-		mu        sync.Mutex   // protects 'running' flag
-		running   bool         // a vacuum goroutine is currently cleaning
-		dirty     atomic.Bool  // opsCount was incremented while running
-		opsCount  atomic.Int64 // total Put+Delete ops since last vacuum
-		totalKeys atomic.Int64 // approximate live entry count
+		mu            sync.Mutex   // protects 'running' flag
+		running       bool         // a vacuum goroutine is currently cleaning
+		dirty         atomic.Bool  // opsCount was incremented while running
+		opsCount      atomic.Int64 // total Put+Delete ops since last vacuum
+		totalKeys     atomic.Int64 // approximate live entry count
+		lastStartNano atomic.Int64 // time.Now().UnixNano() of last vacuum start
 	}
 	vacuumWg sync.WaitGroup // tracks in-flight vacuum goroutines for Close()
 	closing  atomic.Bool   // set early in Close() to signal vacuum goroutines to exit
@@ -1028,6 +1029,12 @@ func (s *store) setVacuumDirty() {
 const defaultAutoVacuumThreshold = 1000
 const defaultAutoVacuumRatio = 0.1
 
+// minVacuumIntervalNanos is the minimum time between vacuum runs.
+// During heavy write loads, vacuum competes for CPU with writes.
+// Throttling vacuum to at most once per 2 seconds significantly reduces
+// GC pressure from vacuum's read-path allocations.
+const minVacuumIntervalNanos = int64(2 * time.Second)
+
 // checkAutoVacuum decides whether to spawn a lazy vacuum goroutine.
 // Called after every Put/Delete. Returns immediately — vacuum runs async.
 //
@@ -1051,6 +1058,14 @@ func (s *store) checkAutoVacuum() {
 		return
 	}
 
+	// Throttle: don't start vacuum if we ran recently.
+	// This prevents vacuum from hogging CPU during sustained write bursts.
+	now := time.Now().UnixNano()
+	lastStart := s.vacuumTrigger.lastStartNano.Load()
+	if lastStart > 0 && now-lastStart < minVacuumIntervalNanos {
+		return
+	}
+
 	// Try to claim the vacuum slot.
 	s.vacuumTrigger.mu.Lock()
 	if s.vacuumTrigger.running {
@@ -1063,6 +1078,7 @@ func (s *store) checkAutoVacuum() {
 		return
 	}
 	s.vacuumTrigger.running = true
+	s.vacuumTrigger.lastStartNano.Store(time.Now().UnixNano())
 	s.vacuumTrigger.mu.Unlock()
 
 	s.vacuumWg.Add(1)
