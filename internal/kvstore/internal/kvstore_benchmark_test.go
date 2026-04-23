@@ -54,10 +54,14 @@ func BenchmarkKVStore_Put_SeqWrite_1k(b *testing.B) {
 		}
 		// Print metrics after benchmark
 		m := s.GetMetrics()
+		hitRate := 0.0
+		if m.PageReads > 0 {
+			hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+		}
 		fmt.Printf("1k: PageReads=%d PageWrites=%d PageSplits=%d BTreeSearchDepth=%d\n",
 			m.PageReads, m.PageWrites, m.PageSplits, m.BTreeSearchDepth)
-		fmt.Printf("     PageReadsPerOp=%.1f SplitsPerOp=%.2f\n",
-			float64(m.PageReads)/1000.0, float64(m.PageSplits)/1000.0)
+		fmt.Printf("     PageReadsPerOp=%.1f SplitsPerOp=%.2f CacheHits=%d HitRate=%.1f%%\n",
+			float64(m.PageReads)/1000.0, float64(m.PageSplits)/1000.0, m.PageCacheHits, hitRate)
 	}
 }
 
@@ -138,6 +142,13 @@ func BenchmarkKVStore_Get_SeqRead_1k(b *testing.B) {
 			s.Get(keyFor(j))
 		}
 	}
+	m := s.GetMetrics()
+	hitRate := 0.0
+	if m.PageReads > 0 {
+		hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+	}
+	fmt.Printf("Get: PageReads=%d PageCacheHits=%d HitRate=%.1f%%\n",
+		m.PageReads, m.PageCacheHits, hitRate)
 }
 
 // ─── 4. Random Read Benchmarks ───────────────────────────────────────
@@ -188,6 +199,13 @@ func BenchmarkKVStore_Get_RandRead_1k(b *testing.B) {
 			s.Get(keys[indices[j]])
 		}
 	}
+	m := s.GetMetrics()
+	hitRate := 0.0
+	if m.PageReads > 0 {
+		hitRate = float64(m.PageCacheHits) / float64(m.PageReads) * 100
+	}
+	fmt.Printf("GetRand: PageReads=%d PageCacheHits=%d HitRate=%.1f%%\n",
+		m.PageReads, m.PageCacheHits, hitRate)
 }
 
 // ─── 5. Batch Write Benchmarks ───────────────────────────────────────
