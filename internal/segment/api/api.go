@@ -75,10 +75,11 @@ func (v VAddr) String() string {
 // ─── Constants ──────────────────────────────────────────────────────
 
 const (
-	// MaxSegmentSize is the maximum size of a single segment file (64MB).
+	// MaxSegmentSize is the maximum size of a single segment file (512MB).
 	// When the active segment reaches this size, it is sealed and a new
-	// segment is opened via Rotate().
-	MaxSegmentSize = 64 * 1024 * 1024 // 64 MB
+	// segment is opened via Rotate(). VAddr.Offset (uint32) supports up
+	// to 4GB per segment; this default balances file count vs mmap size.
+	MaxSegmentSize = 512 * 1024 * 1024 // 512 MB
 )
 
 // ─── Interface ──────────────────────────────────────────────────────
@@ -184,7 +185,7 @@ type Config struct {
 	Dir string
 
 	// MaxSize is the maximum size of a single segment file in bytes.
-	// Defaults to MaxSegmentSize (64MB) if zero.
+	// Defaults to MaxSegmentSize (512MB) if zero.
 	MaxSize int64
 
 	// Magic is the 8-byte magic number for segment headers.

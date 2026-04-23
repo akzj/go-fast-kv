@@ -57,7 +57,7 @@ import (
 // that started at or after this point are invisible to the reader.
 
 const (
-	defaultMaxSegmentSize  = 64 * 1024 * 1024 // 64 MB
+	defaultMaxSegmentSize  = 512 * 1024 * 1024 // 512 MB
 	defaultInlineThreshold = 256
 )
 

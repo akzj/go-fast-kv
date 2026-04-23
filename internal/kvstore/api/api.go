@@ -349,7 +349,7 @@ type Config struct {
 	Dir string
 
 	// MaxSegmentSize is the maximum size of a segment file in bytes.
-	// Defaults to 64MB if zero.
+	// Defaults to 512MB if zero.
 	MaxSegmentSize int64
 
 	// InlineThreshold is the max value size for inline storage in B-tree.
