@@ -23,6 +23,15 @@ var serializeBufPool = sync.Pool{
 	},
 }
 
+// walCollectorPool reuses WALCollector objects. Each Put/Delete operation
+// registers a collector (~1.9M objects per 1M writes); pooling avoids
+// repeated heap allocation.
+var walCollectorPool = sync.Pool{
+	New: func() interface{} {
+		return &WALCollector{}
+	},
+}
+
 // ─── Page Cache (LRU) ──────────────────────────────────────────────
 
 // pageCache is a thread-safe LRU cache for deserialized B-tree nodes.
@@ -174,9 +183,13 @@ func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageP
 //	entries := collector.PageEntries
 func (p *RealPageProvider) RegisterCollector() (*WALCollector, func()) {
 	gid := goid.Get()
-	c := &WALCollector{}
+	c := walCollectorPool.Get().(*WALCollector)
+	c.PageEntries = c.PageEntries[:0]
 	p.collectors.Store(gid, c)
-	return c, func() { p.collectors.Delete(gid) }
+	return c, func() {
+		p.collectors.Delete(gid)
+		walCollectorPool.Put(c)
+	}
 }
 
 // CollectAndClear retrieves all WAL entries from the current goroutine's collector,

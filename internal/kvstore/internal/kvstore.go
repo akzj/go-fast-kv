@@ -395,10 +395,12 @@ func (s *store) Put(key, value []byte) error {
 
 	// WAL fsync provides durability. If this fails, abort the transaction
 	// so the entry never becomes visible.
-	if _, err := s.wal.WriteBatch(batch); err != nil {
+	_, walErr := s.wal.WriteBatch(batch)
+	walBatchPool.Put(batch)
+	if walErr != nil {
 		s.txnMgr.Abort(xid)
 		s.metrics.incError()
-		return err
+		return walErr
 	}
 
 	// WAL succeeded — commit the transaction to make entry visible.
@@ -581,10 +583,12 @@ func (s *store) Delete(key []byte) error {
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
 	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
 
-	if _, err := s.wal.WriteBatch(batch); err != nil {
+	_, walErr := s.wal.WriteBatch(batch)
+	walBatchPool.Put(batch)
+	if walErr != nil {
 		s.txnMgr.Abort(xid)
 		s.metrics.incError()
-		return err
+		return walErr
 	}
 
 	// WAL succeeded — commit the transaction to make entry visible.
@@ -1236,6 +1240,13 @@ func (s *store) runBlobGC() {
 
 // ─── assembleBatchFromCollectors ────────────────────────────────────
 
+// walBatchPool reuses WAL Batch objects (~966K allocations per 1M writes).
+var walBatchPool = sync.Pool{
+	New: func() interface{} {
+		return walapi.NewBatch()
+	},
+}
+
 // assembleBatchFromCollectors builds a WAL batch from per-operation collectors.
 // This replaces the old assembleBatch that drained shared buffers.
 //
@@ -1249,7 +1260,8 @@ func assembleBatchFromCollectors(
 	rootPageID uint64,
 	commitEntry txnapi.WALEntry,
 ) *walapi.Batch {
-	batch := walapi.NewBatch()
+	batch := walBatchPool.Get().(*walapi.Batch)
+	batch.Reset()
 
 	// Drain collectors AFTER tree.Put completes (inside this function, not before).
 	// The btree collector was populated during tree.Put → WritePage.
@@ -1290,6 +1302,13 @@ type blobCollector struct {
 	Entries []blobstoreapi.WALEntry
 }
 
+// blobCollectorPool reuses blobCollector objects (~1.7M allocations per 1M writes).
+var blobCollectorPool = sync.Pool{
+	New: func() interface{} {
+		return &blobCollector{}
+	},
+}
+
 // blobWriterAdapter adapts BlobStore to btreeapi.BlobWriter,
 // collecting WAL entries per-operation via goroutine-keyed collectors.
 type blobWriterAdapter struct {
@@ -1301,9 +1320,13 @@ type blobWriterAdapter struct {
 // for the current goroutine. Returns the collector and an unregister function.
 func (a *blobWriterAdapter) registerCollector() (*blobCollector, func()) {
 	gid := goroutineID()
-	c := &blobCollector{}
+	c := blobCollectorPool.Get().(*blobCollector)
+	c.Entries = c.Entries[:0]
 	a.collectors.Store(gid, c)
-	return c, func() { a.collectors.Delete(gid) }
+	return c, func() {
+		a.collectors.Delete(gid)
+		blobCollectorPool.Put(c)
+	}
 }
 
 // CollectAndClear retrieves all blob WAL entries from the current goroutine's collector,
@@ -1548,9 +1571,11 @@ func (wb *writeBatch) Commit() error {
 	// readers see either all entries (after Commit) or none (before Commit).
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
 	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
-	if _, err := s.wal.WriteBatch(batch); err != nil {
+	_, walErr := s.wal.WriteBatch(batch)
+	walBatchPool.Put(batch)
+	if walErr != nil {
 		s.txnMgr.Abort(xid)
-		return err
+		return walErr
 	}
 
 	// WAL succeeded — commit the transaction to make entry visible.

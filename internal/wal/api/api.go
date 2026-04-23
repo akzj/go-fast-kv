@@ -190,6 +190,11 @@ func (b *Batch) Len() int {
 	return len(b.Records)
 }
 
+// Reset clears the batch for reuse, retaining the underlying slice capacity.
+func (b *Batch) Reset() {
+	b.Records = b.Records[:0]
+}
+
 // ─── Interface ──────────────────────────────────────────────────────
 
 // WAL is the shared Write-Ahead Log.
