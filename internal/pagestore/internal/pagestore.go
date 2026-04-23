@@ -217,6 +217,101 @@ func (ps *pageStore) Write(pageID pagestoreapi.PageID, data []byte) (pagestoreap
 	return pagestoreapi.WALEntry{Type: 1, ID: pageID, VAddr: packed, Size: 0}, nil
 }
 
+// WriteDirect writes a page by reserving space directly in the segment's
+// mmap region and letting the caller serialize into it. This eliminates
+// two intermediate 4KB buffer copies compared to Write.
+//
+// Layout in segment: [pageID(8)][data(4096)][crc32(4)] = 4108 bytes.
+func (ps *pageStore) WriteDirect(pageID pagestoreapi.PageID, serializeFn func(buf []byte) error) (pagestoreapi.WALEntry, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.closed {
+		return pagestoreapi.WALEntry{}, pagestoreapi.ErrClosed
+	}
+
+	// Look up old mapping before overwriting (needed for stats decrement).
+	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
+
+	// Try zero-copy path: reserve space in segment mmap.
+	vaddr, slice, err := ps.segMgr.Reserve(pagestoreapi.PageRecordSize)
+	if err == segmentapi.ErrSegmentFull {
+		if rotErr := ps.segMgr.Rotate(); rotErr != nil {
+			return pagestoreapi.WALEntry{}, fmt.Errorf("pagestore: rotate on full: %w", rotErr)
+		}
+		vaddr, slice, err = ps.segMgr.Reserve(pagestoreapi.PageRecordSize)
+	}
+	if err != nil {
+		// Fallback to old Append path if Reserve fails (e.g., no mmap).
+		return ps.writeViaAppend(pageID, oldPacked, serializeFn)
+	}
+
+	// Write directly into mmap slice: [pageID(8)][data(4096)][crc(4)]
+	binary.BigEndian.PutUint64(slice[:8], pageID)
+	if err := serializeFn(slice[8 : 8+pagestoreapi.PageSize]); err != nil {
+		return pagestoreapi.WALEntry{}, err
+	}
+	checksum := crc32.ChecksumIEEE(slice[:8+pagestoreapi.PageSize])
+	binary.BigEndian.PutUint32(slice[8+pagestoreapi.PageSize:], checksum)
+
+	packed := vaddr.Pack()
+	ps.lsm.SetPageMapping(uint64(pageID), packed)
+	if ps.cache != nil {
+		ps.cache.Invalidate(uint64(pageID))
+	}
+
+	// Stats update.
+	if ps.statsMgr != nil {
+		if oldPacked != 0 {
+			oldSegID := uint32(oldPacked >> 32)
+			ps.statsMgr.Decrement(oldSegID, 1, int64(pagestoreapi.PageRecordSize))
+		}
+		ps.statsMgr.Increment(vaddr.SegmentID, 1, int64(pagestoreapi.PageRecordSize))
+	}
+
+	return pagestoreapi.WALEntry{Type: 1, ID: pageID, VAddr: packed, Size: 0}, nil
+}
+
+// writeViaAppend is the fallback path using Append+copy when Reserve is unavailable.
+func (ps *pageStore) writeViaAppend(pageID pagestoreapi.PageID, oldPacked uint64, serializeFn func(buf []byte) error) (pagestoreapi.WALEntry, error) {
+	bp := pageRecordPool.Get().(*[]byte)
+	defer pageRecordPool.Put(bp)
+	record := *bp
+	binary.BigEndian.PutUint64(record[:8], pageID)
+	if err := serializeFn(record[8 : 8+pagestoreapi.PageSize]); err != nil {
+		return pagestoreapi.WALEntry{}, err
+	}
+	checksum := crc32.ChecksumIEEE(record[:8+pagestoreapi.PageSize])
+	binary.BigEndian.PutUint32(record[8+pagestoreapi.PageSize:], checksum)
+
+	vaddr, err := ps.segMgr.Append(record)
+	if err == segmentapi.ErrSegmentFull {
+		if rotErr := ps.segMgr.Rotate(); rotErr != nil {
+			return pagestoreapi.WALEntry{}, fmt.Errorf("pagestore: rotate on full: %w", rotErr)
+		}
+		vaddr, err = ps.segMgr.Append(record)
+	}
+	if err != nil {
+		return pagestoreapi.WALEntry{}, err
+	}
+
+	packed := vaddr.Pack()
+	ps.lsm.SetPageMapping(uint64(pageID), packed)
+	if ps.cache != nil {
+		ps.cache.Invalidate(uint64(pageID))
+	}
+
+	// Stats update.
+	if ps.statsMgr != nil {
+		if oldPacked != 0 {
+			oldSegID := uint32(oldPacked >> 32)
+			ps.statsMgr.Decrement(oldSegID, 1, int64(pagestoreapi.PageRecordSize))
+		}
+		ps.statsMgr.Increment(vaddr.SegmentID, 1, int64(pagestoreapi.PageRecordSize))
+	}
+
+	return pagestoreapi.WALEntry{Type: 1, ID: pageID, VAddr: packed, Size: 0}, nil
+}
+
 func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 	if ps.cache != nil {
 		if data := ps.cache.Get(uint64(pageID)); data != nil {

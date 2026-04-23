@@ -103,6 +103,21 @@ type PageStore interface {
 	// Returns ErrPageNotFound if the page has not been allocated or was freed.
 	Read(pageID PageID) ([]byte, error)
 
+	// WriteDirect writes a page by serializing directly into the segment's
+	// mmap region, eliminating intermediate buffer copies.
+	//
+	// The serializeFn receives a PageSize (4096-byte) slice that points
+	// directly into the mmap'd segment file. The function must write
+	// exactly PageSize bytes into buf.
+	//
+	// Layout in segment: [pageID(8)][data(4096)][crc32(4)] = 4108 bytes.
+	//
+	// If the underlying segment does not support Reserve (no mmap), falls
+	// back to the standard Append path with a pooled buffer.
+	//
+	// Returns ErrClosed if the store is closed.
+	WriteDirect(pageID PageID, serializeFn func(buf []byte) error) (WALEntry, error)
+
 	// Free marks a PageID as freed. The mapping is cleared.
 	//
 	// Returns a WAL record (RecordPageFree) that the caller must
