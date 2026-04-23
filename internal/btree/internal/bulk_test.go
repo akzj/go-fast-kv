@@ -671,7 +671,7 @@ func TestBulkLoadEntryDistribution(t *testing.T) {
     mp := NewMemPageProvider()
     tree := New(btreeapi.Config{}, mp, nil)
     defer tree.Close()
-    
+
     entries := make([]btreeapi.KVPair, 200)
     for i := 0; i < 200; i++ {
         entries[i] = btreeapi.KVPair{
@@ -679,25 +679,32 @@ func TestBulkLoadEntryDistribution(t *testing.T) {
             Value: []byte(fmt.Sprintf("v%04d", i)),
         }
     }
-    
+
     loader := tree.NewBulkLoader(btreeapi.BulkModeFast)
     loader.AddSorted(entries)
     rootPID, _ := loader.Build()
     tree.SetRootPageID(rootPID)
-    
+
     // Check root structure
     root, _ := mp.ReadPage(rootPID)
-    t.Logf("Root: IsLeaf=%v, Count=%d, HighKey=%v", root.IsLeaf, root.Count, root.HighKey)
-    
-    if !root.IsLeaf {
-        t.Logf("Keys: %v", root.Keys)
-        t.Logf("Children: %v", root.Children)
-        
+    t.Logf("Root: IsLeaf=%v, Count=%d, HighKey=%v", root.IsLeaf(), root.Count(), root.HighKey())
+
+    if !root.IsLeaf() {
+        keys := make([][]byte, 0, root.Count())
+        children := make([]uint64, 0, root.Count()+1)
+        children = append(children, root.Child0())
+        for i := 0; i < root.Count(); i++ {
+            keys = append(keys, root.InternalKey(i))
+            children = append(children, root.InternalChild(i))
+        }
+        t.Logf("Keys: %v", keys)
+        t.Logf("Children: %v", children)
+
         // Check each child
-        for i, childPID := range root.Children {
+        for i, childPID := range children {
             child, _ := mp.ReadPage(childPID)
             t.Logf("Child[%d]: IsLeaf=%v, Count=%d, HighKey=%v, Next=%d",
-                i, child.IsLeaf, child.Count, child.HighKey, child.Next)
+                i, child.IsLeaf(), child.Count(), child.HighKey(), child.Next())
         }
     }
 }
