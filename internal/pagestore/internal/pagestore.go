@@ -235,18 +235,24 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 	if !ok || vaddr == 0 {
 		return nil, pagestoreapi.ErrPageNotFound
 	}
-	raw, err := ps.segMgr.ReadAt(segmentapi.UnpackVAddr(vaddr), pagestoreapi.PageRecordSize)
+	// Use pooled buffer for the raw read to avoid 4108-byte allocation per read.
+	bp := pageRecordPool.Get().(*[]byte)
+	raw := *bp
+	err := ps.segMgr.ReadAtInto(segmentapi.UnpackVAddr(vaddr), raw)
 	if err != nil {
+		pageRecordPool.Put(bp)
 		return nil, err
 	}
 	expected := binary.BigEndian.Uint32(raw[8+pagestoreapi.PageSize:])
 	actual := crc32.ChecksumIEEE(raw[:8+pagestoreapi.PageSize])
 	if expected != actual {
+		pageRecordPool.Put(bp)
 		return nil, fmt.Errorf("%w: pageID=%d expected=0x%08x actual=0x%08x",
 			pagestoreapi.ErrChecksumMismatch, pageID, expected, actual)
 	}
 	result := make([]byte, pagestoreapi.PageSize)
 	copy(result, raw[8:8+pagestoreapi.PageSize])
+	pageRecordPool.Put(bp)
 	if ps.cache != nil {
 		ps.cache.Put(uint64(pageID), result)
 	}

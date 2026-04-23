@@ -117,6 +117,16 @@ type SegmentManager interface {
 	// ReadAt is safe for concurrent use by multiple goroutines.
 	ReadAt(addr VAddr, size uint32) ([]byte, error)
 
+	// ReadAtInto reads exactly len(buf) bytes starting at the given VAddr
+	// into the provided buffer. This avoids allocation compared to ReadAt.
+	//
+	// Returns ErrInvalidVAddr if:
+	//   - The segment file for addr.SegmentID does not exist
+	//   - addr.Offset + len(buf) exceeds the segment's written length
+	//
+	// ReadAtInto is safe for concurrent use by multiple goroutines.
+	ReadAtInto(addr VAddr, buf []byte) error
+
 	// Sync flushes the active segment's data to durable storage (fsync).
 	//
 	// Must be called after Append and before the corresponding WAL

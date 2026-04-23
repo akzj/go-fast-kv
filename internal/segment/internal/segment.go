@@ -387,6 +387,44 @@ func (sm *segmentManager) ReadAt(addr segmentapi.VAddr, size uint32) ([]byte, er
 	return buf, nil
 }
 
+func (sm *segmentManager) ReadAtInto(addr segmentapi.VAddr, buf []byte) error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	if sm.closed {
+		return segmentapi.ErrClosed
+	}
+
+	sf := sm.findSegment(addr.SegmentID)
+	if sf == nil {
+		return fmt.Errorf("segment %d not found: %w", addr.SegmentID, segmentapi.ErrInvalidVAddr)
+	}
+
+	size := len(buf)
+	fileOffset := sf.headerSize + int64(addr.Offset)
+	end := fileOffset + int64(size)
+	if end > sf.size {
+		return fmt.Errorf("read beyond segment end (off=%d size=%d segSize=%d headerSize=%d): %w",
+			addr.Offset, size, sf.size, sf.headerSize, segmentapi.ErrInvalidVAddr)
+	}
+
+	// Fast path: copy from mmap'd slice (no syscall).
+	if sf.data != nil {
+		copy(buf, sf.data[fileOffset:fileOffset+int64(size)])
+		return nil
+	}
+
+	// Slow path: syscall ReadAt (active segment, or mmap fallback).
+	n, err := sf.file.ReadAt(buf, fileOffset)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("segment: readat: %w", err)
+	}
+	if n != size {
+		return fmt.Errorf("segment: short read: %d/%d", n, size)
+	}
+	return nil
+}
+
 func (sm *segmentManager) Sync() error {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
