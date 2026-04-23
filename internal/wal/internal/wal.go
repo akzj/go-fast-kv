@@ -46,6 +46,12 @@ type walResult struct {
 	err error
 }
 
+// batchResult holds per-request outcome in processBatch.
+type batchResult struct {
+	lsn uint64
+	err error
+}
+
 // ─── WAL ────────────────────────────────────────────────────────────
 
 // wal implements walapi.WAL with segmented storage and group commit.
@@ -68,6 +74,11 @@ type wal struct {
 
 	// Batch size limits
 	maxBatchSize int // max requests to drain per batch (from config, default 1024)
+
+	// Reusable buffers for processBatch (single consumer goroutine — no lock needed).
+	combinedBuf []byte        // accumulates serialized batches across pending requests
+	serBuf      []byte        // scratch buffer for serializeBatchLocked
+	results     []batchResult // per-request results, reused across processBatch calls
 }
 
 type segmentInfo struct {
@@ -382,28 +393,30 @@ func (w *wal) processBatch(pending []walRequest) {
 
 	savedLSN := w.currentLSN
 
-	type batchResult struct {
-		lsn uint64
-		err error
+	// Reuse results slice (single consumer goroutine — no contention).
+	if cap(w.results) < len(pending) {
+		w.results = make([]batchResult, len(pending))
+	} else {
+		w.results = w.results[:len(pending)]
 	}
-	results := make([]batchResult, len(pending))
+	results := w.results
 
-	var combinedBuf []byte
+	// Reuse combinedBuf (reset length, keep capacity).
+	w.combinedBuf = w.combinedBuf[:0]
 
 	for i, p := range pending {
 		if w.closed.Load() {
 			results[i] = batchResult{err: walapi.ErrClosed}
 			continue
 		}
-		buf := w.serializeBatchLocked(p.batch)
-		combinedBuf = append(combinedBuf, buf...)
+		w.combinedBuf = w.serializeBatchAppend(p.batch, w.combinedBuf)
 		results[i] = batchResult{lsn: w.currentLSN}
 	}
 
 	var writeErr, syncErr error
-	if len(combinedBuf) > 0 {
+	if len(w.combinedBuf) > 0 {
 		info, err := w.activeFile.Stat()
-		if err == nil && info.Size()+int64(len(combinedBuf)) > w.segmentSize {
+		if err == nil && info.Size()+int64(len(w.combinedBuf)) > w.segmentSize {
 			if err := w.rotateLocked(); err != nil {
 				writeErr = err
 				w.currentLSN = savedLSN
@@ -411,7 +424,7 @@ func (w *wal) processBatch(pending []walRequest) {
 		}
 
 		if writeErr == nil {
-			if _, writeErr = w.activeFile.Write(combinedBuf); writeErr != nil {
+			if _, writeErr = w.activeFile.Write(w.combinedBuf); writeErr != nil {
 				writeErr = fmt.Errorf("wal: write: %w", writeErr)
 				w.currentLSN = savedLSN
 			} else if w.syncMode == 0 {
@@ -434,27 +447,35 @@ func (w *wal) processBatch(pending []walRequest) {
 	}
 }
 
-// serializeBatchLocked assigns LSNs, computes CRCs, and returns serialized bytes.
-func (w *wal) serializeBatchLocked(batch *walapi.Batch) []byte {
+// serializeBatchAppend assigns LSNs, computes CRCs, and appends the
+// serialized batch to dst. It reuses w.serBuf as scratch space to avoid
+// allocating a new buffer per batch.
+func (w *wal) serializeBatchAppend(batch *walapi.Batch, dst []byte) []byte {
 	count := uint32(batch.Len())
-	totalSize := uint32(walapi.BatchHeaderSize + count*walapi.RecordSize)
-	buf := make([]byte, totalSize)
+	totalSize := int(walapi.BatchHeaderSize + count*walapi.RecordSize)
+
+	// Grow scratch buffer if needed (single goroutine — safe).
+	if cap(w.serBuf) < totalSize {
+		w.serBuf = make([]byte, totalSize)
+	}
+	buf := w.serBuf[:totalSize]
 
 	binary.LittleEndian.PutUint32(buf[0:4], count)
-	binary.LittleEndian.PutUint32(buf[4:8], totalSize)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(totalSize))
+	binary.LittleEndian.PutUint32(buf[8:12], 0) // zero CRC field before computing
 
 	for i := range batch.Records {
 		w.currentLSN++
 		batch.Records[i].LSN = w.currentLSN
 
-		off := walapi.BatchHeaderSize + uint32(i)*walapi.RecordSize
-		serializeRecordLocked(buf[off:off+walapi.RecordSize], &batch.Records[i])
+		off := int(walapi.BatchHeaderSize) + i*int(walapi.RecordSize)
+		serializeRecordLocked(buf[off:off+int(walapi.RecordSize)], &batch.Records[i])
 	}
 
 	batchCRC := crc32c(buf)
 	binary.LittleEndian.PutUint32(buf[8:12], batchCRC)
 
-	return buf
+	return append(dst, buf...)
 }
 
 func serializeRecordLocked(buf []byte, r *walapi.Record) {
