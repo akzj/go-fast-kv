@@ -143,10 +143,10 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		if err == nil {
 			blobID = bid
 		} else {
-			inlineVal = cloneBytes(value)
+			inlineVal = value
 		}
 	} else {
-		inlineVal = cloneBytes(value)
+		inlineVal = value
 	}
 
 	// Calculate entry size needed
@@ -171,12 +171,12 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		leaf.SetHighKey(splitKey)
 
 		// Determine which page gets the new entry
-		pos := leaf.FindInsertPos(cloneBytes(key), txnID)
+		pos := leaf.FindInsertPos(key, txnID)
 		if bytes.Compare(key, splitKey) >= 0 {
-			rPos := right.FindInsertPos(cloneBytes(key), txnID)
-			right.InsertLeafEntry(rPos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
+			rPos := right.FindInsertPos(key, txnID)
+			right.InsertLeafEntry(rPos, key, txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
 		} else {
-			leaf.InsertLeafEntry(pos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
+			leaf.InsertLeafEntry(pos, key, txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
 		}
 
 		if err := t.pages.WritePage(rightPID, right); err != nil {
@@ -193,8 +193,8 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 	}
 
 	// No split needed — direct insert
-	pos := leaf.FindInsertPos(cloneBytes(key), txnID)
-	if err := leaf.InsertLeafEntry(pos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID); err != nil {
+	pos := leaf.FindInsertPos(key, txnID)
+	if err := leaf.InsertLeafEntry(pos, key, txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID); err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
 	}
@@ -261,6 +261,7 @@ func (t *bTree) splitLeafPage(page *Page) (splitKey []byte, right *Page) {
 // ─── Search (§3.8.2 search phase) ──────────────────────────────────
 
 func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
+	path = make([]uint64, 0, 4) // pre-alloc for typical tree depth
 	currentPID := t.rootPageID.Load()
 	depth := 0
 
@@ -347,12 +348,12 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 				rPos := sort.Search(rightPage.Count(), func(i int) bool {
 					return bytes.Compare(splitKey, rightPage.InternalKey(i)) <= 0
 				})
-				rightPage.InsertInternalEntry(rPos, cloneBytes(splitKey), newChildPID)
+				rightPage.InsertInternalEntry(rPos, splitKey, newChildPID)
 			} else {
 				pos = sort.Search(parent.Count(), func(i int) bool {
 					return bytes.Compare(splitKey, parent.InternalKey(i)) <= 0
 				})
-				parent.InsertInternalEntry(pos, cloneBytes(splitKey), newChildPID)
+				parent.InsertInternalEntry(pos, splitKey, newChildPID)
 			}
 
 			if err := t.pages.WritePage(newParentPID, rightPage); err != nil {
@@ -371,7 +372,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 		}
 
 		// Insert fits — no split needed
-		if err := parent.InsertInternalEntry(pos, cloneBytes(splitKey), newChildPID); err != nil {
+		if err := parent.InsertInternalEntry(pos, splitKey, newChildPID); err != nil {
 			t.pageLocks.WUnlock(parentPID)
 			return err
 		}
@@ -387,7 +388,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	t.bootstrapMu.Lock()
 	newRoot := NewInternalPage()
 	newRoot.SetChild0(t.rootPageID.Load())
-	newRoot.InsertInternalEntry(0, cloneBytes(splitKey), newChildPID)
+	newRoot.InsertInternalEntry(0, splitKey, newChildPID)
 	newRootPID := t.pages.AllocPage()
 	if err := t.pages.WritePage(newRootPID, newRoot); err != nil {
 		t.bootstrapMu.Unlock()
