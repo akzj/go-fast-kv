@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
@@ -70,10 +71,20 @@ var (
 	ErrPageFull = errors.New("btree: page full")
 )
 
+// pageDataPool amortizes 4096-byte buffer allocations for page clones.
+// Buffers are returned to the pool when evicted from hotPages or LRU cache.
+var pageDataPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, btreeapi.PageSize)
+		return &buf
+	},
+}
+
 // Page is a []byte view of a 4096-byte B-tree page.
 // All operations directly read/write the underlying byte buffer.
 type Page struct {
-	data []byte // exactly btreeapi.PageSize bytes
+	data    []byte  // exactly btreeapi.PageSize bytes
+	poolBuf *[]byte // non-nil if data came from pageDataPool
 }
 
 // ─── Construction ───────────────────────────────────────────────────
@@ -105,6 +116,25 @@ func (p *Page) Clone() *Page {
 	cp := make([]byte, btreeapi.PageSize)
 	copy(cp, p.data)
 	return &Page{data: cp}
+}
+
+// ClonePooled returns a deep copy using a buffer from pageDataPool.
+// The returned page's buffer can be returned to the pool via ReleaseToPool().
+func (p *Page) ClonePooled() *Page {
+	bp := pageDataPool.Get().(*[]byte)
+	buf := *bp
+	copy(buf, p.data)
+	return &Page{data: buf, poolBuf: bp}
+}
+
+// ReleaseToPool returns the page's data buffer to the pool (if it was pooled).
+// After ReleaseToPool, the page must not be used.
+func (p *Page) ReleaseToPool() {
+	if p.poolBuf != nil {
+		pageDataPool.Put(p.poolBuf)
+		p.poolBuf = nil
+		p.data = nil
+	}
 }
 
 // ─── Header Accessors ───────────────────────────────────────────────

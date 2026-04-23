@@ -48,23 +48,30 @@ func newPageCache(capacity int) *pageCache {
 }
 
 // Get returns a clone of the cached page, or (nil, false) on miss.
+// Uses pooled buffers to reduce GC pressure.
 func (c *pageCache) Get(pageID pagestoreapi.PageID) (*Page, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if entry, ok := c.items[pageID]; ok {
 		c.order.MoveToFront(entry.elem)
-		return entry.page.Clone(), true
+		return entry.page.ClonePooled(), true
 	}
 	return nil, false
 }
 
 // Put stores the page in the cache, evicting the LRU entry if at capacity.
+// Evicted pages have their pooled buffers returned to the pool.
 func (c *pageCache) Put(pageID pagestoreapi.PageID, page *Page) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if entry, ok := c.items[pageID]; ok {
+		old := entry.page
 		entry.page = page
 		c.order.MoveToFront(entry.elem)
+		// Release the old page's pooled buffer (if any).
+		if old != nil {
+			old.ReleaseToPool()
+		}
 		return
 	}
 	// Evict LRU if at capacity.
@@ -74,6 +81,10 @@ func (c *pageCache) Put(pageID pagestoreapi.PageID, page *Page) {
 			evicted := back.Value.(*pageCacheEntry)
 			delete(c.items, evicted.pageID)
 			c.order.Remove(back)
+			// Return evicted page's buffer to the pool.
+			if evicted.page != nil {
+				evicted.page.ReleaseToPool()
+			}
 		}
 	}
 	entry := &pageCacheEntry{pageID: pageID, page: page}
@@ -220,12 +231,13 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 
 // ReadPageForWrite returns a clone of the page, safe for in-place mutation.
 // Must be used when the caller intends to modify the page data (under WLock).
+// Uses pooled buffers to reduce GC pressure.
 func (p *RealPageProvider) ReadPageForWrite(pageID pagestoreapi.PageID) (*Page, error) {
 	page, err := p.ReadPage(pageID)
 	if err != nil {
 		return nil, err
 	}
-	return page.Clone(), nil
+	return page.ClonePooled(), nil
 }
 
 // ReadPageUncached reads directly from the underlying PageStore without
@@ -254,7 +266,11 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) err
 	}
 
 	// Update both caches with the new version.
+	// Release the old hotPages entry's pooled buffer (if any) before replacing.
 	p.hotMu.Lock()
+	if old, ok := p.hotPages[pageID]; ok && old != nil {
+		old.ReleaseToPool()
+	}
 	p.hotPages[pageID] = page
 	p.hotMu.Unlock()
 	p.cache.Put(pageID, page)
