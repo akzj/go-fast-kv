@@ -74,12 +74,15 @@ func (s *nodeSerializer) SerializeInto(node *btreeapi.Node, buf []byte) error {
 	if needed > btreeapi.PageSize {
 		return fmt.Errorf("%w: need %d bytes", errNodeTooLarge, needed)
 	}
-	// Clear the buffer — pool buffers may have stale data from previous use.
-	// Only need to clear up to PageSize since that's all we write.
-	for i := range buf[:btreeapi.PageSize] {
+	// Serialize first, then clear only the unused tail.
+	// serializeInto writes all bytes in [0:needed] explicitly.
+	// Only [needed:PageSize] might have stale data from previous use.
+	// Typical node uses 3000-3800 bytes, so we clear ~200-1000 bytes
+	// instead of 4096 — saves ~70-80% of the memset cost.
+	s.serializeInto(node, buf)
+	for i := needed; i < btreeapi.PageSize; i++ {
 		buf[i] = 0
 	}
-	s.serializeInto(node, buf)
 	return nil
 }
 
