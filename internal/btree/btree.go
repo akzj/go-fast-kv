@@ -15,10 +15,16 @@ type (
 	RealPageProvider = internal.RealPageProvider
 	MemPageProvider  = internal.MemPageProvider
 	WALCollector     = internal.WALCollector
+	NodePageAdapter  = internal.NodePageAdapter
 )
 
-// New creates a new BTree.
-func New(cfg btreeapi.Config, pages btreeapi.PageProvider, blobs btreeapi.BlobWriter) btreeapi.BTree {
+// New creates a new BTree backed by a MemPageProvider (for testing).
+func New(cfg btreeapi.Config, pages *MemPageProvider, blobs btreeapi.BlobWriter) btreeapi.BTree {
+	return internal.New(cfg, pages, blobs)
+}
+
+// NewWithRealProvider creates a new BTree backed by a RealPageProvider.
+func NewWithRealProvider(cfg btreeapi.Config, pages *RealPageProvider, blobs btreeapi.BlobWriter) btreeapi.BTree {
 	return internal.New(cfg, pages, blobs)
 }
 
@@ -28,8 +34,6 @@ func NewNodeSerializer() btreeapi.NodeSerializer {
 }
 
 // NewRealPageProvider creates a PageProvider backed by a PageStore.
-// cacheSize is the maximum number of B-tree page entries in the LRU cache.
-// Defaults to 8192 if zero.
 func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageProvider {
 	return internal.NewRealPageProvider(store, cacheSize)
 }
@@ -37,4 +41,11 @@ func NewRealPageProvider(store pagestoreapi.PageStore, cacheSize int) *RealPageP
 // NewMemPageProvider creates an in-memory PageProvider for testing.
 func NewMemPageProvider() *MemPageProvider {
 	return internal.NewMemPageProvider()
+}
+
+// NewNodePageAdapter creates an adapter that wraps *RealPageProvider
+// and implements btreeapi.PageProvider for backward compatibility
+// with consumers (vacuum, etc.) that still use *btreeapi.Node.
+func NewNodePageAdapter(provider *RealPageProvider) *NodePageAdapter {
+	return internal.NewNodePageAdapter(provider)
 }

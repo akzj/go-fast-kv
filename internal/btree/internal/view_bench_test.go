@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
@@ -16,7 +17,7 @@ func BenchmarkViewPut(b *testing.B) {
 
 	// Bootstrap root
 	pid := provider.AllocPage()
-	root := &btreeapi.Node{IsLeaf: true}
+	root := NewLeafPage()
 	provider.WritePage(pid, root)
 
 	b.ResetTimer()
@@ -26,26 +27,21 @@ func BenchmarkViewPut(b *testing.B) {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		value := []byte(fmt.Sprintf("value-%d", i))
 
-		// Read (returns *Node directly, no clone)
-		node, _ := provider.ReadPage(pid)
+		// Read (returns *Page directly, no clone)
+		page, _ := provider.ReadPage(pid)
 
-		// Insert
-		entry := btreeapi.LeafEntry{
-			Key:    cloneBytes(key),
-			TxnMin: uint64(i),
-			TxnMax: btreeapi.TxnMaxInfinity,
-			Value:  btreeapi.Value{Inline: cloneBytes(value)},
+		// Insert at end (simplified — real btree does binary search)
+		pos := page.Count()
+		err := page.InsertLeafEntry(pos, key, uint64(i), math.MaxUint64, value, 0)
+		if err != nil {
+			// Page full — create new page (simplified)
+			pid = provider.AllocPage()
+			page = NewLeafPage()
+			page.InsertLeafEntry(0, key, uint64(i), math.MaxUint64, value, 0)
 		}
-		pos := 0
-		for pos < len(node.Entries) && bytes.Compare(key, node.Entries[pos].Key) > 0 {
-			pos++
-		}
-		node.Entries = append(node.Entries, btreeapi.LeafEntry{})
-		copy(node.Entries[pos+1:], node.Entries[pos:])
-		node.Entries[pos] = entry
 
-		// Write (returns *Node directly, no Serialize)
-		provider.WritePage(pid, node)
+		// Write (returns *Page directly, no Serialize)
+		provider.WritePage(pid, page)
 	}
 }
 
@@ -53,21 +49,20 @@ func BenchmarkViewPut(b *testing.B) {
 func BenchmarkViewGet(b *testing.B) {
 	provider := NewCachedMemPageProvider()
 
-	// Populate with 1000 entries
+	// Populate with entries (fill as many as fit in one page)
 	pid := provider.AllocPage()
-	node := &btreeapi.Node{IsLeaf: true}
+	page := NewLeafPage()
+	count := 0
 	for i := 0; i < 1000; i++ {
 		key := []byte(fmt.Sprintf("key-%04d", i))
 		value := []byte(fmt.Sprintf("value-%04d", i))
-		node.Entries = append(node.Entries, btreeapi.LeafEntry{
-			Key:    key,
-			TxnMin: uint64(i),
-			TxnMax: btreeapi.TxnMaxInfinity,
-			Value:  btreeapi.Value{Inline: value},
-		})
+		err := page.InsertLeafEntry(count, key, uint64(i), math.MaxUint64, value, 0)
+		if err != nil {
+			break // page full
+		}
+		count++
 	}
-	node.Count = uint16(len(node.Entries))
-	provider.WritePage(pid, node)
+	provider.WritePage(pid, page)
 
 	txnID := uint64(999)
 
@@ -75,17 +70,21 @@ func BenchmarkViewGet(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key-%04d", i%1000))
+		key := []byte(fmt.Sprintf("key-%04d", i%count))
 
 		// Read (direct pointer, no clone)
-		node, _ := provider.ReadPage(pid)
+		p, _ := provider.ReadPage(pid)
 
-		// Search
-		for j := range node.Entries {
-			e := &node.Entries[j]
-			if bytes.Equal(e.Key, key) && e.TxnMin <= txnID && e.TxnMax > txnID {
-				_ = cloneBytes(e.Value.Inline) // simulate value copy
-				break
+		// Search using binary search
+		lo := p.SearchLeaf(key)
+		if lo < p.Count() {
+			eKey := p.EntryKey(lo)
+			if bytes.Equal(eKey, key) {
+				eTxnMin := p.EntryTxnMin(lo)
+				eTxnMax := p.EntryTxnMax(lo)
+				if eTxnMin <= txnID && eTxnMax > txnID {
+					_ = cloneBytes(p.EntryInlineValue(lo)) // simulate value copy
+				}
 			}
 		}
 	}
@@ -143,7 +142,7 @@ func BenchmarkViewFullTreeGet(b *testing.B) {
 func newBTreeForTest(pages *CachedMemPageProvider) *bTree {
 	tree := &bTree{
 		pages:       pages,
-		serializer:  NewNodeSerializer(),
+		inlineThres: btreeapi.InlineThreshold,
 		pageLocks:   lock.New(),
 	}
 	return tree

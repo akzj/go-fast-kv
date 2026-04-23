@@ -237,7 +237,7 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 	// for true point-in-time consistency (immune to CLOG mutations mid-scan).
 	// Writers (Delete's internal visibility) have no snapshot registered;
 	// they fall back to a CLOG-only check.
-	tree := btree.New(btreeapi.Config{
+	tree := btree.NewWithRealProvider(btreeapi.Config{
 		InlineThreshold: cfg.InlineThreshold,
 		VisibilityChecker: func(txnMin, txnMax, readTxnID uint64) bool {
 			clog := tm.CLOG()
@@ -286,6 +286,8 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 			return true
 		},
 	}, provider, ba)
+	// Create a node-based adapter for backward-compatible consumers (vacuum).
+	nodeAdapter := btree.NewNodePageAdapter(provider)
 
 	s := &store{
 		dir:         cfg.Dir,
@@ -314,10 +316,10 @@ func Open(cfg kvstoreapi.Config) (kvstoreapi.Store, error) {
 		// RealPageProvider implements ReadPage (with LRU cache + cloneNode)
 		// and ReadPageUncached (bypasses cache, no clone). Vacuum uses
 		// ReadPageUncached for leaf scans to avoid cloneNode allocations.
-		uncached := provider // ReadPageUncached is supported by RealPageProvider
+		uncached := nodeAdapter // Use node adapter for vacuum (backward compat)
 		s.vacuum = vacuum.New(
 			tree.RootPageID,
-			provider,
+			nodeAdapter,
 			uncached,
 			tm,
 			bs,

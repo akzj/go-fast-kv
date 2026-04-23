@@ -11,9 +11,8 @@ import (
 )
 
 type bTree struct {
-	pages       btreeapi.PageProvider
+	pages       pageStore
 	blobs       btreeapi.BlobWriter
-	serializer  btreeapi.NodeSerializer
 	rootPageID  atomic.Uint64        // atomic for concurrent reads (§3.8.8)
 	inlineThres int
 	closed      atomic.Bool          // atomic for concurrent close check
@@ -22,27 +21,26 @@ type bTree struct {
 	visCheck    func(txnMin, txnMax, readTxnID uint64) bool // MVCC visibility via CLOG (nil = default range check)
 
 	// Search path statistics for bottleneck analysis.
-	searchDepthSum   atomic.Uint64 // Total search depth across all operations
-	searchCount      atomic.Uint64 // Number of search operations
-	rightSiblingNavs atomic.Uint64 // B-link correction traversals (high value = many splits during insert)
+	searchDepthSum   atomic.Uint64
+	searchCount      atomic.Uint64
+	rightSiblingNavs atomic.Uint64
 
 	// Split statistics.
-	splitCount atomic.Uint64 // Total leaf node splits (high value = frequent splits = bottleneck)
+	splitCount atomic.Uint64
 }
 
 // New creates a new BTree instance.
-func New(cfg btreeapi.Config, pages btreeapi.PageProvider, blobs btreeapi.BlobWriter) btreeapi.BTree {
+func New(cfg btreeapi.Config, pages pageStore, blobs btreeapi.BlobWriter) btreeapi.BTree {
 	thresh := cfg.InlineThreshold
 	if thresh <= 0 {
 		thresh = btreeapi.InlineThreshold
 	}
 	return &bTree{
-		pages:          pages,
-		blobs:          blobs,
-		serializer:     NewNodeSerializer(),
-		inlineThres:    thresh,
-		pageLocks:      lock.New(),
-		visCheck:       cfg.VisibilityChecker,
+		pages:       pages,
+		blobs:       blobs,
+		inlineThres: thresh,
+		pageLocks:   lock.New(),
+		visCheck:    cfg.VisibilityChecker,
 	}
 }
 
@@ -59,29 +57,21 @@ func (t *bTree) Close() error {
 }
 
 // PageLocks returns the per-page RwLock manager used by this B-tree.
-// This is needed by the Vacuum process to acquire the same page locks
-// as Put/Delete/Get/Scan, preventing concurrent corruption during
-// leaf page rewrites.
 func (t *bTree) PageLocks() *lock.PageRWLocks {
 	return t.pageLocks
 }
 
 // NewBulkLoader creates a new BulkLoader for efficient bulk loading.
-// Entries should be sorted by key before calling Build(), or the loader
-// will sort them automatically.
 func (t *bTree) NewBulkLoader(mode btreeapi.BulkMode) btreeapi.BulkLoader {
 	return newBulkLoader(t, mode, 0)
 }
 
-// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID
-// for MVCC mode. All loaded entries will have the given TxnMin.
+// NewBulkLoaderWithTxn creates a BulkLoader with an explicit transaction ID.
 func (t *bTree) NewBulkLoaderWithTxn(mode btreeapi.BulkMode, txnID uint64) btreeapi.BulkLoader {
 	return newBulkLoader(t, mode, txnID)
 }
 
 // isVisible checks if a version (txnMin, txnMax) is visible.
-// If a VisibilityChecker is configured (CLOG-based), it delegates to that.
-// Otherwise, falls back to the default range check for backward compatibility.
 func (t *bTree) isVisible(txnMin, txnMax, txnID uint64) bool {
 	if t.visCheck != nil {
 		return t.visCheck(txnMin, txnMax, txnID)
@@ -104,7 +94,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		t.bootstrapMu.Lock()
 		if t.rootPageID.Load() == 0 { // double-check under lock
 			pid := t.pages.AllocPage()
-			root := &btreeapi.Node{IsLeaf: true}
+			root := NewLeafPage()
 			if err := t.pages.WritePage(pid, root); err != nil {
 				t.bootstrapMu.Unlock()
 				return err
@@ -129,9 +119,9 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		return err
 	}
 
-	// B-link correction under write lock: the leaf may have split since we searched
-	for leaf.HighKey != nil && bytes.Compare(key, leaf.HighKey) >= 0 && leaf.Next != 0 {
-		nextPID := leaf.Next
+	// B-link correction under write lock
+	for leaf.HighKey() != nil && bytes.Compare(key, leaf.HighKey()) >= 0 && leaf.Next() != 0 {
+		nextPID := leaf.Next()
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
@@ -142,31 +132,69 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		}
 	}
 
-	// Phase 3: MVCC insert
-	t.mvccInsert(leaf, key, value, txnID)
-	leaf.Count = uint16(len(leaf.Entries))
+	// Phase 3: MVCC — mark old version as superseded
+	t.mvccMarkOld(leaf, key, txnID)
 
-	// Check if split needed
-	if t.serializer.SerializedSize(leaf) <= btreeapi.PageSize {
+	// Prepare value
+	var blobID uint64
+	var inlineVal []byte
+	if t.blobs != nil && len(value) > t.inlineThres {
+		bid, err := t.blobs.WriteBlob(value)
+		if err == nil {
+			blobID = bid
+		} else {
+			inlineVal = cloneBytes(value)
+		}
+	} else {
+		inlineVal = cloneBytes(value)
+	}
+
+	// Calculate entry size needed
+	isBlobRef := blobID > 0
+	cellSize := LeafCellSize(len(key), len(inlineVal), isBlobRef)
+
+	// "先判断后分裂" — check if split needed BEFORE insert
+	if leaf.FreeSpace() < cellSize+2 { // +2 for new slot
+		// Split first, then insert into correct half
+		splitKey, right := t.splitLeafPage(leaf)
+		rightPID := t.pages.AllocPage()
+		t.splitCount.Add(1)
+
+		// Set up B-link pointers
+		right.SetNext(leaf.Next())
+		leaf.SetNext(rightPID)
+		// right inherits original HighKey, left gets splitKey
+		rightHK := leaf.HighKey()
+		if rightHK != nil {
+			right.SetHighKey(rightHK)
+		}
+		leaf.SetHighKey(splitKey)
+
+		// Determine which page gets the new entry
+		pos := leaf.FindInsertPos(cloneBytes(key), txnID)
+		if bytes.Compare(key, splitKey) >= 0 {
+			rPos := right.FindInsertPos(cloneBytes(key), txnID)
+			right.InsertLeafEntry(rPos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
+		} else {
+			leaf.InsertLeafEntry(pos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID)
+		}
+
+		if err := t.pages.WritePage(rightPID, right); err != nil {
+			t.pageLocks.WUnlock(leafPID)
+			return err
+		}
 		if err := t.pages.WritePage(leafPID, leaf); err != nil {
 			t.pageLocks.WUnlock(leafPID)
 			return err
 		}
 		t.pageLocks.WUnlock(leafPID)
-		return nil
+
+		return t.propagateSplit(path[:len(path)-1], splitKey, rightPID)
 	}
 
-	// Phase 4: Split the leaf (still under write lock)
-	splitKey, right := t.splitNode(leaf)
-	rightPID := t.pages.AllocPage()
-
-	// Set up B-link pointers
-	right.Next = leaf.Next
-	leaf.Next = rightPID
-	right.HighKey = cloneBytes(leaf.HighKey) // right inherits original HighKey
-	leaf.HighKey = cloneBytes(splitKey)       // left gets splitKey as HighKey
-
-	if err := t.pages.WritePage(rightPID, right); err != nil {
+	// No split needed — direct insert
+	pos := leaf.FindInsertPos(cloneBytes(key), txnID)
+	if err := leaf.InsertLeafEntry(pos, cloneBytes(key), txnID, btreeapi.TxnMaxInfinity, inlineVal, blobID); err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
 	}
@@ -175,84 +203,70 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		return err
 	}
 	t.pageLocks.WUnlock(leafPID)
-
-	// Phase 5: Propagate split upward (each level locks independently)
-	return t.propagateSplit(path[:len(path)-1], splitKey, rightPID)
+	return nil
 }
 
-func (t *bTree) mvccInsert(leaf *btreeapi.Node, key, value []byte, txnID uint64) {
-	// Mark the current visible version as superseded by this transaction.
-	// The page write lock guarantees only one writer modifies the leaf at a time,
-	// so there is at most one entry with TxnMax == TxnMaxInfinity for a given key.
-	//
-	// Note: we do NOT filter by e.TxnMin <= txnID. When concurrent writers race
-	// for the same leaf, a higher-txnID writer may acquire the lock first. If a
-	// lower-txnID writer then acquires the lock, it must still mark the existing
-	// entry as superseded — otherwise both entries retain TxnMax=∞ and vacuum
-	// can never reclaim the "losing" version. The MVCC visibility rules and
-	// abort-restoration in vacuum handle all commit/abort orderings correctly.
-	//
-	// Binary search to find key range, then linear within the (small) range.
-	lo := sort.Search(len(leaf.Entries), func(i int) bool {
-		return bytes.Compare(leaf.Entries[i].Key, key) >= 0
-	})
-	for i := lo; i < len(leaf.Entries); i++ {
-		e := &leaf.Entries[i]
-		if !bytes.Equal(e.Key, key) {
+// mvccMarkOld marks the current visible version as superseded.
+func (t *bTree) mvccMarkOld(leaf *Page, key []byte, txnID uint64) {
+	lo := leaf.SearchLeaf(key)
+	count := leaf.Count()
+	for i := lo; i < count; i++ {
+		if !bytes.Equal(leaf.EntryKey(i), key) {
 			break
 		}
-		if e.TxnMax == btreeapi.TxnMaxInfinity {
-			e.TxnMax = txnID
+		if leaf.EntryTxnMax(i) == btreeapi.TxnMaxInfinity {
+			leaf.SetEntryTxnMax(i, txnID)
 			break
 		}
 	}
-
-	// Build new entry
-	entry := btreeapi.LeafEntry{
-		Key:    cloneBytes(key),
-		TxnMin: txnID,
-		TxnMax: btreeapi.TxnMaxInfinity,
-	}
-	if t.blobs != nil && len(value) > t.inlineThres {
-		blobID, err := t.blobs.WriteBlob(value)
-		if err == nil {
-			entry.Value.BlobID = blobID
-		} else {
-			entry.Value.Inline = cloneBytes(value)
-		}
-	} else {
-		entry.Value.Inline = cloneBytes(value)
-	}
-
-	// Insert maintaining (Key ASC, TxnMin DESC) order
-	pos := t.findInsertPos(leaf, key, txnID)
-	leaf.Entries = append(leaf.Entries, btreeapi.LeafEntry{})
-	copy(leaf.Entries[pos+1:], leaf.Entries[pos:])
-	leaf.Entries[pos] = entry
 }
 
-func (t *bTree) findInsertPos(leaf *btreeapi.Node, key []byte, txnMin uint64) int {
-	return sort.Search(len(leaf.Entries), func(i int) bool {
-		cmp := bytes.Compare(key, leaf.Entries[i].Key)
-		if cmp != 0 {
-			return cmp < 0
+// splitLeafPage splits a leaf page, handling MVCC version chain boundaries.
+func (t *bTree) splitLeafPage(page *Page) (splitKey []byte, right *Page) {
+	count := page.Count()
+	mid := count / 2
+
+	// Don't split in the middle of a version chain — find a key boundary
+	origMid := mid
+	for mid < count-1 && bytes.Equal(page.EntryKey(mid), page.EntryKey(mid-1)) {
+		mid++
+	}
+	// If we went all the way to the end, try going left
+	if mid >= count-1 {
+		mid = origMid
+		for mid > 1 && bytes.Equal(page.EntryKey(mid), page.EntryKey(mid-1)) {
+			mid--
 		}
-		return txnMin > leaf.Entries[i].TxnMin
-	})
+	}
+
+	// All entries share the same key — use synthetic splitKey
+	allSameKey := mid <= 1 && count > 1 &&
+		bytes.Equal(page.EntryKey(0), page.EntryKey(count-1))
+
+	if allSameKey {
+		mid = count / 2
+		sk := page.EntryKey(0)
+		splitKey = make([]byte, len(sk)+1)
+		copy(splitKey, sk)
+		splitKey[len(sk)] = 0x00
+	}
+
+	sk, right := page.SplitLeaf(mid)
+	if splitKey == nil {
+		splitKey = sk
+	}
+	return splitKey, right
 }
 
 // ─── Search (§3.8.2 search phase) ──────────────────────────────────
 
-// searchPath traverses from root to the target leaf using read locks,
-// returning the path of all node PageIDs visited (internal + leaf).
-// Each node is read-locked, then unlocked before moving to the next.
 func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 	currentPID := t.rootPageID.Load()
 	depth := 0
 
 	for {
 		t.pageLocks.RLock(currentPID)
-		node, err := t.pages.ReadPage(currentPID)
+		page, err := t.pages.ReadPage(currentPID)
 		if err != nil {
 			t.pageLocks.RUnlock(currentPID)
 			return nil, err
@@ -261,40 +275,26 @@ func (t *bTree) searchPath(key []byte) (path []uint64, err error) {
 		depth++
 		path = append(path, currentPID)
 
-		// B-link right-link correction — traverse right sibling if key >= HighKey
-		if node.HighKey != nil && bytes.Compare(key, node.HighKey) >= 0 && node.Next != 0 {
-			nextPID := node.Next
+		// B-link right-link correction
+		if page.HighKey() != nil && bytes.Compare(key, page.HighKey()) >= 0 && page.Next() != 0 {
+			nextPID := page.Next()
 			t.pageLocks.RUnlock(currentPID)
 			t.rightSiblingNavs.Add(1)
 			currentPID = nextPID
 			continue
 		}
 
-		if node.IsLeaf {
+		if page.IsLeaf() {
 			t.pageLocks.RUnlock(currentPID)
-			// Record search depth
 			t.searchDepthSum.Add(uint64(depth))
 			t.searchCount.Add(1)
 			return path, nil
 		}
 
-		childPID := findChild(node, key)
+		childPID := page.FindChild(key)
 		t.pageLocks.RUnlock(currentPID)
 		currentPID = childPID
 	}
-}
-
-func findChild(node *btreeapi.Node, key []byte) uint64 {
-	// Binary search: find first index where key < keys[i], then return children[i].
-	// For n keys, there are n+1 children. When key >= all keys, i == n, so we
-	// return the last child (children[len(children)-1]).
-	i := sort.Search(len(node.Keys), func(i int) bool {
-		return bytes.Compare(key, node.Keys[i]) < 0
-	})
-	if i < len(node.Children) {
-		return node.Children[i]
-	}
-	return node.Children[len(node.Children)-1]
 }
 
 // ─── Split propagation (§3.8.4) ────────────────────────────────────
@@ -310,8 +310,8 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 		}
 
 		// B-link correction: parent may have been split concurrently
-		for parent.HighKey != nil && bytes.Compare(splitKey, parent.HighKey) >= 0 && parent.Next != 0 {
-			nextPID := parent.Next
+		for parent.HighKey() != nil && bytes.Compare(splitKey, parent.HighKey()) >= 0 && parent.Next() != 0 {
+			nextPID := parent.Next()
 			t.pageLocks.WUnlock(parentPID)
 			parentPID = nextPID
 			t.pageLocks.WLock(parentPID)
@@ -322,27 +322,56 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 			}
 		}
 
-		insertInternalEntry(parent, splitKey, newChildPID)
-		parent.Count = uint16(len(parent.Keys))
+		// Find insert position for the split key
+		pos := sort.Search(parent.Count(), func(i int) bool {
+			return bytes.Compare(splitKey, parent.InternalKey(i)) <= 0
+		})
 
-		if t.serializer.SerializedSize(parent) <= btreeapi.PageSize {
+		// Check if internal page needs to split before inserting
+		cellSize := InternalCellSize(len(splitKey))
+		if parent.FreeSpace() < cellSize+2 {
+			// Split internal page first
+			newSplitKey, rightPage := parent.SplitInternal(parent.Count() / 2)
+			newParentPID := t.pages.AllocPage()
+
+			rightPage.SetNext(parent.Next())
+			parent.SetNext(newParentPID)
+			rightHK := parent.HighKey()
+			if rightHK != nil {
+				rightPage.SetHighKey(rightHK)
+			}
+			parent.SetHighKey(newSplitKey)
+
+			// Insert the split key into the correct half
+			if bytes.Compare(splitKey, newSplitKey) >= 0 {
+				rPos := sort.Search(rightPage.Count(), func(i int) bool {
+					return bytes.Compare(splitKey, rightPage.InternalKey(i)) <= 0
+				})
+				rightPage.InsertInternalEntry(rPos, cloneBytes(splitKey), newChildPID)
+			} else {
+				pos = sort.Search(parent.Count(), func(i int) bool {
+					return bytes.Compare(splitKey, parent.InternalKey(i)) <= 0
+				})
+				parent.InsertInternalEntry(pos, cloneBytes(splitKey), newChildPID)
+			}
+
+			if err := t.pages.WritePage(newParentPID, rightPage); err != nil {
+				t.pageLocks.WUnlock(parentPID)
+				return err
+			}
 			if err := t.pages.WritePage(parentPID, parent); err != nil {
 				t.pageLocks.WUnlock(parentPID)
 				return err
 			}
 			t.pageLocks.WUnlock(parentPID)
-			return nil // Done — no further propagation needed
+
+			splitKey = newSplitKey
+			newChildPID = newParentPID
+			continue
 		}
 
-		// Parent also needs to split
-		newSplitKey, right := t.splitInternalNode(parent)
-		newParentPID := t.pages.AllocPage()
-		right.Next = parent.Next
-		parent.Next = newParentPID
-		right.HighKey = cloneBytes(parent.HighKey)
-		parent.HighKey = cloneBytes(newSplitKey)
-
-		if err := t.pages.WritePage(newParentPID, right); err != nil {
+		// Insert fits — no split needed
+		if err := parent.InsertInternalEntry(pos, cloneBytes(splitKey), newChildPID); err != nil {
 			t.pageLocks.WUnlock(parentPID)
 			return err
 		}
@@ -351,21 +380,14 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 			return err
 		}
 		t.pageLocks.WUnlock(parentPID)
-
-		splitKey = newSplitKey
-		newChildPID = newParentPID
+		return nil // Done — no further propagation needed
 	}
 
 	// Reached root and still need to split → create new root
-	// Serialize root creation to prevent two concurrent propagateSplits
-	// from both creating a new root (one would be lost).
 	t.bootstrapMu.Lock()
-	newRoot := &btreeapi.Node{
-		IsLeaf:   false,
-		Count:    1,
-		Keys:     [][]byte{cloneBytes(splitKey)},
-		Children: []uint64{t.rootPageID.Load(), newChildPID},
-	}
+	newRoot := NewInternalPage()
+	newRoot.SetChild0(t.rootPageID.Load())
+	newRoot.InsertInternalEntry(0, cloneBytes(splitKey), newChildPID)
 	newRootPID := t.pages.AllocPage()
 	if err := t.pages.WritePage(newRootPID, newRoot); err != nil {
 		t.bootstrapMu.Unlock()
@@ -374,91 +396,6 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	t.rootPageID.Store(newRootPID)
 	t.bootstrapMu.Unlock()
 	return nil
-}
-
-func (t *bTree) splitNode(node *btreeapi.Node) (splitKey []byte, right *btreeapi.Node) {
-	if node.IsLeaf {
-		return t.splitLeafNode(node)
-	}
-	return t.splitInternalNode(node)
-}
-
-func (t *bTree) splitLeafNode(node *btreeapi.Node) (splitKey []byte, right *btreeapi.Node) {
-	t.splitCount.Add(1)
-	entries := node.Entries
-	mid := len(entries) / 2
-
-	// Don't split in the middle of a version chain — find a key boundary
-	origMid := mid
-	for mid < len(entries)-1 && bytes.Equal(entries[mid].Key, entries[mid-1].Key) {
-		mid++
-	}
-	// If we went all the way to the end, try going left
-	if mid >= len(entries)-1 {
-		mid = origMid
-		for mid > 1 && bytes.Equal(entries[mid].Key, entries[mid-1].Key) {
-			mid--
-		}
-	}
-
-	// All entries share the same key (e.g., many MVCC versions of one key).
-	// Using the actual key as splitKey would violate the exclusive HighKey
-	// invariant: LEFT would contain key "K" but have HighKey = "K", making
-	// the latest version unreachable. Use a synthetic splitKey = key + 0x00
-	// so that HighKey > actual key, preserving correct routing.
-	allSameKey := mid <= 1 && len(entries) > 1 &&
-		bytes.Equal(entries[0].Key, entries[len(entries)-1].Key)
-
-	if allSameKey {
-		mid = len(entries) / 2
-		splitKey = append(cloneBytes(entries[0].Key), 0x00)
-	} else {
-		splitKey = cloneBytes(entries[mid].Key)
-	}
-
-	right = &btreeapi.Node{
-		IsLeaf:  true,
-		Entries: cloneLeafEntries(entries[mid:]),
-		Count:   uint16(len(entries) - mid),
-	}
-	// Three-index slice: cap=len forces append to always allocate a new
-	// backing array, preventing shared-memory corruption after split.
-	node.Entries = entries[:mid:mid]
-	node.Count = uint16(mid)
-	return splitKey, right
-}
-
-func (t *bTree) splitInternalNode(node *btreeapi.Node) (splitKey []byte, right *btreeapi.Node) {
-	mid := len(node.Keys) / 2
-	splitKey = cloneBytes(node.Keys[mid])
-
-	right = &btreeapi.Node{
-		IsLeaf:   false,
-		Keys:     cloneBytesSlice(node.Keys[mid+1:]),
-		Children: cloneUint64Slice(node.Children[mid+1:]),
-		Count:    uint16(len(node.Keys) - mid - 1),
-	}
-	// Three-index slice: cap=len forces append to always allocate a new
-	// backing array, preventing shared-memory corruption between left and
-	// right nodes after split.
-	node.Keys = node.Keys[:mid:mid]
-	node.Children = node.Children[:mid+1 : mid+1]
-	node.Count = uint16(mid)
-	return splitKey, right
-}
-
-func insertInternalEntry(node *btreeapi.Node, key []byte, childPID uint64) {
-	pos := 0
-	for pos < len(node.Keys) && bytes.Compare(key, node.Keys[pos]) > 0 {
-		pos++
-	}
-	node.Keys = append(node.Keys, nil)
-	copy(node.Keys[pos+1:], node.Keys[pos:])
-	node.Keys[pos] = cloneBytes(key)
-
-	node.Children = append(node.Children, 0)
-	copy(node.Children[pos+2:], node.Children[pos+1:])
-	node.Children[pos+1] = childPID
 }
 
 // ─── Get (§3.8.2) ──────────────────────────────────────────────────
@@ -475,31 +412,34 @@ func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
 
 	for {
 		t.pageLocks.RLock(currentPID)
-		node, err := t.pages.ReadPage(currentPID)
+		page, err := t.pages.ReadPage(currentPID)
 		if err != nil {
 			t.pageLocks.RUnlock(currentPID)
 			return nil, err
 		}
 
-		// B-link correction: if key >= HighKey, follow right-link
-		if node.HighKey != nil && bytes.Compare(key, node.HighKey) >= 0 && node.Next != 0 {
-			nextPID := node.Next
+		// B-link correction
+		if page.HighKey() != nil && bytes.Compare(key, page.HighKey()) >= 0 && page.Next() != 0 {
+			nextPID := page.Next()
 			t.pageLocks.RUnlock(currentPID)
 			currentPID = nextPID
 			continue
 		}
 
-		if node.IsLeaf {
-			// Find visible entry
-			for i := range node.Entries {
-				e := &node.Entries[i]
-				cmp := bytes.Compare(e.Key, key)
+		if page.IsLeaf() {
+			// Find visible entry using binary search
+			lo := page.SearchLeaf(key)
+			count := page.Count()
+			for i := lo; i < count; i++ {
+				eKey := page.EntryKey(i)
+				cmp := bytes.Compare(eKey, key)
 				if cmp > 0 {
 					break
 				}
-				if cmp == 0 && t.isVisible(e.TxnMin, e.TxnMax, txnID) {
+				if cmp == 0 && t.isVisible(page.EntryTxnMin(i), page.EntryTxnMax(i), txnID) {
+					val := page.EntryValue(i)
 					t.pageLocks.RUnlock(currentPID)
-					return t.resolveValue(&e.Value)
+					return t.resolveValue(&val)
 				}
 			}
 			t.pageLocks.RUnlock(currentPID)
@@ -507,7 +447,7 @@ func (t *bTree) Get(key []byte, txnID uint64) ([]byte, error) {
 		}
 
 		// Internal node: descend to child
-		childPID := findChild(node, key)
+		childPID := page.FindChild(key)
 		t.pageLocks.RUnlock(currentPID)
 		currentPID = childPID
 	}
@@ -517,9 +457,6 @@ func (t *bTree) resolveValue(v *btreeapi.Value) ([]byte, error) {
 	if v.BlobID > 0 && t.blobs != nil {
 		data, err := t.blobs.ReadBlob(v.BlobID)
 		if err != nil {
-			// Blob not found — entry is effectively deleted or vacuum freed the blob
-			// before the entry was physically removed from the tree.
-			// Return btreeapi.ErrKeyNotFound so callers handle it as "not found".
 			return nil, btreeapi.ErrKeyNotFound
 		}
 		return data, nil
@@ -537,7 +474,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 		return btreeapi.ErrKeyNotFound
 	}
 
-	// Phase 1: Search down to leaf (read locks only)
+	// Phase 1: Search down to leaf
 	path, err := t.searchPath(key)
 	if err != nil {
 		return err
@@ -553,8 +490,8 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	}
 
 	// B-link correction under write lock
-	for leaf.HighKey != nil && bytes.Compare(key, leaf.HighKey) >= 0 && leaf.Next != 0 {
-		nextPID := leaf.Next
+	for leaf.HighKey() != nil && bytes.Compare(key, leaf.HighKey()) >= 0 && leaf.Next() != 0 {
+		nextPID := leaf.Next()
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
@@ -566,15 +503,15 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	}
 
 	// Phase 3: MVCC delete (mark TxnMax)
-	// Two cases:
-	// 1. Our own entry (txnMin == txnID): always find it, even if self-deleted.
-	//    This enables SQL rollback via self-delete (txnMax=txnXID → invisible).
-	// 2. Other entries: must be visible via normal MVCC rules.
-	for i := range leaf.Entries {
-		e := &leaf.Entries[i]
-		isOwn := e.TxnMin == txnID
-		if bytes.Equal(e.Key, key) && (isOwn || t.isVisible(e.TxnMin, e.TxnMax, txnID)) {
-			e.TxnMax = txnID
+	count := leaf.Count()
+	for i := 0; i < count; i++ {
+		eKey := leaf.EntryKey(i)
+		if !bytes.Equal(eKey, key) {
+			continue
+		}
+		isOwn := leaf.EntryTxnMin(i) == txnID
+		if isOwn || t.isVisible(leaf.EntryTxnMin(i), leaf.EntryTxnMax(i), txnID) {
+			leaf.SetEntryTxnMax(i, txnID)
 			if err := t.pages.WritePage(leafPID, leaf); err != nil {
 				t.pageLocks.WUnlock(leafPID)
 				return err
@@ -605,7 +542,7 @@ func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 	currentPID := t.rootPageID.Load()
 	for {
 		t.pageLocks.RLock(currentPID)
-		node, err := t.pages.ReadPage(currentPID)
+		page, err := t.pages.ReadPage(currentPID)
 		if err != nil {
 			t.pageLocks.RUnlock(currentPID)
 			it.err = err
@@ -614,22 +551,23 @@ func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 		}
 
 		// B-link correction
-		if node.HighKey != nil && bytes.Compare(start, node.HighKey) >= 0 && node.Next != 0 {
-			nextPID := node.Next
+		if page.HighKey() != nil && bytes.Compare(start, page.HighKey()) >= 0 && page.Next() != 0 {
+			nextPID := page.Next()
 			t.pageLocks.RUnlock(currentPID)
 			currentPID = nextPID
 			continue
 		}
 
-		if node.IsLeaf {
-			// Copy entries while holding the read lock, then release
-			it.curNode = cloneNode(node)
+		if page.IsLeaf() {
+			// Clone the page so we can release the lock
+			it.curPage = page.Clone()
 			t.pageLocks.RUnlock(currentPID)
 			it.curIdx = 0
 
 			// Advance curIdx to the first entry >= start
-			for it.curIdx < len(it.curNode.Entries) {
-				if bytes.Compare(it.curNode.Entries[it.curIdx].Key, start) >= 0 {
+			count := it.curPage.Count()
+			for it.curIdx < count {
+				if bytes.Compare(it.curPage.EntryKey(it.curIdx), start) >= 0 {
 					break
 				}
 				it.curIdx++
@@ -637,41 +575,18 @@ func (t *bTree) Scan(start, end []byte, txnID uint64) btreeapi.Iterator {
 			return it
 		}
 
-		childPID := findChild(node, start)
+		childPID := page.FindChild(start)
 		t.pageLocks.RUnlock(currentPID)
 		currentPID = childPID
 	}
-}
-
-// cloneNode creates a deep copy of a node so the caller doesn't hold
-// a reference to page data that might change. Handles both leaf and
-// internal nodes.
-func cloneNode(node *btreeapi.Node) *btreeapi.Node {
-	clone := &btreeapi.Node{
-		IsLeaf:  node.IsLeaf,
-		Count:   node.Count,
-		HighKey: cloneBytes(node.HighKey),
-		Next:    node.Next,
-	}
-	if node.IsLeaf {
-		clone.Entries = cloneLeafEntries(node.Entries)
-	} else {
-		if len(node.Keys) > 0 {
-			clone.Keys = cloneBytesSlice(node.Keys)
-		}
-		if len(node.Children) > 0 {
-			clone.Children = cloneUint64Slice(node.Children)
-		}
-	}
-	return clone
 }
 
 type iterator struct {
 	tree     *bTree
 	endKey   []byte
 	txnID    uint64
-	visCheck func(txnMin, txnMax, readTxnID uint64) bool // snapshot-based visibility (nil = use tree default)
-	curNode  *btreeapi.Node
+	visCheck func(txnMin, txnMax, readTxnID uint64) bool
+	curPage  *Page
 	curIdx   int
 	curKey   []byte
 	curValue []byte
@@ -687,55 +602,58 @@ func (it *iterator) Next() bool {
 
 	for {
 		// Move to next leaf if needed
-		for it.curIdx >= len(it.curNode.Entries) {
-			if it.curNode.Next == 0 {
+		for it.curIdx >= it.curPage.Count() {
+			if it.curPage.Next() == 0 {
 				it.done = true
 				return false
 			}
 			// Read next leaf with read lock, clone, release
-			nextPID := it.curNode.Next
+			nextPID := it.curPage.Next()
 			it.tree.pageLocks.RLock(nextPID)
-			node, err := it.tree.pages.ReadPage(nextPID)
+			page, err := it.tree.pages.ReadPage(nextPID)
 			if err != nil {
 				it.tree.pageLocks.RUnlock(nextPID)
 				it.err = err
 				return false
 			}
-			it.curNode = cloneNode(node)
+			it.curPage = page.Clone()
 			it.tree.pageLocks.RUnlock(nextPID)
 			it.curIdx = 0
 		}
 
-		e := &it.curNode.Entries[it.curIdx]
+		eKey := it.curPage.EntryKey(it.curIdx)
+		eTxnMin := it.curPage.EntryTxnMin(it.curIdx)
+		eTxnMax := it.curPage.EntryTxnMax(it.curIdx)
+		eVal := it.curPage.EntryValue(it.curIdx)
 		it.curIdx++
 
 		// Check end boundary
-		if it.endKey != nil && bytes.Compare(e.Key, it.endKey) >= 0 {
+		if it.endKey != nil && bytes.Compare(eKey, it.endKey) >= 0 {
 			it.done = true
 			return false
 		}
 
 		// Skip duplicate keys (dedup: only first visible version per key)
-		if it.lastKey != nil && bytes.Equal(e.Key, it.lastKey) {
+		if it.lastKey != nil && bytes.Equal(eKey, it.lastKey) {
 			continue
 		}
 
-		// Visibility check (uses per-scan snapshot if available)
+		// Visibility check
 		visible := false
 		if it.visCheck != nil {
-			visible = it.visCheck(e.TxnMin, e.TxnMax, it.txnID)
+			visible = it.visCheck(eTxnMin, eTxnMax, it.txnID)
 		} else {
-			visible = it.tree.isVisible(e.TxnMin, e.TxnMax, it.txnID)
+			visible = it.tree.isVisible(eTxnMin, eTxnMax, it.txnID)
 		}
 		if visible {
-			val, err := it.tree.resolveValue(&e.Value)
+			val, err := it.tree.resolveValue(&eVal)
 			if err != nil {
 				it.err = err
 				return false
 			}
-			it.curKey = e.Key
+			it.curKey = eKey
 			it.curValue = val
-			it.lastKey = e.Key
+			it.lastKey = eKey
 			return true
 		}
 	}
@@ -787,7 +705,6 @@ func cloneUint64Slice(s []uint64) []uint64 {
 
 // ─── BTree Metrics Accessors ─────────────────────────────────────────
 
-// GetStats returns B-tree operation statistics for metrics/bottleneck analysis.
 func (t *bTree) GetStats() btreeapi.BTreeStats {
 	return btreeapi.BTreeStats{
 		SearchDepthSum:   t.searchDepthSum.Load(),
@@ -797,7 +714,6 @@ func (t *bTree) GetStats() btreeapi.BTreeStats {
 	}
 }
 
-// GetAvgSearchDepth returns the average B-tree search depth.
 func (t *bTree) GetAvgSearchDepth() float64 {
 	count := t.searchCount.Load()
 	if count == 0 {
@@ -806,7 +722,6 @@ func (t *bTree) GetAvgSearchDepth() float64 {
 	return float64(t.searchDepthSum.Load()) / float64(count)
 }
 
-// ResetStats clears all B-tree statistics.
 func (t *bTree) ResetStats() {
 	t.searchDepthSum.Store(0)
 	t.searchCount.Store(0)

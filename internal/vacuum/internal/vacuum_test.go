@@ -95,7 +95,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 	tm := txnmod.New()
 	provider := btree.NewRealPageProvider(ps, 0)
 	ba := &testBlobAdapter{store: bs}
-	tree := btree.New(btreeapi.Config{InlineThreshold: 256}, provider, ba)
+	tree := btree.NewWithRealProvider(btreeapi.Config{InlineThreshold: 256}, provider, ba)
 
 	t.Cleanup(func() {
 		tree.Close()
@@ -216,10 +216,11 @@ func (env *testEnv) newVacuum() vacuumapi.Vacuum {
 	// RealPageProvider implements ReadPage (with LRU cache + cloneNode)
 	// and ReadPageUncached (bypasses cache, no clone). Vacuum uses
 	// ReadPageUncached for leaf scans.
+	adapter := btree.NewNodePageAdapter(env.provider)
 	return New(
 		env.tree.RootPageID,
-		env.provider,
-		env.provider, // uncachedPages — RealPageProvider supports ReadPageUncached
+		adapter,
+		adapter, // uncachedPages — NodePageAdapter wraps RealPageProvider
 		env.txnMgr,
 		env.blobStore,
 		env.wal,
@@ -244,7 +245,7 @@ func (env *testEnv) countLeafEntries(t *testing.T) int {
 	// Navigate to leftmost leaf
 	pid := rootPID
 	for {
-		node, err := env.provider.ReadPage(pid)
+		node, err := env.provider.ReadPageNode(pid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +257,7 @@ func (env *testEnv) countLeafEntries(t *testing.T) int {
 	// Count entries across all leaves
 	total := 0
 	for pid != 0 {
-		node, err := env.provider.ReadPage(pid)
+		node, err := env.provider.ReadPageNode(pid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,7 +276,7 @@ func (env *testEnv) countLeaves(t *testing.T) int {
 	}
 	pid := rootPID
 	for {
-		node, err := env.provider.ReadPage(pid)
+		node, err := env.provider.ReadPageNode(pid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -286,7 +287,7 @@ func (env *testEnv) countLeaves(t *testing.T) int {
 	}
 	count := 0
 	for pid != 0 {
-		node, err := env.provider.ReadPage(pid)
+		node, err := env.provider.ReadPageNode(pid)
 		if err != nil {
 			t.Fatal(err)
 		}

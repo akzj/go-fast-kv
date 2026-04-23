@@ -3,25 +3,23 @@ package internal
 import (
 	"fmt"
 	"sync"
-
-	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
-// CachedMemPageProvider stores deserialized nodes directly in memory.
-// It avoids Serialize/Deserialize overhead for pure in-memory benchmarks,
-// giving true B-tree algorithm performance without I/O cost.
+// CachedMemPageProvider stores pages directly in memory (no serialize/deserialize).
+// It avoids disk I/O overhead for pure in-memory benchmarks,
+// giving true B-tree algorithm performance.
 //
 // This is equivalent to a page cache that always hits.
 type CachedMemPageProvider struct {
 	mu      sync.Mutex
-	nodes   map[uint64]*btreeapi.Node
+	pages   map[uint64]*Page
 	nextPID uint64
 }
 
 // NewCachedMemPageProvider creates a new CachedMemPageProvider.
 func NewCachedMemPageProvider() *CachedMemPageProvider {
 	return &CachedMemPageProvider{
-		nodes:   make(map[uint64]*btreeapi.Node),
+		pages:   make(map[uint64]*Page),
 		nextPID: 1,
 	}
 }
@@ -35,27 +33,27 @@ func (p *CachedMemPageProvider) AllocPage() uint64 {
 	return id
 }
 
-// ReadPage returns the cached node directly (no Deserialize).
-func (p *CachedMemPageProvider) ReadPage(pageID uint64) (*btreeapi.Node, error) {
+// ReadPage returns the page directly (no deserialize).
+func (p *CachedMemPageProvider) ReadPage(pageID uint64) (*Page, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	node, ok := p.nodes[pageID]
+	page, ok := p.pages[pageID]
 	if !ok {
 		return nil, fmt.Errorf("cachedmempage: page %d not found", pageID)
 	}
-	return node, nil
+	return page, nil
 }
 
 // ReadPageUncached is identical to ReadPage (no cache to bypass).
-func (p *CachedMemPageProvider) ReadPageUncached(pageID uint64) (*btreeapi.Node, error) {
+func (p *CachedMemPageProvider) ReadPageUncached(pageID uint64) (*Page, error) {
 	return p.ReadPage(pageID)
 }
 
-// WritePage stores the node directly (no Serialize).
-func (p *CachedMemPageProvider) WritePage(pageID uint64, node *btreeapi.Node) error {
+// WritePage stores the page directly (no serialize).
+func (p *CachedMemPageProvider) WritePage(pageID uint64, page *Page) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.nodes[pageID] = node
+	p.pages[pageID] = page
 	if pageID >= p.nextPID {
 		p.nextPID = pageID + 1
 	}
@@ -66,5 +64,5 @@ func (p *CachedMemPageProvider) WritePage(pageID uint64, node *btreeapi.Node) er
 func (p *CachedMemPageProvider) PageCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.nodes)
+	return len(p.pages)
 }

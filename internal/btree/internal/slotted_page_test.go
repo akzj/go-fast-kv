@@ -28,8 +28,7 @@ func TestNewLeafPage(t *testing.T) {
 	if p.freeEnd() != btreeapi.PageSize {
 		t.Fatalf("expected freeEnd %d, got %d", btreeapi.PageSize, p.freeEnd())
 	}
-	// FreeSpace for empty leaf with no highkey:
-	// slotArrayStart = 16 + 0 = 16, slotArrayEnd = 16
+	// FreeSpace for empty leaf: slotArrayStart=16, slotArrayEnd=16
 	// FreeSpace = 4096 - 16 = 4080
 	if p.FreeSpace() != btreeapi.PageSize-16 {
 		t.Fatalf("expected FreeSpace %d, got %d", btreeapi.PageSize-16, p.FreeSpace())
@@ -47,8 +46,7 @@ func TestNewInternalPage(t *testing.T) {
 	if p.Count() != 0 {
 		t.Fatalf("expected count 0, got %d", p.Count())
 	}
-	// Internal: slotArrayStart = 16 + 0 + 8 = 24
-	// FreeSpace = 4096 - 24 = 4072
+	// Internal: slotArrayStart=24 (16+8 for child0)
 	if p.FreeSpace() != btreeapi.PageSize-24 {
 		t.Fatalf("expected FreeSpace %d, got %d", btreeapi.PageSize-24, p.FreeSpace())
 	}
@@ -62,9 +60,30 @@ func TestSetHighKey(t *testing.T) {
 	if !bytes.Equal(got, hk) {
 		t.Fatalf("expected highkey %q, got %q", hk, got)
 	}
-	// slotArrayStart should shift by highKeyLen
-	if p.slotArrayStart() != 16+len(hk) {
-		t.Fatalf("expected slotArrayStart %d, got %d", 16+len(hk), p.slotArrayStart())
+	// slotArrayStart should NOT change (highKey is in cell area now)
+	if p.slotArrayStart() != 16 {
+		t.Fatalf("expected slotArrayStart 16, got %d", p.slotArrayStart())
+	}
+}
+
+func TestSetHighKey_AfterEntries(t *testing.T) {
+	// Key test: SetHighKey after entries should NOT corrupt slot array
+	p := NewLeafPage()
+	p.InsertLeafEntry(0, []byte("aaa"), 1, math.MaxUint64, []byte("v1"), 0)
+	p.InsertLeafEntry(1, []byte("bbb"), 2, math.MaxUint64, []byte("v2"), 0)
+
+	// Set highKey after entries exist
+	p.SetHighKey([]byte("zzz"))
+
+	// Entries should still be readable
+	if string(p.EntryKey(0)) != "aaa" {
+		t.Fatalf("expected key aaa, got %q", p.EntryKey(0))
+	}
+	if string(p.EntryKey(1)) != "bbb" {
+		t.Fatalf("expected key bbb, got %q", p.EntryKey(1))
+	}
+	if string(p.HighKey()) != "zzz" {
+		t.Fatalf("expected highkey zzz, got %q", p.HighKey())
 	}
 }
 
@@ -94,7 +113,6 @@ func TestInsertLeafEntry_Single(t *testing.T) {
 		t.Fatalf("expected count 1, got %d", p.Count())
 	}
 
-	// Read back
 	gotKey := p.EntryKey(0)
 	if !bytes.Equal(gotKey, key) {
 		t.Fatalf("expected key %q, got %q", key, gotKey)
@@ -147,7 +165,6 @@ func TestInsertLeafEntry_MultipleInOrder(t *testing.T) {
 		t.Fatalf("expected count %d, got %d", len(keys), p.Count())
 	}
 
-	// Verify order
 	for i, k := range keys {
 		got := p.EntryKey(i)
 		if !bytes.Equal(got, []byte(k)) {
@@ -159,11 +176,8 @@ func TestInsertLeafEntry_MultipleInOrder(t *testing.T) {
 func TestInsertLeafEntry_InsertInMiddle(t *testing.T) {
 	p := NewLeafPage()
 
-	// Insert "aaa" at pos 0
 	p.InsertLeafEntry(0, []byte("aaa"), 1, math.MaxUint64, []byte("v1"), 0)
-	// Insert "ccc" at pos 1
 	p.InsertLeafEntry(1, []byte("ccc"), 2, math.MaxUint64, []byte("v3"), 0)
-	// Insert "bbb" at pos 1 (between aaa and ccc)
 	p.InsertLeafEntry(1, []byte("bbb"), 3, math.MaxUint64, []byte("v2"), 0)
 
 	if p.Count() != 3 {
@@ -196,7 +210,6 @@ func TestSetEntryTxnMax(t *testing.T) {
 func TestEntryValue(t *testing.T) {
 	p := NewLeafPage()
 
-	// Inline entry
 	p.InsertLeafEntry(0, []byte("k1"), 1, math.MaxUint64, []byte("inline-val"), 0)
 	v := p.EntryValue(0)
 	if !v.IsInline() {
@@ -206,7 +219,6 @@ func TestEntryValue(t *testing.T) {
 		t.Fatalf("expected inline value %q, got %q", "inline-val", v.Inline)
 	}
 
-	// Blob entry
 	p.InsertLeafEntry(1, []byte("k2"), 2, math.MaxUint64, nil, 777)
 	v2 := p.EntryValue(1)
 	if v2.IsInline() {
@@ -225,7 +237,6 @@ func TestDeleteLeafEntry(t *testing.T) {
 	p.InsertLeafEntry(1, []byte("bbb"), 2, math.MaxUint64, []byte("v2"), 0)
 	p.InsertLeafEntry(2, []byte("ccc"), 3, math.MaxUint64, []byte("v3"), 0)
 
-	// Delete middle entry
 	p.DeleteLeafEntry(1)
 
 	if p.Count() != 2 {
@@ -287,10 +298,10 @@ func TestSearchLeaf(t *testing.T) {
 		{"cherry", 2},
 		{"date", 3},
 		{"elderberry", 4},
-		{"aaa", 0},       // before all
-		{"fig", 5},       // after all
-		{"cat", 2},       // between banana and cherry
-		{"banana1", 2},   // between banana and cherry
+		{"aaa", 0},
+		{"fig", 5},
+		{"cat", 2},
+		{"banana1", 2},
 	}
 
 	for _, tt := range tests {
@@ -303,24 +314,19 @@ func TestSearchLeaf(t *testing.T) {
 
 func TestFindInsertPos_MVCC(t *testing.T) {
 	p := NewLeafPage()
-	// Insert "key" with txnMin=10 (newest first in MVCC order)
 	p.InsertLeafEntry(0, []byte("key"), 10, math.MaxUint64, []byte("v10"), 0)
-	// Insert "key" with txnMin=5
 	p.InsertLeafEntry(1, []byte("key"), 5, math.MaxUint64, []byte("v5"), 0)
 
-	// New version with txnMin=15 should go at position 0 (before txnMin=10)
 	pos := p.FindInsertPos([]byte("key"), 15)
 	if pos != 0 {
 		t.Fatalf("expected pos 0 for txnMin=15, got %d", pos)
 	}
 
-	// New version with txnMin=7 should go at position 1 (between 10 and 5)
 	pos = p.FindInsertPos([]byte("key"), 7)
 	if pos != 1 {
 		t.Fatalf("expected pos 1 for txnMin=7, got %d", pos)
 	}
 
-	// New version with txnMin=1 should go at position 2 (after 5)
 	pos = p.FindInsertPos([]byte("key"), 1)
 	if pos != 2 {
 		t.Fatalf("expected pos 2 for txnMin=1, got %d", pos)
@@ -337,7 +343,6 @@ func TestInternalPage_Basic(t *testing.T) {
 		t.Fatalf("expected child0 100, got %d", p.Child0())
 	}
 
-	// Insert separator keys with right children
 	p.InsertInternalEntry(0, []byte("mmm"), 200)
 	p.InsertInternalEntry(1, []byte("zzz"), 300)
 
@@ -361,20 +366,20 @@ func TestInternalPage_Basic(t *testing.T) {
 
 func TestInternalPage_FindChild(t *testing.T) {
 	p := NewInternalPage()
-	p.SetChild0(10) // child for keys < "ddd"
-	p.InsertInternalEntry(0, []byte("ddd"), 20) // child for ddd <= keys < "mmm"
-	p.InsertInternalEntry(1, []byte("mmm"), 30) // child for keys >= "mmm"
+	p.SetChild0(10)
+	p.InsertInternalEntry(0, []byte("ddd"), 20)
+	p.InsertInternalEntry(1, []byte("mmm"), 30)
 
 	tests := []struct {
 		key  string
 		want uint64
 	}{
-		{"aaa", 10},  // < ddd → child0
-		{"ccc", 10},  // < ddd → child0
-		{"ddd", 20},  // >= ddd, < mmm → child[1] = InternalChild(0)
-		{"fff", 20},  // >= ddd, < mmm
-		{"mmm", 30},  // >= mmm → child[2] = InternalChild(1)
-		{"zzz", 30},  // >= mmm
+		{"aaa", 10},
+		{"ccc", 10},
+		{"ddd", 20},
+		{"fff", 20},
+		{"mmm", 30},
+		{"zzz", 30},
 	}
 
 	for _, tt := range tests {
@@ -401,7 +406,6 @@ func TestSetInternalChild(t *testing.T) {
 func TestInsertLeafEntry_PageFull(t *testing.T) {
 	p := NewLeafPage()
 
-	// Fill the page until it's full
 	i := 0
 	for {
 		key := []byte(fmt.Sprintf("key-%04d", i))
@@ -414,7 +418,7 @@ func TestInsertLeafEntry_PageFull(t *testing.T) {
 			break
 		}
 		i++
-		if i > 200 { // safety limit
+		if i > 200 {
 			t.Fatal("should have hit page full by now")
 		}
 	}
@@ -423,7 +427,6 @@ func TestInsertLeafEntry_PageFull(t *testing.T) {
 		t.Fatal("should have inserted at least one entry")
 	}
 
-	// Verify all inserted entries are readable
 	for j := 0; j < i; j++ {
 		expected := fmt.Sprintf("key-%04d", j)
 		got := string(p.EntryKey(j))
@@ -451,23 +454,18 @@ func TestSplitLeaf(t *testing.T) {
 	mid := n / 2
 	splitKey, right := p.SplitLeaf(mid)
 
-	// Left should have mid entries
 	if p.Count() != mid {
 		t.Fatalf("left count: expected %d, got %d", mid, p.Count())
 	}
-
-	// Right should have n-mid entries
 	if right.Count() != n-mid {
 		t.Fatalf("right count: expected %d, got %d", n-mid, right.Count())
 	}
 
-	// Split key should be the first key of right page
 	rightFirstKey := right.EntryKey(0)
 	if !bytes.Equal(splitKey, rightFirstKey) {
 		t.Fatalf("splitKey %q != right first key %q", splitKey, rightFirstKey)
 	}
 
-	// Verify left entries
 	for i := 0; i < mid; i++ {
 		expected := fmt.Sprintf("key-%02d", i)
 		got := string(p.EntryKey(i))
@@ -476,7 +474,6 @@ func TestSplitLeaf(t *testing.T) {
 		}
 	}
 
-	// Verify right entries
 	for i := 0; i < n-mid; i++ {
 		expected := fmt.Sprintf("key-%02d", i+mid)
 		got := string(right.EntryKey(i))
@@ -504,34 +501,24 @@ func TestSplitInternal(t *testing.T) {
 	mid := n / 2
 	splitKey, right := p.SplitInternal(mid)
 
-	// Split key should be key at mid (pushed up)
 	expectedSplitKey := fmt.Sprintf("key-%02d", mid)
 	if string(splitKey) != expectedSplitKey {
 		t.Fatalf("splitKey: expected %q, got %q", expectedSplitKey, splitKey)
 	}
 
-	// Left should have mid keys
 	if p.Count() != mid {
 		t.Fatalf("left count: expected %d, got %d", mid, p.Count())
 	}
-
-	// Right should have n-mid-1 keys (mid key is pushed up)
 	if right.Count() != n-mid-1 {
 		t.Fatalf("right count: expected %d, got %d", n-mid-1, right.Count())
 	}
-
-	// Left child0 should be unchanged
 	if p.Child0() != 100 {
 		t.Fatalf("left child0: expected 100, got %d", p.Child0())
 	}
-
-	// Right child0 should be the right child of the split key
-	// Split key is key[mid], its right child = InternalChild(mid) = 200+mid
 	if right.Child0() != uint64(200+mid) {
 		t.Fatalf("right child0: expected %d, got %d", 200+mid, right.Child0())
 	}
 
-	// Verify left keys
 	for i := 0; i < mid; i++ {
 		expected := fmt.Sprintf("key-%02d", i)
 		got := string(p.InternalKey(i))
@@ -540,7 +527,6 @@ func TestSplitInternal(t *testing.T) {
 		}
 	}
 
-	// Verify right keys
 	for i := 0; i < n-mid-1; i++ {
 		expected := fmt.Sprintf("key-%02d", i+mid+1)
 		got := string(right.InternalKey(i))
@@ -555,7 +541,6 @@ func TestSplitInternal(t *testing.T) {
 func TestCompact(t *testing.T) {
 	p := NewLeafPage()
 
-	// Insert 5 entries
 	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key-%02d", i))
 		val := []byte(fmt.Sprintf("val-%02d", i))
@@ -564,31 +549,24 @@ func TestCompact(t *testing.T) {
 
 	freeSpaceBefore := p.FreeSpace()
 
-	// Delete entries 1 and 3 (creates fragmentation)
-	p.DeleteLeafEntry(3) // delete "key-03" (now at index 3)
-	p.DeleteLeafEntry(1) // delete "key-01" (now at index 1)
+	p.DeleteLeafEntry(3)
+	p.DeleteLeafEntry(1)
 
 	freeSpaceAfterDelete := p.FreeSpace()
 
-	// After delete, FreeSpace should increase (slot array shrinks) but
-	// cell data is still fragmented
 	if freeSpaceAfterDelete <= freeSpaceBefore {
 		t.Fatal("expected more free space after delete")
 	}
 
-	// Compact to reclaim fragmented space
 	p.Compact()
 
 	freeSpaceAfterCompact := p.FreeSpace()
 
-	// After compact, free space should be >= after delete (should be more
-	// because we reclaimed fragmented cell space)
 	if freeSpaceAfterCompact < freeSpaceAfterDelete {
 		t.Fatalf("expected more free space after compact: before=%d, after=%d",
 			freeSpaceAfterDelete, freeSpaceAfterCompact)
 	}
 
-	// Verify remaining entries are still correct
 	if p.Count() != 3 {
 		t.Fatalf("expected count 3, got %d", p.Count())
 	}
@@ -605,11 +583,9 @@ func TestCompact(t *testing.T) {
 // ─── PageFromBytes ──────────────────────────────────────────────────
 
 func TestPageFromBytes(t *testing.T) {
-	// Create a page, insert entries, then wrap the raw bytes
 	p1 := NewLeafPage()
 	p1.InsertLeafEntry(0, []byte("hello"), 1, math.MaxUint64, []byte("world"), 0)
 
-	// Wrap the raw bytes (simulates reading from mmap)
 	p2 := PageFromBytes(p1.Data())
 
 	if !p2.IsLeaf() {
@@ -634,10 +610,8 @@ func TestClone(t *testing.T) {
 
 	c := p.Clone()
 
-	// Modify original
 	p.SetEntryTxnMax(0, 42)
 
-	// Clone should be unaffected
 	if c.EntryTxnMax(0) != math.MaxUint64 {
 		t.Fatalf("clone should not be affected by original modification")
 	}
@@ -649,7 +623,6 @@ func TestHighKeyWithEntries(t *testing.T) {
 	p := NewLeafPage()
 	p.SetHighKey([]byte("zzz"))
 
-	// Insert entries after setting high key
 	p.InsertLeafEntry(0, []byte("aaa"), 1, math.MaxUint64, []byte("v1"), 0)
 	p.InsertLeafEntry(1, []byte("bbb"), 2, math.MaxUint64, []byte("v2"), 0)
 
@@ -672,7 +645,6 @@ func TestHighKeyWithEntries(t *testing.T) {
 func TestUsedBytes(t *testing.T) {
 	p := NewLeafPage()
 	initialUsed := p.UsedBytes()
-	// Empty page: slotArrayEnd(16) + (4096 - 4096) = 16
 	if initialUsed != 16 {
 		t.Fatalf("expected initial UsedBytes 16, got %d", initialUsed)
 	}
@@ -718,7 +690,6 @@ func TestFillPageAndVerify(t *testing.T) {
 		inserted++
 	}
 
-	// Verify every entry
 	for i := 0; i < inserted; i++ {
 		expectedKey := fmt.Sprintf("k%04d", i)
 		expectedVal := fmt.Sprintf("v%04d", i)
@@ -744,7 +715,6 @@ func TestInternalPage_InsertInMiddle(t *testing.T) {
 
 	p.InsertInternalEntry(0, []byte("aaa"), 20)
 	p.InsertInternalEntry(1, []byte("ccc"), 40)
-	// Insert "bbb" between "aaa" and "ccc"
 	p.InsertInternalEntry(1, []byte("bbb"), 30)
 
 	if p.Count() != 3 {
@@ -772,23 +742,24 @@ func TestInternalPage_InsertInMiddle(t *testing.T) {
 	}
 }
 
-// ─── FreeSpace with HighKey ─────────────────────────────────────────
+// ─── FreeSpace consistency ──────────────────────────────────────────
 
 func TestFreeSpace_WithHighKey(t *testing.T) {
 	p := NewLeafPage()
 	freeNoHK := p.FreeSpace()
 
 	p2 := NewLeafPage()
-	p2.SetHighKey([]byte("highkey-10-bytes"))
+	hk := []byte("highkey-10-bytes")
+	p2.SetHighKey(hk)
 	freeWithHK := p2.FreeSpace()
 
+	// HighKey is stored in cell area, so it reduces freeEnd → reduces FreeSpace
 	diff := freeNoHK - freeWithHK
-	if diff != len("highkey-10-bytes") {
-		t.Fatalf("expected FreeSpace diff of %d, got %d", len("highkey-10-bytes"), diff)
+	expectedDiff := 2 + len(hk) // highKeyLen(2) + highKey bytes
+	if diff != expectedDiff {
+		t.Fatalf("expected FreeSpace diff of %d, got %d", expectedDiff, diff)
 	}
 }
-
-// ─── Internal FreeSpace with HighKey ────────────────────────────────
 
 func TestInternalFreeSpace_WithHighKey(t *testing.T) {
 	p := NewInternalPage()
@@ -799,7 +770,8 @@ func TestInternalFreeSpace_WithHighKey(t *testing.T) {
 	freeWithHK := p2.FreeSpace()
 
 	diff := freeNoHK - freeWithHK
-	if diff != 2 {
-		t.Fatalf("expected FreeSpace diff of 2, got %d", diff)
+	expectedDiff := 2 + 2 // highKeyLen(2) + "hk"(2)
+	if diff != expectedDiff {
+		t.Fatalf("expected FreeSpace diff of %d, got %d", expectedDiff, diff)
 	}
 }

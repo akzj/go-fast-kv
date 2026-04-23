@@ -356,7 +356,7 @@ func TestHighKeyAfterSplit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if root.IsLeaf && len(root.Entries) > 50 {
+	if root.IsLeaf() && root.Count() > 50 {
 		t.Fatal("expected splits to have occurred")
 	}
 
@@ -368,37 +368,39 @@ func TestHighKeyAfterSplit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if node.IsLeaf {
+		if node.IsLeaf() {
 			// Walk the leaf chain
-			prevHighKey := []byte(nil)
+			var prevHighKey []byte
 			for {
-				if prevHighKey != nil && node.HighKey != nil {
-					if bytes.Compare(prevHighKey, node.HighKey) >= 0 {
-						t.Fatalf("HighKey not increasing: prev=%q cur=%q", prevHighKey, node.HighKey)
+				hk := node.HighKey()
+				if prevHighKey != nil && hk != nil {
+					if bytes.Compare(prevHighKey, hk) >= 0 {
+						t.Fatalf("HighKey not increasing: prev=%q cur=%q", prevHighKey, hk)
 					}
 				}
 				// All entries should be < HighKey (if HighKey is set)
-				for _, e := range node.Entries {
-					if node.HighKey != nil && bytes.Compare(e.Key, node.HighKey) >= 0 {
-						t.Fatalf("entry key %q >= HighKey %q", e.Key, node.HighKey)
+				for i := 0; i < node.Count(); i++ {
+					eKey := node.EntryKey(i)
+					if hk != nil && bytes.Compare(eKey, hk) >= 0 {
+						t.Fatalf("entry key %q >= HighKey %q", eKey, hk)
 					}
 				}
-				prevHighKey = node.HighKey
-				if node.Next == 0 {
+				prevHighKey = cloneBytes(hk)
+				if node.Next() == 0 {
 					// Rightmost leaf should have nil HighKey
-					if node.HighKey != nil {
-						t.Fatalf("rightmost leaf should have nil HighKey, got %q", node.HighKey)
+					if node.HighKey() != nil {
+						t.Fatalf("rightmost leaf should have nil HighKey, got %q", node.HighKey())
 					}
 					break
 				}
-				node, err = pages.ReadPage(node.Next)
+				node, err = pages.ReadPage(node.Next())
 				if err != nil {
 					t.Fatal(err)
 				}
 			}
 			break
 		}
-		pid = node.Children[0]
+		pid = node.Child0()
 	}
 }
 

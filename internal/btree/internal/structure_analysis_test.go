@@ -10,11 +10,11 @@ import (
     btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
-// TestBTreeStructureAnalysis 分析 B-tree 结构
+// TestBTreeStructureAnalysis analyzes B-tree structure.
 func TestBTreeStructureAnalysis(t *testing.T) {
     const N = 100000
-    fmt.Printf("=== B-tree 结构分析测试 ===\n")
-    fmt.Printf("写入 %d keys...\n", N)
+    fmt.Printf("=== B-tree Structure Analysis ===\n")
+    fmt.Printf("Writing %d keys...\n", N)
     
     pages := NewMemPageProvider()
     tree := New(btreeapi.Config{}, pages, nil)
@@ -23,7 +23,6 @@ func TestBTreeStructureAnalysis(t *testing.T) {
     for i := 0; i < N; i++ {
         keys[i] = []byte(fmt.Sprintf("key%08d", i))
     }
-    // 打乱顺序模拟随机写入
     rand.Seed(42)
     rand.Shuffle(N, func(i, j int) {
         keys[i], keys[j] = keys[j], keys[i]
@@ -33,25 +32,21 @@ func TestBTreeStructureAnalysis(t *testing.T) {
     for i := 0; i < N; i++ {
         tree.Put(keys[i], []byte(fmt.Sprintf("value%d", i)), uint64(i+1))
     }
-    fmt.Printf("写入耗时: %v\n", time.Since(start))
+    fmt.Printf("Write time: %v\n", time.Since(start))
     
-    // 分析树结构
     analyzeStructure(pages, tree, t)
     
-    // 测试读取路径
-    fmt.Printf("\n=== 读取路径分析 ===\n")
+    fmt.Printf("\n=== Read Path Analysis ===\n")
     testReadPath(tree, keys[:100], t)
 }
 
-// analyzeStructure 分析树结构
 func analyzeStructure(pages *MemPageProvider, tree btreeapi.BTree, t *testing.T) {
     rootPID := tree.RootPageID()
     if rootPID == 0 {
-        fmt.Println("树为空")
+        fmt.Println("Tree is empty")
         return
     }
     
-    // 递归分析
     var visit func(pid uint64, depth int)
     levelCounts := make(map[int]int)
     levelNodes := make(map[int]int)
@@ -62,20 +57,22 @@ func analyzeStructure(pages *MemPageProvider, tree btreeapi.BTree, t *testing.T)
             return
         }
         
-        levelCounts[depth] += int(node.Count)
+        levelCounts[depth] += node.Count()
         levelNodes[depth]++
         
-        if !node.IsLeaf {
-            for _, childPID := range node.Children {
-                visit(childPID, depth+1)
+        if !node.IsLeaf() {
+            // Visit child0
+            visit(node.Child0(), depth+1)
+            // Visit children from internal entries
+            for i := 0; i < node.Count(); i++ {
+                visit(node.InternalChild(i), depth+1)
             }
         }
     }
     
     visit(rootPID, 0)
     
-    // 打印结果
-    fmt.Printf("\n--- 层结构统计 ---\n")
+    fmt.Printf("\n--- Level Statistics ---\n")
     maxDepth := 0
     totalKeys := 0
     totalNodes := 0
@@ -86,30 +83,27 @@ func analyzeStructure(pages *MemPageProvider, tree btreeapi.BTree, t *testing.T)
             maxDepth = depth - 1
             break
         }
-        fmt.Printf("层 %d: %d 个节点, %d 个 keys\n", depth, nodes, count)
+        fmt.Printf("Level %d: %d nodes, %d keys\n", depth, nodes, count)
         totalKeys += count
         totalNodes += nodes
     }
     
-    fmt.Printf("\n--- 总结 ---\n")
-    fmt.Printf("总层数: %d\n", maxDepth+1)
-    fmt.Printf("总节点数: %d\n", totalNodes)
-    fmt.Printf("总 keys: %d\n", totalKeys)
-    fmt.Printf("平均每节点 keys: %.1f\n", float64(totalKeys)/float64(totalNodes))
+    fmt.Printf("\n--- Summary ---\n")
+    fmt.Printf("Total levels: %d\n", maxDepth+1)
+    fmt.Printf("Total nodes: %d\n", totalNodes)
+    fmt.Printf("Total keys: %d\n", totalKeys)
+    fmt.Printf("Avg keys/node: %.1f\n", float64(totalKeys)/float64(totalNodes))
 }
 
-// testReadPath 测试读取路径是否使用二分搜索
 func testReadPath(tree btreeapi.BTree, keys [][]byte, t *testing.T) {
-    fmt.Printf("测试 %d 个 key 的读取路径...\n", len(keys))
+    fmt.Printf("Testing read path for %d keys...\n", len(keys))
     
-    // 类型断言获取 bTree 以访问 searchPath
     bt := tree.(*bTree)
     
-    // 记录每次 searchPath 访问的 page_id
     for i, key := range keys {
         path, err := bt.searchPath(key)
         if err != nil {
-            t.Fatalf("searchPath 失败: %v", err)
+            t.Fatalf("searchPath failed: %v", err)
         }
         
         if i < 5 {
@@ -121,53 +115,28 @@ func testReadPath(tree btreeapi.BTree, keys [][]byte, t *testing.T) {
         }
     }
     
-    // 验证 key 搜索是二分的
-    fmt.Printf("\n--- 二分搜索验证 ---\n")
+    fmt.Printf("\n--- Binary Search Verification ---\n")
     
-    // 读取 root 节点
     rootPID := tree.RootPageID()
     root, _ := bt.pages.ReadPage(rootPID)
     
-    if root.IsLeaf {
-        fmt.Println("root 是叶节点 (树很小)")
+    if root.IsLeaf() {
+        fmt.Println("root is leaf (small tree)")
     } else {
-        fmt.Printf("root 有 %d 个 keys\n", len(root.Keys))
+        fmt.Printf("root has %d keys\n", root.Count())
         
-        // 测试二分搜索
         testKey := []byte("key00500000")
         
-        // 手动实现二分搜索
-        lo, hi := 0, len(root.Keys)-1
-        for lo <= hi {
-            mid := (lo + hi) / 2
-            cmp := bytes.Compare(testKey, root.Keys[mid])
-            if cmp < 0 {
-                hi = mid - 1
-            } else if cmp > 0 {
-                lo = mid + 1
-            } else {
-                fmt.Printf("key %s 在 root.Keys[%d]\n", string(testKey), mid)
-                break
-            }
-        }
-        if lo > hi {
-            fmt.Printf("key %s 应在 child[%d]\n", string(testKey), lo)
-        }
-        
-        // 验证 findChild 的行为与二分搜索一致
-        for _, childPID := range root.Children {
-            child, _ := bt.pages.ReadPage(childPID)
-            if child.IsLeaf {
-                for _, e := range child.Entries {
-                    if bytes.Equal(e.Key, testKey) {
-                        fmt.Printf("找到 key 在 leaf page %d\n", childPID)
-                        break
-                    }
-                }
-                break
+        // Verify findChild binary search
+        childPID := root.FindChild(testKey)
+        child, _ := bt.pages.ReadPage(childPID)
+        if child.IsLeaf() {
+            lo := child.SearchLeaf(testKey)
+            if lo < child.Count() && bytes.Equal(child.EntryKey(lo), testKey) {
+                fmt.Printf("Found key in leaf page %d\n", childPID)
             }
         }
     }
     
-    fmt.Println("\n✅ 读取路径分析完成")
+    fmt.Println("\n✅ Read path analysis complete")
 }

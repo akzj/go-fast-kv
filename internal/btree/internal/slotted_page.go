@@ -13,11 +13,20 @@
 //	2       2     count (number of entries / keys)
 //	4       8     next (right sibling PageID, B-link)
 //	12      2     freeEnd (offset where cell content area starts, grows ←)
-//	14      2     highKeyLen
-//	16      N     highKey bytes
-//	16+N    ...   Slot Array: count × 2 bytes (uint16 offsets into page)
+//	14      2     highKeyOff (offset of highKey cell in page, 0 = nil/+∞)
+//
+//	For leaf pages:
+//	  16      ...   Slot Array: count × 2 bytes (uint16 offsets into page)
+//
+//	For internal pages:
+//	  16      8     child0 (leftmost child PageID)
+//	  24      ...   Slot Array: count × 2 bytes
+//
 //	...           Free Space
 //	freeEnd ...   Cell Content Area (cells packed from end of page, growing ←)
+//
+// The highKey is stored as a cell in the content area: [highKeyLen:2][highKeyBytes:N]
+// This ensures that changing the highKey does NOT shift the slot array.
 //
 // Leaf Cell:
 //
@@ -28,15 +37,13 @@
 // Internal Cell:
 //
 //	[keyLen:2] [key:keyLen] [rightChild:8]
-//
-// Internal pages also store child0 (leftmost child) at offset 16+highKeyLen,
-// and the slot array starts at 16+highKeyLen+8.
 package internal
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sort"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
@@ -49,8 +56,8 @@ const (
 	offCount      = 2
 	offNext       = 4
 	offFreeEnd    = 12
-	offHighKeyLen = 14
-	offHighKey    = 16
+	offHighKeyOff = 14
+	offData       = 16 // start of slot array (leaf) or child0 (internal)
 )
 
 // Flag bits.
@@ -135,41 +142,81 @@ func (p *Page) setFreeEnd(off int) {
 	binary.LittleEndian.PutUint16(p.data[offFreeEnd:], uint16(off))
 }
 
-// highKeyLen returns the length of the highKey.
-func (p *Page) highKeyLen() int {
-	return int(binary.LittleEndian.Uint16(p.data[offHighKeyLen:]))
+// highKeyOff returns the offset of the highKey cell in the page (0 = nil).
+func (p *Page) highKeyOff() int {
+	return int(binary.LittleEndian.Uint16(p.data[offHighKeyOff:]))
+}
+
+func (p *Page) setHighKeyOff(off int) {
+	binary.LittleEndian.PutUint16(p.data[offHighKeyOff:], uint16(off))
 }
 
 // HighKey returns the high key bytes (zero-copy slice into p.data).
-// Returns nil if highKeyLen == 0 (rightmost node, +∞).
+// Returns nil if highKeyOff == 0 (rightmost node, +∞).
 func (p *Page) HighKey() []byte {
-	hkl := p.highKeyLen()
+	hkOff := p.highKeyOff()
+	if hkOff == 0 {
+		return nil
+	}
+	hkl := int(binary.LittleEndian.Uint16(p.data[hkOff:]))
 	if hkl == 0 {
 		return nil
 	}
-	return p.data[offHighKey : offHighKey+hkl]
+	return p.data[hkOff+2 : hkOff+2+hkl]
 }
 
-// SetHighKey writes the high key into the page header.
-// This must be called before any entries are inserted (it affects slot array position).
-// Passing nil sets highKeyLen to 0 (rightmost node).
+// SetHighKey writes the high key into the cell content area.
+// Can be called at any time — does NOT affect slot array position.
+// Passing nil clears the highKey (sets highKeyOff to 0).
+//
+// If a highKey already exists and the new key fits in the same space,
+// it is overwritten in-place (no new allocation). Otherwise, the old
+// highKey cell becomes garbage and a new cell is allocated.
 func (p *Page) SetHighKey(key []byte) {
-	hkl := len(key)
-	binary.LittleEndian.PutUint16(p.data[offHighKeyLen:], uint16(hkl))
-	if hkl > 0 {
-		copy(p.data[offHighKey:], key)
+	if len(key) == 0 {
+		p.setHighKeyOff(0)
+		return
 	}
+
+	// Check if we can reuse the existing highKey cell
+	hkOff := p.highKeyOff()
+	if hkOff != 0 {
+		oldLen := int(binary.LittleEndian.Uint16(p.data[hkOff:]))
+		if len(key) <= oldLen {
+			// Reuse in-place: update length and copy key (pad with zeros if shorter)
+			binary.LittleEndian.PutUint16(p.data[hkOff:], uint16(len(key)))
+			copy(p.data[hkOff+2:hkOff+2+len(key)], key)
+			// Zero out remaining bytes if shorter
+			for i := hkOff + 2 + len(key); i < hkOff+2+oldLen; i++ {
+				p.data[i] = 0
+			}
+			return
+		}
+		// New key is larger — old cell becomes garbage, allocate new
+	}
+
+	// Allocate space in cell content area for [highKeyLen:2][highKey:N]
+	cellSize := 2 + len(key)
+	newFreeEnd := p.freeEnd() - cellSize
+	binary.LittleEndian.PutUint16(p.data[newFreeEnd:], uint16(len(key)))
+	copy(p.data[newFreeEnd+2:], key)
+	p.setFreeEnd(newFreeEnd)
+	p.setHighKeyOff(newFreeEnd)
+}
+
+// ClearHighKey sets highKey to nil (+∞) without allocating new space.
+func (p *Page) ClearHighKey() {
+	p.setHighKeyOff(0)
 }
 
 // slotArrayStart returns the byte offset where the slot array begins.
-// For leaf pages: 16 + highKeyLen
-// For internal pages: 16 + highKeyLen + 8 (child0)
+// For leaf pages: 16
+// For internal pages: 24 (after child0)
 func (p *Page) slotArrayStart() int {
-	base := offHighKey + p.highKeyLen()
 	if !p.IsLeaf() {
-		base += 8 // child0
+		return offData + 8 // child0
 	}
-	return base
+	return offData
 }
 
 // slotArrayEnd returns the byte offset just past the last slot.
@@ -382,7 +429,7 @@ func (p *Page) DeleteLeafEntry(i int) {
 
 // child0Offset returns the byte offset of child0 in the page.
 func (p *Page) child0Offset() int {
-	return offHighKey + p.highKeyLen()
+	return offData
 }
 
 // Child0 returns the leftmost child PageID (internal nodes only).
@@ -503,6 +550,9 @@ func (p *Page) FindInsertPos(key []byte, txnMin uint64) int {
 // The caller is responsible for setting HighKey and Next on both pages.
 func (p *Page) SplitLeaf(mid int) (splitKey []byte, right *Page) {
 	count := p.Count()
+	if count < 2 {
+		panic(fmt.Sprintf("SplitLeaf: cannot split page with count=%d", count))
+	}
 	if mid <= 0 || mid >= count {
 		mid = count / 2
 	}
@@ -527,10 +577,23 @@ func (p *Page) SplitLeaf(mid int) (splitKey []byte, right *Page) {
 	splitKey = make([]byte, len(right.EntryKey(0)))
 	copy(splitKey, right.EntryKey(0))
 
-	// Truncate left page: remove slots [mid:count)
-	// We just reduce the count — the cell data becomes garbage but that's OK.
-	// If we need the space, Compact() can be called.
+	// Truncate left page: zero stale slots and update count
+	oldCount := count
 	p.setCount(mid)
+
+	// Clear stale slot entries to prevent corruption on future inserts
+	slotBase := p.slotArrayStart()
+	for i := mid; i < oldCount; i++ {
+		off := slotBase + i*2
+		p.data[off] = 0
+		p.data[off+1] = 0
+	}
+
+	// Reclaim cell space: compact the left page to recover space from
+	// the entries that were moved to the right page.
+	// This is critical — without it, repeated splits of the same page
+	// cause freeEnd to keep decreasing until the page can't hold entries.
+	p.Compact()
 
 	return splitKey, right
 }
@@ -562,8 +625,16 @@ func (p *Page) SplitInternal(mid int) (splitKey []byte, right *Page) {
 		right.InsertInternalEntry(i-mid-1, key, child)
 	}
 
-	// Truncate left page
+	// Truncate left page: zero stale slots and compact
+	oldCount := count
 	p.setCount(mid)
+	slotBase := p.slotArrayStart()
+	for i := mid; i < oldCount; i++ {
+		off := slotBase + i*2
+		p.data[off] = 0
+		p.data[off+1] = 0
+	}
+	p.Compact()
 
 	return splitKey, right
 }
@@ -588,14 +659,35 @@ func (p *Page) Compact() {
 
 	for i := 0; i < count; i++ {
 		cellOff := p.slotOffset(i)
+		if cellOff < p.slotArrayStart() || cellOff >= btreeapi.PageSize {
+			panic(fmt.Sprintf("Compact: corrupt slot[%d]=%d, count=%d, freeEnd=%d, isLeaf=%v",
+				i, cellOff, count, p.freeEnd(), p.IsLeaf()))
+		}
 		cellEnd := p.cellEnd(i)
 		cellData := make([]byte, cellEnd-cellOff)
 		copy(cellData, p.data[cellOff:cellEnd])
 		cells[i] = cellInfo{slotIdx: i, data: cellData}
 	}
 
+	// Also preserve the highKey cell if present
+	var highKeyData []byte
+	hkOff := p.highKeyOff()
+	if hkOff != 0 {
+		hkl := int(binary.LittleEndian.Uint16(p.data[hkOff:]))
+		highKeyData = make([]byte, 2+hkl)
+		copy(highKeyData, p.data[hkOff:hkOff+2+hkl])
+	}
+
 	// Re-pack cells from the end of the page
 	newFreeEnd := btreeapi.PageSize
+
+	// Re-pack highKey first (if present)
+	if highKeyData != nil {
+		newFreeEnd -= len(highKeyData)
+		copy(p.data[newFreeEnd:], highKeyData)
+		p.setHighKeyOff(newFreeEnd)
+	}
+
 	for i := 0; i < count; i++ {
 		cellSize := len(cells[i].data)
 		newFreeEnd -= cellSize
@@ -648,4 +740,79 @@ func (p *Page) internalCellEnd(cellOff int) int {
 // Useful for split threshold checks.
 func (p *Page) UsedBytes() int {
 	return p.slotArrayEnd() + (btreeapi.PageSize - p.freeEnd())
+}
+
+// ─── Page ↔ Node Conversion ────────────────────────────────────────
+
+// PageToNode converts a slotted *Page to a *btreeapi.Node for backward
+// compatibility with vacuum and other external consumers.
+func PageToNode(p *Page) *btreeapi.Node {
+	count := p.Count()
+	node := &btreeapi.Node{
+		IsLeaf: p.IsLeaf(),
+		Count:  uint16(count),
+		Next:   p.Next(),
+	}
+	if hk := p.HighKey(); hk != nil {
+		node.HighKey = cloneBytes(hk)
+	}
+
+	if p.IsLeaf() {
+		node.Entries = make([]btreeapi.LeafEntry, count)
+		for i := 0; i < count; i++ {
+			node.Entries[i] = btreeapi.LeafEntry{
+				Key:    cloneBytes(p.EntryKey(i)),
+				TxnMin: p.EntryTxnMin(i),
+				TxnMax: p.EntryTxnMax(i),
+			}
+			v := p.EntryValue(i)
+			node.Entries[i].Value = btreeapi.Value{
+				Inline: cloneBytes(v.Inline),
+				BlobID: v.BlobID,
+			}
+		}
+	} else {
+		node.Keys = make([][]byte, count)
+		node.Children = make([]uint64, count+1)
+		node.Children[0] = p.Child0()
+		for i := 0; i < count; i++ {
+			node.Keys[i] = cloneBytes(p.InternalKey(i))
+			node.Children[i+1] = p.InternalChild(i)
+		}
+	}
+	return node
+}
+
+// NodeToPage converts a *btreeapi.Node to a slotted *Page for backward
+// compatibility with WritePageNode.
+func NodeToPage(node *btreeapi.Node) *Page {
+	var p *Page
+	if node.IsLeaf {
+		p = NewLeafPage()
+		if node.HighKey != nil {
+			p.SetHighKey(node.HighKey)
+		}
+		p.SetNext(node.Next)
+		for i, e := range node.Entries {
+			blobID := e.Value.BlobID
+			p.InsertLeafEntry(i, e.Key, e.TxnMin, e.TxnMax, e.Value.Inline, blobID)
+		}
+	} else {
+		p = NewInternalPage()
+		if node.HighKey != nil {
+			p.SetHighKey(node.HighKey)
+		}
+		p.SetNext(node.Next)
+		if len(node.Children) > 0 {
+			p.SetChild0(node.Children[0])
+		}
+		for i, key := range node.Keys {
+			childPID := uint64(0)
+			if i+1 < len(node.Children) {
+				childPID = node.Children[i+1]
+			}
+			p.InsertInternalEntry(i, key, childPID)
+		}
+	}
+	return p
 }
