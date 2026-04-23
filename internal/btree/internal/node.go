@@ -5,22 +5,18 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
-
 var (
-	errNodeTooLarge    = errors.New("btree: serialized node exceeds PageSize")
-	errChecksumInvalid = errors.New("btree: checksum mismatch")
-	errDataTooShort    = errors.New("btree: data too short for deserialization")
+	errNodeTooLarge = errors.New("btree: serialized node exceeds PageSize")
+	errDataTooShort = errors.New("btree: data too short for deserialization")
 )
 
 // headerBaseSize is the fixed portion of the header before highKey.
-// flags(1) + reserved(1) + count(2) + next(8) + checksum(4) + highKeyLen(2) = 18
-const headerBaseSize = 18
+// flags(1) + reserved(1) + count(2) + next(8) + highKeyLen(2) = 14
+const headerBaseSize = 14
 
 // nodeSerializer implements btreeapi.NodeSerializer.
 type nodeSerializer struct{}
@@ -85,10 +81,6 @@ func (s *nodeSerializer) Serialize(node *btreeapi.Node) ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[off:], node.Next)
 	off += 8
 
-	// checksum placeholder (offset 12)
-	checksumOff := off
-	off += 4
-
 	// highKeyLen + highKey
 	binary.LittleEndian.PutUint16(buf[off:], uint16(len(node.HighKey)))
 	off += 2
@@ -100,10 +92,6 @@ func (s *nodeSerializer) Serialize(node *btreeapi.Node) ([]byte, error) {
 	} else {
 		off = serializeInternalEntries(buf, off, node.Keys, node.Children)
 	}
-
-	// compute CRC32-C over entire page (checksum field is 0)
-	crc := crc32.Checksum(buf, crc32cTable)
-	binary.LittleEndian.PutUint32(buf[checksumOff:], crc)
 
 	return buf, nil
 }
@@ -175,8 +163,6 @@ func (s *nodeSerializer) Deserialize(data []byte) (*btreeapi.Node, error) {
 
 	node.Next = binary.LittleEndian.Uint64(data[off:])
 	off += 8
-
-	off += 4 // skip checksum
 
 	hkl := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
