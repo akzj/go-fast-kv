@@ -277,6 +277,87 @@ func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) err
 	return nil
 }
 
+// WritePageCompact writes a page using compact serialization (variable-length).
+// Only the used bytes are written to disk, reducing write amplification by ~50%
+// for pages that are partially full (e.g., after B-tree splits).
+func (p *RealPageProvider) WritePageCompact(pageID pagestoreapi.PageID, page *Page) error {
+	startNs := time.Now().UnixNano()
+	p.pageWrites.Add(1)
+
+	// Serialize compact: only used bytes (no free gap).
+	compactData := page.SerializeCompact()
+
+	entry, err := p.store.WriteCompact(pageID, compactData)
+	if err != nil {
+		return fmt.Errorf("realpage: write compact page %d: %w", pageID, err)
+	}
+
+	// Update both caches with the full in-memory page.
+	p.hotMu.Lock()
+	p.hotPages[pageID] = page
+	p.hotMu.Unlock()
+	p.cache.Put(pageID, page)
+
+	// Track write latency.
+	latencyNs := time.Now().UnixNano() - startNs
+	p.writeLatencyNanos.Add(uint64(latencyNs))
+	p.writeLatencyCount.Add(1)
+
+	// Route WAL entry to per-operation collector or shared buffer.
+	gid := goid.Get()
+	if c, ok := p.collectors.Load(gid); ok {
+		collector := c.(*WALCollector)
+		collector.PageEntries = append(collector.PageEntries, entry)
+	} else {
+		p.mu.Lock()
+		p.walEntries = append(p.walEntries, entry)
+		p.mu.Unlock()
+	}
+	return nil
+}
+
+// ReadPageCompact reads a page written with WritePageCompact.
+// The compact data is expanded back to a full 4096-byte in-memory page.
+func (p *RealPageProvider) ReadPageCompact(pageID pagestoreapi.PageID) (*Page, error) {
+	startNs := time.Now().UnixNano()
+	p.pageReads.Add(1)
+
+	// Hot page cache: return shared pointer directly.
+	p.hotMu.Lock()
+	if page, ok := p.hotPages[pageID]; ok {
+		p.hotMu.Unlock()
+		p.pageCacheHits.Add(1)
+		return page, nil
+	}
+	p.hotMu.Unlock()
+
+	// LRU cache (returns a clone).
+	if page, ok := p.cache.Get(pageID); ok {
+		p.pageCacheHits.Add(1)
+		return page, nil
+	}
+
+	// Cache miss — read compact data from disk.
+	compactData, err := p.store.ReadCompact(pageID)
+	if err != nil {
+		return nil, fmt.Errorf("realpage: read compact page %d: %w", pageID, err)
+	}
+	page := DeserializeCompact(compactData)
+
+	// Populate both caches.
+	p.hotMu.Lock()
+	p.hotPages[pageID] = page
+	p.hotMu.Unlock()
+	p.cache.Put(pageID, page)
+
+	// Track latency.
+	latencyNs := time.Now().UnixNano() - startNs
+	p.readLatencyNanos.Add(uint64(latencyNs))
+	p.readLatencyCount.Add(1)
+
+	return page, nil
+}
+
 // ─── Node-based compatibility methods for vacuum ────────────────────
 
 // ReadPageNode reads and deserializes a node from the given PageID.
