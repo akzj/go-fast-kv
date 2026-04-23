@@ -763,3 +763,93 @@ func TestRotateMmapConcurrentRead(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestReserveBasic(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	// Reserve space and write directly into the mmap slice.
+	vaddr, slice, err := sm.Reserve(100)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if len(slice) != 100 {
+		t.Fatalf("expected slice len 100, got %d", len(slice))
+	}
+
+	// Write a known pattern.
+	for i := range slice {
+		slice[i] = byte(i)
+	}
+
+	// Read it back via ReadAt.
+	got, err := sm.ReadAt(vaddr, 100)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	for i := range got {
+		if got[i] != byte(i) {
+			t.Fatalf("byte %d: got %d, want %d", i, got[i], byte(i))
+		}
+	}
+}
+
+func TestReserveSegmentFull(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	// Reserve should fail when segment is full.
+	_, _, err := sm.Reserve(4097)
+	if err != segmentapi.ErrSegmentFull {
+		t.Fatalf("expected ErrSegmentFull, got %v", err)
+	}
+}
+
+func TestReserveMultiple(t *testing.T) {
+	sm := newTestManager(t, 4096)
+	defer sm.Close()
+
+	// Multiple reserves should return non-overlapping slices.
+	v1, s1, err := sm.Reserve(100)
+	if err != nil {
+		t.Fatalf("Reserve 1: %v", err)
+	}
+	v2, s2, err := sm.Reserve(200)
+	if err != nil {
+		t.Fatalf("Reserve 2: %v", err)
+	}
+
+	// Offsets should not overlap.
+	if v1.Offset == v2.Offset {
+		t.Fatal("overlapping offsets")
+	}
+
+	// Write different patterns.
+	for i := range s1 {
+		s1[i] = 0xAA
+	}
+	for i := range s2 {
+		s2[i] = 0xBB
+	}
+
+	// Read back and verify.
+	got1, err := sm.ReadAt(v1, 100)
+	if err != nil {
+		t.Fatalf("ReadAt 1: %v", err)
+	}
+	for i, b := range got1 {
+		if b != 0xAA {
+			t.Fatalf("s1[%d]: got %x, want 0xAA", i, b)
+		}
+	}
+
+	got2, err := sm.ReadAt(v2, 200)
+	if err != nil {
+		t.Fatalf("ReadAt 2: %v", err)
+	}
+	for i, b := range got2 {
+		if b != 0xBB {
+			t.Fatalf("s2[%d]: got %x, want 0xBB", i, b)
+		}
+	}
+}
