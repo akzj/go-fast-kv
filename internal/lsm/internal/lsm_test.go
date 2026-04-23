@@ -236,6 +236,10 @@ func (m *mockSegmentManagerForDelete) ReadAt(addr segmentapi.VAddr, size uint32)
 	return nil, nil
 }
 
+func (m *mockSegmentManagerForDelete) ReadAtInto(addr segmentapi.VAddr, buf []byte) error {
+	return nil
+}
+
 func (m *mockSegmentManagerForDelete) Sync() error { return nil }
 
 func (m *mockSegmentManagerForDelete) Rotate() error { return nil }
