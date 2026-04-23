@@ -44,6 +44,11 @@ type vacuumer struct {
 	// passComplete is true when the last incremental pass reached the end.
 	// When true, next RunIncremental starts fresh from leftmost leaf.
 	passComplete bool
+
+	// Reusable buffers to avoid per-leaf allocations.
+	// vacuum is single-threaded so these are safe to reuse.
+	keepBuf        []bool
+	blobsToFreeBuf []blobstoreapi.BlobID
 }
 
 // New creates a new Vacuum instance.
@@ -368,8 +373,17 @@ func (v *vacuumer) processLeaf(
 	// We free them AFTER rewriting the node to ensure entries are physically
 	// removed before their blobs are freed.
 	removed := 0
-	var blobsToFree []blobstoreapi.BlobID // BlobIDs to free AFTER node rewrite
-	keep := make([]bool, len(node.Entries))
+	// Reuse buffers to avoid per-leaf allocations (vacuum is single-threaded).
+	n := len(node.Entries)
+	if cap(v.keepBuf) < n {
+		v.keepBuf = make([]bool, n*2)
+	}
+	keep := v.keepBuf[:n]
+	for i := range keep {
+		keep[i] = false
+	}
+	v.blobsToFreeBuf = v.blobsToFreeBuf[:0]
+	blobsToFree := v.blobsToFreeBuf
 
 	for i := range node.Entries {
 		e := &node.Entries[i]
@@ -483,6 +497,9 @@ func (v *vacuumer) processLeaf(
 	}
 	node.Entries = newEntries
 	node.Count = uint16(len(newEntries))
+
+	// Save blobsToFree back so next call reuses the grown capacity.
+	v.blobsToFreeBuf = blobsToFree
 
 	// NOW free blobs — entries are physically removed from the tree.
 	// This ensures no reader can find an entry with a freed blob.
