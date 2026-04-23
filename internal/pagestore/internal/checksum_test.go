@@ -279,18 +279,16 @@ func corruptSegmentFile(t *testing.T, segDir string, recordOffset int64, xorByte
 	}
 	defer f.Close()
 
-	// Segment files have a header. We need to find where page records start.
-	// Read the file size to determine the header size.
-	info, err := f.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The segment header size = total file size - PageRecordSize
-	// (we wrote exactly one page record)
-	headerSize := info.Size() - int64(pagestoreapi.PageRecordSize)
-	if headerSize < 0 {
-		t.Fatalf("segment file too small: %d bytes", info.Size())
+	// Detect segment header by checking for known magic bytes.
+	// Legacy segments (no magic) have headerSize = 0.
+	// New segments start with "PAGESEGM" or "BLOBSEGM" and have a 64-byte header.
+	magicBuf := make([]byte, 8)
+	var headerSize int64
+	if n, err := f.ReadAt(magicBuf, 0); err == nil && n == 8 {
+		magic := string(magicBuf)
+		if magic == "PAGESEGM" || magic == "BLOBSEGM" {
+			headerSize = 64 // SegmentHeaderSize
+		}
 	}
 
 	absOffset := headerSize + recordOffset

@@ -209,13 +209,6 @@ func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFil
 				headerSize = SegmentHeaderSize
 			}
 		}
-		// Seek back to start for writable files
-		if writable {
-			if _, err := f.Seek(0, io.SeekEnd); err != nil {
-				f.Close()
-				return nil, fmt.Errorf("segment: seek end %s: %w", path, err)
-			}
-		}
 	}
 
 	sf := &segmentFile{
@@ -225,39 +218,29 @@ func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFil
 		headerSize: headerSize,
 	}
 
-	// mmap disabled — always use ReadAt for consistency.
-	// Previously: memory-map read-only files for fast zero-syscall reads.
-	// Active (writable) segments keep using file.ReadAt.
-	// if !writable && info.Size() > 0 {
-	// 	data, err := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
-	// 	if err != nil {
-	// 		// Fallback: log warning and fall through to ReadAt.
-	// 		log.Printf("segment: mmap seg %d (%d bytes): %v — falling back to ReadAt", id, info.Size(), err)
-	// 		sf.data = nil
-	// 	} else {
-	// 		sf.data = data
-	// 		// Hint sequential access for sealed segments (read-ahead optimization).
-	// 		unix.Madvise(data, unix.MADV_SEQUENTIAL)
-	// 	}
-	// }
-
-	// For writable files, seek to end so Write appends correctly.
-	// Mmap'd files don't need this — the file is read-only.
 	if writable {
-		if _, err := f.Seek(0, io.SeekEnd); err != nil {
-			// Munmap if already mmap'd (shouldn't happen for writable).
-			if sf.data != nil {
-				unix.Munmap(sf.data)
-			}
+		// Active segment on recovery: pre-allocate to maxSize and mmap for writes.
+		if err := f.Truncate(sm.maxSize); err != nil {
 			f.Close()
-			return nil, fmt.Errorf("segment: seek end %s: %w", path, err)
+			return nil, fmt.Errorf("segment: truncate %s: %w", path, err)
 		}
+		data, err := unix.Mmap(int(f.Fd()), 0, int(sm.maxSize),
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("segment: mmap %s: %w", path, err)
+		}
+		sf.data = data
+		// sf.size stays at info.Size() — the actual written portion.
 	}
+	// Sealed (read-only) segments: no mmap, use file.ReadAt.
 
 	return sf, nil
 }
 
 // createSegment creates a new segment file and sets it as active.
+// The file is pre-allocated to maxSize and memory-mapped (PROT_READ|PROT_WRITE,
+// MAP_SHARED) so that Append writes go directly to the page cache — no syscall.
 func (sm *segmentManager) createSegment(id uint32) error {
 	path := sm.segPath(id)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0o644)
@@ -267,26 +250,24 @@ func (sm *segmentManager) createSegment(id uint32) error {
 
 	var headerSize int64 = 0
 	if sm.magic != "" {
-		// Write new style segment header
+		// Build the 64-byte segment header.
 		var header segmentHeader
 		copy(header.Magic[:], []byte(sm.magic))
 		header.Version = SegmentHeaderVersion
 		header.CreateTime = uint64(time.Now().UnixNano())
-		// Calculate CRC32 of header bytes [0:60]
 		headerBytes := make([]byte, 60)
 		copy(headerBytes[0:8], header.Magic[:])
 		binary.LittleEndian.PutUint32(headerBytes[8:12], header.Version)
 		binary.LittleEndian.PutUint64(headerBytes[16:24], header.CreateTime)
 		header.CRC32 = crc32.Checksum(headerBytes, crc32cTable)
 
-		// Write full 64-byte header
 		fullHeader := make([]byte, SegmentHeaderSize)
 		copy(fullHeader[0:8], header.Magic[:])
 		binary.LittleEndian.PutUint32(fullHeader[8:12], header.Version)
 		binary.LittleEndian.PutUint32(fullHeader[12:16], header.CRC32)
 		binary.LittleEndian.PutUint64(fullHeader[16:24], header.CreateTime)
-		// Reserved bytes are zero
 
+		// Write header via file I/O before mmap.
 		n, err := f.Write(fullHeader)
 		if err != nil {
 			f.Close()
@@ -299,9 +280,24 @@ func (sm *segmentManager) createSegment(id uint32) error {
 		headerSize = SegmentHeaderSize
 	}
 
+	// Pre-allocate the file to maxSize so the mmap covers the full capacity.
+	if err := f.Truncate(sm.maxSize); err != nil {
+		f.Close()
+		return fmt.Errorf("segment: truncate %s: %w", path, err)
+	}
+
+	// Memory-map the entire file for read+write (MAP_SHARED).
+	data, err := unix.Mmap(int(f.Fd()), 0, int(sm.maxSize),
+		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("segment: mmap %s: %w", path, err)
+	}
+
 	sm.active = &segmentFile{
 		id:         id,
 		file:       f,
+		data:       data,
 		size:       headerSize,
 		headerSize: headerSize,
 	}
@@ -324,21 +320,28 @@ func (sm *segmentManager) Append(data []byte) (segmentapi.VAddr, error) {
 		return segmentapi.VAddr{}, segmentapi.ErrClosed
 	}
 
-	if sm.active.size+int64(len(data)) > sm.maxSize {
+	needed := sm.active.size + int64(len(data))
+	if needed > sm.maxSize {
 		return segmentapi.VAddr{}, segmentapi.ErrSegmentFull
 	}
 
 	offset := sm.active.size
 
-	n, err := sm.active.file.Write(data)
-	if err != nil {
-		return segmentapi.VAddr{}, fmt.Errorf("segment: write: %w", err)
-	}
-	if n != len(data) {
-		return segmentapi.VAddr{}, fmt.Errorf("segment: short write: %d/%d", n, len(data))
+	// Fast path: copy into mmap'd region (no syscall).
+	if sm.active.data != nil {
+		copy(sm.active.data[offset:offset+int64(len(data))], data)
+	} else {
+		// Fallback: file.Write (shouldn't happen for active segment, but safe).
+		n, err := sm.active.file.Write(data)
+		if err != nil {
+			return segmentapi.VAddr{}, fmt.Errorf("segment: write: %w", err)
+		}
+		if n != len(data) {
+			return segmentapi.VAddr{}, fmt.Errorf("segment: short write: %d/%d", n, len(data))
+		}
 	}
 
-	sm.active.size += int64(n)
+	sm.active.size += int64(len(data))
 
 	return segmentapi.VAddr{
 		SegmentID: sm.active.id,
@@ -433,6 +436,12 @@ func (sm *segmentManager) Sync() error {
 		return segmentapi.ErrClosed
 	}
 
+	// Flush mmap'd pages to disk, then fsync the file for durability.
+	if sm.active.data != nil {
+		if err := unix.Msync(sm.active.data, unix.MS_SYNC); err != nil {
+			return fmt.Errorf("segment: msync: %w", err)
+		}
+	}
 	return sm.active.file.Sync()
 }
 
@@ -444,43 +453,43 @@ func (sm *segmentManager) Rotate() error {
 		return segmentapi.ErrClosed
 	}
 
-	// Sync before sealing.
-	if err := sm.active.file.Sync(); err != nil {
+	oldActive := sm.active
+
+	// Munmap the writable mmap before touching the file.
+	if oldActive.data != nil {
+		if err := unix.Msync(oldActive.data, unix.MS_SYNC); err != nil {
+			return fmt.Errorf("segment: msync before rotate: %w", err)
+		}
+		if err := unix.Munmap(oldActive.data); err != nil {
+			return fmt.Errorf("segment: munmap active %d: %w", oldActive.id, err)
+		}
+		oldActive.data = nil
+	}
+
+	// Truncate file to actual written size (remove unused pre-allocated space).
+	actualSize := oldActive.size
+	if err := oldActive.file.Truncate(actualSize); err != nil {
+		return fmt.Errorf("segment: truncate sealed %d: %w", oldActive.id, err)
+	}
+
+	// Sync to disk.
+	if err := oldActive.file.Sync(); err != nil {
 		return fmt.Errorf("segment: sync before rotate: %w", err)
 	}
 
-	oldActive := sm.active
-
-	// Seal: close O_RDWR fd, reopen O_RDONLY, then mmap.
-	// Without this, sealed segments use the slow ReadAt syscall path forever
-	// (data=nil). The recover() path mmaps via openSegmentFile(writable=false),
-	// but Rotate() used createSegment which leaves data=nil. This closes that gap:
-	// sealed segments now get the fast mmap path in-process on every Rotate().
+	// Close O_RDWR fd, reopen O_RDONLY for sealed segment.
 	if err := oldActive.file.Close(); err != nil {
 		return fmt.Errorf("segment: close old fd before rotate: %w", err)
 	}
 	f, err := os.OpenFile(sm.segPath(oldActive.id), os.O_RDONLY, 0)
 	if err != nil {
-		return fmt.Errorf("segment: reopen old segment for mmap: %w", err)
+		return fmt.Errorf("segment: reopen old segment: %w", err)
 	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return fmt.Errorf("segment: stat old segment: %w", err)
-	}
-	// mmap disabled — always use ReadAt
-	// if info.Size() > 0 {
-	//     data, mmapErr := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
-	//     if mmapErr != nil {
-	//         log.Printf("segment: mmap sealed seg %d: %v — falling back to ReadAt", oldActive.id, mmapErr)
-	//     } else {
-	//         unix.Madvise(data, unix.MADV_SEQUENTIAL)
-	//         oldActive.data = data
-	//     }
-	// }
-	oldActive.data = nil // ensure ReadAt is used
+
+	// Sealed segments: NO mmap — use ReadAt to save memory.
 	oldActive.file = f
-	oldActive.size = info.Size()
+	oldActive.data = nil
+	oldActive.size = actualSize
 	oldActive.sealed = true
 	sm.sealed[oldActive.id] = oldActive
 
@@ -591,8 +600,18 @@ func (sm *segmentManager) Close() error {
 		}
 	}
 
-	// Sync and close active.
+	// Munmap, truncate, sync, and close active.
 	if sm.active != nil {
+		if sm.active.data != nil {
+			if err := unix.Munmap(sm.active.data); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("segment: munmap active %d: %w", sm.active.id, err)
+			}
+			sm.active.data = nil
+		}
+		// Truncate to actual written size (remove unused pre-allocated space).
+		if err := sm.active.file.Truncate(sm.active.size); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("segment: truncate active %d: %w", sm.active.id, err)
+		}
 		if err := sm.active.file.Sync(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("segment: sync %d: %w", sm.active.id, err)
 		}
