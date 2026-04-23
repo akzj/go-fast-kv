@@ -47,6 +47,13 @@ func (m *MemPageProvider) ReadPage(pageID uint64) (*Page, error) {
 	return PageFromBytes(cp), nil
 }
 
+// ReadPageForWrite returns a clone of the page, safe for in-place mutation.
+func (m *MemPageProvider) ReadPageForWrite(pageID uint64) (*Page, error) {
+	// MemPageProvider.ReadPage already returns a copy, but we clone again
+	// to match the contract: the returned page must be independently mutable.
+	return m.ReadPage(pageID)
+}
+
 // ReadPageUncached reads directly without cache.
 // MemPageProvider has no cache, so this is identical to ReadPage.
 func (m *MemPageProvider) ReadPageUncached(pageID uint64) (*Page, error) {

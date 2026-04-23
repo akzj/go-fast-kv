@@ -218,6 +218,16 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 	return page, nil
 }
 
+// ReadPageForWrite returns a clone of the page, safe for in-place mutation.
+// Must be used when the caller intends to modify the page data (under WLock).
+func (p *RealPageProvider) ReadPageForWrite(pageID pagestoreapi.PageID) (*Page, error) {
+	page, err := p.ReadPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return page.Clone(), nil
+}
+
 // ReadPageUncached reads directly from the underlying PageStore without
 // going through the LRU cache.
 func (p *RealPageProvider) ReadPageUncached(pageID pagestoreapi.PageID) (*Page, error) {

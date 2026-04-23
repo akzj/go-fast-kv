@@ -113,7 +113,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 	// Phase 2: Write-lock the leaf
 	leafPID := path[len(path)-1]
 	t.pageLocks.WLock(leafPID)
-	leaf, err := t.pages.ReadPage(leafPID)
+	leaf, err := t.pages.ReadPageForWrite(leafPID)
 	if err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
@@ -125,7 +125,7 @@ func (t *bTree) Put(key, value []byte, txnID uint64) error {
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
-		leaf, err = t.pages.ReadPage(leafPID)
+		leaf, err = t.pages.ReadPageForWrite(leafPID)
 		if err != nil {
 			t.pageLocks.WUnlock(leafPID)
 			return err
@@ -303,7 +303,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 	for i := len(path) - 1; i >= 0; i-- {
 		parentPID := path[i]
 		t.pageLocks.WLock(parentPID)
-		parent, err := t.pages.ReadPage(parentPID)
+		parent, err := t.pages.ReadPageForWrite(parentPID)
 		if err != nil {
 			t.pageLocks.WUnlock(parentPID)
 			return err
@@ -315,7 +315,7 @@ func (t *bTree) propagateSplit(path []uint64, splitKey []byte, newChildPID uint6
 			t.pageLocks.WUnlock(parentPID)
 			parentPID = nextPID
 			t.pageLocks.WLock(parentPID)
-			parent, err = t.pages.ReadPage(parentPID)
+			parent, err = t.pages.ReadPageForWrite(parentPID)
 			if err != nil {
 				t.pageLocks.WUnlock(parentPID)
 				return err
@@ -483,7 +483,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 	// Phase 2: Write-lock the leaf
 	leafPID := path[len(path)-1]
 	t.pageLocks.WLock(leafPID)
-	leaf, err := t.pages.ReadPage(leafPID)
+	leaf, err := t.pages.ReadPageForWrite(leafPID)
 	if err != nil {
 		t.pageLocks.WUnlock(leafPID)
 		return err
@@ -495,7 +495,7 @@ func (t *bTree) Delete(key []byte, txnID uint64) error {
 		t.pageLocks.WUnlock(leafPID)
 		leafPID = nextPID
 		t.pageLocks.WLock(leafPID)
-		leaf, err = t.pages.ReadPage(leafPID)
+		leaf, err = t.pages.ReadPageForWrite(leafPID)
 		if err != nil {
 			t.pageLocks.WUnlock(leafPID)
 			return err
