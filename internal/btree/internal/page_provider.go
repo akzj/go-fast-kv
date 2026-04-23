@@ -118,8 +118,8 @@ type RealPageProvider struct {
 
 	// Hot page cache: stores pages for zero-copy reads.
 	// ReadPage returns directly from hotPages on hit — no clone.
-	// Protected by hotMu to allow concurrent read-only access.
-	hotMu    sync.Mutex
+	// Protected by hotMu (RWMutex) to allow concurrent read-only access.
+	hotMu    sync.RWMutex
 	hotPages map[pagestoreapi.PageID]*Page
 
 	// Per-operation WAL entry collectors, keyed by goroutine ID.
@@ -201,13 +201,13 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 	}
 
 	// Hot page cache: return shared pointer directly (zero-copy).
-	p.hotMu.Lock()
+	p.hotMu.RLock()
 	if page, ok := p.hotPages[pageID]; ok {
-		p.hotMu.Unlock()
+		p.hotMu.RUnlock()
 		p.pageCacheHits.Add(1)
 		return page, nil
 	}
-	p.hotMu.Unlock()
+	p.hotMu.RUnlock()
 
 	// Fallback: LRU cache (returns a clone).
 	if page, ok := p.cache.Get(pageID); ok {
