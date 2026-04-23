@@ -488,15 +488,21 @@ func (v *vacuumer) processLeaf(
 		return 0, nil, nil
 	}
 
-	// Build new entry list (physically remove dead entries from node)
-	newEntries := make([]btreeapi.LeafEntry, 0, len(node.Entries)-removed)
+	// Build new entry list by compacting in-place (avoids allocation).
+	// We shift kept entries to the front of the existing slice.
+	j := 0
 	for i, e := range node.Entries {
 		if keep[i] {
-			newEntries = append(newEntries, e)
+			node.Entries[j] = e
+			j++
 		}
 	}
-	node.Entries = newEntries
-	node.Count = uint16(len(newEntries))
+	// Clear trailing entries to avoid holding references (help GC).
+	for k := j; k < len(node.Entries); k++ {
+		node.Entries[k] = btreeapi.LeafEntry{}
+	}
+	node.Entries = node.Entries[:j]
+	node.Count = uint16(j)
 
 	// Save blobsToFree back so next call reuses the grown capacity.
 	v.blobsToFreeBuf = blobsToFree
