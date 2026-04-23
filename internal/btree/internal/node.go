@@ -6,11 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync"
 
 	btreeapi "github.com/akzj/go-fast-kv/internal/btree/api"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// crcBufPool reduces Deserialize allocations by reusing a 4KB temp buffer
+// for CRC32-C checksum validation. sync.Pool is safe for concurrent use.
+var crcBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 4096)
+		return &b
+	},
+}
 
 var (
 	errNodeTooLarge    = errors.New("btree: serialized node exceeds PageSize")
@@ -159,12 +169,18 @@ func (s *nodeSerializer) Deserialize(data []byte) (*btreeapi.Node, error) {
 		return nil, errDataTooShort
 	}
 
-	// validate checksum
+	// validate checksum — reuse pooled 4KB buffer instead of allocating
 	saved := binary.LittleEndian.Uint32(data[12:16])
-	tmp := make([]byte, len(data))
-	copy(tmp, data)
-	binary.LittleEndian.PutUint32(tmp[12:16], 0)
-	computed := crc32.Checksum(tmp, crc32cTable)
+	tmp := crcBufPool.Get().(*[]byte)
+	// Ensure buffer is large enough (PageSize = 4096)
+	if cap(*tmp) < len(data) {
+		*tmp = make([]byte, len(data))
+	}
+	*tmp = (*tmp)[:len(data)]
+	copy(*tmp, data)
+	binary.LittleEndian.PutUint32((*tmp)[12:16], 0)
+	computed := crc32.Checksum(*tmp, crc32cTable)
+	crcBufPool.Put(tmp)
 	if saved != computed {
 		return nil, fmt.Errorf("%w: stored=%08x computed=%08x", errChecksumInvalid, saved, computed)
 	}
