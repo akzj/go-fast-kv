@@ -354,6 +354,167 @@ func (ps *pageStore) Read(pageID pagestoreapi.PageID) ([]byte, error) {
 	return result, nil
 }
 
+// ─── Variable-Length Compact Write/Read ──────────────────────────────
+
+// WriteCompact writes variable-length compact page data.
+//
+// Record format: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
+// Packed VAddr uses SegmentID:20 | Offset:30 | RecordLen:14 encoding.
+func (ps *pageStore) WriteCompact(pageID pagestoreapi.PageID, compactData []byte) (pagestoreapi.WALEntry, error) {
+	dataLen := len(compactData)
+	if dataLen > pagestoreapi.PageSize {
+		return pagestoreapi.WALEntry{}, pagestoreapi.ErrInvalidPageSize
+	}
+	recordLen := pagestoreapi.PageRecordOverhead + dataLen // 14 + N
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.closed {
+		return pagestoreapi.WALEntry{}, pagestoreapi.ErrClosed
+	}
+
+	// Look up old mapping before overwriting (needed for stats decrement).
+	oldPacked, _ := ps.lsm.GetPageMapping(uint64(pageID))
+
+	// Build record: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
+	record := make([]byte, recordLen)
+	binary.BigEndian.PutUint64(record[:8], pageID)
+	binary.BigEndian.PutUint16(record[8:10], uint16(dataLen))
+	copy(record[10:10+dataLen], compactData)
+	checksum := crc32.ChecksumIEEE(record[:10+dataLen])
+	binary.BigEndian.PutUint32(record[10+dataLen:], checksum)
+
+	// Append to segment.
+	vaddr, err := ps.segMgr.Append(record)
+	if err == segmentapi.ErrSegmentFull {
+		if rotErr := ps.segMgr.Rotate(); rotErr != nil {
+			return pagestoreapi.WALEntry{}, fmt.Errorf("pagestore: rotate on full: %w", rotErr)
+		}
+		vaddr, err = ps.segMgr.Append(record)
+	}
+	if err != nil {
+		return pagestoreapi.WALEntry{}, err
+	}
+
+	// Pack VAddr with record length using new 20:30:14 encoding.
+	packed := segmentapi.PackPageVAddr(vaddr.SegmentID, vaddr.Offset, uint16(recordLen))
+	ps.lsm.SetPageMapping(uint64(pageID), packed)
+	if ps.cache != nil {
+		ps.cache.Invalidate(uint64(pageID))
+	}
+
+	// Stats update.
+	if ps.statsMgr != nil {
+		if oldPacked != 0 {
+			_, _, oldRecLen := segmentapi.UnpackPageVAddr(oldPacked)
+			oldSegID := segmentapi.SegmentIDFromPageVAddr(oldPacked)
+			if oldRecLen > 0 {
+				ps.statsMgr.Decrement(oldSegID, 1, int64(oldRecLen))
+			} else {
+				// Legacy fixed-size record
+				ps.statsMgr.Decrement(oldSegID, 1, int64(pagestoreapi.PageRecordSize))
+			}
+		}
+		ps.statsMgr.Increment(vaddr.SegmentID, 1, int64(recordLen))
+	}
+
+	return pagestoreapi.WALEntry{Type: 1, ID: pageID, VAddr: packed, Size: 0}, nil
+}
+
+// ReadCompact reads variable-length compact page data.
+//
+// Uses RecordLen from the packed VAddr to read the exact bytes in one I/O.
+// Returns the compact data (without PageID header or CRC).
+func (ps *pageStore) ReadCompact(pageID pagestoreapi.PageID) ([]byte, error) {
+	// Check cache first.
+	if ps.cache != nil {
+		if data := ps.cache.Get(uint64(pageID)); data != nil {
+			result := make([]byte, len(data))
+			copy(result, data)
+			return result, nil
+		}
+	}
+
+	ps.mu.Lock()
+	if ps.closed {
+		ps.mu.Unlock()
+		return nil, pagestoreapi.ErrClosed
+	}
+	packed, ok := ps.lsm.GetPageMapping(uint64(pageID))
+	ps.mu.Unlock()
+	if !ok || packed == 0 {
+		return nil, pagestoreapi.ErrPageNotFound
+	}
+
+	// Unpack VAddr to get segment location and record length.
+	segID, offset, recordLen := segmentapi.UnpackPageVAddr(packed)
+	if recordLen == 0 || recordLen < uint16(pagestoreapi.PageRecordOverhead) {
+		// Fallback to legacy fixed-size read if RecordLen is 0 (old format).
+		return ps.readLegacy(pageID, packed)
+	}
+
+	// Single read: exactly recordLen bytes.
+	addr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
+	raw, err := ps.segMgr.ReadAt(addr, uint32(recordLen))
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
+	dataLen := int(binary.BigEndian.Uint16(raw[8:10]))
+	if 10+dataLen+4 != int(recordLen) {
+		return nil, fmt.Errorf("pagestore: record length mismatch: header says %d, vaddr says %d",
+			10+dataLen+4, recordLen)
+	}
+
+	// CRC check on [PageID:8][DataLen:2][CompactData:N].
+	expected := binary.BigEndian.Uint32(raw[10+dataLen:])
+	actual := crc32.ChecksumIEEE(raw[:10+dataLen])
+	if expected != actual {
+		return nil, fmt.Errorf("%w: pageID=%d expected=0x%08x actual=0x%08x",
+			pagestoreapi.ErrChecksumMismatch, pageID, expected, actual)
+	}
+
+	// Extract compact data.
+	compactData := make([]byte, dataLen)
+	copy(compactData, raw[10:10+dataLen])
+
+	// Cache the compact data.
+	if ps.cache != nil {
+		ps.cache.Put(uint64(pageID), compactData)
+	}
+
+	return compactData, nil
+}
+
+// readLegacy handles reading pages written with the old fixed-size format.
+// This provides backward compatibility during migration.
+func (ps *pageStore) readLegacy(pageID pagestoreapi.PageID, packed uint64) ([]byte, error) {
+	// Old format: VAddr is packed with 32:32 encoding.
+	addr := segmentapi.UnpackVAddr(packed)
+	bp := pageRecordPool.Get().(*[]byte)
+	raw := *bp
+	err := ps.segMgr.ReadAtInto(addr, raw)
+	if err != nil {
+		pageRecordPool.Put(bp)
+		return nil, err
+	}
+	expected := binary.BigEndian.Uint32(raw[8+pagestoreapi.PageSize:])
+	actual := crc32.ChecksumIEEE(raw[:8+pagestoreapi.PageSize])
+	if expected != actual {
+		pageRecordPool.Put(bp)
+		return nil, fmt.Errorf("%w: pageID=%d expected=0x%08x actual=0x%08x (legacy)",
+			pagestoreapi.ErrChecksumMismatch, pageID, expected, actual)
+	}
+	result := make([]byte, pagestoreapi.PageSize)
+	copy(result, raw[8:8+pagestoreapi.PageSize])
+	pageRecordPool.Put(bp)
+	if ps.cache != nil {
+		ps.cache.Put(uint64(pageID), result)
+	}
+	return result, nil
+}
+
 func (ps *pageStore) Free(pageID pagestoreapi.PageID) pagestoreapi.WALEntry {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()

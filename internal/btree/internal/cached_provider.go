@@ -44,6 +44,15 @@ func (p *CachedMemPageProvider) ReadPage(pageID uint64) (*Page, error) {
 	return page, nil
 }
 
+// ReadPageForWrite returns a clone of the page, safe for in-place mutation.
+func (p *CachedMemPageProvider) ReadPageForWrite(pageID uint64) (*Page, error) {
+	page, err := p.ReadPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return page.Clone(), nil
+}
+
 // ReadPageUncached is identical to ReadPage (no cache to bypass).
 func (p *CachedMemPageProvider) ReadPageUncached(pageID uint64) (*Page, error) {
 	return p.ReadPage(pageID)

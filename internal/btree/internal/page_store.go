@@ -21,6 +21,10 @@ type pageStore interface {
 	// WritePage writes a page to the given PageID.
 	WritePage(pageID pagestoreapi.PageID, page *Page) error
 
+	// ReadPageForWrite returns a clone of the page, safe for in-place mutation.
+	// Must be used when the caller intends to modify the page data (under WLock).
+	ReadPageForWrite(pageID pagestoreapi.PageID) (*Page, error)
+
 	// ReadPageUncached reads directly from the underlying store without
 	// going through the LRU cache.
 	ReadPageUncached(pageID pagestoreapi.PageID) (*Page, error)

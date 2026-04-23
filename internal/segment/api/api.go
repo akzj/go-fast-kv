@@ -72,6 +72,35 @@ func (v VAddr) String() string {
 	return fmt.Sprintf("seg:%04d/off:%08d", v.SegmentID, v.Offset)
 }
 
+// ─── Page VAddr (with record length) ────────────────────────────────
+//
+// PageStore uses a different packing that embeds the record length,
+// enabling single-read page retrieval without knowing the size upfront.
+//
+// Layout: SegmentID:20 | Offset:30 | RecordLen:14
+//   Max SegmentID = 1,048,575 (1M segments)
+//   Max Offset    = 1,073,741,823 (1GB per segment)
+//   Max RecordLen = 16,383 bytes (covers 4096-byte page + overhead)
+
+// PackPageVAddr encodes a page VAddr with record length into uint64.
+func PackPageVAddr(segID uint32, offset uint32, recordLen uint16) uint64 {
+	return (uint64(segID) << 44) | (uint64(offset) << 14) | uint64(recordLen)
+}
+
+// UnpackPageVAddr decodes a page VAddr with record length.
+func UnpackPageVAddr(packed uint64) (segID uint32, offset uint32, recordLen uint16) {
+	segID = uint32(packed >> 44)
+	offset = uint32((packed >> 14) & 0x3FFFFFFF)
+	recordLen = uint16(packed & 0x3FFF)
+	return
+}
+
+// SegmentIDFromPageVAddr extracts just the SegmentID from a packed page VAddr.
+// Useful for stats tracking without full unpack.
+func SegmentIDFromPageVAddr(packed uint64) uint32 {
+	return uint32(packed >> 44)
+}
+
 // ─── Constants ──────────────────────────────────────────────────────
 
 const (

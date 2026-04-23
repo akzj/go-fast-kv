@@ -41,14 +41,28 @@ const (
 	// PageSize is the fixed size of a page in bytes (4KB).
 	PageSize = 4096
 
-	// PageRecordSize is the size of a page record in a segment file:
+	// PageRecordSize is the size of a FIXED page record in a segment file:
 	// 8 bytes pageID header + 4096 bytes page data + 4 bytes CRC32 = 4108 bytes.
 	//
-	// The CRC32 (IEEE polynomial) covers [pageID:8][data:4096] and is stored
-	// as the last 4 bytes of the record in big-endian order.
+	// DEPRECATED: With dynamic page sizes, actual record size varies.
+	// Use PageRecordOverhead + actual data length instead.
+	// Kept for backward compatibility with tests and stats.
 	//
 	// Design reference: docs/DESIGN.md §3.2, §3.7, §7.7
 	PageRecordSize = 8 + PageSize + 4 // 4108
+
+	// PageRecordHeaderSize is the fixed header size in a variable-length page record:
+	// [PageID:8][DataLen:2] = 10 bytes.
+	PageRecordHeaderSize = 10
+
+	// PageRecordOverhead is the total overhead per variable-length page record:
+	// [PageID:8][DataLen:2] + [CRC32:4] = 14 bytes.
+	// Actual record size = PageRecordOverhead + compactDataLen.
+	PageRecordOverhead = 14
+
+	// MaxPageRecordSize is the maximum possible variable-length page record:
+	// PageRecordOverhead + PageSize = 4110 bytes.
+	MaxPageRecordSize = PageRecordOverhead + PageSize
 )
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -117,6 +131,26 @@ type PageStore interface {
 	//
 	// Returns ErrClosed if the store is closed.
 	WriteDirect(pageID PageID, serializeFn func(buf []byte) error) (WALEntry, error)
+
+	// WriteCompact writes variable-length compact page data for the given PageID.
+	//
+	// Segment record format: [PageID:8][DataLen:2][CompactData:N][CRC32:4]
+	// The packed VAddr encodes SegmentID:20 | Offset:30 | RecordLen:14,
+	// allowing single-read retrieval without knowing the size upfront.
+	//
+	// compactData must be ≤ PageSize bytes (the output of Page.SerializeCompact).
+	// Returns ErrInvalidPageSize if len(compactData) > PageSize.
+	WriteCompact(pageID PageID, compactData []byte) (WALEntry, error)
+
+	// ReadCompact reads variable-length compact page data for the given PageID.
+	//
+	// Uses the RecordLen encoded in the packed VAddr to read the exact number
+	// of bytes in a single I/O operation, then returns the compact data
+	// (without PageID header or CRC — just the page content).
+	//
+	// Returns ErrPageNotFound if the page has not been allocated or was freed.
+	// Returns ErrChecksumMismatch if the CRC32 does not match.
+	ReadCompact(pageID PageID) ([]byte, error)
 
 	// Free marks a PageID as freed. The mapping is cleared.
 	//

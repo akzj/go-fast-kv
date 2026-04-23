@@ -742,6 +742,42 @@ func (p *Page) UsedBytes() int {
 	return p.slotArrayEnd() + (btreeapi.PageSize - p.freeEnd())
 }
 
+// ─── Validation ─────────────────────────────────────────────────────
+
+// Validate checks page structural integrity. Returns nil if valid.
+func (p *Page) Validate() error {
+	count := p.Count()
+	freeEnd := p.freeEnd()
+	slotStart := p.slotArrayStart()
+	slotEnd := slotStart + count*2
+
+	if freeEnd < slotEnd {
+		return fmt.Errorf("freeEnd=%d < slotEnd=%d", freeEnd, slotEnd)
+	}
+	if freeEnd > btreeapi.PageSize {
+		return fmt.Errorf("freeEnd=%d > PageSize", freeEnd)
+	}
+
+	for i := 0; i < count; i++ {
+		off := p.slotOffset(i)
+		if off < slotEnd || off >= btreeapi.PageSize {
+			return fmt.Errorf("slot[%d]=%d out of range [%d, %d)", i, off, slotEnd, btreeapi.PageSize)
+		}
+		if p.IsLeaf() {
+			kl := int(binary.LittleEndian.Uint16(p.data[off:]))
+			if kl > btreeapi.MaxKeySize || kl <= 0 {
+				return fmt.Errorf("slot[%d] at off=%d: invalid keyLen=%d", i, off, kl)
+			}
+			cellEnd := off + 2 + kl + 8 + 8 + 1 // min cell size (keyLen+key+txnMin+txnMax+valueType)
+			if cellEnd > btreeapi.PageSize {
+				return fmt.Errorf("slot[%d] at off=%d: cellEnd=%d > PageSize (kl=%d)", i, off, cellEnd, kl)
+			}
+		}
+	}
+	return nil
+}
+
+
 // ─── Page ↔ Node Conversion ────────────────────────────────────────
 
 // PageToNode converts a slotted *Page to a *btreeapi.Node for backward
@@ -815,4 +851,130 @@ func NodeToPage(node *btreeapi.Node) *Page {
 		}
 	}
 	return p
+}
+
+// ─── Compact Serialization ─────────────────────────────────────────
+//
+// SerializeCompact returns only the used bytes of the page, eliminating
+// the free gap between the slot array and the cell content area.
+//
+// In-memory layout:
+//   [header:16][slots:count*2][  FREE GAP  ][cells at freeEnd..PageSize]
+//
+// Compact layout:
+//   [header:16][slots:count*2][cells packed contiguously]
+//
+// Slot offsets and highKeyOff are adjusted downward by the gap size so
+// they remain valid within the compact buffer.
+//
+// The compact freeEnd header field is set to slotArrayEnd (no gap).
+func (p *Page) SerializeCompact() []byte {
+	slotEnd := p.slotArrayEnd()
+	freeEnd := p.freeEnd()
+	cellBytes := btreeapi.PageSize - freeEnd // bytes used by cells (at end of page)
+
+	compactSize := slotEnd + cellBytes
+	if compactSize <= 0 {
+		compactSize = slotEnd // empty page: just header + slots
+	}
+
+	buf := make([]byte, compactSize)
+
+	// 1. Copy header + slot array
+	copy(buf[:slotEnd], p.data[:slotEnd])
+
+	// 2. Copy cell content area (from freeEnd to end of page)
+	if cellBytes > 0 {
+		copy(buf[slotEnd:], p.data[freeEnd:btreeapi.PageSize])
+	}
+
+	// 3. Compute gap = freeEnd - slotEnd (the eliminated free space)
+	gap := freeEnd - slotEnd
+
+	// 4. Adjust freeEnd in compact header to slotEnd (no gap)
+	binary.LittleEndian.PutUint16(buf[offFreeEnd:], uint16(slotEnd))
+
+	// 5. Adjust slot offsets: each slot offset -= gap
+	count := int(binary.LittleEndian.Uint16(buf[offCount:]))
+	saStart := p.slotArrayStart()
+	for i := 0; i < count; i++ {
+		off := saStart + i*2
+		oldOff := int(binary.LittleEndian.Uint16(buf[off:]))
+		binary.LittleEndian.PutUint16(buf[off:], uint16(oldOff-gap))
+	}
+
+	// 6. Adjust highKeyOff
+	hkOff := int(binary.LittleEndian.Uint16(buf[offHighKeyOff:]))
+	if hkOff != 0 {
+		binary.LittleEndian.PutUint16(buf[offHighKeyOff:], uint16(hkOff-gap))
+	}
+
+	return buf
+}
+
+// CompactSize returns the number of bytes SerializeCompact would produce,
+// without allocating. Useful for sizing record buffers.
+func (p *Page) CompactSize() int {
+	slotEnd := p.slotArrayEnd()
+	freeEnd := p.freeEnd()
+	cellBytes := btreeapi.PageSize - freeEnd
+	size := slotEnd + cellBytes
+	if size <= 0 {
+		return slotEnd
+	}
+	return size
+}
+
+// DeserializeCompact expands a compact byte slice back into a full
+// PageSize (4096-byte) in-memory page.
+//
+// It reverses SerializeCompact: the cell content is placed at the end
+// of the 4096-byte buffer, and slot offsets / highKeyOff are adjusted
+// upward by the restored gap size.
+func DeserializeCompact(compact []byte) *Page {
+	data := make([]byte, btreeapi.PageSize)
+
+	// Read enough of the compact header to compute layout.
+	// Determine slotArrayStart from the isLeaf flag.
+	isLeaf := compact[offFlags]&flagLeaf != 0
+	count := int(binary.LittleEndian.Uint16(compact[offCount:]))
+
+	var saStart int
+	if isLeaf {
+		saStart = offData // 16
+	} else {
+		saStart = offData + 8 // 24 (after child0)
+	}
+	slotEnd := saStart + count*2
+	cellBytes := len(compact) - slotEnd
+
+	// 1. Copy header + slot array
+	copy(data[:slotEnd], compact[:slotEnd])
+
+	// 2. Place cells at end of full page
+	newFreeEnd := btreeapi.PageSize - cellBytes
+	if cellBytes > 0 {
+		copy(data[newFreeEnd:], compact[slotEnd:])
+	}
+
+	// 3. Compute gap = newFreeEnd - slotEnd (the restored free space)
+	gap := newFreeEnd - slotEnd
+
+	// 4. Update freeEnd in header
+	binary.LittleEndian.PutUint16(data[offFreeEnd:], uint16(newFreeEnd))
+
+	// 5. Adjust slot offsets: each slot offset += gap
+	for i := 0; i < count; i++ {
+		off := saStart + i*2
+		oldOff := int(binary.LittleEndian.Uint16(data[off:]))
+		binary.LittleEndian.PutUint16(data[off:], uint16(oldOff+gap))
+	}
+
+	// 6. Adjust highKeyOff
+	hkOff := int(binary.LittleEndian.Uint16(data[offHighKeyOff:]))
+	if hkOff != 0 {
+		binary.LittleEndian.PutUint16(data[offHighKeyOff:], uint16(hkOff+gap))
+	}
+
+	return &Page{data: data}
 }

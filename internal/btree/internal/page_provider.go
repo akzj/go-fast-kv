@@ -197,12 +197,12 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 		return page, nil
 	}
 
-	// Cache miss — read from disk.
-	data, err := p.store.Read(pageID)
+	// Cache miss — read compact data from disk.
+	compactData, err := p.store.ReadCompact(pageID)
 	if err != nil {
 		return nil, fmt.Errorf("realpage: read page %d: %w", pageID, err)
 	}
-	page := PageFromBytes(data)
+	page := DeserializeCompact(compactData)
 
 	// Populate both caches.
 	p.hotMu.Lock()
@@ -218,27 +218,35 @@ func (p *RealPageProvider) ReadPage(pageID pagestoreapi.PageID) (*Page, error) {
 	return page, nil
 }
 
+// ReadPageForWrite returns a clone of the page, safe for in-place mutation.
+// Must be used when the caller intends to modify the page data (under WLock).
+func (p *RealPageProvider) ReadPageForWrite(pageID pagestoreapi.PageID) (*Page, error) {
+	page, err := p.ReadPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return page.Clone(), nil
+}
+
 // ReadPageUncached reads directly from the underlying PageStore without
 // going through the LRU cache.
 func (p *RealPageProvider) ReadPageUncached(pageID pagestoreapi.PageID) (*Page, error) {
-	data, err := p.store.Read(pageID)
+	compactData, err := p.store.ReadCompact(pageID)
 	if err != nil {
 		return nil, fmt.Errorf("realpage: uncached read page %d: %w", pageID, err)
 	}
-	return PageFromBytes(data), nil
+	return DeserializeCompact(compactData), nil
 }
 
-// WritePage writes a page to the given PageID.
-// The page's Data() IS the serialized form — zero serialize!
+// WritePage writes a page to the given PageID using compact serialization.
+// Only the used bytes are written to disk, reducing I/O by ~50-90%.
 func (p *RealPageProvider) WritePage(pageID pagestoreapi.PageID, page *Page) error {
 	startNs := time.Now().UnixNano()
 	p.pageWrites.Add(1)
 
-	// Write directly: copy page data into mmap region.
-	entry, err := p.store.WriteDirect(pageID, func(buf []byte) error {
-		copy(buf, page.Data())
-		return nil
-	})
+	// Serialize compact: only used bytes (no free gap).
+	compactData := page.SerializeCompact()
+	entry, err := p.store.WriteCompact(pageID, compactData)
 	if err != nil {
 		return fmt.Errorf("realpage: write page %d: %w", pageID, err)
 	}

@@ -192,3 +192,115 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 
 	return stats, nil
 }
+
+// CollectOneCompact collects a sealed segment containing variable-length
+// compact page records (written by WriteCompact).
+//
+// Record format: [PageID:8][DataLen:2][Data:N][CRC32:4] = N+14 bytes.
+// The scan reads the 10-byte header first to determine record size.
+//
+// Packed VAddr uses the 20:30:14 encoding (SegmentID:Offset:RecordLen).
+func (gc *pageGC) CollectOneCompact() (*gcapi.GCStats, error) {
+	sealed := gc.segMgr.SealedSegments()
+	if len(sealed) == 0 {
+		return nil, gcapi.ErrNoSegmentsToGC
+	}
+	segID := sealed[0]
+
+	segSize, err := gc.segMgr.SegmentSize(segID)
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &gcapi.GCStats{SegmentID: segID}
+
+	type mappingUpdate struct {
+		pageID   uint64
+		oldVAddr uint64
+		newVAddr uint64
+	}
+	var updates []mappingUpdate
+	batch := walapi.NewBatch()
+
+	var offset uint32
+	headerBuf := make([]byte, pagestoreapi.PageRecordHeaderSize) // 10 bytes
+
+	for int64(offset)+int64(pagestoreapi.PageRecordHeaderSize) <= segSize {
+		// 1. Read 10-byte header: [PageID:8][DataLen:2]
+		headerAddr := segmentapi.VAddr{SegmentID: segID, Offset: offset}
+		if err := gc.segMgr.ReadAtInto(headerAddr, headerBuf); err != nil {
+			return nil, err
+		}
+
+		pageID := binary.BigEndian.Uint64(headerBuf[:8])
+		dataLen := int(binary.BigEndian.Uint16(headerBuf[8:10]))
+		recordSize := uint32(pagestoreapi.PageRecordOverhead + dataLen) // 14 + N
+
+		// Validate record fits in segment.
+		if int64(offset)+int64(recordSize) > segSize {
+			break // Truncated record at end of segment
+		}
+
+		// 2. Read full record.
+		record, err := gc.segMgr.ReadAt(headerAddr, recordSize)
+		if err != nil {
+			return nil, err
+		}
+
+		stats.TotalRecords++
+
+		// 3. Construct packed VAddr for liveness check.
+		oldPacked := segmentapi.PackPageVAddr(segID, offset, uint16(recordSize))
+
+		// Check liveness against LSM mapping.
+		if mappedVAddr, ok := gc.recovery.LSMLifecycle().GetPageMapping(pageID); ok && mappedVAddr == oldPacked {
+			// Live — copy to active segment.
+			newAddr, err := gc.segMgr.Append(record)
+			if err != nil {
+				return nil, err
+			}
+
+			newPacked := segmentapi.PackPageVAddr(newAddr.SegmentID, newAddr.Offset, uint16(recordSize))
+			batch.Add(walapi.ModuleTree, walapi.RecordPageMap, pageID, newPacked, 0)
+			updates = append(updates, mappingUpdate{pageID: pageID, oldVAddr: oldPacked, newVAddr: newPacked})
+
+			stats.LiveRecords++
+		} else {
+			stats.DeadRecords++
+			stats.BytesFreed += int64(recordSize)
+		}
+
+		offset += recordSize
+	}
+
+	// Sync + WAL + CAS mapping updates.
+	if err := gc.segMgr.Sync(); err != nil {
+		return nil, err
+	}
+	if err := gc.segMgr.Sync(); err != nil {
+		return nil, err
+	}
+	if batch.Len() > 0 {
+		if _, err := gc.wal.WriteBatch(batch); err != nil {
+			return nil, err
+		}
+	}
+	for _, u := range updates {
+		if gc.recovery.LSMLifecycle().CompareAndSetPageMapping(u.pageID, u.oldVAddr, u.newVAddr) {
+			gc.ps.InvalidatePage(u.pageID)
+		}
+	}
+
+	// Remove old segment.
+	manifest := gc.recovery.LSMLifecycle().Manifest()
+	if manifest != nil {
+		if !manifest.TryDelete(gc.segMgr, segID) {
+			return stats, nil
+		}
+		return stats, nil
+	}
+	if err := gc.segMgr.RemoveSegment(segID); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
