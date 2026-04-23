@@ -428,3 +428,25 @@ func BenchmarkKVStore_Mixed_50_50_100(b *testing.B) {
 		}
 	}
 }
+// BenchmarkKVStore_Put_SeqWrite_1k_NoVacuum measures allocations without vacuum.
+func BenchmarkKVStore_Put_SeqWrite_1k_NoVacuum(b *testing.B) {
+	dir := b.TempDir()
+	s, err := Open(kvstoreapi.Config{
+		Dir:                 dir,
+		SyncMode:            kvstoreapi.SyncNone,
+		AutoVacuumThreshold: 0, // disable vacuum
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keyFor(i)
+		val := []byte(fmt.Sprintf("v%08d", i))
+		if err := s.Put(key, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

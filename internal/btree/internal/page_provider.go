@@ -71,13 +71,18 @@ func (c *pageCache) Get(pageID pagestoreapi.PageID) (*btreeapi.Node, bool) {
 	return nil, false
 }
 
-// Put stores a deep clone of the node in the cache, evicting the LRU
+// Put stores the node directly in the cache (no clone), evicting the LRU
 // entry if at capacity.
+//
+// The stored reference is safe because:
+// - hotNodes holds the original reference for zero-copy reads
+// - pageCache.Get returns a clone to protect callers from mutations
+// - WritePage always replaces hotNodes before calling Put
 func (c *pageCache) Put(pageID pagestoreapi.PageID, node *btreeapi.Node) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if entry, ok := c.items[pageID]; ok {
-		entry.node = cloneNode(node)
+		entry.node = node
 		c.order.MoveToFront(entry.elem)
 		return
 	}
@@ -90,7 +95,7 @@ func (c *pageCache) Put(pageID pagestoreapi.PageID, node *btreeapi.Node) {
 			c.order.Remove(back)
 		}
 	}
-	entry := &pageCacheEntry{pageID: pageID, node: cloneNode(node)}
+	entry := &pageCacheEntry{pageID: pageID, node: node}
 	entry.elem = c.order.PushFront(entry)
 	c.items[pageID] = entry
 }
