@@ -226,20 +226,21 @@ func (sm *segmentManager) openSegmentFile(id uint32, writable bool) (*segmentFil
 		headerSize: headerSize,
 	}
 
-	// Memory-map read-only files for fast zero-syscall reads.
+	// mmap disabled — always use ReadAt for consistency.
+	// Previously: memory-map read-only files for fast zero-syscall reads.
 	// Active (writable) segments keep using file.ReadAt.
-	if !writable && info.Size() > 0 {
-		data, err := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
-		if err != nil {
-			// Fallback: log warning and fall through to ReadAt.
-			log.Printf("segment: mmap seg %d (%d bytes): %v — falling back to ReadAt", id, info.Size(), err)
-			sf.data = nil
-		} else {
-			sf.data = data
-			// Hint sequential access for sealed segments (read-ahead optimization).
-			unix.Madvise(data, unix.MADV_SEQUENTIAL)
-		}
-	}
+	// if !writable && info.Size() > 0 {
+	// 	data, err := unix.Mmap(int(f.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
+	// 	if err != nil {
+	// 		// Fallback: log warning and fall through to ReadAt.
+	// 		log.Printf("segment: mmap seg %d (%d bytes): %v — falling back to ReadAt", id, info.Size(), err)
+	// 		sf.data = nil
+	// 	} else {
+	// 		sf.data = data
+	// 		// Hint sequential access for sealed segments (read-ahead optimization).
+	// 		unix.Madvise(data, unix.MADV_SEQUENTIAL)
+	// 	}
+	// }
 
 	// For writable files, seek to end so Write appends correctly.
 	// Mmap'd files don't need this — the file is read-only.
