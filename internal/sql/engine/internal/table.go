@@ -53,6 +53,7 @@ func encodeMetaKey(tableID uint32) []byte {
 // Caller must hold te.mu.
 func (te *tableEngine) nextRowID(tableID uint32) (uint64, error) {
 	if rid, ok := te.rowCounters[tableID]; ok {
+		te.rowCounters[tableID] = rid + 1
 		return rid, nil
 	}
 	// Read from KV.
@@ -125,6 +126,7 @@ func (te *tableEngine) AllocRowID(tableID uint32) (uint64, error) {
 	te.mu.Lock()
 	defer te.mu.Unlock()
 	if rid, ok := te.rowCounters[tableID]; ok {
+		te.rowCounters[tableID] = rid + 1
 		return rid, nil
 	}
 	// Read from KV.

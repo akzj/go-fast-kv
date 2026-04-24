@@ -1366,9 +1366,9 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		}
 
 		// Persist counter with transaction's XID.
-		// In-line the counter persistence logic (tableEngine is not used for transactional writes).
+		// AllocRowID already advanced the in-memory counter for each row,
+		// so we just persist the current value without further incrementing.
 		tableID := plan.Table.TableID
-		e.tableEngine.IncrementCounter(tableID) // advance in-memory counter
 		metaKey := encodeMetaKeyLocal(tableID)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(tableID))
@@ -1684,8 +1684,7 @@ func (e *executor) upsertInsertRowTxn(plan *plannerapi.UpsertPlan, row []catalog
 		}
 		e.txnCtx.AddPendingWrite(idxKey, nil)
 	}
-	// Persist counter
-	e.tableEngine.IncrementCounter(plan.Table.TableID)
+	// Persist counter — AllocRowID already advanced it
 	metaKey := encodeMetaKeyLocal(plan.Table.TableID)
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(plan.Table.TableID))
@@ -1927,8 +1926,7 @@ func (e *executor) execInsertParameterized(plan *plannerapi.InsertPlan, columns 
 			}
 		}
 
-		// Persist counter
-		e.tableEngine.IncrementCounter(plan.Table.TableID)
+		// Persist counter — AllocRowID already advanced it
 		metaKey := encodeMetaKeyLocal(plan.Table.TableID)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(plan.Table.TableID))
