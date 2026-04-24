@@ -306,8 +306,8 @@ func TestCheckConstraintErrorType(t *testing.T) {
 		return
 	}
 
-	if sqlErr.SQLState != "23522" {
-		t.Errorf("SQLState = %q, want 23522", sqlErr.SQLState)
+	if sqlErr.SQLState != "23514" {
+		t.Errorf("SQLState = %q, want 23514", sqlErr.SQLState)
 	}
 }
 

@@ -28,9 +28,8 @@ const (
 	// Class 23 — Integrity Constraint Violation
 	SQLStateUniqueViolation          = "23505"
 	SQLStateNotNullViolation         = "23502"
-	SQLStateCheckViolation           = "23522" // CHECK constraint violation
+	SQLStateCheckViolation           = "23514" // CHECK constraint violation
 	SQLStateForeignKeyViolation      = "23503"
-	SQLStateCheckConstraintViolation = "23514"
 	SQLStateExclusionViolation       = "23P01"
 
 	// Class 34 — Program Name Not Found
@@ -53,7 +52,7 @@ const (
 	SQLStateDuplicateColumn        = "42701"
 	SQLStateDuplicateAlias         = "42712"
 	SQLStateDuplicateObject        = "42710"
-	SQLStateAmbiguousColumn        = "42703"
+	SQLStateAmbiguousColumn        = "42702"
 	SQLStateAmbiguousFunction      = "42725"
 	SQLStateInvalidColumnReference = "42P10"
 	SQLStateInvalidObjectName      = "42602"
