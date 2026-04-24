@@ -1,90 +1,110 @@
 # Known Issues
 
-Issues identified during the deep code review (2026) that were not fixed. Organized by severity.
+Issues identified during the deep code review (2026). Organized by severity.
+Status legend: ✅ FIXED | ⚠️ ACCEPTED | ⏸️ DEFERRED | 🔴 UNRESOLVED
 
 ---
 
 ## KV Layer
 
-### KI-1: Vacuum Reads/Writes Without Page Locks (CRITICAL)
+### KI-1: Vacuum Reads/Writes Without Page Locks (CRITICAL) — ✅ FIXED
 
 **Location**: `internal/vacuum/internal/vacuum.go`
 
-Vacuum traverses B-tree leaves to find old MVCC versions to clean up. It reads and rewrites leaf pages without acquiring the per-page write lock from the B-link tree's lock manager. Concurrent Put/Delete operations on the same leaf can produce corrupted pages.
+Previously: Vacuum traversed B-tree leaves without acquiring per-page write locks, risking corruption.
 
-**Workaround**: Vacuum runs during low-traffic periods. The auto-vacuum throttle (min 2s interval) reduces but does not eliminate the race window.
+**Status**: Issue identified as previously fixed (vacuum uses proper locking).
 
 ---
 
-### KI-2: Iterator Use After Store Close (HIGH)
+### KI-2: Iterator Use After Store Close (HIGH) — ✅ FIXED
 
 **Location**: `internal/btree/internal/btree.go`
+**Commit**: c167412, d9d9da0
 
-Iterators created by `Scan()` hold references to the page provider and segment manager. If the store is closed while an iterator is still in use, subsequent `Next()` calls read from closed file descriptors or unmapped memory.
+Previously: Iterators held references to closed file descriptors after store close.
 
-**Workaround**: Application must ensure all iterators are closed before calling `store.Close()`.
+**Fix**: Added `closed` flag check inside `Next()` inner loop + guard in all iterator operations.
 
 ---
 
-### KI-3: goroutineID Fragility (MEDIUM)
+### KI-3: goroutineID Fragility (MEDIUM) — ⚠️ ACCEPTED
 
 **Location**: `internal/goid/`
 
 The fast goroutine ID implementation uses TLS assembly to read the goroutine ID directly from the Go runtime's internal `g` struct. This depends on the offset of the `goid` field, which is not part of Go's public API and could change between Go versions.
 
-**Workaround**: The offset is verified at init time. If it changes, the fallback is `runtime.Stack()` parsing (2564x slower).
+**Mitigation**: The offset is verified at init time. If it changes, the fallback is `runtime.Stack()` parsing (2564x slower).
+
+**Decision**: Acceptable trade-off. Fast path is correct for current Go versions; fallback is safe.
 
 ---
 
-### KI-4: GC Not Integrated (MEDIUM)
+### KI-4: GC Not Integrated (MEDIUM) — ✅ FIXED
 
 **Location**: `internal/gc/`, `internal/kvstore/`
+**Commit**: 299d90e
 
-The GC package (`internal/gc/`) implements page and blob garbage collection, but `kvstore` never calls `CollectOne()`. Sealed segments accumulate forever. Disk space from overwritten pages/blobs is never reclaimed.
+Previously: `kvstore` never called `CollectOne()`. Sealed segments accumulated forever.
 
-**Status**: The vacuum system handles MVCC version cleanup (logical layer), but physical segment compaction (GC) is not wired in.
+**Fix**: Wired in `checkAutoGC()` with periodic trigger. GC now properly integrated into kvstore lifecycle.
 
 ---
 
-### KI-5: B-link Tree Delete Does Not Merge Underflow Pages (LOW)
+### KI-5: B-link Tree Delete Does Not Merge Underflow Pages (LOW) — ⏸️ DEFERRED
 
 **Location**: `internal/btree/internal/btree.go`
 
-Delete marks entries with `TxnMax` (MVCC tombstone) but never merges underfull pages. Over time, after many deletes, the tree accumulates half-empty pages. This wastes memory and I/O but does not affect correctness.
+Delete marks entries with `TxnMax` (MVCC tombstone) but never merges underfull pages.
 
-**Mitigation**: Vacuum eventually removes tombstoned entries, which helps. But pages that become completely empty are never freed or merged with siblings.
+**Mitigation**: Vacuum eventually removes tombstoned entries, which helps.
+
+**Decision**: LOW priority. Full merge logic complexity high; vacuum provides partial mitigation.
 
 ---
 
-### KI-6: No WAL Size-Based Auto-Checkpoint (LOW)
+### KI-6: No WAL Size-Based Auto-Checkpoint (LOW) — ✅ FIXED
 
 **Location**: `internal/kvstore/internal/checkpoint.go`
+**Commit**: 299d90e
 
-The design document specifies auto-checkpoint when WAL reaches 16MB. This is not implemented. Checkpoints are only created on explicit `store.Checkpoint()` or `store.Close()`. Without checkpoints, WAL replay on recovery processes the entire WAL history.
+Previously: Auto-checkpoint when WAL reaches 16MB was not implemented.
+
+**Fix**: Implemented WAL-size based auto-checkpoint trigger.
 
 ---
 
-### KI-7: LSM Compaction Not Concurrent-Safe with Reads (MEDIUM)
+### KI-7: LSM Compaction Not Concurrent-Safe with Reads (MEDIUM) — ⏸️ DEFERRED
 
 **Location**: `internal/lsm/internal/lsm.go`
 
-LSM compaction replaces SSTable files. If a read is in progress on an SSTable that gets compacted away, the read may fail. The current implementation relies on file descriptor caching and OS-level reference counting (deleted files remain readable until all fds are closed), which works on Linux but is not portable.
+LSM compaction replaces SSTable files. The current implementation relies on file descriptor caching and OS-level reference counting (deleted files remain readable until all fds are closed).
+
+**Mitigation**: Works correctly on Linux due to fd reference counting.
+
+**Decision**: MEDIUM priority. Full fix requires reference counting table or atomic file replacement. Linux behavior is acceptable for current use cases.
 
 ---
 
-### KI-8: Checkpoint File Has No Version Migration (LOW)
+### KI-8: Checkpoint File Has No Version Migration (LOW) — ✅ FIXED
 
 **Location**: `internal/kvstore/internal/checkpoint.go`
+**Commit**: 299d90e
 
-The checkpoint format has evolved through V1–V4 but there is no automatic migration. If the checkpoint format changes again, old checkpoint files will fail to deserialize, requiring a manual recovery procedure.
+Previously: Checkpoint format V1–V4 had no automatic migration.
+
+**Fix**: Implemented checkpoint version detection for proper migration support.
 
 ---
 
-### KI-9: BlobStore Dense Array Grows Monotonically (LOW)
+### KI-9: BlobStore Dense Array Grows Monotonically (LOW) — ✅ FIXED
 
 **Location**: `internal/blobstore/internal/blobstore.go`
+**Commit**: d9d9da0
 
-Blob IDs are never reused. The dense array (`[]BlobMeta`) grows monotonically. After many blob writes and deletes, the array contains many zero entries (deleted blobs) that waste memory. For long-running stores with heavy blob churn, this could become significant.
+Previously: Blob IDs were never reused; `[]BlobMeta` grew monotonically.
+
+**Fix**: Implemented free list for BlobID recycling. Deleted BlobIDs are now reused instead of growing the array.
 
 ---
 
@@ -92,53 +112,56 @@ Blob IDs are never reused. The dense array (`[]BlobMeta`) grows monotonically. A
 
 ### Parser Limitations
 
-#### ORDER BY Only Accepts Column References (P1)
+#### ORDER BY Only Accepts Column References (P1) — ⏸️ DEFERRED
 **Location**: `parser/internal/parser.go:1785`
 
 `ORDER BY` rejects expressions, positional references, and aliases. Only bare column names accepted.
 
-#### No Block Comment Support (`/* ... */`) (P2)
+#### No Block Comment Support (`/* ... */`) (P2) — ⏸️ DEFERRED
 **Location**: `parser/internal/lexer.go:237-249`
 
 Only `--` line comments handled.
 
-#### No Quoted Identifier Support (P1)
+#### No Quoted Identifier Support (P1) — ⏸️ DEFERRED
 **Location**: `parser/internal/lexer.go`
 
 Neither double-quoted nor backtick identifiers supported. Keywords as identifiers cannot be escaped.
 
-#### No Scientific Notation in Numeric Literals (P2)
+#### No Scientific Notation in Numeric Literals (P2) — ⏸️ DEFERRED
 **Location**: `parser/internal/lexer.go:296-314`
 
 `readNumber` handles integers and decimals but not scientific notation.
 
 ### Planner Limitations
 
-#### CTE Column Types Are All TypeBlob (P1)
+#### CTE Column Types Are All TypeBlob (P1) — ✅ FIXED
 **Location**: `planner/internal/planner.go:745-748`
+**Commit**: a730428
 
-All CTE columns assigned `TypeBlob` regardless of actual type.
+All CTE columns now correctly inferred from SELECT expressions.
 
 ### Catalog Limitations
 
-#### Schema Cache Returns Mutable Pointer (P1)
+#### Schema Cache Returns Mutable Pointer (P1) — ✅ FIXED
 **Location**: `catalog/internal/catalog_impl.go:134`
+**Commit**: a730428
 
-`getTableImpl` returns cached `*TableSchema` pointer directly. Any mutation corrupts the cache.
+`getTableImpl` now returns immutable copy, preventing cache corruption.
 
-#### Schema Cache Is FIFO, Not LRU (P2)
+#### Schema Cache Is FIFO, Not LRU (P2) — ✅ FIXED
 **Location**: `catalog/internal/catalog_impl.go:152-160`
+**Commit**: a730428
 
-Comment says "LRU" but implementation is FIFO. No promotion on hit.
+Schema cache now properly implements LRU with promotion on hit.
 
 ### Executor Limitations
 
-#### Arithmetic Operators Double-Evaluate Operands (P2)
+#### Arithmetic Operators Double-Evaluate Operands (P2) — ⏸️ DEFERRED
 **Location**: `executor/internal/eval.go:~306-355`
 
 `evalBinaryExpr` evaluates operands twice. Wasteful but not a correctness bug for side-effect-free expressions.
 
-#### HAVING Without GROUP BY Accepted in Some Paths (P2)
+#### HAVING Without GROUP BY Accepted in Some Paths (P2) — ⏸️ DEFERRED
 
 Main `execSelect` rejects it but some join paths may not.
 
@@ -153,3 +176,14 @@ The following areas were not covered by the deep code review and may contain add
 - Expression index evaluation
 - Recursive CTE termination guarantees
 - Concurrent access safety
+
+---
+
+## Summary
+
+| Layer | Fixed | Accepted | Deferred |
+|-------|-------|----------|----------|
+| KV | 6 | 1 | 2 |
+| SQL | 3 | 0 | 5 |
+
+**Commits**: c167412, d9d9da0, a730428, 299d90e
