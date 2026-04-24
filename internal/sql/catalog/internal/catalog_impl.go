@@ -500,6 +500,39 @@ func (c *Catalog) renameTableImpl(oldName, newName string) error {
 	delete(c.schemaCache, upperOld)
 	c.schemaCache[upperNew] = &schema
 
+	// Re-key all indexes from old table name to new table name.
+	// Index keys are "_sql:index:TABLENAME:INDEXNAME" — must be moved.
+	oldIdxPrefix := tableIndexPrefix(upperOld)
+	idxIter := c.kv.Scan(oldIdxPrefix, append(oldIdxPrefix, 0xFF))
+	defer idxIter.Close()
+
+	for idxIter.Next() {
+		// Parse index schema to update the Table field
+		var idx api.IndexSchema
+		if err := json.Unmarshal(idxIter.Value(), &idx); err != nil {
+			return err
+		}
+		idx.Table = upperNew
+
+		// Write under new key
+		newIdxKey := indexKey(upperNew, strings.ToUpper(idx.Name))
+		newData, err := json.Marshal(idx)
+		if err != nil {
+			return err
+		}
+		if err := c.kv.Put(newIdxKey, newData); err != nil {
+			return err
+		}
+
+		// Delete old key
+		if err := c.kv.Delete(idxIter.Key()); err != nil {
+			return err
+		}
+	}
+	if err := idxIter.Err(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
