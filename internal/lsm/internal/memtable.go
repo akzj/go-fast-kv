@@ -9,22 +9,17 @@ import (
 // memtable is an in-memory skip list for storing mappings.
 // Uses sync.Map for concurrent access.
 type memtable struct {
-	pageMappings sync.Map // key=uint64, value=uint64 (packed vaddr)
-	blobMappings sync.Map // key=uint64, value=uint64 (packed blob meta)
+	pageMappings sync.Map // key=uint64, value=uint64 (vaddr)
+	blobMappings sync.Map // key=uint64, value=blobMeta
 	size         int64
 	mu           sync.RWMutex
 }
 
-// packedBlobMeta packs (vaddr, size) into a single uint64.
-func packBlobMeta(vaddr uint64, size uint32) uint64 {
-	return (vaddr << 32) | uint64(size)
-}
-
-// unpackBlobMeta unpacks (vaddr, size) from a single uint64.
-func unpackBlobMeta(packed uint64) (vaddr uint64, size uint32) {
-	vaddr = packed >> 32
-	size = uint32(packed)
-	return
+// blobMeta stores a blob's virtual address and size without truncation.
+// Previously (vaddr << 32 | size) destroyed upper 32 bits of vaddr.
+type blobMeta struct {
+	VAddr uint64
+	Size  uint32
 }
 
 // newMemtable creates a new memtable.
@@ -91,14 +86,13 @@ func (m *memtable) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	packed := packBlobMeta(vaddr, size)
 	_, loaded := m.blobMappings.Load(blobID)
 	if loaded {
 		m.size -= 16
 	} else {
 		m.size += 16
 	}
-	m.blobMappings.Store(blobID, packed)
+	m.blobMappings.Store(blobID, blobMeta{VAddr: vaddr, Size: size})
 }
 
 // GetBlobMapping gets a blob mapping.
@@ -109,10 +103,8 @@ func (m *memtable) GetBlobMapping(blobID uint64) (vaddr uint64, size uint32, ok 
 	if !ok {
 		return 0, 0, false
 	}
-	packed := val.(uint64)
-	vaddr = packed >> 32
-	size = uint32(packed)
-	return vaddr, size, true
+	meta := val.(blobMeta)
+	return meta.VAddr, meta.Size, true
 }
 
 // CompareAndSetBlobMapping atomically sets a blob mapping only if the current
@@ -126,21 +118,18 @@ func (m *memtable) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64,
 	if !ok {
 		return false
 	}
-	packed := current.(uint64)
-	currentVAddr := packed >> 32
-	currentSize := uint32(packed)
-	if currentVAddr != expectedVAddr || currentSize != expectedSize {
+	meta := current.(blobMeta)
+	if meta.VAddr != expectedVAddr || meta.Size != expectedSize {
 		return false // current value doesn't match expected
 	}
 	// Already locked, safe to update
-	newPacked := packBlobMeta(newVAddr, newSize)
 	_, loaded := m.blobMappings.Load(blobID)
 	if loaded {
 		m.size -= 16
 	} else {
 		m.size += 16
 	}
-	m.blobMappings.Store(blobID, newPacked)
+	m.blobMappings.Store(blobID, blobMeta{VAddr: newVAddr, Size: newSize})
 	return true
 }
 
@@ -176,9 +165,8 @@ func (m *memtable) RangePages(fn func(pageID uint64, vaddr uint64) bool) {
 // RangeBlobs iterates over all blob mappings.
 func (m *memtable) RangeBlobs(fn func(blobID uint64, vaddr uint64, size uint32) bool) {
 	m.blobMappings.Range(func(k, v interface{}) bool {
-		packed := v.(uint64)
-		vaddr, size := unpackBlobMeta(packed)
-		return fn(k.(uint64), vaddr, size)
+		meta := v.(blobMeta)
+		return fn(k.(uint64), meta.VAddr, meta.Size)
 	})
 }
 
