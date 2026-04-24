@@ -986,3 +986,34 @@ func TestV3CheckpointRecovery(t *testing.T) {
 		}
 	}
 }
+
+// TestCloseReopenDataPersistence verifies that data survives Close+Reopen.
+// This specifically tests that checkpointLocked() persists page mappings.
+func TestCloseReopenDataPersistence(t *testing.T) {
+	dir := t.TempDir()
+
+	// Phase 1: Open, write 100 keys, close.
+	s := openTestStoreAt(t, dir)
+	for i := 0; i < 100; i++ {
+		if err := s.Put(testKey(i), testValue(i)); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Phase 2: Reopen, verify all 100 keys.
+	s2 := openTestStoreAt(t, dir)
+	defer s2.Close()
+	for i := 0; i < 100; i++ {
+		val, err := s2.Get(testKey(i))
+		if err != nil {
+			t.Fatalf("Get(%d) after reopen: %v", i, err)
+		}
+		expected := testValue(i)
+		if string(val) != string(expected) {
+			t.Fatalf("Get(%d) = %q, want %q", i, val, expected)
+		}
+	}
+}

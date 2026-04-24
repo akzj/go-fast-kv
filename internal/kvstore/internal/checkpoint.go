@@ -362,6 +362,20 @@ func (s *store) checkpointLocked() error {
 	nextXID := s.txnMgr.NextXID()
 	clogEntries := s.txnMgr.CLOG().EntriesUpTo(nextXID)
 
+	// Collect page mappings from LSM (CRITICAL for recovery).
+	// Without page mappings, B-tree pages are unfindable after WAL truncation.
+	var pageMappings []pagestoreapi.MappingEntry
+	if lsmStore, ok := lsmRecovery.(interface {
+		GetAllPageMappings() []walapi.Record
+	}); ok {
+		for _, rec := range lsmStore.GetAllPageMappings() {
+			pageMappings = append(pageMappings, pagestoreapi.MappingEntry{
+				PageID: rec.ID,
+				VAddr:  rec.VAddr,
+			})
+		}
+	}
+
 	data := &checkpointData{
 		LSN:         s.wal.CurrentLSN(),
 		NextXID:     nextXID,
@@ -377,6 +391,14 @@ func (s *store) checkpointLocked() error {
 			BlobID: b.BlobID,
 			VAddr:  b.VAddr,
 			Size:   b.Size,
+		})
+	}
+
+	// Convert page mappings to internal format.
+	for _, p := range pageMappings {
+		data.Pages = append(data.Pages, pageMapping{
+			PageID: p.PageID,
+			VAddr:  p.VAddr,
 		})
 	}
 
