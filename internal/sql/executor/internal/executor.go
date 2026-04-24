@@ -3572,17 +3572,9 @@ func (e *executor) execSelectFromCTE(plan *plannerapi.SelectPlan, cteResult *exe
 		seen := make(map[string]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			var key strings.Builder
-			for _, v := range row {
-				if v.IsNull {
-					key.WriteString("NULL")
-				} else {
-					key.WriteString(fmt.Sprintf("%v", v))
-				}
-				key.WriteByte(0)
-			}
-			if !seen[key.String()] {
-				seen[key.String()] = true
+			key := distinctRowKey(row)
+			if !seen[key] {
+				seen[key] = true
 				deduped = append(deduped, row)
 			}
 		}
@@ -3761,17 +3753,9 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 		seen := make(map[string]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			var key strings.Builder
-			for _, v := range row {
-				if v.IsNull {
-					key.WriteString("NULL")
-				} else {
-					key.WriteString(fmt.Sprintf("%v", v))
-				}
-				key.WriteByte(0)
-			}
-			if !seen[key.String()] {
-				seen[key.String()] = true
+			key := distinctRowKey(row)
+			if !seen[key] {
+				seen[key] = true
 				deduped = append(deduped, row)
 			}
 		}
@@ -4045,24 +4029,14 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		}
 	}
 
-	// DISTINCT: deduplicate projected rows by concatenating all column values into a key
+	// DISTINCT: deduplicate projected rows
 	if plan.Distinct {
 		seen := make(map[string]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			var key strings.Builder
-			for _, v := range row {
-				if v.IsNull {
-					// Use type-aware NULL key to follow SQL standard semantics.
-					// Different NULL types (INT vs TEXT) are not equivalent in comparisons.
-					key.WriteString(fmt.Sprintf("NULL:%d", v.Type))
-				} else {
-					key.WriteString(fmt.Sprintf("%v", v))
-				}
-				key.WriteByte(0) // separator between columns
-			}
-			if !seen[key.String()] {
-				seen[key.String()] = true
+			key := distinctRowKey(row)
+			if !seen[key] {
+				seen[key] = true
 				deduped = append(deduped, row)
 			}
 		}
@@ -4073,6 +4047,38 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		Columns: colNames,
 		Rows:    projected,
 	}, nil
+}
+
+// distinctRowKey builds a deduplication key for a row of values.
+// NULL values are keyed uniformly (regardless of type) per SQL standard.
+// Non-NULL values include the type tag to prevent collisions (e.g., int 1 vs text "1").
+func distinctRowKey(row []catalogapi.Value) string {
+	var b strings.Builder
+	for i, v := range row {
+		if i > 0 {
+			b.WriteByte(0) // column separator
+		}
+		if v.IsNull {
+			b.WriteString("N")
+		} else {
+			// Type prefix prevents collision between different types with same representation
+			b.WriteByte(byte('0' + v.Type))
+			b.WriteByte(':')
+			switch v.Type {
+			case catalogapi.TypeInt:
+				fmt.Fprintf(&b, "%d", v.Int)
+			case catalogapi.TypeFloat:
+				fmt.Fprintf(&b, "%g", v.Float)
+			case catalogapi.TypeText:
+				b.WriteString(v.Text)
+			case catalogapi.TypeBlob:
+				fmt.Fprintf(&b, "%x", v.Blob)
+			default:
+				fmt.Fprintf(&b, "%v", v.Int)
+			}
+		}
+	}
+	return b.String()
 }
 
 func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, error) {
@@ -4091,19 +4097,9 @@ func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, e
 		seen := make(map[string]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range rows {
-			var key strings.Builder
-			for _, v := range row {
-				if v.IsNull {
-					// Use type-aware NULL key to follow SQL standard semantics.
-					// Different NULL types (INT vs TEXT) are not equivalent in comparisons.
-					key.WriteString(fmt.Sprintf("NULL:%d", v.Type))
-				} else {
-					key.WriteString(fmt.Sprintf("%v", v))
-				}
-				key.WriteByte(0) // separator between columns
-			}
-			if !seen[key.String()] {
-				seen[key.String()] = true
+			key := distinctRowKey(row)
+			if !seen[key] {
+				seen[key] = true
 				deduped = append(deduped, row)
 			}
 		}
@@ -4129,32 +4125,14 @@ func (e *executor) execIntersect(plan *plannerapi.IntersectPlan) (*executorapi.R
 	// Build a hash set of right rows for O(1) lookup
 	rightSet := make(map[string]bool)
 	for _, row := range rightResult.Rows {
-		var key strings.Builder
-		for _, v := range row {
-			if v.IsNull {
-				key.WriteString("NULL")
-			} else {
-				key.WriteString(fmt.Sprintf("%v", v))
-			}
-			key.WriteByte(0)
-		}
-		rightSet[key.String()] = true
+		rightSet[distinctRowKey(row)] = true
 	}
 
 	// Keep rows that appear in both left and right (with dedup)
 	seen := make(map[string]bool)
 	var result [][]catalogapi.Value
 	for _, row := range leftResult.Rows {
-		var key strings.Builder
-		for _, v := range row {
-			if v.IsNull {
-				key.WriteString("NULL")
-			} else {
-				key.WriteString(fmt.Sprintf("%v", v))
-			}
-			key.WriteByte(0)
-		}
-		keyStr := key.String()
+		keyStr := distinctRowKey(row)
 		if rightSet[keyStr] && !seen[keyStr] {
 			seen[keyStr] = true
 			result = append(result, row)
@@ -4180,32 +4158,14 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 	// Build a hash set of right rows for O(1) lookup
 	rightSet := make(map[string]bool)
 	for _, row := range rightResult.Rows {
-		var key strings.Builder
-		for _, v := range row {
-			if v.IsNull {
-				key.WriteString("NULL")
-			} else {
-				key.WriteString(fmt.Sprintf("%v", v))
-			}
-			key.WriteByte(0)
-		}
-		rightSet[key.String()] = true
+		rightSet[distinctRowKey(row)] = true
 	}
 
 	// Keep rows that appear in left but NOT in right (with dedup)
 	seen := make(map[string]bool)
 	var result [][]catalogapi.Value
 	for _, row := range leftResult.Rows {
-		var key strings.Builder
-		for _, v := range row {
-			if v.IsNull {
-				key.WriteString("NULL")
-			} else {
-				key.WriteString(fmt.Sprintf("%v", v))
-			}
-			key.WriteByte(0)
-		}
-		keyStr := key.String()
+		keyStr := distinctRowKey(row)
 		if !rightSet[keyStr] && !seen[keyStr] {
 			seen[keyStr] = true
 			result = append(result, row)
