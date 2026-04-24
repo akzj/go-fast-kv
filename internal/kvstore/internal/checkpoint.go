@@ -492,13 +492,22 @@ func serializeCheckpointV3(data *checkpointData) []byte {
 	statsCount := uint32(len(data.Stats))
 	lsmCount := uint32(len(data.lsmSegments))
 
+	// Calculate actual size needed for LSM segment names.
+	// Each name is serialized as: 2 (length) + len(name) + pad_to_16.
+	lsmNamesSize := 0
+	for _, name := range data.lsmSegments {
+		nameLen := len(name)
+		pad := (16 - (nameLen % 16)) % 16
+		lsmNamesSize += 2 + nameLen + pad
+	}
+
 	// Calculate total size.
 	totalSize := checkpointHeaderSizeV3 +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
 		int(statsCount)*20 +
-		int(lsmCount)*16 + // segment names (max 16 bytes each)
+		lsmNamesSize +
 		4 // trailing CRC32
 
 	buf := make([]byte, totalSize)
@@ -716,16 +725,17 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		return nil, fmt.Errorf("checkpoint: unsupported version %d", version)
 	}
 
-	// Validate size.
-	expected := headerSize +
+	// Validate minimum size (LSM segment names are variable-length, so exact
+	// validation requires parsing them; we check the fixed-size portions here).
+	minExpected := headerSize +
 		int(pageCount)*16 +
 		int(blobCount)*20 +
 		int(clogCount)*9 +
 		int(statsCount)*20 +
-		int(lsmCount)*16 +
+		int(lsmCount)*2 + // at minimum 2 bytes per name (length prefix)
 		4
-	if len(buf) != expected {
-		return nil, fmt.Errorf("checkpoint: size mismatch (got %d, expected %d)", len(buf), expected)
+	if len(buf) < minExpected {
+		return nil, fmt.Errorf("checkpoint: size too small (got %d, minimum %d)", len(buf), minExpected)
 	}
 
 	// Page mappings.
