@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	"github.com/akzj/go-fast-kv/internal/sql/encoding"
@@ -1658,6 +1659,164 @@ func evalCaseExpr(expr *parserapi.CaseExpr, row *engineapi.Row, columns []catalo
 	return catalogapi.Value{IsNull: true}, nil
 }
 
+// evalDateTimeFuncExpr evaluates date/time functions: NOW, CURRENT_TIMESTAMP, DATE_TRUNC, AGE, TO_CHAR, TO_TIMESTAMP.
+func evalDateTimeFuncExpr(expr *parserapi.DateTimeFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	now := time.Now()
+	switch strings.ToUpper(expr.Func) {
+	case "NOW", "CURRENT_TIMESTAMP":
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: now.Format("2006-01-02 15:04:05.999999")}, nil
+
+	case "DATE_TRUNC":
+		if len(expr.Args) < 2 {
+			return catalogapi.Value{}, fmt.Errorf("%w: DATE_TRUNC requires 2 arguments", executorapi.ErrExecFailed)
+		}
+		// Evaluate precision argument
+		precVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if precVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		precision := strings.ToUpper(precVal.Text)
+		// Evaluate timestamp argument
+		tsVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if tsVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// Parse timestamp (format: 2006-01-02 15:04:05 or similar)
+		ts, err := parseTimestamp(tsVal.Text)
+		if err != nil {
+			// Use current time if parsing fails
+			ts = now
+		}
+		// Truncate based on precision
+		switch precision {
+		case "YEAR":
+			ts = time.Date(ts.Year(), 1, 1, 0, 0, 0, 0, ts.Location())
+		case "MONTH":
+			ts = time.Date(ts.Year(), ts.Month(), 1, 0, 0, 0, 0, ts.Location())
+		case "DAY":
+			ts = time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, ts.Location())
+		case "HOUR":
+			ts = time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), 0, 0, 0, ts.Location())
+		case "MINUTE":
+			ts = time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), ts.Minute(), 0, 0, ts.Location())
+		case "SECOND":
+			ts = time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), ts.Minute(), ts.Second(), 0, ts.Location())
+		default:
+			// Default to day truncation
+			ts = time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, ts.Location())
+		}
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: ts.Format("2006-01-02 15:04:05")}, nil
+
+	case "AGE":
+		if len(expr.Args) < 1 {
+			return catalogapi.Value{}, fmt.Errorf("%w: AGE requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		tsVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if tsVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		ts, err := parseTimestamp(tsVal.Text)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: AGE: invalid timestamp: %v", executorapi.ErrExecFailed, err)
+		}
+		diff := now.Sub(ts)
+		years := int(diff.Hours() / (365.25 * 24))
+		months := int((diff.Hours() / (30.44 * 24)) - float64(years*12))
+		days := int(diff.Hours()/24) - years*365 - months*30
+		if years > 0 {
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: fmt.Sprintf("%d years %d months %d days", years, months, days)}, nil
+		}
+		if months > 0 {
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: fmt.Sprintf("%d months %d days", months, days)}, nil
+		}
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: fmt.Sprintf("%d days", days)}, nil
+
+	case "TO_CHAR":
+		if len(expr.Args) < 2 {
+			return catalogapi.Value{}, fmt.Errorf("%w: TO_CHAR requires 2 arguments", executorapi.ErrExecFailed)
+		}
+		val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		formatVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		format := strings.ToUpper(formatVal.Text)
+		// Simplified TO_CHAR: handle common format patterns
+		switch format {
+		case "YYYY", "YYYY-MM-DD", "YYYY-MM-DD HH:MI:SS":
+			ts, err := parseTimestamp(val.Text)
+			if err != nil {
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: val.Text}, nil
+			}
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: ts.Format("2006-01-02 15:04:05")}, nil
+		default:
+			// Fallback: return the value as-is
+			switch val.Type {
+			case catalogapi.TypeInt:
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: strconv.FormatInt(val.Int, 10)}, nil
+			case catalogapi.TypeFloat:
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: strconv.FormatFloat(val.Float, 'f', -1, 64)}, nil
+			default:
+				return catalogapi.Value{Type: catalogapi.TypeText, Text: val.Text}, nil
+			}
+		}
+
+	case "TO_TIMESTAMP":
+		if len(expr.Args) < 1 {
+			return catalogapi.Value{}, fmt.Errorf("%w: TO_TIMESTAMP requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		strVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if strVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		ts, err := parseTimestamp(strVal.Text)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: TO_TIMESTAMP: cannot parse %q: %v", executorapi.ErrExecFailed, strVal.Text, err)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: ts.Format("2006-01-02 15:04:05")}, nil
+
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown datetime function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// parseTimestamp parses a timestamp string in various formats.
+func parseTimestamp(s string) (time.Time, error) {
+	layouts := []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+		time.RFC3339,
+		time.RFC3339Nano,
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse timestamp: %s", s)
+}
+
 // evalExistsExpr evaluates EXISTS (SELECT ...) or NOT EXISTS (SELECT ...).
 // EXISTS returns TRUE if subquery returns at least 1 row, FALSE otherwise.
 // The subquery is executed with outer row context for correlated subqueries.
@@ -1712,6 +1871,291 @@ func evalJsonFuncExpr(expr *parserapi.JsonFuncExpr, row *engineapi.Row, columns 
 		return evalJsonRemove(expr, row, columns, subqueryResults, ex)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unknown JSON function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// evalExtractExpr evaluates EXTRACT(field FROM date).
+// Supported fields: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, DOW (day of week), DOY (day of year).
+func evalExtractExpr(expr *parserapi.ExtractExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if expr.Date == nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: EXTRACT requires a date argument", executorapi.ErrExecFailed)
+	}
+	dateVal, err := evalExpr(expr.Date, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if dateVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	// Parse timestamp or use current time
+	var ts time.Time
+	if dateVal.Type == catalogapi.TypeText {
+		ts, err = parseTimestamp(dateVal.Text)
+		if err != nil {
+			ts = time.Now()
+		}
+	} else if dateVal.Type == catalogapi.TypeInt {
+		// Unix timestamp
+		ts = time.Unix(dateVal.Int, 0)
+	} else {
+		ts = time.Now()
+	}
+	switch strings.ToUpper(expr.Field) {
+	case "YEAR":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Year())}, nil
+	case "MONTH":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Month())}, nil
+	case "DAY":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Day())}, nil
+	case "HOUR":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Hour())}, nil
+	case "MINUTE":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Minute())}, nil
+	case "SECOND":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Second())}, nil
+	case "DOW": // 0=Sunday, 1=Monday, ... (PostgreSQL convention)
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.Weekday())}, nil
+	case "DOY": // day of year (1-366)
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(ts.YearDay())}, nil
+	case "QUARTER":
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64((int(ts.Month())-1)/3 + 1)}, nil
+	case "WEEK":
+		// ISO week number
+		_, week := ts.ISOWeek()
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(week)}, nil
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown EXTRACT field %s", executorapi.ErrExecFailed, expr.Field)
+	}
+}
+
+// evalJsonbFuncExpr evaluates jsonb functions: JSONB_EXTRACT_PATH_TEXT, JSONB_EXTRACT_PATH, JSONB_TYPEOF, JSONB_ARRAY_LENGTH, JSONB_BUILD_OBJECT, JSONB_BUILD_ARRAY.
+func evalJsonbFuncExpr(expr *parserapi.JsonbFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch strings.ToUpper(expr.Func) {
+	case "JSONB_EXTRACT_PATH_TEXT":
+		if len(expr.Args) < 2 {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_EXTRACT_PATH_TEXT requires 2 arguments", executorapi.ErrExecFailed)
+		}
+		jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if jsonVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if pathVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		path := pathVal.Text
+		return extractJsonPathText(jsonVal.Text, path)
+
+	case "JSONB_EXTRACT_PATH":
+		if len(expr.Args) < 2 {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_EXTRACT_PATH requires 2 arguments", executorapi.ErrExecFailed)
+		}
+		jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if jsonVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		pathVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if pathVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		path := pathVal.Text
+		return extractJsonPath(jsonVal.Text, path)
+
+	case "JSONB_TYPEOF":
+		if len(expr.Args) < 1 {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_TYPEOF requires 1 argument", executorapi.ErrExecFailed)
+		}
+		jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if jsonVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// Parse JSON and determine type
+		var obj interface{}
+		if err := json.Unmarshal([]byte(jsonVal.Text), &obj); err != nil {
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+		}
+		switch obj.(type) {
+		case map[string]interface{}:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "object"}, nil
+		case []interface{}:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "array"}, nil
+		case string:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "string"}, nil
+		case float64:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "number"}, nil
+		case bool:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "boolean"}, nil
+		case nil:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "null"}, nil
+		default:
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "unknown"}, nil
+		}
+
+	case "JSONB_ARRAY_LENGTH":
+		if len(expr.Args) < 1 {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_ARRAY_LENGTH requires 1 argument", executorapi.ErrExecFailed)
+		}
+		jsonVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if jsonVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		var arr []interface{}
+		if err := json.Unmarshal([]byte(jsonVal.Text), &arr); err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_ARRAY_LENGTH requires valid JSON array", executorapi.ErrExecFailed)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(len(arr))}, nil
+
+	case "JSONB_BUILD_OBJECT":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{Type: catalogapi.TypeText, Text: "{}"}, nil
+		}
+		if len(expr.Args)%2 != 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: JSONB_BUILD_OBJECT requires even number of arguments", executorapi.ErrExecFailed)
+		}
+		pairs := make(map[string]interface{})
+		for i := 0; i < len(expr.Args); i += 2 {
+			keyVal, err := evalExpr(expr.Args[i], row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			if keyVal.IsNull {
+				continue
+			}
+			valVal, err := evalExpr(expr.Args[i+1], row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			pairs[keyVal.Text] = jsonValueToInterface(valVal)
+		}
+		data, _ := json.Marshal(pairs)
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: string(data)}, nil
+
+	case "JSONB_BUILD_ARRAY":
+		var elems []interface{}
+		for _, arg := range expr.Args {
+			val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			elems = append(elems, jsonValueToInterface(val))
+		}
+		data, _ := json.Marshal(elems)
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: string(data)}, nil
+
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown jsonb function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// extractJsonPathText extracts text value from JSON using a path.
+func extractJsonPathText(jsonStr, path string) (catalogapi.Value, error) {
+	result, err := extractJsonPath(jsonStr, path)
+	if err != nil || result.IsNull {
+		return result, err
+	}
+	// Return text value directly
+	return result, nil
+}
+
+// extractJsonPath extracts JSON value from path (e.g., "a.b.c" or "0").
+func extractJsonPath(jsonStr, path string) (catalogapi.Value, error) {
+	var obj interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: invalid JSON", executorapi.ErrExecFailed)
+	}
+	// Navigate path
+	parts := strings.Split(path, ".")
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		switch v := obj.(type) {
+		case map[string]interface{}:
+			var ok bool
+			obj, ok = v[part]
+			if !ok {
+				return catalogapi.Value{IsNull: true}, nil
+			}
+		case []interface{}:
+			idx, err := strconv.Atoi(part)
+			if err != nil || idx < 0 || idx >= len(v) {
+				return catalogapi.Value{IsNull: true}, nil
+			}
+			obj = v[idx]
+		default:
+			return catalogapi.Value{IsNull: true}, nil
+		}
+	}
+	// Convert result to Value
+	return jsonInterfaceToValue(obj), nil
+}
+
+// jsonValueToInterface converts a catalog.Value to a JSON-compatible interface{}.
+func jsonValueToInterface(val catalogapi.Value) interface{} {
+	if val.IsNull {
+		return nil
+	}
+	switch val.Type {
+	case catalogapi.TypeInt:
+		return val.Int
+	case catalogapi.TypeFloat:
+		return val.Float
+	case catalogapi.TypeText:
+		return val.Text
+	case catalogapi.TypeBlob:
+		return string(val.Blob)
+	default:
+		return nil
+	}
+}
+
+// jsonInterfaceToValue converts a JSON-parsed interface{} to a catalog.Value.
+func jsonInterfaceToValue(v interface{}) catalogapi.Value {
+	if v == nil {
+		return catalogapi.Value{IsNull: true}
+	}
+	switch val := v.(type) {
+	case string:
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: val}
+	case float64:
+		// JSON numbers are float64; check if it's an integer
+		if val == math.Trunc(val) {
+			return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(val)}
+		}
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: val}
+	case bool:
+		if val {
+			return catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}
+		}
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}
+	case []interface{}:
+		data, _ := json.Marshal(val)
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: string(data)}
+	case map[string]interface{}:
+		data, _ := json.Marshal(val)
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: string(data)}
+	default:
+		return catalogapi.Value{IsNull: true}
 	}
 }
 
