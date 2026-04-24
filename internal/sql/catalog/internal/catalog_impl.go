@@ -201,7 +201,23 @@ func (c *Catalog) dropTableImpl(name string) error {
 			return err
 		}
 	}
-	return iter.Err()
+	if err := iter.Err(); err != nil {
+		return err
+	}
+
+	// Delete all triggers on this table
+	triggers, err := c.listTriggersImpl(upperName)
+	if err != nil {
+		return err
+	}
+	for _, trig := range triggers {
+		tKey := triggerKey(strings.ToUpper(trig.Name))
+		if err := c.kv.Delete(tKey); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *Catalog) CreateIndex(schema api.IndexSchema) error {
