@@ -55,8 +55,8 @@ type blobStore struct {
 
 	// Free list: stack of recycled BlobIDs available for reuse.
 	// Reduces memory growth from monotonically increasing mapping array.
-	freeList    []uint64
-	freeListMu  sync.Mutex
+	freeList   []uint64
+	freeListMu sync.Mutex
 
 	// Per-key sharded CAS locks for fine-grained concurrent access.
 	// Reduces contention vs global mu — concurrent CAS on different blobIDs
@@ -111,9 +111,21 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 		return 0, blobstoreapi.WALEntry{}, blobstoreapi.ErrClosed
 	}
 
-	// Allocate BlobID
-	blobID := bs.nextBlobID
-	bs.nextBlobID++
+	// Allocate BlobID: try to reuse from free list first, then allocate new
+	var blobID uint64
+	bs.freeListMu.Lock()
+	if len(bs.freeList) > 0 {
+		// Pop from end (LIFO)
+		blobID = bs.freeList[len(bs.freeList)-1]
+		bs.freeList = bs.freeList[:len(bs.freeList)-1]
+	}
+	bs.freeListMu.Unlock()
+
+	if blobID == 0 {
+		// No free IDs, allocate new
+		blobID = bs.nextBlobID
+		bs.nextBlobID++
+	}
 
 	// Build record: [blobID:8][size:4][data:N][crc32:4]
 	dataLen := uint32(len(data))

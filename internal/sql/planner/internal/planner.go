@@ -718,7 +718,7 @@ func (p *planner) planWith(s *parserapi.WithStmt) (plannerapi.Plan, error) {
 			if _, ok := col.Expr.(*parserapi.StarExpr); ok {
 				colDef.Type = catalogapi.TypeBlob
 			} else {
-				colDef.Type = catalogapi.TypeBlob
+				colDef.Type = inferTypeFromExpr(col.Expr)
 			}
 			schema.Columns = append(schema.Columns, colDef)
 		}

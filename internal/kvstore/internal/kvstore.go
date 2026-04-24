@@ -608,6 +608,9 @@ func (s *store) Delete(key []byte) error {
 	s.vacuumTrigger.dirty.Store(true)
 	s.checkAutoVacuum()
 
+	// Trigger auto-GC check (lazy async goroutine).
+	s.checkAutoGC()
+
 	return nil
 }
 
