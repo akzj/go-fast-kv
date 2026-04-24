@@ -72,10 +72,6 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 		return nil, err
 	}
 
-	// 3. Build liveness map from current PageStore mapping.
-	//    map[pageID] → packed VAddr
-	liveMap := make(map[uint64]uint64, 0)
-
 	// 4. Scan all page records in the segment.
 	stats := &gcapi.GCStats{
 		SegmentID: segID,
@@ -119,10 +115,6 @@ func (gc *pageGC) CollectOne() (*gcapi.GCStats, error) {
 			newPacked := newAddr.Pack()
 			batch.Add(walapi.ModuleTree, walapi.RecordPageMap, pageID, newPacked, 0)
 			updates = append(updates, mappingUpdate{pageID: pageID, oldVAddr: oldVAddr, newVAddr: newPacked})
-
-			// Update liveMap so subsequent records for the same pageID
-			// in this segment won't also be considered live.
-			liveMap[pageID] = newPacked
 
 			stats.LiveRecords++
 		} else {
