@@ -316,35 +316,42 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 		return catalogapi.Value{}, fmt.Errorf("%w: %v", executorapi.ErrExecFailed, err)
 	}
 
-	var result bool
 	switch expr.Op {
 	case parserapi.BinEQ:
-		result = cmp == 0
+		if cmp == 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinNE:
-		result = cmp != 0
+		if cmp != 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinLT:
-		result = cmp < 0
+		if cmp < 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinLE:
-		result = cmp <= 0
+		if cmp <= 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinGT:
-		result = cmp > 0
+		if cmp > 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinGE:
-		result = cmp >= 0
+		if cmp >= 0 {
+			return intVal(1), nil
+		}
+		return intVal(0), nil
 	case parserapi.BinAdd, parserapi.BinSub, parserapi.BinMul, parserapi.BinDiv:
-		// Arithmetic operators: evaluate left and right as numbers
-		left, err := evalExpr(expr.Left, row, columns, subqueryResults, ex)
-		if err != nil {
-			return catalogapi.Value{}, err
-		}
-		right, err := evalExpr(expr.Right, row, columns, subqueryResults, ex)
-		if err != nil {
-			return catalogapi.Value{}, err
-		}
-		// Handle NULL arithmetic
+		// Arithmetic operators: use already-evaluated left/right from above.
 		if left.IsNull || right.IsNull {
 			return catalogapi.Value{IsNull: true}, nil
 		}
-		// Perform arithmetic
 		switch left.Type {
 		case catalogapi.TypeInt:
 			switch right.Type {
@@ -404,11 +411,6 @@ func evalBinaryExpr(expr *parserapi.BinaryExpr, row *engineapi.Row, columns []ca
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported binary op %d", executorapi.ErrExecFailed, expr.Op)
 	}
-
-	if result {
-		return intVal(1), nil
-	}
-	return intVal(0), nil
 }
 
 // evalUnaryExpr evaluates NOT and unary minus.
