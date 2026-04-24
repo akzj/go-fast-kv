@@ -3036,9 +3036,12 @@ func (e *executor) execRightJoin(leftRows, rightRows []*engineapi.Row, jplan *pl
 
 // mergeRows concatenates left and right values.
 func (e *executor) mergeRows(left, right *engineapi.Row, leftLen, rightLen int) []catalogapi.Value {
-	result := make([]catalogapi.Value, leftLen+rightLen)
+	// Use actual left length for nested JOINs where left row has columns from
+	// multiple tables (e.g. A JOIN B JOIN C: left has A+B columns, not just A).
+	actualLeftLen := len(left.Values)
+	result := make([]catalogapi.Value, actualLeftLen+rightLen)
 	copy(result, left.Values)
-	copy(result[leftLen:], right.Values)
+	copy(result[actualLeftLen:], right.Values)
 	return result
 }
 
