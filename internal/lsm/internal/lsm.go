@@ -263,10 +263,20 @@ func (s *lsm) SetPageMapping(pageID uint64, vaddr uint64) {
 //
 // Uses per-key sharded lock (not s.mu) to allow concurrent CAS on different keys.
 func (s *lsm) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newVAddr uint64) bool {
-	// Register collector for this goroutine (idempotent per call)
-	registerLSMWALCollector()
+	// Per-key sharded lock — serializes CAS on this specific pageID.
+	lockIdx := pageID & s.casLockMask
+	s.casLocks[lockIdx].Lock()
+	defer s.casLocks[lockIdx].Unlock()
 
-	// Append WAL entry to per-goroutine collector (protected by per-goroutine mutex)
+	// CAS check FIRST — only record WAL if CAS succeeds.
+	current, ok := s.active.GetPageMapping(pageID)
+	if !ok || current != expectedVAddr {
+		return false
+	}
+	s.active.SetPageMapping(pageID, newVAddr)
+
+	// WAL record ONLY after successful CAS — prevents phantom records on crash recovery.
+	registerLSMWALCollector()
 	gid := goroutineID()
 	colMu := getOrCreateCollectorMu(gid)
 	colMu.Lock()
@@ -280,18 +290,6 @@ func (s *lsm) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newV
 		})
 	}
 	colMu.Unlock()
-
-	// Per-key sharded lock — serializes CAS on this specific pageID.
-	lockIdx := pageID & s.casLockMask
-	s.casLocks[lockIdx].Lock()
-	defer s.casLocks[lockIdx].Unlock()
-
-	// Read current value under lock, then compare-and-set.
-	current, ok := s.active.GetPageMapping(pageID)
-	if !ok || current != expectedVAddr {
-		return false
-	}
-	s.active.SetPageMapping(pageID, newVAddr)
 	return true
 }
 
@@ -500,10 +498,20 @@ func (s *lsm) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
 //
 // Uses per-key sharded lock (not s.mu) to allow concurrent CAS on different keys.
 func (s *lsm) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
-	// Register collector for this goroutine
-	registerLSMWALCollector()
+	// Per-key sharded lock — serializes CAS on this specific blobID.
+	lockIdx := blobID & s.casLockMask
+	s.casLocks[lockIdx].Lock()
+	defer s.casLocks[lockIdx].Unlock()
 
-	// Append WAL entry to per-goroutine collector (always record new value, protected by per-goroutine mutex)
+	// CAS check FIRST — only record WAL if CAS succeeds.
+	current, size, ok := s.active.GetBlobMapping(blobID)
+	if !ok || current != expectedVAddr || size != expectedSize {
+		return false
+	}
+	s.active.SetBlobMapping(blobID, newVAddr, newSize)
+
+	// WAL record ONLY after successful CAS — prevents phantom records on crash recovery.
+	registerLSMWALCollector()
 	gid := goroutineID()
 	colMu := getOrCreateCollectorMu(gid)
 	colMu.Lock()
@@ -518,18 +526,6 @@ func (s *lsm) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expe
 		})
 	}
 	colMu.Unlock()
-
-	// Per-key sharded lock — serializes CAS on this specific blobID.
-	lockIdx := blobID & s.casLockMask
-	s.casLocks[lockIdx].Lock()
-	defer s.casLocks[lockIdx].Unlock()
-
-	// Read current value under lock, then compare-and-set.
-	current, size, ok := s.active.GetBlobMapping(blobID)
-	if !ok || current != expectedVAddr || size != expectedSize {
-		return false
-	}
-	s.active.SetBlobMapping(blobID, newVAddr, newSize)
 	return true
 }
 
