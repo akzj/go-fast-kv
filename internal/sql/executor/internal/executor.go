@@ -1300,6 +1300,11 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
 		for _, row := range plan.Rows {
+			// Fire BEFORE INSERT triggers
+			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+				return nil, err
+			}
+
 			// Check NOT NULL constraint before inserting.
 			if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
 				return nil, err
