@@ -1458,6 +1458,63 @@ These changes are backward-compatible — existing tests should still pass.
 
 ---
 
+---
+
+## §10.5 User-Defined Functions (UDF) — MVP Implemented
+
+**Status**: MVP Complete (feature/postgres-functions branch)
+
+### Syntax
+
+```sql
+CREATE FUNCTION name(arg1 type1, arg2 type2) RETURNS type AS $$
+    expression
+$$ LANGUAGE SQL;
+
+DROP FUNCTION name;
+```
+
+### Implementation
+
+| Component | Status | Commit |
+|-----------|--------|--------|
+| Lexer: `$$...$$` dollar-quoted strings | ✅ | 41ff17a |
+| Parser: `CREATE FUNCTION` / `DROP FUNCTION` | ✅ | 41ff17a |
+| AST: `CreateFunctionStmt`, `FunctionCallExpr` | ✅ | 41ff17a |
+| Executor: `FunctionRegistry` | ✅ | 478beda |
+| Executor: `evalFunctionCall()` | ✅ | 478beda |
+| Planner: `CreateFunctionPlan` | ✅ | 935fddf |
+| Multi-argument function calls | ✅ | 69df681 |
+
+### Architecture
+
+```
+Parser → CreateFunctionStmt
+       → Planner → CreateFunctionPlan
+       → Executor → FunctionRegistry.Register()
+```
+
+```
+Parser → FunctionCallExpr
+       → Planner → FunctionCallPlan
+       → Executor → FunctionRegistry.Get()
+       → evalFunctionCall() → returns "body evaluation not yet implemented"
+```
+
+### Limitations (MVP)
+
+1. **No persistent function storage** — Functions exist only in-memory (`FunctionRegistry`)
+2. **No body evaluation** — Function calls return error "body evaluation not yet implemented"
+3. **No plpgsql** — Only SQL scalar expressions in function body
+
+### Future Enhancements
+
+1. **Function body evaluation** — Parse and evaluate function body expression with bound arguments
+2. **Persistent function storage** — Store functions in catalog (`FunctionSchema`)
+3. **Built-in functions as UDFs** — Migrate hardcoded built-in functions to UDF registry
+4. **plpgsql support** — `BEGIN...END` blocks, `DECLARE`, `IF`/`CASE`/`LOOP`
+
+
 ## §10 Review Resolutions (v1.1)
 
 Review identified 5 CRITICAL, 10 WARNING, 10 SUGGESTION issues. Resolutions:
