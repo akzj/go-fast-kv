@@ -463,6 +463,16 @@ go test ./internal/wal/internal/ -race -count=1
 | Modules | 10 |
 | Go version | 1.23+ |
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — Full system architecture (KV + SQL layers)
+- [Bug Fixes](docs/BUGFIXES.md) — All bugs found and fixed with root cause analysis
+- [Performance](docs/PERFORMANCE.md) — Benchmark results, optimizations, and analysis
+- [Known Issues](docs/KNOWN_ISSUES.md) — Identified issues not yet fixed
+- [Design Notes](docs/DESIGN_NOTES.md) — Patterns and pitfalls for future developers
+- [Design](docs/DESIGN.md) — Original KV design document
+- [SQL Design](docs/DESIGN_SQL.md) — Original SQL design document
+
 ## License
 
 MIT
