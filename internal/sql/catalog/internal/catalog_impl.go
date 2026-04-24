@@ -132,7 +132,17 @@ func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
 
 	// Check cache first
 	if cached, ok := c.schemaCache[upperName]; ok {
-		return cached, nil
+		// LRU promotion: move accessed entry to end of queue
+		for i, cachedName := range c.schemaCacheOrder {
+			if cachedName == upperName {
+				c.schemaCacheOrder = append(c.schemaCacheOrder[:i], c.schemaCacheOrder[i+1:]...)
+				break
+			}
+		}
+		c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
+		// Return deep copy to prevent caller mutation of cache
+		copy := *cached
+		return &copy, nil
 	}
 
 	key := tableKey(upperName)
@@ -151,17 +161,19 @@ func (c *Catalog) getTableImpl(name string) (*api.TableSchema, error) {
 
 	// Cache the schema (LRU eviction if needed)
 	if len(c.schemaCache) >= c.schemaCacheSize {
-		// Evict oldest entry (FIFO)
+		// Evict oldest entry (LRU)
 		if len(c.schemaCacheOrder) > 0 {
 			oldest := c.schemaCacheOrder[0]
 			delete(c.schemaCache, oldest)
 			c.schemaCacheOrder = c.schemaCacheOrder[1:]
 		}
 	}
-	c.schemaCache[upperName] = &schema
+	// Store copy in cache and return pointer to that copy
+	cacheCopy := schema
+	c.schemaCache[upperName] = &cacheCopy
 	c.schemaCacheOrder = append(c.schemaCacheOrder, upperName)
 
-	return &schema, nil
+	return &cacheCopy, nil
 }
 
 func (c *Catalog) DropTable(name string) error {

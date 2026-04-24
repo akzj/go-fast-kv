@@ -53,6 +53,11 @@ type blobStore struct {
 		Decrement(segID uint32, count, bytes int64)
 	}
 
+	// Free list: stack of recycled BlobIDs available for reuse.
+	// Reduces memory growth from monotonically increasing mapping array.
+	freeList    []uint64
+	freeListMu  sync.Mutex
+
 	// Per-key sharded CAS locks for fine-grained concurrent access.
 	// Reduces contention vs global mu — concurrent CAS on different blobIDs
 	// can proceed in parallel. lockCount must be power of 2 for fast bitmask modulo.

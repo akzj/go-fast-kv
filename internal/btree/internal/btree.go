@@ -608,6 +608,12 @@ func (it *iterator) Next() bool {
 		return false
 	}
 
+	// Guard against use-after-store-close (KI-2)
+	if it.tree.closed.Load() {
+		it.done = true
+		return false
+	}
+
 	for {
 		// Move to next leaf if needed
 		for it.curIdx >= it.curPage.Count() {

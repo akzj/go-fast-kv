@@ -56,9 +56,9 @@ func makePage(fill byte) []byte {
 // Returns the WAL entry for reference.
 func writePageViaStore(t *testing.T, ps pagestoreapi.PageStore, w walapi.WAL, segMgr segmentapi.SegmentManager, pageID uint64, data []byte) {
 	t.Helper()
-	entry, err := ps.Write(pageID, data)
+	entry, err := ps.WriteCompact(pageID, data)
 	if err != nil {
-		t.Fatalf("PageStore.Write(%d): %v", pageID, err)
+		t.Fatalf("PageStore.WriteCompact(%d): %v", pageID, err)
 	}
 	if err := segMgr.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
@@ -101,7 +101,7 @@ func TestPageGC_NoSealedSegments(t *testing.T) {
 	recovery := ps.(pagestoreapi.PageStoreRecovery)
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
-	_, err := gc.CollectOne()
+	_, err := gc.CollectOneCompact()
 	if !errors.Is(err, gcapi.ErrNoSegmentsToGC) {
 		t.Fatalf("expected ErrNoSegmentsToGC, got %v", err)
 	}
@@ -135,9 +135,9 @@ func TestPageGC_AllDead(t *testing.T) {
 	writePageViaStore(t, ps, w, segMgr, id3, makePage(0x13))
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
-	stats, err := gc.CollectOne()
+	stats, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne: %v", err)
+		t.Fatalf("CollectOneCompact: %v", err)
 	}
 
 	if stats.TotalRecords != 3 {
@@ -149,8 +149,9 @@ func TestPageGC_AllDead(t *testing.T) {
 	if stats.DeadRecords != 3 {
 		t.Errorf("DeadRecords: got %d, want 3", stats.DeadRecords)
 	}
-	if stats.BytesFreed != 3*pagestoreapi.PageRecordSize {
-		t.Errorf("BytesFreed: got %d, want %d", stats.BytesFreed, 3*pagestoreapi.PageRecordSize)
+	wantFreed := int64(3) * int64(pagestoreapi.MaxPageRecordSize)
+	if stats.BytesFreed != wantFreed {
+		t.Errorf("BytesFreed: got %d, want %d", stats.BytesFreed, wantFreed)
 	}
 
 	// Sealed segments should be empty now.
@@ -159,7 +160,7 @@ func TestPageGC_AllDead(t *testing.T) {
 	}
 
 	// Pages should still be readable (from segment 2).
-	data, err := ps.Read(id1)
+	data, err := ps.ReadCompact(id1)
 	if err != nil {
 		t.Fatalf("Read(%d) after GC: %v", id1, err)
 	}
@@ -190,9 +191,9 @@ func TestPageGC_AllLive(t *testing.T) {
 	}
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
-	stats, err := gc.CollectOne()
+	stats, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne: %v", err)
+		t.Fatalf("CollectOneCompact: %v", err)
 	}
 
 	if stats.TotalRecords != 3 {
@@ -217,7 +218,7 @@ func TestPageGC_AllLive(t *testing.T) {
 	}{
 		{id1, 0xAA}, {id2, 0xBB}, {id3, 0xCC},
 	} {
-		data, err := ps.Read(tc.id)
+		data, err := ps.ReadCompact(tc.id)
 		if err != nil {
 			t.Fatalf("Read(%d) after GC: %v", tc.id, err)
 		}
@@ -254,9 +255,9 @@ func TestPageGC_MixedLiveness(t *testing.T) {
 	writePageViaStore(t, ps, w, segMgr, ids[4], makePage(0xF4))
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
-	stats, err := gc.CollectOne()
+	stats, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne: %v", err)
+		t.Fatalf("CollectOneCompact: %v", err)
 	}
 
 	if stats.TotalRecords != 5 {
@@ -272,7 +273,7 @@ func TestPageGC_MixedLiveness(t *testing.T) {
 	// Verify all pages are still readable with correct data.
 	expected := []byte{0xF0, 0x02, 0xF2, 0x04, 0xF4}
 	for i, id := range ids {
-		data, err := ps.Read(id)
+		data, err := ps.ReadCompact(id)
 		if err != nil {
 			t.Fatalf("Read(%d) after GC: %v", id, err)
 		}
@@ -301,9 +302,9 @@ func TestPageGC_DuplicatePageInSegment(t *testing.T) {
 	}
 
 	gc := NewPageGC(segMgr, ps, recovery, w)
-	stats, err := gc.CollectOne()
+	stats, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne: %v", err)
+		t.Fatalf("CollectOneCompact: %v", err)
 	}
 
 	if stats.TotalRecords != 3 {
@@ -317,7 +318,7 @@ func TestPageGC_DuplicatePageInSegment(t *testing.T) {
 	}
 
 	// The page should still be readable with the latest data.
-	data, err := ps.Read(id)
+	data, err := ps.ReadCompact(id)
 	if err != nil {
 		t.Fatalf("Read after GC: %v", err)
 	}
@@ -504,15 +505,20 @@ func TestBlobGC_MixedLiveness(t *testing.T) {
 
 // ─── Test 10: Multiple sealed segments — collect one at a time ──
 
-
 // mockLSMForTests is a simple in-memory LSM MappingStore for tests.
 type mockLSMForTests struct {
 	pages map[uint64]uint64
-	blobs map[uint64]struct{ vaddr uint64; size uint32 }
+	blobs map[uint64]struct {
+		vaddr uint64
+		size  uint32
+	}
 }
 
 func newMockLSM() *mockLSMForTests {
-	return &mockLSMForTests{pages: make(map[uint64]uint64), blobs: make(map[uint64]struct{ vaddr uint64; size uint32 })}
+	return &mockLSMForTests{pages: make(map[uint64]uint64), blobs: make(map[uint64]struct {
+		vaddr uint64
+		size  uint32
+	})}
 }
 
 func (m *mockLSMForTests) SetPageMapping(pageID uint64, vaddr uint64) {
@@ -523,20 +529,23 @@ func (m *mockLSMForTests) GetPageMapping(pageID uint64) (uint64, bool) {
 	return v, ok
 }
 func (m *mockLSMForTests) SetBlobMapping(blobID uint64, vaddr uint64, size uint32) {
-	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+	m.blobs[blobID] = struct {
+		vaddr uint64
+		size  uint32
+	}{vaddr, size}
 }
 func (m *mockLSMForTests) GetBlobMapping(blobID uint64) (uint64, uint32, bool) {
 	b, ok := m.blobs[blobID]
 	return b.vaddr, b.size, ok
 }
 func (m *mockLSMForTests) DeleteBlobMapping(blobID uint64) { delete(m.blobs, blobID) }
-func (m *mockLSMForTests) SetWAL(wal walapi.WAL) {}
-func (m *mockLSMForTests) FlushToWAL() (uint64, error)    { return 0, nil }
-func (m *mockLSMForTests) LastLSN() uint64                { return 0 }
-func (m *mockLSMForTests) Checkpoint(lsn uint64) error    { return nil }
-func (m *mockLSMForTests) CheckpointLSN() uint64          { return 0 }
-func (m *mockLSMForTests) MaybeCompact() error            { return nil }
-func (m *mockLSMForTests) Close() error                  { return nil }
+func (m *mockLSMForTests) SetWAL(wal walapi.WAL)           {}
+func (m *mockLSMForTests) FlushToWAL() (uint64, error)     { return 0, nil }
+func (m *mockLSMForTests) LastLSN() uint64                 { return 0 }
+func (m *mockLSMForTests) Checkpoint(lsn uint64) error     { return nil }
+func (m *mockLSMForTests) CheckpointLSN() uint64           { return 0 }
+func (m *mockLSMForTests) MaybeCompact() error             { return nil }
+func (m *mockLSMForTests) Close() error                    { return nil }
 func (m *mockLSMForTests) CompareAndSetPageMapping(pageID uint64, expectedVAddr uint64, newVAddr uint64) bool {
 	if v, ok := m.pages[pageID]; ok && v == expectedVAddr {
 		m.pages[pageID] = newVAddr
@@ -546,7 +555,10 @@ func (m *mockLSMForTests) CompareAndSetPageMapping(pageID uint64, expectedVAddr 
 }
 func (m *mockLSMForTests) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
 	if b, ok := m.blobs[blobID]; ok && b.vaddr == expectedVAddr && b.size == expectedSize {
-		m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{newVAddr, newSize}
+		m.blobs[blobID] = struct {
+			vaddr uint64
+			size  uint32
+		}{newVAddr, newSize}
 		return true
 	}
 	return false
@@ -561,17 +573,19 @@ func (m *mockLSMForTests) ApplyPageDelete(pageID uint64) {
 	delete(m.pages, pageID)
 }
 func (m *mockLSMForTests) ApplyBlobMapping(blobID uint64, vaddr uint64, size uint32) {
-	m.blobs[blobID] = struct{ vaddr uint64; size uint32 }{vaddr, size}
+	m.blobs[blobID] = struct {
+		vaddr uint64
+		size  uint32
+	}{vaddr, size}
 }
 func (m *mockLSMForTests) ApplyBlobDelete(blobID uint64) {
 	delete(m.blobs, blobID)
 }
-func (m *mockLSMForTests) SetCheckpointLSN(lsn uint64) {}
+func (m *mockLSMForTests) SetCheckpointLSN(lsn uint64)     {}
 func (m *mockLSMForTests) DrainCollector() []walapi.Record { return nil }
 
 // Manifest returns a nil mock manifest for tests.
 func (m *mockLSMForTests) Manifest() lsmapi.Manifest { return nil }
-
 
 func TestGC_MultipleSegments(t *testing.T) {
 	segMgr := newSegMgr(t, "pages")
@@ -606,9 +620,9 @@ func TestGC_MultipleSegments(t *testing.T) {
 	gc := NewPageGC(segMgr, ps, recovery, w)
 
 	// Collect first segment.
-	stats1, err := gc.CollectOne()
+	stats1, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne 1: %v", err)
+		t.Fatalf("CollectOneCompact 1: %v", err)
 	}
 	if stats1.TotalRecords != 2 || stats1.LiveRecords != 2 {
 		t.Errorf("first GC: total=%d live=%d, want 2/2", stats1.TotalRecords, stats1.LiveRecords)
@@ -621,9 +635,9 @@ func TestGC_MultipleSegments(t *testing.T) {
 	}
 
 	// Collect second segment.
-	stats2, err := gc.CollectOne()
+	stats2, err := gc.CollectOneCompact()
 	if err != nil {
-		t.Fatalf("CollectOne 2: %v", err)
+		t.Fatalf("CollectOneCompact 2: %v", err)
 	}
 	if stats2.TotalRecords != 2 || stats2.LiveRecords != 2 {
 		t.Errorf("second GC: total=%d live=%d, want 2/2", stats2.TotalRecords, stats2.LiveRecords)
@@ -636,7 +650,7 @@ func TestGC_MultipleSegments(t *testing.T) {
 	}
 
 	// Third attempt → no segments to GC.
-	_, err = gc.CollectOne()
+	_, err = gc.CollectOneCompact()
 	if !errors.Is(err, gcapi.ErrNoSegmentsToGC) {
 		t.Fatalf("expected ErrNoSegmentsToGC, got %v", err)
 	}
@@ -648,7 +662,7 @@ func TestGC_MultipleSegments(t *testing.T) {
 	}{
 		{id1, 0x01}, {id2, 0x02}, {id3, 0x03}, {id4, 0x04},
 	} {
-		data, err := ps.Read(tc.id)
+		data, err := ps.ReadCompact(tc.id)
 		if err != nil {
 			t.Fatalf("Read(%d): %v", tc.id, err)
 		}
