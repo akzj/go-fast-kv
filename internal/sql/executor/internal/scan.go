@@ -111,13 +111,7 @@ func (e *executor) tableScan(table *catalogapi.TableSchema, filter parserapi.Exp
 			}
 		}
 
-		// Copy row to avoid iterator reuse issues
-		rowCopy := &engineapi.Row{
-			RowID:  row.RowID,
-			Values: make([]catalogapi.Value, len(row.Values)),
-		}
-		copy(rowCopy.Values, row.Values)
-		rows = append(rows, rowCopy)
+		rows = append(rows, row)
 	}
 	if err := iter.Err(); err != nil {
 		return nil, fmt.Errorf("%w: scan iteration: %v", executorapi.ErrExecFailed, err)
