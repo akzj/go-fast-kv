@@ -1134,6 +1134,15 @@ func (s *store) checkAutoVacuum() {
 			}
 		}
 	}()
+// WAL size-based auto-checkpoint (design doc §3.9.5).
+	// Check WAL size after vacuum completes. Threshold: 16MB.
+	// Checkpoint runs asynchronously — does not block writes.
+	const walCheckpointThreshold = 16 * 1024 * 1024 // 16MB
+	if wal, ok := s.wal.(walSizeProvider); ok {
+		if wal.SizeBytes() > walCheckpointThreshold {
+			_ = s.Checkpoint()
+		}
+	}
 }
 
 // ─── Auto-GC trigger ────────────────────────────────────────────────

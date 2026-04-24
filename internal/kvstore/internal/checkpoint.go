@@ -601,8 +601,22 @@ func loadCheckpoint(path string) (*checkpointData, error) {
 		return nil, err
 	}
 
-	if len(raw) < checkpointHeaderSizeV3+4 {
-		return nil, fmt.Errorf("checkpoint: file too small (%d bytes)", len(raw))
+	// Read version byte to determine minimum header size.
+	if len(raw) < 1 {
+		return nil, fmt.Errorf("checkpoint: file too small (no version byte)")
+	}
+	version := raw[0]
+	var minSize int
+	switch version {
+	case 1, 2:
+		minSize = checkpointHeaderSize + 4 // 65 bytes
+	case 3, 4:
+		minSize = checkpointHeaderSizeV3 + 4 // 77 bytes
+	default:
+		return nil, fmt.Errorf("checkpoint: unsupported version %d", version)
+	}
+	if len(raw) < minSize {
+		return nil, fmt.Errorf("checkpoint: file too small (%d bytes, need v%d min %d)", len(raw), version, minSize)
 	}
 
 	// Verify CRC.
@@ -659,35 +673,10 @@ func deserializeCheckpoint(buf []byte) (*checkpointData, error) {
 		off += 4
 		lsmCount = 0 // v1/v2 don't have LSM manifest
 		data.SnapshotXID = data.NextXID // default for v1/v2
-	} else if version == 3 {
-		// v3 format.
-		headerSize = checkpointHeaderSizeV3
-
-		data.LSN = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		data.NextXID = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		data.SnapshotXID = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		data.RootPageID = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		data.NextPageID = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		data.NextBlobID = binary.LittleEndian.Uint64(buf[off:])
-		off += 8
-		pageCount = binary.LittleEndian.Uint32(buf[off:])
-		off += 4
-		blobCount = binary.LittleEndian.Uint32(buf[off:])
-		off += 4
-		clogCount = binary.LittleEndian.Uint32(buf[off:])
-		off += 4
-		statsCount = binary.LittleEndian.Uint32(buf[off:])
-		off += 4
-		lsmCount = binary.LittleEndian.Uint32(buf[off:])
-		off += 4
-		// reserved
-		off += 4
 	} else if version == 3 || version == 4 {
+		// v3/v4 format (same header size 73).
+		// v4 added page mappings for backup recovery; header layout is identical.
+		headerSize = checkpointHeaderSizeV3
 		// v3/v4 format (same header size 73).
 		// v4 added page mappings for backup recovery; header layout is identical.
 		headerSize = checkpointHeaderSizeV3
