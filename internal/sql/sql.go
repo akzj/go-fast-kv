@@ -251,10 +251,21 @@ func (db *DB) exec(sql string) (*Result, error) {
 	if db.closed {
 		return nil, fmt.Errorf("sql: database is closed")
 	}
-	goroutineID := goroutineID()
+
+	// Fast path: check statement cache first.
+	if cached := db.stmtCache.Get(sql); cached != nil {
+		gid := goroutineID()
+		var txnCtx txnapi.TxnContext
+		if val, ok := db.txnCtxMap.Load(gid); ok {
+			txnCtx = val.(txnapi.TxnContext)
+		}
+		return cached.ExecCached(txnCtx)
+	}
+
+	gid := goroutineID()
 	// Get per-goroutine transaction context (if any)
 	var txnCtx txnapi.TxnContext
-	if val, ok := db.txnCtxMap.Load(goroutineID); ok {
+	if val, ok := db.txnCtxMap.Load(gid); ok {
 		txnCtx = val.(txnapi.TxnContext)
 	}
 
@@ -268,6 +279,29 @@ func (db *DB) exec(sql string) (*Result, error) {
 	plan, err := db.planner.Plan(stmt)
 	if err != nil {
 		return nil, err
+	}
+
+	// Cache parsed statement for future fast-path hits.
+	// For transaction-control statements, plan is nil → skip cache.
+	if plan != nil {
+		execFn := func(stmt parserapi.Statement, plan plannerapi.Plan, _ []catalogapi.Value) (*executorapi.Result, error) {
+			var err error
+			if plan == nil {
+				plan, err = db.planner.Plan(stmt)
+				if err != nil {
+					return nil, err
+				}
+			}
+			var localTxnCtx txnapi.TxnContext
+			if val, ok := db.txnCtxMap.Load(goroutineID()); ok {
+				localTxnCtx = val.(txnapi.TxnContext)
+			}
+			if localTxnCtx != nil {
+				return db.executor.ExecuteWithTxn(plan, localTxnCtx)
+			}
+			return db.executor.Execute(plan)
+		}
+		db.stmtCache.Put(sql, stmtcache.NewPreparedStmt(sql, stmt, execFn))
 	}
 
 	// Handle EXPLAIN: delegate to executor for proper plan formatting + timing
@@ -303,7 +337,7 @@ func (db *DB) exec(sql string) (*Result, error) {
 			if newTxnCtx == nil {
 				return nil, fmt.Errorf("sql: failed to begin transaction")
 			}
-			db.txnCtxMap.Store(goroutineID, newTxnCtx)
+			db.txnCtxMap.Store(gid, newTxnCtx)
 			db.store.SetActiveTxnContext(newTxnCtx)
 			return &executorapi.Result{}, nil
 
@@ -314,7 +348,7 @@ func (db *DB) exec(sql string) (*Result, error) {
 			xid := txnCtx.XID()
 			err := db.store.CommitWithXID(xid)
 			db.store.ClearActiveTxnContext()
-			db.txnCtxMap.Delete(goroutineID)
+			db.txnCtxMap.Delete(gid)
 			return &executorapi.Result{}, err
 
 		case *parserapi.RollbackStmt:
@@ -329,7 +363,7 @@ func (db *DB) exec(sql string) (*Result, error) {
 			}
 			err := db.store.AbortWithXID(xid)
 			db.store.ClearActiveTxnContext()
-			db.txnCtxMap.Delete(goroutineID)
+			db.txnCtxMap.Delete(gid)
 			return &executorapi.Result{}, err
 
 		case *parserapi.SavepointStmt:

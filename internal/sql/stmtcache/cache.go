@@ -83,6 +83,15 @@ func (p *PreparedStmt) setPlan(plan plannerapi.Plan) {
 	p.mu.Unlock()
 }
 
+// ExecCached executes the prepared statement with no parameters (fast path from DB.exec).
+func (p *PreparedStmt) ExecCached(txnCtx txnapi.TxnContext) (*executorapi.Result, error) {
+	p.mu.RLock()
+	plan := p.plan
+	stmt := p.stmt
+	p.mu.RUnlock()
+	return p.execFn(stmt, plan, nil)
+}
+
 // StatementCache caches parsed and planned SQL statements.
 type StatementCache struct {
 	maxSize int
