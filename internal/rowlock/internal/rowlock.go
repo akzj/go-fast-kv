@@ -7,7 +7,8 @@
 // Design:
 //   - 16 shards reduce contention by distributing locks across independent maps
 //   - Each shard uses a sync.Mutex for thread-safe access
-//   - Blocking acquires use retry with sleep for simplicity
+//   - Blocking acquires use per-key channel notification (instant wake-up)
+//   - Wait-for graph provides basic deadlock detection
 //   - Lock ordering (sorted rowKey) is the caller's responsibility
 package internal
 
@@ -25,8 +26,9 @@ const numShards = 16
 // Supports both shared (multiple holders) and exclusive (single holder) modes.
 type lockEntry struct {
 	mu      sync.Mutex
-	mode    api.LockMode          // Current lock mode
+	mode    api.LockMode           // Current lock mode
 	holders map[api.TxnID]struct{} // Set of transaction holders (for shared locks)
+	waiters []chan struct{}         // Channels to notify blocked acquirers
 }
 
 // shard manages locks for a subset of rowKeys.
@@ -35,14 +37,75 @@ type shard struct {
 	locks map[string]*lockEntry
 }
 
+// waitForGraph tracks waiter → holder edges for deadlock detection.
+type waitForGraph struct {
+	mu    sync.Mutex
+	edges map[api.TxnID]map[api.TxnID]struct{} // waiter → set of holders
+}
+
+func newWaitForGraph() *waitForGraph {
+	return &waitForGraph{
+		edges: make(map[api.TxnID]map[api.TxnID]struct{}),
+	}
+}
+
+// AddAndCheck adds edges from waiter to all holders and checks for cycles.
+// Returns true if a cycle (deadlock) is detected. On deadlock, edges are removed.
+func (g *waitForGraph) AddAndCheck(waiter api.TxnID, holders map[api.TxnID]struct{}) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.edges[waiter] == nil {
+		g.edges[waiter] = make(map[api.TxnID]struct{})
+	}
+	for h := range holders {
+		if h == waiter {
+			continue
+		}
+		g.edges[waiter][h] = struct{}{}
+	}
+
+	// DFS cycle detection
+	visited := make(map[api.TxnID]bool)
+	if g.hasCycle(waiter, visited) {
+		delete(g.edges, waiter)
+		return true // deadlock
+	}
+	return false
+}
+
+func (g *waitForGraph) hasCycle(node api.TxnID, visited map[api.TxnID]bool) bool {
+	if visited[node] {
+		return true
+	}
+	visited[node] = true
+	for next := range g.edges[node] {
+		if g.hasCycle(next, visited) {
+			return true
+		}
+	}
+	visited[node] = false
+	return false
+}
+
+// Remove removes all edges for a transaction (called on release/abort).
+func (g *waitForGraph) Remove(txnID api.TxnID) {
+	g.mu.Lock()
+	delete(g.edges, txnID)
+	g.mu.Unlock()
+}
+
 // RowLockManager implements the api.LockManager interface using 16 shards.
 type RowLockManager struct {
 	shards [numShards]shard
+	wfg    *waitForGraph
 }
 
 // New creates a new RowLockManager with 16 shards.
 func New() *RowLockManager {
-	m := &RowLockManager{}
+	m := &RowLockManager{
+		wfg: newWaitForGraph(),
+	}
 	for i := range m.shards {
 		m.shards[i].locks = make(map[string]*lockEntry)
 	}
@@ -100,7 +163,7 @@ func (m *RowLockManager) canAcquire(entry *lockEntry, txnID api.TxnID, mode api.
 }
 
 // Acquire attempts to acquire a lock, blocking until available or timeout.
-// Returns true if acquired, false if timeout occurred.
+// Returns true if acquired, false if timeout or deadlock detected.
 func (m *RowLockManager) Acquire(rowKey string, ctx api.LockContext, mode api.LockMode) bool {
 	s := m.getShard(rowKey)
 	timeout := ctx.Timeout()
@@ -118,6 +181,7 @@ func (m *RowLockManager) Acquire(rowKey string, ctx api.LockContext, mode api.Lo
 			}
 			s.locks[rowKey] = entry
 			s.mu.Unlock()
+			m.wfg.Remove(ctx.TxnID)
 			incAcquire()
 			return true
 		}
@@ -130,18 +194,40 @@ func (m *RowLockManager) Acquire(rowKey string, ctx api.LockContext, mode api.Lo
 				entry.mode = api.LockExclusive
 			}
 			s.mu.Unlock()
+			m.wfg.Remove(ctx.TxnID)
 			incAcquire()
 			return true
 		}
 
+		// Deadlock detection: check if adding waiter→holders creates a cycle
+		if m.wfg.AddAndCheck(ctx.TxnID, entry.holders) {
+			s.mu.Unlock()
+			return false // deadlock detected
+		}
+
+		// Register a waiter channel for instant notification
+		ch := make(chan struct{})
+		entry.waiters = append(entry.waiters, ch)
 		s.mu.Unlock()
 
-		// Check timeout
-		if timeout > 0 && time.Now().After(deadline) {
-			return false
+		// Wait for notification or timeout
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				m.wfg.Remove(ctx.TxnID)
+				return false
+			}
+			select {
+			case <-ch:
+				// Lock released, retry
+			case <-time.After(remaining):
+				m.wfg.Remove(ctx.TxnID)
+				return false
+			}
+		} else {
+			// No timeout — wait indefinitely for notification
+			<-ch
 		}
-		// Short sleep before retry
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -195,14 +281,30 @@ func (m *RowLockManager) Release(rowKey string, txnID api.TxnID) {
 	delete(entry.holders, txnID)
 
 	if len(entry.holders) == 0 {
-		// No more holders - remove the entry
+		// No more holders - remove the entry and wake ALL waiters
+		waiters := entry.waiters
+		entry.waiters = nil
 		delete(s.locks, rowKey)
+		for _, ch := range waiters {
+			close(ch)
+		}
+	} else {
+		// Still has holders but mode may allow more acquisitions.
+		// Wake all waiters to re-check (e.g., shared lock holders remaining,
+		// new shared requests can proceed).
+		waiters := entry.waiters
+		entry.waiters = nil
+		for _, ch := range waiters {
+			close(ch)
+		}
 	}
 	incRelease()
 }
 
 // ReleaseAll releases all locks held by the given transaction.
 func (m *RowLockManager) ReleaseAll(txnID api.TxnID) {
+	m.wfg.Remove(txnID)
+
 	for i := range m.shards {
 		s := &m.shards[i]
 		s.mu.Lock()
@@ -211,7 +313,18 @@ func (m *RowLockManager) ReleaseAll(txnID api.TxnID) {
 			if _, held := entry.holders[txnID]; held {
 				delete(entry.holders, txnID)
 				if len(entry.holders) == 0 {
+					waiters := entry.waiters
+					entry.waiters = nil
 					delete(s.locks, rowKey)
+					for _, ch := range waiters {
+						close(ch)
+					}
+				} else {
+					waiters := entry.waiters
+					entry.waiters = nil
+					for _, ch := range waiters {
+						close(ch)
+					}
 				}
 				incRelease()
 			}
@@ -270,15 +383,17 @@ func (m *RowLockManager) LockStats() api.LockStats {
 		s.mu.Lock()
 
 		count := 0
+		waiters := 0
 		for _, entry := range s.locks {
 			if len(entry.holders) > 0 {
 				count++
 			}
+			waiters += len(entry.waiters)
 		}
 		stats.ShardStats[i] = api.ShardStat{
 			ShardID: i,
 			Locks:   count,
-			Waiters: 0,
+			Waiters: waiters,
 		}
 		stats.TotalLocks += int64(count)
 
@@ -293,6 +408,13 @@ func (m *RowLockManager) Close() {
 	for i := range m.shards {
 		s := &m.shards[i]
 		s.mu.Lock()
+		// Wake all waiters before clearing
+		for _, entry := range s.locks {
+			for _, ch := range entry.waiters {
+				close(ch)
+			}
+			entry.waiters = nil
+		}
 		s.locks = make(map[string]*lockEntry)
 		s.mu.Unlock()
 	}

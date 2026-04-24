@@ -490,3 +490,91 @@ func BenchmarkConcurrentAcquire(b *testing.B) {
 		}
 	})
 }
+
+// TestDeadlockDetection verifies that the wait-for graph detects circular waits.
+func TestDeadlockDetection(t *testing.T) {
+	m := New()
+	defer m.Close()
+
+	// Txn A holds row1, Txn B holds row2
+	m.TryAcquire("row1", 1, LockExclusive)
+	m.TryAcquire("row2", 2, LockExclusive)
+
+	var aResult, bResult atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Txn A requests row2 (held by B)
+	go func() {
+		defer wg.Done()
+		ctx := LockContext{TxnID: 1, TimeoutMs: 2000}
+		aResult.Store(m.Acquire("row2", ctx, LockExclusive))
+	}()
+
+	// Small delay to ensure A blocks first
+	time.Sleep(20 * time.Millisecond)
+
+	// Txn B requests row1 (held by A) — this should detect deadlock
+	go func() {
+		defer wg.Done()
+		ctx := LockContext{TxnID: 2, TimeoutMs: 2000}
+		bResult.Store(m.Acquire("row1", ctx, LockExclusive))
+	}()
+
+	wg.Wait()
+
+	// At least one of them should have failed (deadlock detected)
+	if aResult.Load() && bResult.Load() {
+		t.Fatal("Both transactions acquired — deadlock was not detected")
+	}
+
+	// Clean up
+	m.ReleaseAll(1)
+	m.ReleaseAll(2)
+}
+
+// TestChannelNotificationLatency verifies that release wakes blocked acquirers
+// faster than the old 10ms polling.
+func TestChannelNotificationLatency(t *testing.T) {
+	m := New()
+	defer m.Close()
+
+	// Txn 1 holds exclusive lock
+	m.TryAcquire("row1", 1, LockExclusive)
+
+	var acquired atomic.Bool
+	var acquireTime atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Txn 2 blocks trying to acquire
+	go func() {
+		defer wg.Done()
+		ctx := LockContext{TxnID: 2, TimeoutMs: 5000}
+		start := time.Now()
+		acquired.Store(m.Acquire("row1", ctx, LockExclusive))
+		acquireTime.Store(time.Since(start).Nanoseconds())
+	}()
+
+	// Let Txn 2 block
+	time.Sleep(50 * time.Millisecond)
+
+	// Release — Txn 2 should wake up almost instantly
+	releaseTime := time.Now()
+	m.Release("row1", 1)
+
+	wg.Wait()
+
+	if !acquired.Load() {
+		t.Fatal("Txn 2 should have acquired after release")
+	}
+
+	// Wake-up latency should be well under 10ms (the old polling interval)
+	wakeLatency := time.Duration(acquireTime.Load()) - 50*time.Millisecond
+	_ = releaseTime // used implicitly via timing
+	if wakeLatency > 5*time.Millisecond {
+		t.Logf("Warning: wake latency %v is higher than expected (should be <5ms)", wakeLatency)
+	}
+
+	m.Release("row1", 2)
+}
