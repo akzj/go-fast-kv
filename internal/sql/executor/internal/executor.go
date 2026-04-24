@@ -4,6 +4,7 @@ package internal
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -3594,10 +3595,10 @@ func (e *executor) execSelectFromCTE(plan *plannerapi.SelectPlan, cteResult *exe
 
 	// Apply DISTINCT
 	if plan.Distinct {
-		seen := make(map[string]bool)
+		seen := make(map[uint64]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			key := distinctRowKey(row)
+			key := makeRowKey(row)
 			if !seen[key] {
 				seen[key] = true
 				deduped = append(deduped, row)
@@ -3775,10 +3776,10 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 
 	// Step 10: DISTINCT
 	if plan.Distinct {
-		seen := make(map[string]bool)
+		seen := make(map[uint64]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			key := distinctRowKey(row)
+			key := makeRowKey(row)
 			if !seen[key] {
 				seen[key] = true
 				deduped = append(deduped, row)
@@ -4056,10 +4057,10 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 
 	// DISTINCT: deduplicate projected rows
 	if plan.Distinct {
-		seen := make(map[string]bool)
+		seen := make(map[uint64]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range projected {
-			key := distinctRowKey(row)
+			key := makeRowKey(row)
 			if !seen[key] {
 				seen[key] = true
 				deduped = append(deduped, row)
@@ -4074,36 +4075,35 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	}, nil
 }
 
-// distinctRowKey builds a deduplication key for a row of values.
-// NULL values are keyed uniformly (regardless of type) per SQL standard.
-// Non-NULL values include the type tag to prevent collisions (e.g., int 1 vs text "1").
-func distinctRowKey(row []catalogapi.Value) string {
-	var b strings.Builder
+// makeRowKey computes a FNV-64a hash of a row for deduplication.
+// Eliminates per-row string allocation from distinctRowKey.
+// Semantics match distinctRowKey: NULL keyed uniformly, type tag prevents
+// int 1 vs text "1" collision. Hash collisions are astronomically unlikely.
+func makeRowKey(row []catalogapi.Value) uint64 {
+	h := fnv.New64a()
 	for i, v := range row {
 		if i > 0 {
-			b.WriteByte(0) // column separator
+			h.Write([]byte{0}) // column separator
 		}
 		if v.IsNull {
-			b.WriteString("N")
+			h.Write([]byte("N"))
 		} else {
-			// Type prefix prevents collision between different types with same representation
-			b.WriteByte(byte('0' + v.Type))
-			b.WriteByte(':')
+			h.Write([]byte{byte('0' + v.Type), ':'})
 			switch v.Type {
 			case catalogapi.TypeInt:
-				fmt.Fprintf(&b, "%d", v.Int)
+				fmt.Fprintf(h, "%d", v.Int)
 			case catalogapi.TypeFloat:
-				fmt.Fprintf(&b, "%g", v.Float)
+				fmt.Fprintf(h, "%g", v.Float)
 			case catalogapi.TypeText:
-				b.WriteString(v.Text)
+				h.Write([]byte(v.Text))
 			case catalogapi.TypeBlob:
-				fmt.Fprintf(&b, "%x", v.Blob)
+				fmt.Fprintf(h, "%x", v.Blob)
 			default:
-				fmt.Fprintf(&b, "%v", v.Int)
+				fmt.Fprintf(h, "%v", v.Int)
 			}
 		}
 	}
-	return b.String()
+	return h.Sum64()
 }
 
 func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, error) {
@@ -4119,10 +4119,10 @@ func (e *executor) execUnion(plan *plannerapi.UnionPlan) (*executorapi.Result, e
 	rows := append(leftResult.Rows, rightResult.Rows...)
 
 	if !plan.UnionAll {
-		seen := make(map[string]bool)
+		seen := make(map[uint64]bool)
 		var deduped [][]catalogapi.Value
 		for _, row := range rows {
-			key := distinctRowKey(row)
+			key := makeRowKey(row)
 			if !seen[key] {
 				seen[key] = true
 				deduped = append(deduped, row)
@@ -4148,16 +4148,16 @@ func (e *executor) execIntersect(plan *plannerapi.IntersectPlan) (*executorapi.R
 	}
 
 	// Build a hash set of right rows for O(1) lookup
-	rightSet := make(map[string]bool)
+	rightSet := make(map[uint64]bool)
 	for _, row := range rightResult.Rows {
-		rightSet[distinctRowKey(row)] = true
+		rightSet[makeRowKey(row)] = true
 	}
 
 	// Keep rows that appear in both left and right (with dedup)
-	seen := make(map[string]bool)
+	seen := make(map[uint64]bool)
 	var result [][]catalogapi.Value
 	for _, row := range leftResult.Rows {
-		keyStr := distinctRowKey(row)
+		keyStr := makeRowKey(row)
 		if rightSet[keyStr] && !seen[keyStr] {
 			seen[keyStr] = true
 			result = append(result, row)
@@ -4181,16 +4181,16 @@ func (e *executor) execExcept(plan *plannerapi.ExceptPlan) (*executorapi.Result,
 	}
 
 	// Build a hash set of right rows for O(1) lookup
-	rightSet := make(map[string]bool)
+	rightSet := make(map[uint64]bool)
 	for _, row := range rightResult.Rows {
-		rightSet[distinctRowKey(row)] = true
+		rightSet[makeRowKey(row)] = true
 	}
 
 	// Keep rows that appear in left but NOT in right (with dedup)
-	seen := make(map[string]bool)
+	seen := make(map[uint64]bool)
 	var result [][]catalogapi.Value
 	for _, row := range leftResult.Rows {
-		keyStr := distinctRowKey(row)
+		keyStr := makeRowKey(row)
 		if !rightSet[keyStr] && !seen[keyStr] {
 			seen[keyStr] = true
 			result = append(result, row)
