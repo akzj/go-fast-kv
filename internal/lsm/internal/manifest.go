@@ -350,14 +350,9 @@ func (m *manifest) NextID() uint64 {
 	defer m.mu.Unlock()
 	id := m.data.NextSegmentID
 	m.data.NextSegmentID++
-	// Save asynchronously
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		m.saveLocked()
-	}()
+	// Save synchronously — prevents ID reuse on crash recovery.
+	// Segment allocation is infrequent (only on rotation), so latency is acceptable.
+	m.saveLocked()
 	return id
 }
 
