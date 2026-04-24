@@ -3273,6 +3273,27 @@ func projectJoinRows(rows [][]catalogapi.Value, colNames []string, plan *planner
 	}
 	return projected, projNames
 }
+
+// scanHasFilter returns true if the scan plan includes any filter that is applied
+// during or after scanning. When a filter exists, LIMIT cannot be safely pushed
+// down to storage because the filter may discard rows after the limit is applied.
+func scanHasFilter(scan plannerapi.ScanPlan) bool {
+	switch s := scan.(type) {
+	case *plannerapi.TableScanPlan:
+		return s.Filter != nil
+	case *plannerapi.IndexScanPlan:
+		return s.ResidualFilter != nil
+	case *plannerapi.IndexOnlyScanPlan:
+		return s.ResidualFilter != nil
+	case *plannerapi.IndexRangePlan:
+		return s.ResidualFilter != nil
+	case *plannerapi.FTSSearchPlan:
+		return s.ResidualFilter != nil
+	default:
+		return false
+	}
+}
+
 // hasCorrelatedSubquery checks whether an expression tree contains any correlated subquery.
 func hasCorrelatedSubquery(expr parserapi.Expr) bool {
 	if expr == nil {
@@ -3813,8 +3834,11 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 	}
 
 	// Collect matching rows via scan (filter during scan uses precomputed subquery results)
-	// LIMIT/OFFSET pushdown: only push down if there's no ORDER BY (ORDER BY requires all rows first)
-	pushedDown := plan.OrderBy == nil && plan.GroupByExprs == nil
+	// LIMIT/OFFSET pushdown: only safe when there's no ORDER BY, no GROUP BY,
+	// no post-scan filter (plan.Filter), and no scan-level filter. A filter applied
+	// after storage-level LIMIT would discard rows, returning fewer than requested.
+	hasFilter := plan.Filter != nil || scanHasFilter(scanPlan)
+	pushedDown := plan.OrderBy == nil && plan.GroupByExprs == nil && !hasFilter
 	// Limit/offset to push down to storage. When pushedDown=false, pass 0 (no pushdown)
 	storageLimit, storageOffset := plan.Limit, plan.Offset
 	if !pushedDown {
