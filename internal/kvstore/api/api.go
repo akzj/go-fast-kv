@@ -115,6 +115,11 @@ type WriteBatch interface {
 	// directly in the btree. Used by SQL executor for deferred-write
 	// transactions to enable rollback via self-delete.
 	DeleteWithXID(key []byte, txnID uint64) error
+
+	// CommitWithXID atomically applies all operations staged with PutWithXID/DeleteWithXID
+	// under the given transaction ID. All operations share one WAL fsync.
+	// Used by SQL executor to commit deferred-write transactions.
+	CommitWithXID(xid uint64) error
 }
 
 // ─── Store ──────────────────────────────────────────────────────────

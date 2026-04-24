@@ -2,6 +2,7 @@
 package internal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -339,6 +340,84 @@ func (te *tableEngine) Get(table *catalogapi.TableSchema, rowID uint64) (*engine
 		return nil, err
 	}
 	return &engineapi.Row{RowID: rowID, Values: values}, nil
+}
+
+// GetBatch retrieves multiple rows by their rowIDs in a single call.
+// Uses a single KV store.Scan instead of N Get calls for better performance.
+// Skips rowIDs that return ErrRowNotFound (stale index entries).
+// Preserves the order of input rowIDs.
+func (te *tableEngine) GetBatch(table *catalogapi.TableSchema, rowIDs []uint64) ([]*engineapi.Row, error) {
+	if table.TableID == 0 {
+		return nil, engineapi.ErrTableIDNotSet
+	}
+	if len(rowIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build a map of rowID -> index for result ordering.
+	// We collect results into this map, then convert to slice preserving order.
+	results := make(map[uint64]*engineapi.Row, len(rowIDs))
+	for _, rowID := range rowIDs {
+		results[rowID] = nil // placeholder
+	}
+
+	// Encode row keys and find min/max for range scan.
+	var minKey, maxKey []byte
+	for i, rowID := range rowIDs {
+		key := te.encoder.EncodeRowKey(table.TableID, rowID)
+		if i == 0 {
+			minKey = append([]byte(nil), key...)
+			maxKey = append([]byte(nil), key...)
+		} else {
+			if bytes.Compare(key, minKey) < 0 {
+				minKey = append(minKey[:0], key...)
+			}
+			if bytes.Compare(key, maxKey) > 0 {
+				maxKey = append(maxKey[:0], key...)
+			}
+		}
+	}
+	// maxKey is inclusive, but range scan is [start, end), so we need to
+	// append 0xFF to make it exclusive.
+	maxKey = append(maxKey, 0xFF)
+
+	// Scan the range covering all row keys.
+	iter := te.store.Scan(minKey, maxKey)
+	defer iter.Close()
+
+	for iter.Next() {
+		key := iter.Key()
+		value := iter.Value()
+
+		// Decode rowID from key.
+		_, rowID, err := te.encoder.DecodeRowKey(key)
+		if err != nil {
+			continue // skip malformed keys
+		}
+
+		if _, ok := results[rowID]; !ok {
+			continue // not in our request set
+		}
+
+		values, err := te.codec.DecodeRow(value, table.Columns)
+		if err != nil {
+			continue // skip malformed rows
+		}
+
+		results[rowID] = &engineapi.Row{RowID: rowID, Values: values}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	// Build result slice preserving original order, skipping stale entries.
+	var rows []*engineapi.Row
+	for _, rowID := range rowIDs {
+		if row := results[rowID]; row != nil {
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
 }
 
 func (te *tableEngine) Scan(table *catalogapi.TableSchema) (engineapi.RowIterator, error) {

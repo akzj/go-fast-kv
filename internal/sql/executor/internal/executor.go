@@ -1294,96 +1294,121 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 		return nil, fmt.Errorf("%w: listing indexes: %v", executorapi.ErrExecFailed, err)
 	}
 
-	// When in a transaction, use PutWithXID so writes share the transaction's XID.
-	// This enables own-write visibility (txnMin==s.XID) and rollback (txnMax==txnXID).
-	// When NOT in a transaction, use WriteBatch for auto-commit per statement.
+	// When in a transaction, use WriteBatch + PutWithXID for batching.
+	// All writes share the transaction's XID and are committed atomically via
+	// CommitWithXID. This enables own-write visibility (txnMin==s.XID) and
+	// rollback (txnMax==txnXID).
 	if e.txnCtx != nil {
 		xid := e.txnCtx.XID()
+		batch := e.store.NewWriteBatch()
+		rowIDs := make([]uint64, 0, len(plan.Rows))
+
 		for _, row := range plan.Rows {
 			// Fire BEFORE INSERT triggers
 			if err := e.fireTriggers(plan.Table.Name, "BEFORE", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 
 			// Check NOT NULL constraint before inserting.
 			if err := checkNotNullConstraint(plan.Table.Columns, row); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 
 			// Check UNIQUE constraint before inserting.
 			if err := e.checkUniqueConstraint(plan.Table.Name, plan.Table.Columns, row, 0); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 
 			// Check CHECK constraints before inserting.
 			if err := e.checkCheckConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.CheckConstraints); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 
 			// Check FOREIGN KEY constraints before inserting.
 			if err := e.checkForeignKeyConstraints(plan.Table.Name, plan.Table.Columns, row, plan.Table.ForeignKeys); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 
-			// Allocate rowID via table engine (in-memory only, no persistence yet).
+			// Allocate rowID via table engine (in-memory only).
 			rowID, err := e.tableEngine.AllocRowID(plan.Table.TableID)
 			if err != nil {
+				batch.Discard()
 				return nil, fmt.Errorf("%w: alloc rowid: %v", executorapi.ErrExecFailed, err)
 			}
+			rowIDs = append(rowIDs, rowID)
 
-			// Write row data directly with transaction's XID.
+			// Stage row data write via batch.
 			rowKey := e.keyEncoder.EncodeRowKey(plan.Table.TableID, rowID)
 			rowVal := e.tableEngine.EncodeRow(row)
-			if err := e.store.PutWithXID(rowKey, rowVal, xid); err != nil {
+			if err := batch.PutWithXID(rowKey, rowVal, xid); err != nil {
+				batch.Discard()
 				return nil, fmt.Errorf("%w: insert: %v", executorapi.ErrExecFailed, err)
 			}
 			e.txnCtx.AddPendingWrite(rowKey, nil) // nil preValue: INSERT rollback = delete
 
-			// Write index entries with same XID.
+			// Stage index entries via batch.
 			for _, idx := range indexes {
-				// Get index value (column or expression)
 				rowForIdx := &engineapi.Row{RowID: rowID, Values: row}
 				val, err := getIndexValue(idx, rowForIdx, plan.Table.Columns, e)
 				if err != nil {
+					batch.Discard()
 					return nil, fmt.Errorf("%w: get index value: %v", executorapi.ErrExecFailed, err)
 				}
 				idxKey := e.indexEngine.EncodeIndexKey(plan.Table.TableID, idx.IndexID, val, rowID)
-				if err := e.store.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+				if err := batch.PutWithXID(idxKey, nilValueForIndex(), xid); err != nil {
+					batch.Discard()
 					return nil, fmt.Errorf("%w: index insert: %v", executorapi.ErrExecFailed, err)
 				}
 				e.txnCtx.AddPendingWrite(idxKey, nil) // nil preValue: rollback = delete
 			}
 
-			// FTS: Index FTS content columns
+			// FTS: Index FTS content columns.
 			if e.ftsEngine != nil {
 				texts := getFTSColumnValues(plan.Table.Columns, row)
 				if len(texts) > 0 {
-					if err := e.indexFTSWithTxn(plan.Table.Name, rowID, texts, "", xid); err != nil {
-						return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+					tokens := e.tokenizeTexts(texts, "")
+					for _, token := range tokens {
+						ftsKey := e.ftsEngineSearchKey(plan.Table.Name, token, rowID)
+						if err := batch.PutWithXID(ftsKey, []byte{}, xid); err != nil {
+							batch.Discard()
+							return nil, fmt.Errorf("%w: FTS index: %v", executorapi.ErrExecFailed, err)
+						}
+						e.txnCtx.AddPendingWrite(ftsKey, nil)
 					}
 				}
 			}
 
-			// Fire AFTER INSERT triggers (after row and indexes are committed)
+			// Fire AFTER INSERT triggers
 			if err := e.fireTriggers(plan.Table.Name, "AFTER", "INSERT", plan.Table.Columns, row, nil, nil); err != nil {
+				batch.Discard()
 				return nil, err
 			}
 		}
 
-		// Persist counter with transaction's XID.
-		// AllocRowID already advanced the in-memory counter for each row,
-		// so we just persist the current value without further incrementing.
+		// Persist counter via batch.
 		tableID := plan.Table.TableID
 		metaKey := encodeMetaKeyLocal(tableID)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, e.tableEngine.GetCounter(tableID))
-		if err := e.store.PutWithXID(metaKey, buf, xid); err != nil {
+		if err := batch.PutWithXID(metaKey, buf, xid); err != nil {
+			batch.Discard()
 			return nil, fmt.Errorf("%w: persist counter: %v", executorapi.ErrExecFailed, err)
 		}
 		e.txnCtx.AddPendingWrite(metaKey, nil) // nil preValue: rollback = delete
 
-		return &executorapi.Result{RowsAffected: int64(len(plan.Rows))}, nil
+		// Commit all staged operations atomically under the SQL transaction's XID.
+		// All rows share one WAL fsync instead of per-row fsync.
+		if err := batch.CommitWithXID(xid); err != nil {
+			batch.Discard()
+			return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
+		}
 	}
+
 
 	// Non-transactional path: use WriteBatch for auto-commit per statement.
 	batch := e.store.NewWriteBatch()

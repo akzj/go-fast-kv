@@ -1503,9 +1503,10 @@ func (it *errIterator) Close()        {}
 
 // batchOp represents a single staged operation in a WriteBatch.
 type batchOp struct {
-	opType byte // 0 = put, 1 = delete
+	opType byte   // 0 = put, 1 = delete
 	key    []byte
 	value  []byte
+	xid    uint64 // 0 = auto-commit, non-zero = use specific XID
 }
 
 // writeBatch implements kvstoreapi.WriteBatch.
@@ -1548,6 +1549,11 @@ func (wb *writeBatch) Delete(key []byte) error {
 // Commit atomically applies all staged operations.
 // All operations share one transaction and one WAL fsync.
 // On error, the transaction is aborted — no partial writes are visible.
+//
+// NOTE: Operations staged with PutWithXID/DeleteWithXID (op.xid != 0) are
+// SKIPPED here — they are committed separately via CommitWithXID. This
+// enables SQL transactions to use WriteBatch for batching, then commit
+// all writes under the SQL transaction's XID in a single fsync.
 func (wb *writeBatch) Commit() error {
 	if wb.finished {
 		return kvstoreapi.ErrBatchCommitted
@@ -1562,14 +1568,18 @@ func (wb *writeBatch) Commit() error {
 		return kvstoreapi.ErrClosed
 	}
 
-	// Empty batch — nothing to do
-	if len(wb.ops) == 0 {
-		return nil
+	// Count non-XID ops (skip XID ops — committed separately via CommitWithXID).
+	autoOps := 0
+	for _, op := range wb.ops {
+		if op.xid == 0 {
+			autoOps++
+		}
+	}
+	if autoOps == 0 {
+		return nil // all ops were XID ops
 	}
 
 	// Register per-operation WAL collectors (goroutine-keyed).
-	// LSM's registerLSMWALCollector is idempotent — SetPageMapping inside
-	// tree.Put uses the same collector, not a new one.
 	_, unregPage := s.provider.RegisterCollector()
 	defer unregPage()
 	_, unregBlob := s.blobAdapter.registerCollector()
@@ -1578,8 +1588,12 @@ func (wb *writeBatch) Commit() error {
 	// Start regular auto-commit transaction
 	xid, _ := s.txnMgr.BeginTxn()
 
-	// Execute all operations in the same transaction
+	// Execute auto-commit operations in the same transaction.
+	// Skip op.xid != 0 (those use PutWithXID/DeleteWithXID and are committed separately).
 	for _, op := range wb.ops {
+		if op.xid != 0 {
+			continue // handled by CommitWithXID
+		}
 		var err error
 		switch op.opType {
 		case 0: // Put
@@ -1600,9 +1614,6 @@ func (wb *writeBatch) Commit() error {
 	rootPageID := s.tree.RootPageID()
 
 	// Build WAL commit entry manually. Write WAL BEFORE committing in CLOG.
-	// All batch entries are in the tree but NOT visible — VisibilityChecker
-	// checks CLOG, and xid is still InProgress. This guarantees atomicity:
-	// readers see either all entries (after Commit) or none (before Commit).
 	commitWALEntry := txnapi.WALEntry{Type: 7, ID: xid}
 	batch := assembleBatchFromCollectors(s.provider, s.blobAdapter, s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(), rootPageID, commitWALEntry)
 	_, walErr := s.wal.WriteBatch(batch)
@@ -1645,10 +1656,13 @@ func (wb *writeBatch) PutWithXID(key, value []byte, txnID uint64) error {
 	if len(key) > btreeapi.MaxKeySize {
 		return kvstoreapi.ErrKeyTooLarge
 	}
+	if txnID == 0 {
+		return fmt.Errorf("PutWithXID: txnID must be non-zero")
+	}
 
-	// Write directly to btree without new XID allocation or WAL entry.
-	// Caller handles WAL durability and CLOG commit/abort.
-	return wb.store.tree.Put(key, value, txnID)
+	// Stage the operation. CommitWithXID will apply all staged ops atomically.
+	wb.ops = append(wb.ops, batchOp{opType: 0, key: key, value: value, xid: txnID})
+	return nil
 }
 
 // DeleteWithXID marks a key as deleted with a specific transaction ID.
@@ -1660,12 +1674,100 @@ func (wb *writeBatch) DeleteWithXID(key []byte, txnID uint64) error {
 	if wb.finished {
 		return kvstoreapi.ErrBatchCommitted
 	}
-
-	err := wb.store.tree.Delete(key, txnID)
-	if err == btreeapi.ErrKeyNotFound {
-		return kvstoreapi.ErrKeyNotFound
+	if txnID == 0 {
+		return fmt.Errorf("DeleteWithXID: txnID must be non-zero")
 	}
-	return err
+
+	// Stage the operation. CommitWithXID will apply all staged ops atomically.
+	wb.ops = append(wb.ops, batchOp{opType: 1, key: key, xid: txnID})
+	return nil
+}
+
+// CommitWithXID atomically applies all operations staged with PutWithXID/DeleteWithXID
+// under the given transaction ID. All operations share one WAL fsync.
+// Used by SQL executor to commit deferred-write transactions.
+//
+// All staged ops (both auto-commit and XID) share the same WAL fsync when
+// the SQL transaction commits. This is the normal path for SQL BEGIN...COMMIT.
+//
+// NOTE: If the batch contains both auto-commit (op.xid==0) and XID (op.xid!=0)
+// ops, only XID ops are committed here. Auto-commit ops require a different
+// transaction and must be committed separately via Commit().
+func (wb *writeBatch) CommitWithXID(xid uint64) error {
+	if wb.finished {
+		return kvstoreapi.ErrBatchCommitted
+	}
+	wb.finished = true
+
+	s := wb.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return kvstoreapi.ErrClosed
+	}
+
+	// Collect XID ops from the batch.
+	var xidOps []batchOp
+	for _, op := range wb.ops {
+		if op.xid != 0 && op.xid == xid {
+			xidOps = append(xidOps, op)
+		}
+	}
+	if len(xidOps) == 0 {
+		return nil
+	}
+
+	// Register WAL collectors for page/blob persistence.
+	_, unregPage := s.provider.RegisterCollector()
+	defer unregPage()
+	_, unregBlob := s.blobAdapter.registerCollector()
+	defer unregBlob()
+
+	// Execute all XID ops against the btree.
+	for _, op := range xidOps {
+		var err error
+		switch op.opType {
+		case 0: // Put
+			err = s.tree.Put(op.key, op.value, xid)
+		case 1: // Delete
+			err = s.tree.Delete(op.key, xid)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	// Collect root change and WAL entries.
+	rootPageID := s.tree.RootPageID()
+	pageEntries := s.provider.CollectAndClear()
+	blobEntries := s.blobAdapter.CollectAndClear()
+
+	// Build WAL batch.
+	batch := walapi.NewBatch()
+	for _, e := range pageEntries {
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	for _, e := range blobEntries {
+		batch.Add(walapi.ModuleLSM, walapi.RecordType(e.Type), e.ID, e.VAddr, e.Size)
+	}
+	if lsm := s.pageStore.(pagestoreapi.PageStoreRecovery).LSMLifecycle(); lsm != nil {
+		for _, rec := range lsm.DrainCollector() {
+			batch.Records = append(batch.Records, rec)
+		}
+	}
+	batch.Add(walapi.ModuleTree, walapi.RecordSetRoot, rootPageID, 0, 0)
+	batch.Add(walapi.ModuleTree, walapi.RecordTxnCommit, xid, 0, 0)
+
+	// WAL fsync — provides durability.
+	if _, err := s.wal.WriteBatch(batch); err != nil {
+		return err
+	}
+
+	// WAL succeeded — update CLOG to make transaction visible.
+	s.txnMgr.Commit(xid)
+
+	return nil
 }
 
 

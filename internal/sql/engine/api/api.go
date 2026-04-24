@@ -114,6 +114,13 @@ type TableEngine interface {
 	// Returns ErrRowNotFound if the row does not exist.
 	Get(table *catalogapi.TableSchema, rowID uint64) (*Row, error)
 
+	// GetBatch retrieves multiple rows by their rowIDs in a single call.
+	// Skips rowIDs that return ErrRowNotFound (stale index entries).
+	// Preserves the order of input rowIDs — output rows are in the same order.
+	// Performance: uses a single KV store.Scan instead of N Get calls.
+	// Caller must not modify the returned rows.
+	GetBatch(table *catalogapi.TableSchema, rowIDs []uint64) ([]*Row, error)
+
 	// Scan returns an iterator over all rows in the table, ordered by rowID.
 	// Caller must call Close() on the returned iterator.
 	Scan(table *catalogapi.TableSchema) (RowIterator, error)

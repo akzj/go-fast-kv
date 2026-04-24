@@ -134,32 +134,37 @@ func (e *executor) indexScan(table *catalogapi.TableSchema, scan *plannerapi.Ind
 	}
 	defer rowIDIter.Close()
 
-	var rows []*engineapi.Row
+	// Collect all rowIDs first.
+	var rowIDs []uint64
 	for rowIDIter.Next() {
-		rowID := rowIDIter.RowID()
-		row, err := e.tableEngine.Get(table, rowID)
-		if err != nil {
-			if err == engineapi.ErrRowNotFound {
-				continue // stale index entry
-			}
-			return nil, fmt.Errorf("%w: get row: %v", executorapi.ErrExecFailed, err)
-		}
+		rowIDs = append(rowIDs, rowIDIter.RowID())
+	}
+	if err := rowIDIter.Err(); err != nil {
+		return nil, fmt.Errorf("%w: index scan iteration: %v", executorapi.ErrExecFailed, err)
+	}
+	if len(rowIDs) == 0 {
+		return nil, nil
+	}
 
-		// Apply residual filter
-		if scan.ResidualFilter != nil {
+	// Batch fetch all rows in a single call.
+	rows, err := e.tableEngine.GetBatch(table, rowIDs)
+	if err != nil {
+		return nil, fmt.Errorf("%w: get batch: %v", executorapi.ErrExecFailed, err)
+	}
+
+	// Apply residual filter if present.
+	if scan.ResidualFilter != nil {
+		var filtered []*engineapi.Row
+		for _, row := range rows {
 			pass, err := matchFilter(scan.ResidualFilter, row, table.Columns, subqueryResults, e)
 			if err != nil {
 				return nil, err
 			}
-			if !pass {
-				continue
+			if pass {
+				filtered = append(filtered, row)
 			}
 		}
-
-		rows = append(rows, row)
-	}
-	if err := rowIDIter.Err(); err != nil {
-		return nil, fmt.Errorf("%w: index scan iteration: %v", executorapi.ErrExecFailed, err)
+		return filtered, nil
 	}
 
 	return rows, nil
