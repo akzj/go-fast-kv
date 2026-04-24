@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	catalogapi "github.com/akzj/go-fast-kv/internal/sql/catalog/api"
 	"github.com/akzj/go-fast-kv/internal/sql/encoding"
@@ -153,9 +154,77 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		}
 		// Not pre-computed: execute on-demand for correlated subqueries
 		return ex.execSubquery(node.Plan)
+	case *parserapi.FunctionCallExpr:
+		return evalFunctionCall(node, row, columns, subqueryResults, ex)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported expression type %T", executorapi.ErrExecFailed, expr)
 	}
+}
+
+// FunctionRegistry stores user-defined functions in memory.
+type FunctionRegistry struct {
+	funcs map[string]*FunctionDef
+	mu    sync.RWMutex
+}
+
+// FunctionDef defines a user-defined function.
+type FunctionDef struct {
+	Name    string
+	Args    []string // parameter names (in order)
+	RetType string   // return type: "INT", "TEXT", "FLOAT", "BLOB"
+	Body    string   // function body expression (e.g., "a + b")
+}
+
+// Register adds a function to the registry.
+func (r *FunctionRegistry) Register(def *FunctionDef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.funcs == nil {
+		r.funcs = make(map[string]*FunctionDef)
+	}
+	r.funcs[strings.ToUpper(def.Name)] = def
+}
+
+// Get retrieves a function by name. Returns nil if not found.
+func (r *FunctionRegistry) Get(name string) (*FunctionDef, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	fn, ok := r.funcs[strings.ToUpper(name)]
+	return fn, ok
+}
+
+// NewFunctionRegistry creates a new empty FunctionRegistry.
+func NewFunctionRegistry() *FunctionRegistry {
+	return &FunctionRegistry{}
+}
+
+// evalFunctionCall evaluates a user-defined function call.
+func evalFunctionCall(call *parserapi.FunctionCallExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Get function from registry
+	fn, ok := ex.funcRegistry.Get(call.Name)
+	if !ok || fn == nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: function %q not found", executorapi.ErrExecFailed, call.Name)
+	}
+
+	// Bind arguments to parameter names
+	env := make(map[string]parserapi.Expr)
+	for i, arg := range call.Args {
+		val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if i < len(fn.Args) {
+			env[fn.Args[i]] = &parserapi.Literal{Value: val}
+		}
+	}
+
+	// Parse body as expression using a simple approach:
+	// Re-parse the body expression with parameter substitutions pre-evaluated.
+	// For MVP, body must be a single expression.
+	// Note: Full implementation would substitute parameters in the body string.
+	// Here we return the body string for now (MVP: not yet implemented).
+	return catalogapi.Value{}, fmt.Errorf("%w: function execution: body evaluation not yet implemented", executorapi.ErrExecFailed)
 }
 
 // evalColumnRef looks up a column value from the row.

@@ -61,6 +61,8 @@ type executor struct {
 	triggerOldVals []catalogapi.Value
 	// triggerDepth prevents infinite recursion from nested triggers
 	triggerDepth int
+	// funcRegistry stores user-defined functions registered via CREATE FUNCTION
+	funcRegistry *FunctionRegistry
 }
 
 // New creates a new Executor.
@@ -79,6 +81,7 @@ func New(store kvstoreapi.Store, catalog catalogapi.CatalogManager,
 		parser:      parser,
 		cteResults:   make(map[string]*executorapi.Result),
 		windowResults: make(map[*parserapi.WindowFuncExpr]*WindowFunctionResult),
+		funcRegistry: NewFunctionRegistry(),
 	}
 }
 
