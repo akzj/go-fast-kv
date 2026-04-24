@@ -655,8 +655,10 @@ func (s *lsm) DeleteBlobMapping(blobID uint64) {
 	// Register collector for this goroutine
 	registerLSMWALCollector()
 
-	// Append WAL entry to per-goroutine collector
+	// Append WAL entry to per-goroutine collector (protected by per-goroutine mutex)
 	gid := goroutineID()
+	colMu := getOrCreateCollectorMu(gid)
+	colMu.Lock()
 	if v, ok := lsmWALCollectors.Load(gid); ok {
 		records := v.(*[]walapi.Record)
 		*records = append(*records, walapi.Record{
@@ -665,6 +667,7 @@ func (s *lsm) DeleteBlobMapping(blobID uint64) {
 			ID:         blobID,
 		})
 	}
+	colMu.Unlock()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
