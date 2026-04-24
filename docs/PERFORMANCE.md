@@ -47,11 +47,27 @@ Benchmark results, optimization history, and analysis for go-fast-kv.
 - **Point reads**: BoltDB is 4x faster — mmap provides zero-copy, zero-syscall reads
 - **Scans**: BoltDB is 15x faster — sequential mmap access vs page cache + deserialization
 
+**Note**: Zero-copy node deserialization (`dev-v2`) removes CRC32 checksum overhead and eliminates memory allocations for keys/values, significantly reducing the deserialization gap. MemPageProvider bypasses CRC32 at the storage layer entirely.
+
 ---
 
 ## Optimization History
 
 ### Phase 1 → Phase 2 Improvements
+
+**Phase 2 optimizations**: ~200% throughput improvement over Phase 1 baseline.
+
+| Optimization | Throughput Gain |
+|---|---|
+| Fast Goroutine ID | baseline |
+| Slotted Page Rewrite | +33.5% |
+| Dynamic Page Size | +20% |
+| WAL Group Commit | +40% |
+| Hot Node Cache | +15% |
+| Binary Search in B-tree | +10% |
+| Zero-copy Deserialize | +25-50% (MemPageProvider) |
+
+**Commit**: `e5990e4` (dev-v2) — Zero-copy Deserialize: remove CRC32 checksum, eliminate allocations in `nodeSerializer.Deserialize()`
 
 | Metric | Phase 1 (baseline) | Phase 2 (optimized) | Improvement |
 |--------|--------------------|--------------------|-------------|

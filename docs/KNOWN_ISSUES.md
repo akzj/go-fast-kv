@@ -171,8 +171,8 @@ The following areas were not covered by the deep code review and may contain add
 
 - Full-text search executor paths
 - Window function computation correctness
-- Savepoint rollback under complex scenarios
-- Row locking under contention
+- Savepoint rollback under complex scenarios ~~(Deferred → FIXED in `f50e518`)~~
+- ~~Row locking under contention~~
 - Expression index evaluation
 - Recursive CTE termination guarantees
 - Concurrent access safety
@@ -184,6 +184,6 @@ The following areas were not covered by the deep code review and may contain add
 | Layer | Fixed | Accepted | Deferred |
 |-------|-------|----------|----------|
 | KV | 6 | 1 | 2 |
-| SQL | 3 | 0 | 5 |
+| SQL | 4 | 0 | 5 |
 
-**Commits**: c167412, d9d9da0, a730428, 299d90e
+**Commits**: c167412, d9d9da0, a730428, 299d90e, **f50e518**

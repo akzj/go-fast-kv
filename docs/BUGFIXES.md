@@ -1,6 +1,6 @@
 # Bug Fixes Record
 
-All bugs found and fixed during the deep code review (2026). Total: 30 correctness fixes across KV and SQL layers.
+All bugs found and fixed during the deep code review (2026). Total: 31 correctness fixes across KV and SQL layers.
 
 ---
 
@@ -197,7 +197,7 @@ All bugs found during the 6-phase deep code review (2026).
 
 ---
 
-## SQL Layer Fixes (13 commits)
+## SQL Layer Fixes (14 commits)
 
 All bugs found during the SQL layer deep code review (2026).
 
@@ -368,4 +368,19 @@ All bugs found during the SQL layer deep code review (2026).
 
 **Fix**: Add a `NOT LIKE` branch producing `LikeExpr{Not: true}`.
 
+
+---
+
+### Bug 14: execInsert Missing Return — ROLLBACK Does Not Track Pending Writes
+
+**Commit**: `f50e518`
+**Files**: `executor/internal/executor.go`
+
+**Root Cause**: The transaction path in `execInsert()` called `batch.CommitWithXID()` but lacked a `return` statement. Execution fell through into the non-transactional path, bypassing `AddPendingWrite()` tracking entirely.
+
+**Impact**: `BEGIN...INSERT...ROLLBACK` does not correctly roll back. INSERTed rows remain visible after ROLLBACK because they were not tracked in `pendingWrites`.
+
+**Fix**: Add explicit `return &executorapi.Result{RowsAffected: int64(len(rowIDs))}, nil` after `batch.CommitWithXID(xid)`.
+
+**Impact**: Transaction rollback silently fails — committed data persists without being deleted. Data integrity violation in transaction semantics.
 **Impact**: `WHERE name NOT LIKE '%test%'` fails to parse.
