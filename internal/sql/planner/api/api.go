@@ -164,6 +164,24 @@ type DropViewPlan struct {
 
 func (*DropViewPlan) planNode() {}
 
+// CreateFunctionPlan creates a user-defined function.
+type CreateFunctionPlan struct {
+	Name    string
+	Args    []parserapi.FunctionArg
+	Returns string
+	Body    string
+}
+
+func (*CreateFunctionPlan) planNode() {}
+
+// DropFunctionPlan drops a user-defined function.
+type DropFunctionPlan struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropFunctionPlan) planNode() {}
+
 // ─── FTS Plans ─────────────────────────────────────────────────────
 
 // FTSIndexSchema stores FTS table metadata.

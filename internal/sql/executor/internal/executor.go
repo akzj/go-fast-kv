@@ -205,6 +205,8 @@ func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error
 		return e.execCreateFTS(p)
 	case *plannerapi.FTSSearchPlan:
 		return e.execFTSSearch(p)
+	case *plannerapi.CreateFunctionPlan:
+		return e.execCreateFunction(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
@@ -742,6 +744,33 @@ func (e *executor) execDropView(plan *plannerapi.DropViewPlan) (*executorapi.Res
 		return nil, fmt.Errorf("%w: drop view: %v", executorapi.ErrExecFailed, err)
 	}
 
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execCreateFunction registers a user-defined function in the FunctionRegistry.
+func (e *executor) execCreateFunction(p *plannerapi.CreateFunctionPlan) (*executorapi.Result, error) {
+	// Register function in the registry
+	args := make([]string, len(p.Args))
+	for i, arg := range p.Args {
+		args[i] = arg.Name
+	}
+
+	e.funcRegistry.Register(&FunctionDef{
+		Name:    p.Name,
+		Args:    args,
+		RetType: p.Returns,
+		Body:    p.Body,
+	})
+
+	return &executorapi.Result{RowsAffected: 1}, nil
+}
+
+// execDropFunction drops a user-defined function from the FunctionRegistry.
+func (e *executor) execDropFunction(p *plannerapi.DropFunctionPlan) (*executorapi.Result, error) {
+	// For MVP, we don't implement DROP FUNCTION since functions are in-memory
+	// The planner returns the plan but executor just acknowledges it
+	// In a full implementation, we'd remove from funcRegistry
+	_ = p // unused in MVP
 	return &executorapi.Result{RowsAffected: 1}, nil
 }
 

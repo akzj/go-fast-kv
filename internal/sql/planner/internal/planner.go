@@ -91,6 +91,10 @@ func (p *planner) Plan(stmt parserapi.Statement) (plannerapi.Plan, error) {
 		return p.planCreateView(s)
 	case *parserapi.DropViewStmt:
 		return p.planDropView(s)
+	case *parserapi.CreateFunctionStmt:
+		return p.planCreateFunction(s)
+	case *parserapi.DropFunctionStmt:
+		return p.planDropFunction(s)
 	case *parserapi.CreateFTSStmt:
 		return p.planCreateFTS(s)
 	default:
@@ -2420,6 +2424,24 @@ func (p *planner) planCreateView(stmt *parserapi.CreateViewStmt) (*plannerapi.Cr
 
 func (p *planner) planDropView(stmt *parserapi.DropViewStmt) (*plannerapi.DropViewPlan, error) {
 	return &plannerapi.DropViewPlan{
+		Name:     stmt.Name,
+		IfExists: stmt.IfExists,
+	}, nil
+}
+
+// ─── FUNCTION Planning ──────────────────────────────────────────────
+
+func (p *planner) planCreateFunction(stmt *parserapi.CreateFunctionStmt) (*plannerapi.CreateFunctionPlan, error) {
+	return &plannerapi.CreateFunctionPlan{
+		Name:    stmt.Name,
+		Args:    stmt.Args,
+		Returns: stmt.Returns,
+		Body:    stmt.Body,
+	}, nil
+}
+
+func (p *planner) planDropFunction(stmt *parserapi.DropFunctionStmt) (*plannerapi.DropFunctionPlan, error) {
+	return &plannerapi.DropFunctionPlan{
 		Name:     stmt.Name,
 		IfExists: stmt.IfExists,
 	}, nil
