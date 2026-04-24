@@ -2648,7 +2648,8 @@ func isAggregateFunc(name string) bool {
 // isStringFunc returns true for built-in string function names (case-insensitive).
 func isStringFunc(name string) bool {
 	switch strings.ToUpper(name) {
-	case "SUBSTRING", "CONCAT", "TRIM", "UPPER", "LOWER", "LENGTH":
+	case "SUBSTRING", "CONCAT", "TRIM", "UPPER", "LOWER", "LENGTH",
+		"LTRIM", "RTRIM", "REPLACE", "STRPOS", "SPLIT_PART":
 		return true
 	default:
 		return false
@@ -2659,6 +2660,42 @@ func isStringFunc(name string) bool {
 func isJsonFunc(name string) bool {
 	switch strings.ToUpper(name) {
 	case "JSON_EXTRACT", "JSON_SET", "JSON_INSERT", "JSON_REMOVE", "JSON_TYPE":
+		return true
+	default:
+		return false
+	}
+}
+
+// isMathFunc returns true for built-in math function names (case-insensitive).
+func isMathFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "ABS", "CEIL", "FLOOR", "ROUND", "MOD", "GREATEST", "LEAST", "RANDOM":
+		return true
+	default:
+		return false
+	}
+}
+
+// isDateTimeFunc returns true for built-in date/time function names (case-insensitive).
+func isDateTimeFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "NOW", "CURRENT_TIMESTAMP", "DATE_TRUNC", "AGE", "TO_CHAR", "TO_TIMESTAMP":
+		return true
+	default:
+		return false
+	}
+}
+
+// isExtractFunc returns true for EXTRACT function.
+func isExtractFunc(name string) bool {
+	return strings.ToUpper(name) == "EXTRACT"
+}
+
+// isJsonbFunc returns true for built-in jsonb function names (case-insensitive).
+func isJsonbFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "JSONB_EXTRACT_PATH_TEXT", "JSONB_EXTRACT_PATH", "JSONB_TYPEOF",
+		"JSONB_ARRAY_LENGTH", "JSONB_BUILD_OBJECT", "JSONB_BUILD_ARRAY":
 		return true
 	default:
 		return false
@@ -3149,6 +3186,18 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			// JSON functions: JSON_EXTRACT, JSON_SET, JSON_INSERT, JSON_REMOVE, JSON_TYPE
 			if isJsonFunc(name) {
 				return &api.JsonFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
+			}
+			// Math functions: ABS, CEIL, FLOOR, ROUND, MOD, GREATEST, LEAST, RANDOM
+			if isMathFunc(name) {
+				return &api.MathFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
+			}
+			// Date/time functions: NOW, CURRENT_TIMESTAMP, DATE_TRUNC, AGE, TO_CHAR, TO_TIMESTAMP
+			if isDateTimeFunc(name) {
+				return &api.DateTimeFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
+			}
+			// jsonb functions: JSONB_EXTRACT_PATH_TEXT, JSONB_EXTRACT_PATH, etc.
+			if isJsonbFunc(name) {
+				return &api.JsonbFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
 			}
 			// Unknown function — treat as user-defined function call
 			// (Executor will resolve it against catalog; backward compat: ColumnRef fallback)

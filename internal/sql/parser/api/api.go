@@ -609,6 +609,38 @@ type JsonFuncExpr struct {
 
 func (*JsonFuncExpr) exprNode() {}
 
+// MathFuncExpr represents mathematical functions: ABS, CEIL, FLOOR, ROUND, MOD, GREATEST, LEAST, RANDOM
+type MathFuncExpr struct {
+	Func string // "ABS", "CEIL", "FLOOR", "ROUND", "MOD", "GREATEST", "LEAST", "RANDOM"
+	Args []Expr // arguments for the function
+}
+
+func (*MathFuncExpr) exprNode() {}
+
+// DateTimeFuncExpr represents date/time functions: NOW, CURRENT_TIMESTAMP, DATE_TRUNC, AGE, TO_CHAR, TO_TIMESTAMP
+type DateTimeFuncExpr struct {
+	Func string // "NOW", "CURRENT_TIMESTAMP", "DATE_TRUNC", "AGE", "TO_CHAR", "TO_TIMESTAMP"
+	Args []Expr // arguments for the function
+}
+
+func (*DateTimeFuncExpr) exprNode() {}
+
+// ExtractExpr represents the EXTRACT(field FROM date) function
+type ExtractExpr struct {
+	Field string // "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DOW", "DOY"
+	Date  Expr   // the date/timestamp expression
+}
+
+func (*ExtractExpr) exprNode() {}
+
+// JsonbFuncExpr represents jsonb functions: jsonb_extract_path_text, jsonb_extract_path, jsonb_typeof, jsonb_array_length, jsonb_build_object, jsonb_build_array
+type JsonbFuncExpr struct {
+	Func string // "JSONB_EXTRACT_PATH_TEXT", "JSONB_EXTRACT_PATH", "JSONB_TYPEOF", "JSONB_ARRAY_LENGTH", "JSONB_BUILD_OBJECT", "JSONB_BUILD_ARRAY"
+	Args []Expr // arguments for the function
+}
+
+func (*JsonbFuncExpr) exprNode() {}
+
 // CastExpr: CAST(expr AS type) performs type conversion.
 type CastExpr struct {
 	Expr     Expr  // the expression to cast

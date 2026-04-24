@@ -3,6 +3,8 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +59,10 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		walkExpr(e.Start, fn)
 		walkExpr(e.Len, fn)
 	case *parserapi.JsonFuncExpr:
+		for _, arg := range e.Args {
+			walkExpr(arg, fn)
+		}
+	case *parserapi.MathFuncExpr:
 		for _, arg := range e.Args {
 			walkExpr(arg, fn)
 		}
@@ -132,6 +138,14 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalStringFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.JsonFuncExpr:
 		return evalJsonFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.MathFuncExpr:
+		return evalMathFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.DateTimeFuncExpr:
+		return evalDateTimeFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.ExtractExpr:
+		return evalExtractExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.JsonbFuncExpr:
+		return evalJsonbFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CastExpr:
 		return evalCastExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
@@ -873,7 +887,7 @@ func evalNullIfExpr(expr *parserapi.NullIfExpr, row *engineapi.Row, columns []ca
 	return left, nil
 }
 
-// evalStringFuncExpr evaluates string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM.
+// evalStringFuncExpr evaluates string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM, LTRIM, RTRIM, REPLACE, STRPOS, SPLIT_PART.
 func evalStringFuncExpr(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
 	switch expr.Func {
@@ -889,6 +903,16 @@ func evalStringFuncExpr(expr *parserapi.StringFuncExpr, row *engineapi.Row, colu
 		return evalLength(expr, row, columns, subqueryResults, ex)
 	case "TRIM":
 		return evalTrim(expr, row, columns, subqueryResults, ex)
+	case "LTRIM":
+		return evalLtrim(expr, row, columns, subqueryResults, ex)
+	case "RTRIM":
+		return evalRtrim(expr, row, columns, subqueryResults, ex)
+	case "REPLACE":
+		return evalReplace(expr, row, columns, subqueryResults, ex)
+	case "STRPOS":
+		return evalStrpos(expr, row, columns, subqueryResults, ex)
+	case "SPLIT_PART":
+		return evalSplitPart(expr, row, columns, subqueryResults, ex)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unknown string function %s", executorapi.ErrExecFailed, expr.Func)
 	}
@@ -1072,6 +1096,171 @@ func evalTrim(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []cata
 	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.TrimSpace(val.Text)}, nil
 }
 
+// evalLtrim evaluates LTRIM(str). Removes leading whitespace.
+func evalLtrim(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: LTRIM requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: LTRIM requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.TrimLeft(val.Text, " \t\n\r")}, nil
+}
+
+// evalRtrim evaluates RTRIM(str). Removes trailing whitespace.
+func evalRtrim(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) == 0 {
+		return catalogapi.Value{}, fmt.Errorf("%w: RTRIM requires one argument", executorapi.ErrExecFailed)
+	}
+	val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if val.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: RTRIM requires text argument, got %v", executorapi.ErrExecFailed, val.Type)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: strings.TrimRight(val.Text, " \t\n\r")}, nil
+}
+
+// evalReplace evaluates REPLACE(str, from, to). Replaces all occurrences of 'from' with 'to'.
+func evalReplace(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 3 {
+		return catalogapi.Value{}, fmt.Errorf("%w: REPLACE requires 3 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate str
+	strVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if strVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if strVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: REPLACE requires text argument, got %v", executorapi.ErrExecFailed, strVal.Type)
+	}
+	// Evaluate from
+	fromVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if fromVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if fromVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: REPLACE 'from' must be text, got %v", executorapi.ErrExecFailed, fromVal.Type)
+	}
+	// Evaluate to
+	toVal, err := evalExpr(expr.Args[2], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if toVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if toVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: REPLACE 'to' must be text, got %v", executorapi.ErrExecFailed, toVal.Type)
+	}
+	result := strings.ReplaceAll(strVal.Text, fromVal.Text, toVal.Text)
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: result}, nil
+}
+
+// evalStrpos evaluates STRPOS(str, substr). Returns position of substring (1-indexed), 0 if not found.
+func evalStrpos(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: STRPOS requires 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate str
+	strVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if strVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if strVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: STRPOS requires text arguments, got %v", executorapi.ErrExecFailed, strVal.Type)
+	}
+	// Evaluate substr
+	subVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if subVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if subVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: STRPOS requires text arguments, got %v", executorapi.ErrExecFailed, subVal.Type)
+	}
+	// PostgreSQL STRPOS is 1-indexed; 0 means not found
+	idx := strings.Index(strVal.Text, subVal.Text)
+	if idx < 0 {
+		return catalogapi.Value{Type: catalogapi.TypeInt, Int: 0}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(idx + 1)}, nil
+}
+
+// evalSplitPart evaluates SPLIT_PART(str, delim, n). Splits by delimiter, returns nth part (1-indexed).
+func evalSplitPart(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 3 {
+		return catalogapi.Value{}, fmt.Errorf("%w: SPLIT_PART requires 3 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate str
+	strVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if strVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if strVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: SPLIT_PART requires text arguments, got %v", executorapi.ErrExecFailed, strVal.Type)
+	}
+	// Evaluate delim
+	delimVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if delimVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if delimVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: SPLIT_PART requires text arguments, got %v", executorapi.ErrExecFailed, delimVal.Type)
+	}
+	// Evaluate n
+	nVal, err := evalExpr(expr.Args[2], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if nVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if nVal.Type != catalogapi.TypeInt {
+		return catalogapi.Value{}, fmt.Errorf("%w: SPLIT_PART n must be integer, got %v", executorapi.ErrExecFailed, nVal.Type)
+	}
+	// Split and return nth part (PostgreSQL 1-indexed)
+	parts := strings.Split(strVal.Text, delimVal.Text)
+	n := int(nVal.Int)
+	if n == 0 || n < 0 || n > len(parts) {
+		return catalogapi.Value{Type: catalogapi.TypeText, Text: ""}, nil
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: parts[n-1]}, nil
+}
+
 // evalCastExpr evaluates CAST(expr AS type).
 // Converts a value from one type to another.
 func evalCastExpr(expr *parserapi.CastExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
@@ -1170,6 +1359,279 @@ func castToBlob(val catalogapi.Value) (catalogapi.Value, error) {
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to BLOB", executorapi.ErrExecFailed, val.Type)
 	}
+}
+
+// evalMathFuncExpr evaluates mathematical functions: ABS, CEIL, FLOOR, ROUND, MOD, GREATEST, LEAST, RANDOM.
+func evalMathFuncExpr(expr *parserapi.MathFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch strings.ToUpper(expr.Func) {
+	case "ABS":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: ABS requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		switch val.Type {
+		case catalogapi.TypeInt:
+			if val.Int < 0 {
+				return catalogapi.Value{Type: catalogapi.TypeInt, Int: -val.Int}, nil
+			}
+			return val, nil
+		case catalogapi.TypeFloat:
+			if val.Float < 0 {
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: -val.Float}, nil
+			}
+			return val, nil
+		default:
+			return catalogapi.Value{}, fmt.Errorf("%w: ABS requires numeric argument, got %v", executorapi.ErrExecFailed, val.Type)
+		}
+
+	case "CEIL", "CEILING":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: CEIL requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		switch val.Type {
+		case catalogapi.TypeInt:
+			return val, nil
+		case catalogapi.TypeFloat:
+			return catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.Ceil(val.Float)}, nil
+		default:
+			return catalogapi.Value{}, fmt.Errorf("%w: CEIL requires numeric argument, got %v", executorapi.ErrExecFailed, val.Type)
+		}
+
+	case "FLOOR":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: FLOOR requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		switch val.Type {
+		case catalogapi.TypeInt:
+			return val, nil
+		case catalogapi.TypeFloat:
+			return catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.Floor(val.Float)}, nil
+		default:
+			return catalogapi.Value{}, fmt.Errorf("%w: FLOOR requires numeric argument, got %v", executorapi.ErrExecFailed, val.Type)
+		}
+
+	case "ROUND":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: ROUND requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		val, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		if len(expr.Args) >= 2 {
+			// ROUND(n, d) — round to d decimal places
+			dVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			if dVal.IsNull {
+				return catalogapi.Value{IsNull: true}, nil
+			}
+			if dVal.Type != catalogapi.TypeInt {
+				return catalogapi.Value{}, fmt.Errorf("%w: ROUND decimal places must be integer, got %v", executorapi.ErrExecFailed, dVal.Type)
+			}
+			d := int(dVal.Int)
+			switch val.Type {
+			case catalogapi.TypeFloat:
+				factor := math.Pow(10, float64(d))
+				return catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.Round(val.Float*factor) / factor}, nil
+			case catalogapi.TypeInt:
+				if d >= 0 {
+					return val, nil
+				}
+				// Negative d rounds to powers of 10
+				factor := math.Pow(10, float64(-d))
+				return catalogapi.Value{Type: catalogapi.TypeInt, Int: int64(math.Round(float64(val.Int)*factor) / factor)}, nil
+			default:
+				return catalogapi.Value{}, fmt.Errorf("%w: ROUND requires numeric argument, got %v", executorapi.ErrExecFailed, val.Type)
+			}
+		}
+		// ROUND(n) — round to nearest integer
+		switch val.Type {
+		case catalogapi.TypeFloat:
+			return catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.Round(val.Float)}, nil
+		case catalogapi.TypeInt:
+			return val, nil
+		default:
+			return catalogapi.Value{}, fmt.Errorf("%w: ROUND requires numeric argument, got %v", executorapi.ErrExecFailed, val.Type)
+		}
+
+	case "MOD":
+		if len(expr.Args) < 2 {
+			return catalogapi.Value{}, fmt.Errorf("%w: MOD requires 2 arguments", executorapi.ErrExecFailed)
+		}
+		aVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if aVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		bVal, err := evalExpr(expr.Args[1], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if bVal.IsNull {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		// MOD works with integers in PostgreSQL
+		if aVal.Type == catalogapi.TypeInt && bVal.Type == catalogapi.TypeInt {
+			if bVal.Int == 0 {
+				return catalogapi.Value{}, fmt.Errorf("%w: division by zero in MOD", executorapi.ErrExecFailed)
+			}
+			return catalogapi.Value{Type: catalogapi.TypeInt, Int: aVal.Int % bVal.Int}, nil
+		}
+		// Fallback to float mod
+		a, b := toFloat(aVal), toFloat(bVal)
+		if b == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: division by zero in MOD", executorapi.ErrExecFailed)
+		}
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: math.Mod(a, b)}, nil
+
+	case "GREATEST":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: GREATEST requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		var result catalogapi.Value
+		for _, arg := range expr.Args {
+			val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			if val.IsNull {
+				continue
+			}
+			if result.Type == 0 || compareMathValues(val, result) > 0 {
+				result = val
+			}
+		}
+		if result.Type == 0 {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return result, nil
+
+	case "LEAST":
+		if len(expr.Args) == 0 {
+			return catalogapi.Value{}, fmt.Errorf("%w: LEAST requires at least 1 argument", executorapi.ErrExecFailed)
+		}
+		var result catalogapi.Value
+		for _, arg := range expr.Args {
+			val, err := evalExpr(arg, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			if val.IsNull {
+				continue
+			}
+			if result.Type == 0 || compareMathValues(val, result) < 0 {
+				result = val
+			}
+		}
+		if result.Type == 0 {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+		return result, nil
+
+	case "RANDOM":
+		return catalogapi.Value{Type: catalogapi.TypeFloat, Float: rand.Float64()}, nil
+
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unknown math function %s", executorapi.ErrExecFailed, expr.Func)
+	}
+}
+
+// toFloat converts a Value to float64.
+func toFloat(val catalogapi.Value) float64 {
+	switch val.Type {
+	case catalogapi.TypeInt:
+		return float64(val.Int)
+	case catalogapi.TypeFloat:
+		return val.Float
+	case catalogapi.TypeText:
+		if f, err := strconv.ParseFloat(val.Text, 64); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+// compareMathValues compares two Values for math functions. Returns -1 if a < b, 0 if a == b, 1 if a > b.
+func compareMathValues(a, b catalogapi.Value) int {
+	switch a.Type {
+	case catalogapi.TypeInt:
+		if b.Type == catalogapi.TypeInt {
+			if a.Int < b.Int {
+				return -1
+			}
+			if a.Int > b.Int {
+				return 1
+			}
+			return 0
+		}
+		if b.Type == catalogapi.TypeFloat {
+			if float64(a.Int) < b.Float {
+				return -1
+			}
+			if float64(a.Int) > b.Float {
+				return 1
+			}
+			return 0
+		}
+	case catalogapi.TypeFloat:
+		if b.Type == catalogapi.TypeInt {
+			if a.Float < float64(b.Int) {
+				return -1
+			}
+			if a.Float > float64(b.Int) {
+				return 1
+			}
+			return 0
+		}
+		if b.Type == catalogapi.TypeFloat {
+			if a.Float < b.Float {
+				return -1
+			}
+			if a.Float > b.Float {
+				return 1
+			}
+			return 0
+		}
+	case catalogapi.TypeText:
+		if b.Type == catalogapi.TypeText {
+			if a.Text < b.Text {
+				return -1
+			}
+			if a.Text > b.Text {
+				return 1
+			}
+			return 0
+		}
+	}
+	return 0
 }
 
 // evalCaseExpr evaluates a CASE expression.
