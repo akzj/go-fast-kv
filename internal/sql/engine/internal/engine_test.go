@@ -1131,9 +1131,11 @@ func TestTableEngine_AllocRowID(t *testing.T) {
 	}
 
 	te.Insert(table, []catalogapi.Value{intVal(0), textVal("A"), intVal(1)})
+	// After two AllocRowID calls (counter=3) + Insert (auto-increment, counter=4),
+	// the next AllocRowID should return 4.
 	id3, _ := te.AllocRowID(table.TableID)
-	if id3 != 3 {
-		t.Errorf("expected third AllocRowID=3, got %d", id3)
+	if id3 != 4 {
+		t.Errorf("expected third AllocRowID=4, got %d", id3)
 	}
 }
 
@@ -1180,14 +1182,16 @@ func TestTableEngine_PersistCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocRowID failed: %v", err)
 	}
-	// PersistCounter persisted 3, so AllocRowID returns 3 and increments to 4
-	if id != 3 {
-		t.Errorf("expected AllocRowID=3 (persisted value), got %d", id)
+	// PersistCounter persisted 4 (counter was 3 before AllocRowID, which
+	// returned 3 and incremented to 4). New engine reads 4 from KV.
+	// AllocRowID returns 4 and increments to 5.
+	if id != 4 {
+		t.Errorf("expected AllocRowID=4 (persisted value), got %d", id)
 	}
 
 	counter3 := te2.GetCounter(table.TableID)
-	if counter3 != 4 {
-		t.Errorf("expected counter=4 after AllocRowID, got %d", counter3)
+	if counter3 != 5 {
+		t.Errorf("expected counter=5 after AllocRowID, got %d", counter3)
 	}
 }
 
