@@ -584,88 +584,73 @@ func (p *parser) parseColumnDef() (api.ColumnDef, error) {
 	}
 	p.advance()
 
-	// Optional AUTOINCREMENT / SERIAL — can appear before or after PRIMARY KEY
-	if p.cur.Type == api.TokAutoIncrement || p.cur.Type == api.TokSerial {
-		p.advance()
-		col.AutoInc = true
-	}
-
-	// Optional PRIMARY KEY
-	if p.cur.Type == api.TokPrimary {
-		p.advance()
-		if err := p.expect(api.TokKey); err != nil {
-			return col, err
-		}
-		col.PrimaryKey = true
-	}
-
-	// Optional UNIQUE
-	if p.cur.Type == api.TokUnique {
-		p.advance()
-		col.Unique = true
-	}
-
-	// Optional NOT NULL
-	if p.cur.Type == api.TokNot {
-		p.advance()
-		if p.cur.Type != api.TokNull {
-			return col, p.errorf("expected NULL after NOT")
-		}
-		p.advance()
-		col.NotNull = true
-	}
-
-	// Optional AUTOINCREMENT / SERIAL — marks the column for auto-generated IDs
-	if p.cur.Type == api.TokAutoIncrement || p.cur.Type == api.TokSerial {
-		p.advance()
-		col.AutoInc = true
-	}
-
-	// Optional DEFAULT value
-	if p.cur.Type == api.TokDefault {
-		p.advance()
-		// Parse the default value expression
-		if p.cur.Type == api.TokLParen {
-			// Parenthesized expression: DEFAULT (expr)
+	// Parse column constraints in any order.
+	for {
+		switch {
+		case p.cur.Type == api.TokAutoIncrement || p.cur.Type == api.TokSerial:
 			p.advance()
-			val, err := p.parseExpr()
+			col.AutoInc = true
+
+		case p.cur.Type == api.TokPrimary:
+			p.advance()
+			if err := p.expect(api.TokKey); err != nil {
+				return col, err
+			}
+			col.PrimaryKey = true
+
+		case p.cur.Type == api.TokUnique:
+			p.advance()
+			col.Unique = true
+
+		case p.cur.Type == api.TokNot:
+			p.advance()
+			if p.cur.Type != api.TokNull {
+				return col, p.errorf("expected NULL after NOT")
+			}
+			p.advance()
+			col.NotNull = true
+
+		case p.cur.Type == api.TokDefault:
+			p.advance()
+			if p.cur.Type == api.TokLParen {
+				p.advance()
+				val, err := p.parseExpr()
+				if err != nil {
+					return col, err
+				}
+				if p.cur.Type != api.TokRParen {
+					return col, p.errorf("expected ) after default value expression")
+				}
+				p.advance()
+				col.DefaultValue = valToValue(val)
+			} else {
+				val, err := p.parseExpr()
+				if err != nil {
+					return col, err
+				}
+				col.DefaultValue = valToValue(val)
+			}
+
+		case p.cur.Type == api.TokCheck:
+			p.advance()
+			if p.cur.Type != api.TokLParen {
+				return col, p.errorf("expected ( after CHECK")
+			}
+			p.advance()
+			expr, err := p.parseExpr()
 			if err != nil {
 				return col, err
 			}
 			if p.cur.Type != api.TokRParen {
-				return col, p.errorf("expected ) after default value expression")
+				return col, p.errorf("expected ) after CHECK expression")
 			}
 			p.advance()
-			col.DefaultValue = valToValue(val)
-		} else {
-			// Simple literal: DEFAULT 0, DEFAULT 'hello', DEFAULT NULL
-			val, err := p.parseExpr()
-			if err != nil {
-				return col, err
-			}
-			col.DefaultValue = valToValue(val)
+			col.CheckExpr = expr
+
+		default:
+			return col, nil
 		}
 	}
-
-	// Optional CHECK constraint: CHECK (expr) or CHECK expr
-	if p.cur.Type == api.TokCheck {
-		p.advance()
-		if p.cur.Type != api.TokLParen {
-			return col, p.errorf("expected ( after CHECK")
-		}
-		p.advance()
-		expr, err := p.parseExpr()
-		if err != nil {
-			return col, err
-		}
-		if p.cur.Type != api.TokRParen {
-			return col, p.errorf("expected ) after CHECK expression")
-		}
-		p.advance()
-		col.CheckExpr = expr
-	}
-
-	return col, nil
 }
 
 // parseTableLevelForeignKey parses: FOREIGN KEY (col, ...) REFERENCES table (col, ...) [ON DELETE action] [ON UPDATE action]
