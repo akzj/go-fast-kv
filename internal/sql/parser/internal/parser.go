@@ -2295,15 +2295,20 @@ func (p *parser) parseCompareExpr() (api.Expr, error) {
 		return &api.IsNullExpr{Expr: left, Not: not}, nil
 	}
 
-	// LIKE
-	if p.cur.Type == api.TokLike {
-		p.advance()
+	// LIKE / NOT LIKE
+	if p.cur.Type == api.TokLike || (p.cur.Type == api.TokNot && p.peek.Type == api.TokLike) {
+		not := false
+		if p.cur.Type == api.TokNot {
+			not = true
+			p.advance()
+		}
+		p.advance() // consume LIKE
 		if p.cur.Type != api.TokString {
 			return nil, p.errorf("expected string pattern after LIKE")
 		}
 		pattern := p.cur.Literal
 		p.advance()
-		return &api.LikeExpr{Expr: left, Pattern: pattern}, nil
+		return &api.LikeExpr{Expr: left, Pattern: pattern, Not: not}, nil
 	}
 
 	// MATCH — FTS full-text search

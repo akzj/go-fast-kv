@@ -552,6 +552,9 @@ func evalLikeExpr(expr *parserapi.LikeExpr, row *engineapi.Row, columns []catalo
 		return catalogapi.Value{}, fmt.Errorf("LIKE requires text, got %v", val.Type)
 	}
 	matched := matchLike(val.Text, expr.Pattern, expr.Escape)
+	if expr.Not {
+		matched = !matched
+	}
 	if matched {
 		return catalogapi.Value{Type: catalogapi.TypeInt, Int: 1}, nil
 	}

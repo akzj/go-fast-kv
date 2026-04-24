@@ -664,11 +664,12 @@ type ParamRef struct {
 
 func (*ParamRef) exprNode() {}
 
-// LikeExpr: col LIKE 'pattern'
+// LikeExpr: col LIKE 'pattern' or col NOT LIKE 'pattern'
 type LikeExpr struct {
-	Expr    Expr  // the column expression
+	Expr    Expr   // the column expression
 	Pattern string // pattern string
-	Escape  byte  // escape char (0 = none)
+	Escape  byte   // escape char (0 = none)
+	Not     bool   // true for NOT LIKE
 }
 
 func (*LikeExpr) exprNode() {}
