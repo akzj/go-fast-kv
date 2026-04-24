@@ -140,6 +140,10 @@ var keywords = map[string]api.TokenType{
 	"FTS4":          api.TokFTS4,
 	"FTS3":          api.TokFTS3,
 	"VIEW":          api.TokView,
+	"FUNCTION":      api.TokFunction,
+	"RETURNS":       api.TokReturns,
+	"LANGUAGE":      api.TokLanguage,
+	"SQL":           api.TokSQL,
 }
 
 // lexer tokenizes SQL input.
@@ -188,6 +192,10 @@ func (l *lexer) nextToken() api.Token {
 		l.pos++
 		return api.Token{Type: api.TokQuestion, Literal: "?", Pos: startPos}
 	case '$':
+		// Check for dollar-quoted string ($$ or $tag$)
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '$' {
+			return l.readDollarQuote()
+		}
 		return l.readParam()
 	case '+':
 		l.pos++
@@ -315,6 +323,41 @@ func (l *lexer) readNumber() api.Token {
 		return api.Token{Type: api.TokFloat, Literal: literal, Pos: startPos}
 	}
 	return api.Token{Type: api.TokInteger, Literal: literal, Pos: startPos}
+}
+
+// readDollarQuote handles PostgreSQL $$...$$ or $tag$...$tag$ string literals.
+// Returns TokString with the content between delimiters.
+func (l *lexer) readDollarQuote() api.Token {
+	startPos := l.pos - 1 // include opening $
+
+	// Read tag (optional, default empty)
+	l.pos++
+	tagStart := l.pos
+	for l.pos < len(l.input) && l.input[l.pos] != '$' {
+		l.pos++
+	}
+	tag := string(l.input[tagStart:l.pos])
+
+	// Expect closing $
+	if l.pos >= len(l.input) || l.input[l.pos] != '$' {
+		return api.Token{Type: api.TokIllegal, Literal: string(l.input[startPos:l.pos]), Pos: startPos}
+	}
+	l.pos++ // skip closing $
+
+	// Scan until matching $tag$
+	searchTag := "$" + tag + "$"
+	searchStart := l.pos
+	for l.pos < len(l.input) {
+		if l.pos+len(searchTag) <= len(l.input) &&
+			string(l.input[l.pos:l.pos+len(searchTag)]) == searchTag {
+			content := string(l.input[searchStart:l.pos])
+			l.pos += len(searchTag) // skip closing delimiter
+			return api.Token{Type: api.TokString, Literal: content, Pos: startPos}
+		}
+		l.pos++
+	}
+	// Unterminated dollar quote
+	return api.Token{Type: api.TokIllegal, Literal: string(l.input[startPos:l.pos]), Pos: startPos}
 }
 
 // readParam reads a positional parameter ($1, $2, ...).

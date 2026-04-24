@@ -343,9 +343,140 @@ func (p *parser) parseCreate() (api.Statement, error) {
 		return p.parseCreateView()
 	case api.TokVirtual:
 		return p.parseCreateFTS()
+	case api.TokFunction:
+		return p.parseCreateFunction()
 	default:
-		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, VIEW, or VIRTUAL after CREATE")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, VIEW, FUNCTION, or VIRTUAL after CREATE")
 	}
+}
+
+// ─── CREATE FUNCTION ─────────────────────────────────────────────
+
+// parseCreateFunction parses: CREATE FUNCTION name(args) RETURNS type AS $$ body $$ LANGUAGE SQL
+func (p *parser) parseCreateFunction() (api.Statement, error) {
+	p.advance() // consume FUNCTION
+
+	// Function name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected function name")
+	}
+	name := p.cur.Literal
+	p.advance()
+
+	// Arguments: (arg1 type1, arg2 type2)
+	if p.cur.Type != api.TokLParen {
+		return nil, p.errorf("expected '(' after function name")
+	}
+	p.advance() // consume '('
+	args, err := p.parseFunctionArgsWithTypes()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur.Type != api.TokRParen {
+		return nil, p.errorf("expected ')' after arguments")
+	}
+	p.advance() // consume ')'
+
+	// RETURNS type
+	if p.cur.Type != api.TokReturns {
+		return nil, p.errorf("expected RETURNS")
+	}
+	p.advance() // consume RETURNS
+	returns := p.parseTypeName()
+	if returns == "" {
+		return nil, p.errorf("expected return type")
+	}
+
+	// AS keyword — accept both TokAs and TokIdent "AS"
+	if p.cur.Type == api.TokAs {
+		p.advance()
+	} else if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "AS" {
+		p.advance()
+	} else {
+		return nil, p.errorf("expected AS before function body")
+	}
+
+	// $$ body $$ (dollar-quoted string)
+	if p.cur.Type != api.TokString {
+		return nil, p.errorf("expected function body ($$...$$ string)")
+	}
+	body := p.cur.Literal
+	p.advance() // consume body string
+
+	// LANGUAGE SQL (optional, ignore)
+	if p.cur.Type == api.TokLanguage || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "LANGUAGE") {
+		if p.cur.Type == api.TokIdent {
+			p.advance() // consume LANGUAGE identifier
+		} else {
+			p.advance() // consume TokLanguage
+		}
+		if p.cur.Type == api.TokSQL || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "SQL") {
+			p.advance() // skip language name
+		}
+	}
+
+	return &api.CreateFunctionStmt{
+		Name:    name,
+		Args:    args,
+		Returns: returns,
+		Body:    body,
+		Lang:    "SQL",
+	}, nil
+}
+
+// parseFunctionArgsWithTypes parses function arguments with type annotations.
+func (p *parser) parseFunctionArgsWithTypes() ([]api.FunctionArg, error) {
+	var args []api.FunctionArg
+	for p.cur.Type != api.TokRParen && p.cur.Type != api.TokEOF {
+		if len(args) > 0 {
+			if p.cur.Type != api.TokComma {
+				return nil, p.errorf("expected ','")
+			}
+			p.advance()
+		}
+		if p.cur.Type == api.TokRParen {
+			break
+		}
+		argName := ""
+		if p.cur.Type == api.TokIdent {
+			argName = p.cur.Literal
+			p.advance()
+		}
+		// Parse type name (supports INT, TEXT, FLOAT, BLOB keywords)
+		argType := p.parseTypeName()
+		if argType == "" {
+			return nil, p.errorf("expected argument type")
+		}
+		args = append(args, api.FunctionArg{Name: argName, Type: argType})
+	}
+	return args, nil
+}
+
+// parseTypeName parses a type name (INT, TEXT, FLOAT, BLOB, or identifier).
+// Handles both type keywords and regular identifiers (including type names that are keywords).
+func (p *parser) parseTypeName() string {
+	switch p.cur.Type {
+	case api.TokIntKw:
+		p.advance()
+		return "INT"
+	case api.TokInteger2:
+		p.advance()
+		return "INT"
+	case api.TokTextKw:
+		p.advance()
+		return "TEXT"
+	case api.TokFloatKw:
+		p.advance()
+		return "FLOAT"
+	case api.TokBlobKw:
+		p.advance()
+		return "BLOB"
+	case api.TokIdent:
+		typ := p.cur.Literal
+		p.advance()
+		return typ
+	}
+	return ""
 }
 
 // ─── CREATE VIEW ─────────────────────────────────────────────────
@@ -1179,9 +1310,35 @@ func (p *parser) parseDrop() (api.Statement, error) {
 		return p.parseDropTrigger()
 	case api.TokView:
 		return p.parseDropView()
+	case api.TokFunction:
+		return p.parseDropFunction()
 	default:
-		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, or VIEW after DROP")
+		return nil, p.errorf("expected TABLE, INDEX, TRIGGER, VIEW, or FUNCTION after DROP")
 	}
+}
+
+// parseDropFunction parses: DROP FUNCTION [IF EXISTS] name
+func (p *parser) parseDropFunction() (api.Statement, error) {
+	p.advance() // consume FUNCTION
+	stmt := &api.DropFunctionStmt{}
+
+	// IF EXISTS
+	if p.cur.Type == api.TokIf {
+		p.advance()
+		if err := p.expect(api.TokExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	// Function name
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected function name")
+	}
+	stmt.Name = p.cur.Literal
+	p.advance()
+
+	return stmt, nil
 }
 
 func (p *parser) parseDropTable() (api.Statement, error) {
@@ -2988,8 +3145,9 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			if isJsonFunc(name) {
 				return &api.JsonFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
 			}
-			// Unknown function — treat as column reference for backward compatibility
-			return &api.ColumnRef{Column: name}, nil
+			// Unknown function — treat as user-defined function call
+			// (Executor will resolve it against catalog; backward compat: ColumnRef fallback)
+			return &api.FunctionCallExpr{Name: name, Args: args}, nil
 		}
 		return &api.ColumnRef{Column: name}, nil
 

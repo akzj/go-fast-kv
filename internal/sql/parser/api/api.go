@@ -177,6 +177,10 @@ const (
 	TokFTS5          TokenType = 159 // FTS5
 	TokFTS4          TokenType = 160 // FTS4
 	TokFTS3          TokenType = 161 // FTS3
+	TokFunction      TokenType = 164 // FUNCTION (CREATE FUNCTION)
+	TokReturns       TokenType = 165 // RETURNS
+	TokLanguage      TokenType = 166 // LANGUAGE
+	TokSQL           TokenType = 167 // SQL (LANGUAGE SQL)
 )
 
 // Token represents a single lexical token.
@@ -741,6 +745,41 @@ type PragmaStmt struct {
 }
 
 func (*PragmaStmt) stmtNode() {}
+
+// ─── User-Defined Function Statements ────────────────────────────
+
+// FunctionArg represents a named argument with its type for CREATE FUNCTION.
+type FunctionArg struct {
+	Name string
+	Type string
+}
+
+// CreateFunctionStmt: CREATE FUNCTION name(args) RETURNS type AS $$ body $$ LANGUAGE SQL
+type CreateFunctionStmt struct {
+	Name    string         // function name
+	Args    []FunctionArg  // argument list with names and types
+	Returns string         // return type: "INT", "TEXT", "FLOAT", etc.
+	Body    string         // function body (SQL expression or $$...$$ string)
+	Lang    string         // language: "SQL" (MVP only)
+}
+
+func (*CreateFunctionStmt) stmtNode() {}
+
+// DropFunctionStmt: DROP FUNCTION [IF EXISTS] name
+type DropFunctionStmt struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropFunctionStmt) stmtNode() {}
+
+// FunctionCallExpr represents a call to a user-defined function in an expression context.
+type FunctionCallExpr struct {
+	Name string  // function name
+	Args []Expr  // arguments passed to the function
+}
+
+func (*FunctionCallExpr) exprNode() {}
 
 // ─── FTS Statements ───────────────────────────────────────────────
 

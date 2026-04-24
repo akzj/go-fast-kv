@@ -1534,16 +1534,22 @@ func TestParse_Aggregates(t *testing.T) {
 		}
 	})
 
-	t.Run("unknown_function_treated_as_column", func(t *testing.T) {
+	t.Run("unknown_function_treated_as_function_call", func(t *testing.T) {
 		p := newParser()
 		stmt, err := p.Parse("SELECT myfunc(id) FROM users")
 		if err != nil {
 			t.Fatalf("parse error: %v", err)
 		}
 		sel := stmt.(*api.SelectStmt)
-		_, ok := sel.Columns[0].Expr.(*api.ColumnRef)
+		call, ok := sel.Columns[0].Expr.(*api.FunctionCallExpr)
 		if !ok {
-			t.Fatalf("expected ColumnRef for unknown function, got %T", sel.Columns[0].Expr)
+			t.Fatalf("expected FunctionCallExpr for unknown function, got %T", sel.Columns[0].Expr)
+		}
+		if call.Name != "MYFUNC" {
+			t.Errorf("expected function name 'MYFUNC', got %q", call.Name)
+		}
+		if len(call.Args) != 1 {
+			t.Fatalf("expected 1 argument, got %d", len(call.Args))
 		}
 	})
 }
@@ -2207,6 +2213,53 @@ func TestParse_SubquerySelect(t *testing.T) {
 		subSel := sel.DerivedTable.Subquery.Stmt.(*api.SelectStmt)
 		if subSel.Having == nil {
 			t.Error("expected HAVING in subquery")
+		}
+	})
+}
+
+func TestParse_CreateFunction(t *testing.T) {
+	t.Run("basic create function", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("CREATE FUNCTION myadd(a INT, b INT) RETURNS INT AS $$ a + b $$ LANGUAGE SQL")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		fn, ok := stmt.(*api.CreateFunctionStmt)
+		if !ok {
+			t.Fatalf("expected CreateFunctionStmt, got %T", stmt)
+		}
+		if fn.Name != "MYADD" {
+			t.Errorf("expected function name 'MYADD', got %q", fn.Name)
+		}
+		if fn.Returns != "INT" {
+			t.Errorf("expected returns 'INT', got %q", fn.Returns)
+		}
+		if fn.Body != " a + b " {
+			t.Errorf("expected body ' a + b ', got %q", fn.Body)
+		}
+		if len(fn.Args) != 2 {
+			t.Fatalf("expected 2 args, got %d", len(fn.Args))
+		}
+		if fn.Args[0].Name != "A" || fn.Args[0].Type != "INT" {
+			t.Errorf("expected arg[0] 'A INT', got %q %q", fn.Args[0].Name, fn.Args[0].Type)
+		}
+	})
+
+	t.Run("drop function", func(t *testing.T) {
+		p := newParser()
+		stmt, err := p.Parse("DROP FUNCTION IF EXISTS myfunc")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		fn, ok := stmt.(*api.DropFunctionStmt)
+		if !ok {
+			t.Fatalf("expected DropFunctionStmt, got %T", stmt)
+		}
+		if fn.Name != "MYFUNC" {
+			t.Errorf("expected name 'MYFUNC', got %q", fn.Name)
+		}
+		if !fn.IfExists {
+			t.Error("expected IfExists=true")
 		}
 	})
 }
