@@ -881,7 +881,8 @@ func (s *store) ScanWithParams(start, end []byte, params kvstoreapi.ScanParams) 
 			s.readSnaps.Store(readXID, snap)
 		}
 	} else {
-		readXID, snap := s.txnMgr.ReadSnapshot()
+		var snap *txnapi.Snapshot
+		readXID, snap = s.txnMgr.ReadSnapshot()
 		s.readSnaps.Store(readXID, snap)
 	}
 
