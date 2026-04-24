@@ -2629,11 +2629,16 @@ func (p *parser) parseJoin(left interface{}) (*api.JoinExpr, error) {
 		p.advance()
 	}
 
-	// Now expect JOIN keyword (not consumed yet for bare JOIN)
+	// Now expect JOIN keyword.
+	// For "INNER JOIN", INNER maps to TokJoin, so we see TokJoin TokJoin.
+	// Consume the first TokJoin; if the next is also TokJoin, consume that too.
 	if p.cur.Type != api.TokJoin {
 		return nil, p.errorf("expected JOIN")
 	}
 	p.advance()
+	if p.cur.Type == api.TokJoin {
+		p.advance() // consume the actual JOIN after INNER
+	}
 
 	// CROSS JOIN — no ON
 	if joinType == api.JoinType("CROSS") {
