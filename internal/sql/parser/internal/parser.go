@@ -3117,10 +3117,15 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 		}
 		// Function call: ident followed by '('
 		if p.cur.Type == api.TokLParen {
+			p.advance() // consume '('
 			args, err := p.parseFunctionArgs()
 			if err != nil {
 				return nil, err
 			}
+			if p.cur.Type != api.TokRParen {
+				return nil, p.errorf("expected ) after function arguments, got %s", p.cur.Literal)
+			}
+			p.advance() // consume ')'
 			// COUNT(*) — arg is nil, already set
 			if isAggregateFunc(name) {
 				var arg api.Expr

@@ -201,6 +201,11 @@ func NewFunctionRegistry() *FunctionRegistry {
 // evalFunctionCall evaluates a user-defined function call.
 func evalFunctionCall(call *parserapi.FunctionCallExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Check if executor context is available
+	if ex == nil || ex.funcRegistry == nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: function execution: body evaluation not yet implemented", executorapi.ErrExecFailed)
+	}
+
 	// Get function from registry
 	fn, ok := ex.funcRegistry.Get(call.Name)
 	if !ok || fn == nil {

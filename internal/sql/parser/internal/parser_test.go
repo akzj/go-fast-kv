@@ -2263,3 +2263,52 @@ func TestParse_CreateFunction(t *testing.T) {
 		}
 	})
 }
+
+func TestParse_FunctionCallArgs(t *testing.T) {
+	p := newParser()
+	
+	t.Run("single arg", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT myadd(1) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		call, ok := sel.Columns[0].Expr.(*api.FunctionCallExpr)
+		if !ok {
+			t.Fatalf("expected FunctionCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if len(call.Args) != 1 {
+			t.Errorf("expected 1 arg, got %d", len(call.Args))
+		}
+	})
+	
+	t.Run("two args", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT myadd(1, 2) FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		call, ok := sel.Columns[0].Expr.(*api.FunctionCallExpr)
+		if !ok {
+			t.Fatalf("expected FunctionCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if len(call.Args) != 2 {
+			t.Errorf("expected 2 args, got %d", len(call.Args))
+		}
+	})
+	
+	t.Run("no args", func(t *testing.T) {
+		stmt, err := p.Parse("SELECT myadd() FROM users")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		sel := stmt.(*api.SelectStmt)
+		call, ok := sel.Columns[0].Expr.(*api.FunctionCallExpr)
+		if !ok {
+			t.Fatalf("expected FunctionCallExpr, got %T", sel.Columns[0].Expr)
+		}
+		if len(call.Args) != 0 {
+			t.Errorf("expected 0 args, got %d", len(call.Args))
+		}
+	})
+}

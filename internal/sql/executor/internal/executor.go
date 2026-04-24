@@ -207,6 +207,8 @@ func (e *executor) executePlan(plan plannerapi.Plan) (*executorapi.Result, error
 		return e.execFTSSearch(p)
 	case *plannerapi.CreateFunctionPlan:
 		return e.execCreateFunction(p)
+	case *plannerapi.DropFunctionPlan:
+		return e.execDropFunction(p)
 	default:
 		return nil, fmt.Errorf("%w: unsupported plan type %T", executorapi.ErrExecFailed, plan)
 	}
