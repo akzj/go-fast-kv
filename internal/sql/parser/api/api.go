@@ -87,7 +87,7 @@ const (
 
 	// Special
 	TokEOF      TokenType = 64
-	TokIllegal  TokenType = 64
+	TokIllegal  TokenType = 0
 	TokExplain  TokenType = 65 // EXPLAIN
 	TokAnalyze  TokenType = 66 // ANALYZE
 	TokJoin     TokenType = 67 // JOIN

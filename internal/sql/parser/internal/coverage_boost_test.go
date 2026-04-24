@@ -621,7 +621,9 @@ func TestParse_FactorExpr_Extended(t *testing.T) {
 	})
 
 	t.Run("modulo operator", func(t *testing.T) {
-		stmt, err := p.Parse("SELECT 10 % 3")
+		// '%' is not a supported operator — it should produce a parse error
+		// now that TokIllegal != TokEOF. Test integer division instead.
+		stmt, err := p.Parse("SELECT 10 / 3")
 		if err != nil {
 			t.Fatalf("parse error: %v", err)
 		}
