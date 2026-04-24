@@ -74,7 +74,12 @@ func (m *RowLockManager) canAcquire(entry *lockEntry, txnID api.TxnID, mode api.
 
 	// Check if this transaction already holds the lock
 	if _, exists := entry.holders[txnID]; exists {
-		// Same transaction - always allowed (handles re-entrant locking)
+		// Same transaction holds the lock
+		if mode == api.LockExclusive && entry.mode == api.LockShared {
+			// Upgrade from shared to exclusive: only allowed if we're the ONLY holder
+			return len(entry.holders) == 1
+		}
+		// Re-entrant same-mode or downgrade: always allowed
 		return true
 	}
 
