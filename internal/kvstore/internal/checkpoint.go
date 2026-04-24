@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	blobstoreapi "github.com/akzj/go-fast-kv/internal/blobstore/api"
@@ -85,10 +84,6 @@ const checkpointVersion = 4 // v4: includes page mappings for backup recovery
 
 // ─── Store.Checkpoint — lock-free background checkpoint ─────────────
 
-// activeCheckpoint tracks the currently running background checkpoint.
-// Only one checkpoint runs at a time.
-var activeCheckpoint atomic.Pointer[checkpointCtx]
-
 // Checkpoint triggers a background checkpoint goroutine and returns immediately.
 // The checkpoint runs asynchronously without blocking user operations (Put/Get/Delete/Scan).
 // Checkpoint state is captured at a consistent MVCC snapshot point.
@@ -110,7 +105,7 @@ func (s *store) Checkpoint() error {
 	}
 
 	// Try to set as active checkpoint (only one runs at a time).
-	if !activeCheckpoint.CompareAndSwap(nil, ctx) {
+	if !s.activeCheckpoint.CompareAndSwap(nil, ctx) {
 		// Another checkpoint is already running — skip this request.
 		// The in-flight checkpoint will eventually complete and become
 		// the latest state. No need to force-kill it.
@@ -310,13 +305,13 @@ func (s *store) unpinAndClear(ctx *checkpointCtx) {
 	}
 
 	// Clear active checkpoint reference.
-	activeCheckpoint.Store((*checkpointCtx)(nil))
+	s.activeCheckpoint.Store((*checkpointCtx)(nil))
 }
 
 // StopCheckpoint signals the active checkpoint goroutine to abort.
 // Called by store.Close() to cleanly stop the checkpoint before shutdown.
 func (s *store) stopCheckpoint() {
-	ctx := activeCheckpoint.Swap(nil)
+	ctx := s.activeCheckpoint.Swap(nil)
 	if ctx == nil {
 		return
 	}

@@ -144,6 +144,9 @@ type store struct {
 	// reads use the same txnCtx snapshot for own-write visibility.
 	activeTxnCtx sync.Map // map[int64]txnapi.TxnContext
 
+	// Background checkpoint — per-store (not global) to support multiple store instances.
+	activeCheckpoint atomic.Pointer[checkpointCtx]
+
 	closed bool
 }
 
@@ -1734,7 +1737,7 @@ func (s *store) Backup(destinationDir string) error {
 
 func (s *store) getCheckpointLSN() (uint64, error) {
 	// Check for active checkpoint.
-	ctx := activeCheckpoint.Load()
+	ctx := s.activeCheckpoint.Load()
 	if ctx != nil {
 		select {
 		case <-ctx.doneCh:
@@ -1748,8 +1751,8 @@ func (s *store) getCheckpointLSN() (uint64, error) {
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 	}
-	if !activeCheckpoint.CompareAndSwap(nil, backupCtx) {
-		ctx := activeCheckpoint.Load()
+	if !s.activeCheckpoint.CompareAndSwap(nil, backupCtx) {
+		ctx := s.activeCheckpoint.Load()
 		if ctx != nil {
 			select {
 			case <-ctx.doneCh:
