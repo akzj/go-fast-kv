@@ -2301,6 +2301,8 @@ func (e *executor) execRegularJoin(jp *plannerapi.JoinPlan, plan *plannerapi.Sel
 		// OFFSET on grouped rows (skip first N)
 		if plan.Offset >= 0 && plan.Offset < len(grouped) {
 			grouped = grouped[plan.Offset:]
+		} else if plan.Offset >= len(grouped) {
+			grouped = nil
 		}
 
 		// LIMIT on grouped rows (take from remaining)
@@ -2338,6 +2340,8 @@ func (e *executor) execRegularJoin(jp *plannerapi.JoinPlan, plan *plannerapi.Sel
 	// OFFSET on merged rows (skip first N)
 	if plan.Offset >= 0 && plan.Offset < len(mergedRows) {
 		mergedRows = mergedRows[plan.Offset:]
+	} else if plan.Offset >= len(mergedRows) {
+		mergedRows = nil
 	}
 
 	// LIMIT on merged rows (take from remaining)
@@ -2465,6 +2469,8 @@ func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *planne
 
 		if plan.Offset >= 0 && plan.Offset < len(grouped) {
 			grouped = grouped[plan.Offset:]
+		} else if plan.Offset >= len(grouped) {
+			grouped = nil
 		}
 
 		if plan.Limit >= 0 && plan.Limit < len(grouped) {
@@ -2498,6 +2504,8 @@ func (e *executor) execHashJoinSelect(plan *plannerapi.SelectPlan, hplan *planne
 
 	if plan.Offset >= 0 && plan.Offset < len(mergedRows) {
 		mergedRows = mergedRows[plan.Offset:]
+	} else if plan.Offset >= len(mergedRows) {
+		mergedRows = nil
 	}
 
 	if plan.Limit >= 0 && plan.Limit < len(mergedRows) {
@@ -2663,6 +2671,8 @@ func (e *executor) execIndexNestedLoopJoinSelect(plan *plannerapi.SelectPlan, nl
 
 		if plan.Offset >= 0 && plan.Offset < len(grouped) {
 			grouped = grouped[plan.Offset:]
+		} else if plan.Offset >= len(grouped) {
+			grouped = nil
 		}
 
 		if plan.Limit >= 0 && plan.Limit < len(grouped) {
@@ -2696,6 +2706,8 @@ func (e *executor) execIndexNestedLoopJoinSelect(plan *plannerapi.SelectPlan, nl
 
 	if plan.Offset >= 0 && plan.Offset < len(result) {
 		result = result[plan.Offset:]
+	} else if plan.Offset >= len(result) {
+		result = nil
 	}
 
 	if plan.Limit >= 0 && plan.Limit < len(result) {
@@ -3654,6 +3666,8 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 		// OFFSET
 		if plan.Offset >= 0 && plan.Offset < len(rows2) {
 			rows2 = rows2[plan.Offset:]
+		} else if plan.Offset >= len(rows2) {
+			rows2 = nil
 		}
 
 		// LIMIT
@@ -3724,6 +3738,8 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 	// Step 7: OFFSET
 	if plan.Offset >= 0 && plan.Offset < len(rows) {
 		rows = rows[plan.Offset:]
+	} else if plan.Offset >= len(rows) {
+		rows = nil
 	}
 
 	// Step 8: LIMIT
@@ -3925,6 +3941,8 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		// OFFSET (skip first N rows first)
 		if plan.Offset > 0 && plan.Offset < len(rows) {
 			rows = rows[plan.Offset:]
+		} else if plan.Offset >= len(rows) {
+			rows = nil
 		}
 		// LIMIT (take N from remaining)
 		if plan.Limit > 0 && plan.Limit < len(rows) {
