@@ -85,52 +85,9 @@ type PageID = uint64
 //
 // Design reference: docs/DESIGN.md §3.2, §4 (why dense array, not LSM)
 type PageStore interface {
-	// Alloc allocates a new PageID. The page has no data until Write is called.
+	// Alloc allocates a new PageID. The page has no data until WriteCompact is called.
 	// PageIDs are monotonically increasing and never reused.
 	Alloc() PageID
-
-	// Write writes page data for the given PageID.
-	//
-	// Internally:
-	//   1. Prepends pageID (8 bytes big-endian) to data, appends CRC32 → 4108-byte record
-	//   2. Appends record to page segment via SegmentManager
-	//   3. Returns a WAL record (RecordPageMap) that the caller must
-	//      include in their WAL batch for crash recovery
-	//   4. Updates the in-memory mapping: mapping[pageID] = newVAddr
-	//
-	// The caller is responsible for:
-	//   - Calling segment.Sync() before writing the WAL batch
-	//   - Writing the WAL batch (which includes the returned WAL record)
-	//   - The fsync ordering: segment.Sync → wal.WriteBatch → mapping update
-	//
-	// Note: In the current implementation, Write updates the mapping
-	// immediately and returns the WAL record for the caller to batch.
-	// This is safe because the B-tree's per-page WLock prevents
-	// concurrent reads of the same page during a write.
-	//
-	// Returns ErrInvalidPageSize if len(data) != PageSize.
-	Write(pageID PageID, data []byte) (WALEntry, error)
-
-	// Read reads the page data for the given PageID.
-	//
-	// Returns exactly PageSize (4096) bytes — the pageID header is stripped.
-	// Returns ErrPageNotFound if the page has not been allocated or was freed.
-	Read(pageID PageID) ([]byte, error)
-
-	// WriteDirect writes a page by serializing directly into the segment's
-	// mmap region, eliminating intermediate buffer copies.
-	//
-	// The serializeFn receives a PageSize (4096-byte) slice that points
-	// directly into the mmap'd segment file. The function must write
-	// exactly PageSize bytes into buf.
-	//
-	// Layout in segment: [pageID(8)][data(4096)][crc32(4)] = 4108 bytes.
-	//
-	// If the underlying segment does not support Reserve (no mmap), falls
-	// back to the standard Append path with a pooled buffer.
-	//
-	// Returns ErrClosed if the store is closed.
-	WriteDirect(pageID PageID, serializeFn func(buf []byte) error) (WALEntry, error)
 
 	// WriteCompact writes variable-length compact page data for the given PageID.
 	//
@@ -151,14 +108,6 @@ type PageStore interface {
 	// Returns ErrPageNotFound if the page has not been allocated or was freed.
 	// Returns ErrChecksumMismatch if the CRC32 does not match.
 	ReadCompact(pageID PageID) ([]byte, error)
-
-	// Free marks a PageID as freed. The mapping is cleared.
-	//
-	// Returns a WAL record (RecordPageFree) that the caller must
-	// include in their WAL batch.
-	//
-	// The actual segment space is reclaimed by GC later.
-	Free(pageID PageID) WALEntry
 
 	// NextPageID returns the next PageID that will be allocated.
 	// Useful for checkpoint serialization.
