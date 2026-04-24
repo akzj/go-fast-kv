@@ -831,12 +831,13 @@ func (s *lsm) runLevelCompaction(l0seg *segmentEntry) {
 	// Find overlapping L1 segments using the provided L0 segment's key range
 	overlapping := s.manifest.GetOverlappingSegments(1, l0seg.minKey, l0seg.maxKey)
 
-	// Collect all segments to merge (L0 + overlapping L1s)
+	// Collect all segments to merge (L1 first = older, L0 last = newer)
+	// Last-write-wins in the map means L0 entries correctly overwrite L1 entries.
 	segmentsToMerge := make([]string, 0, 1+len(overlapping))
-	segmentsToMerge = append(segmentsToMerge, l0seg.name)
 	for i := range overlapping {
 		segmentsToMerge = append(segmentsToMerge, overlapping[i].name)
 	}
+	segmentsToMerge = append(segmentsToMerge, l0seg.name)
 
 	// Read and merge entries from all segments
 	mergedPages := make(map[uint64]uint64)  // pageID -> vaddr (newest wins)
@@ -851,7 +852,8 @@ func (s *lsm) runLevelCompaction(l0seg *segmentEntry) {
 		segPath := filepath.Join(s.dir, segName)
 		pages, blobs, err := readSSTable(segPath)
 		if err != nil {
-			continue
+			// Abort compaction — do NOT silently drop data
+			return
 		}
 		for _, p := range pages {
 			mergedPages[p.key] = p.value
@@ -903,15 +905,16 @@ func (s *lsm) runLevelCompaction(l0seg *segmentEntry) {
 		return
 	}
 
-	// Remove merged segments from manifest (safely)
+	// Remove merged segments (manifest first, then file — crash-safe ordering)
 	s.mu.Lock()
 	for _, name := range segmentsToMerge {
 		if s.manifest.CanDelete(name) {
-			// Delete the file
+			// Remove from manifest FIRST (crash between here and file delete is safe —
+			// orphan file on disk is harmless, but manifest referencing deleted file is fatal)
+			s.manifest.RemoveSegment(name)
+			// Then delete file
 			segPath := filepath.Join(s.dir, name)
 			os.Remove(segPath)
-			// Remove from manifest
-			s.manifest.RemoveSegment(name)
 		}
 	}
 	s.mu.Unlock()
