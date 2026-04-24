@@ -1408,6 +1408,7 @@ func (e *executor) execInsert(plan *plannerapi.InsertPlan) (*executorapi.Result,
 			batch.Discard()
 			return nil, fmt.Errorf("%w: commit: %v", executorapi.ErrExecFailed, err)
 		}
+		return &executorapi.Result{RowsAffected: int64(len(rowIDs))}, nil
 	}
 
 
