@@ -2649,7 +2649,7 @@ func isAggregateFunc(name string) bool {
 func isStringFunc(name string) bool {
 	switch strings.ToUpper(name) {
 	case "SUBSTRING", "CONCAT", "TRIM", "UPPER", "LOWER", "LENGTH",
-		"LTRIM", "RTRIM", "REPLACE", "STRPOS", "SPLIT_PART":
+		"LTRIM", "RTRIM", "REPLACE", "STRPOS", "SPLIT_PART", "CONCAT_WS":
 		return true
 	default:
 		return false
@@ -2700,6 +2700,26 @@ func isJsonbFunc(name string) bool {
 	default:
 		return false
 	}
+}
+
+// isTypeCastFunc returns true for type cast function names (case-insensitive).
+func isTypeCastFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "TO_INT", "TO_INTEGER", "TO_FLOAT", "TO_DOUBLE", "TO_TEXT", "TO_VARCHAR":
+		return true
+	default:
+		return false
+	}
+}
+
+// isArrayAggFunc returns true for array_agg.
+func isArrayAggFunc(name string) bool {
+	return strings.ToUpper(name) == "ARRAY_AGG"
+}
+
+// isStringAggFunc returns true for string_agg.
+func isStringAggFunc(name string) bool {
+	return strings.ToUpper(name) == "STRING_AGG"
 }
 
 // parseFunctionArgs parses a comma-separated list of expressions inside parentheses.
@@ -3191,6 +3211,13 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			if isMathFunc(name) {
 				return &api.MathFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
 			}
+			// Type cast functions: to_int(), to_float(), to_text()
+			if isTypeCastFunc(name) {
+				if len(args) != 1 {
+					return nil, p.errorf("%s requires exactly 1 argument", strings.ToUpper(name))
+				}
+				return &api.TypeCastFuncExpr{Func: strings.ToUpper(name), Arg: args[0]}, nil
+			}
 			// Date/time functions: NOW, CURRENT_TIMESTAMP, DATE_TRUNC, AGE, TO_CHAR, TO_TIMESTAMP
 			if isDateTimeFunc(name) {
 				return &api.DateTimeFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
@@ -3198,6 +3225,20 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 			// jsonb functions: JSONB_EXTRACT_PATH_TEXT, JSONB_EXTRACT_PATH, etc.
 			if isJsonbFunc(name) {
 				return &api.JsonbFuncExpr{Func: strings.ToUpper(name), Args: args}, nil
+			}
+			// array_agg(expr)
+			if isArrayAggFunc(name) {
+				if len(args) != 1 {
+					return nil, p.errorf("array_agg requires exactly 1 argument")
+				}
+				return &api.ArrayAggExpr{Arg: args[0]}, nil
+			}
+			// string_agg(expr, delimiter)
+			if isStringAggFunc(name) {
+				if len(args) != 2 {
+					return nil, p.errorf("string_agg requires exactly 2 arguments")
+				}
+				return &api.StringAggExpr{Arg: args[0], Delimiter: args[1]}, nil
 			}
 			// Unknown function — treat as user-defined function call
 			// (Executor will resolve it against catalog; backward compat: ColumnRef fallback)

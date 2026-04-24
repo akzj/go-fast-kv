@@ -641,6 +641,23 @@ type JsonbFuncExpr struct {
 
 func (*JsonbFuncExpr) exprNode() {}
 
+// ArrayAggExpr represents the array_agg aggregate function: array_agg(expr)
+// Collects values into a JSON array representation.
+type ArrayAggExpr struct {
+	Arg Expr // the expression to aggregate
+}
+
+func (*ArrayAggExpr) exprNode() {}
+
+// StringAggExpr represents the string_agg aggregate function: string_agg(expr, delimiter)
+// Concatenates values with a delimiter.
+type StringAggExpr struct {
+	Arg       Expr // the expression to aggregate
+	Delimiter Expr // the delimiter between values
+}
+
+func (*StringAggExpr) exprNode() {}
+
 // CastExpr: CAST(expr AS type) performs type conversion.
 type CastExpr struct {
 	Expr     Expr  // the expression to cast
@@ -648,6 +665,14 @@ type CastExpr struct {
 }
 
 func (*CastExpr) exprNode() {}
+
+// TypeCastFuncExpr: type conversion functions: to_int(), to_float(), to_text()
+type TypeCastFuncExpr struct {
+	Func string // "TO_INT", "TO_FLOAT", "TO_TEXT"
+	Arg  Expr   // the expression to convert
+}
+
+func (*TypeCastFuncExpr) exprNode() {}
 
 // StarExpr: SELECT *
 type StarExpr struct{}

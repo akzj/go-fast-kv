@@ -3,9 +3,11 @@ package internal
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -3758,6 +3760,10 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 		for _, sc := range plan.SelectColumns {
 			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 				hasScalarAgg = true
+			} else if _, ok := sc.Expr.(*parserapi.ArrayAggExpr); ok {
+				hasScalarAgg = true
+			} else if _, ok := sc.Expr.(*parserapi.StringAggExpr); ok {
+				hasScalarAgg = true
 			} else if _, ok := sc.Expr.(*parserapi.ColumnRef); ok {
 				// Non-aggregate column ref — will be flagged below if no GROUP BY.
 				// Literals (constants) are allowed alongside aggregates.
@@ -3778,6 +3784,18 @@ func (e *executor) execSelectFromDerived(plan *plannerapi.SelectPlan, dtScan *pl
 				names[i] = sc.Alias
 				if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 					val, err := computeAggregate(agg, rows, tableCols)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if agg, ok := sc.Expr.(*parserapi.ArrayAggExpr); ok {
+					val, err := computeArrayAgg(agg, rows, tableCols)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if agg, ok := sc.Expr.(*parserapi.StringAggExpr); ok {
+					val, err := computeStringAgg(agg, rows, tableCols)
 					if err != nil {
 						return nil, err
 					}
@@ -4007,6 +4025,10 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 		for _, sc := range plan.SelectColumns {
 			if _, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 				hasScalarAgg = true
+			} else if _, ok := sc.Expr.(*parserapi.ArrayAggExpr); ok {
+				hasScalarAgg = true
+			} else if _, ok := sc.Expr.(*parserapi.StringAggExpr); ok {
+				hasScalarAgg = true
 			} else if _, ok := sc.Expr.(*parserapi.ColumnRef); ok {
 				// Non-aggregate column ref — will be flagged below if no GROUP BY.
 				// Literals (constants) are allowed alongside aggregates.
@@ -4028,6 +4050,18 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 				names[i] = sc.Alias
 				if agg, ok := sc.Expr.(*parserapi.AggregateCallExpr); ok {
 					val, err := computeAggregate(agg, rows, plan.Table.Columns)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if agg, ok := sc.Expr.(*parserapi.ArrayAggExpr); ok {
+					val, err := computeArrayAgg(agg, rows, plan.Table.Columns)
+					if err != nil {
+						return nil, err
+					}
+					vals[i] = val
+				} else if agg, ok := sc.Expr.(*parserapi.StringAggExpr); ok {
+					val, err := computeStringAgg(agg, rows, plan.Table.Columns)
 					if err != nil {
 						return nil, err
 					}
@@ -5099,6 +5133,18 @@ func projectGroupedRowForJoin(groupRows []*engineapi.Row, plan *plannerapi.Selec
 				return nil, err
 			}
 			result[i] = val
+		case *parserapi.ArrayAggExpr:
+			val, err := computeArrayAgg(expr, groupRows, combinedCols)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		case *parserapi.StringAggExpr:
+			val, err := computeStringAgg(expr, groupRows, combinedCols)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
 		case *parserapi.CoalesceExpr:
 			val, err := evalExpr(expr, groupRows[0], combinedCols, nil, nil)
 			if err != nil {
@@ -5149,6 +5195,105 @@ func groupKeyColIndices(plan *plannerapi.SelectPlan) map[int]bool {
 		}
 	}
 	return groupCols
+}
+
+// computeArrayAgg computes array_agg(expr) - collects all values into a JSON array.
+func computeArrayAgg(expr *parserapi.ArrayAggExpr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if expr.Arg == nil {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colRef, ok := expr.Arg.(*parserapi.ColumnRef)
+	if !ok {
+		return catalogapi.Value{}, fmt.Errorf("%w: array_agg argument must be a column", executorapi.ErrExecFailed)
+	}
+	idx := findColumnIndexByName(columns, colRef.Column)
+	var elems []interface{}
+	for _, row := range rows {
+		if idx >= 0 && idx < len(row.Values) {
+			val := row.Values[idx]
+			if !val.IsNull {
+				elems = append(elems, valueToInterface(val))
+			}
+		}
+	}
+	data, err := json.Marshal(elems)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: array_agg failed: %v", executorapi.ErrExecFailed, err)
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: string(data)}, nil
+}
+
+// computeStringAgg computes string_agg(expr, delimiter) - concatenates values with delimiter.
+func computeStringAgg(expr *parserapi.StringAggExpr, rows []*engineapi.Row, columns []catalogapi.ColumnDef) (catalogapi.Value, error) {
+	if expr.Arg == nil {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	colRef, ok := expr.Arg.(*parserapi.ColumnRef)
+	if !ok {
+		return catalogapi.Value{}, fmt.Errorf("%w: string_agg argument must be a column", executorapi.ErrExecFailed)
+	}
+	idx := findColumnIndexByName(columns, colRef.Column)
+	
+	// Evaluate delimiter - should be a literal
+	var delim string
+	if lit, ok := expr.Delimiter.(*parserapi.Literal); ok {
+		if lit.Value.Type == catalogapi.TypeText {
+			delim = lit.Value.Text
+		} else {
+			return catalogapi.Value{}, fmt.Errorf("%w: string_agg delimiter must be text", executorapi.ErrExecFailed)
+		}
+	} else {
+		return catalogapi.Value{}, fmt.Errorf("%w: string_agg delimiter must be a literal string", executorapi.ErrExecFailed)
+	}
+	
+	var sb strings.Builder
+	first := true
+	for _, row := range rows {
+		if idx >= 0 && idx < len(row.Values) {
+			val := row.Values[idx]
+			if !val.IsNull {
+				if !first {
+					sb.WriteString(delim)
+				}
+				first = false
+				sb.WriteString(valueToString(val))
+			}
+		}
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: sb.String()}, nil
+}
+
+// valueToInterface converts a catalog.Value to a JSON-serializable interface.
+func valueToInterface(val catalogapi.Value) interface{} {
+	if val.IsNull {
+		return nil
+	}
+	switch val.Type {
+	case catalogapi.TypeInt:
+		return val.Int
+	case catalogapi.TypeFloat:
+		return val.Float
+	case catalogapi.TypeText:
+		return val.Text
+	case catalogapi.TypeBlob:
+		return string(val.Blob)
+	}
+	return nil
+}
+
+// valueToString converts a catalog.Value to its string representation.
+func valueToString(val catalogapi.Value) string {
+	switch val.Type {
+	case catalogapi.TypeInt:
+		return strconv.FormatInt(val.Int, 10)
+	case catalogapi.TypeFloat:
+		return strconv.FormatFloat(val.Float, 'f', -1, 64)
+	case catalogapi.TypeText:
+		return val.Text
+	case catalogapi.TypeBlob:
+		return string(val.Blob)
+	}
+	return ""
 }
 
 // computeAggregate computes the aggregate value for an AggregateCallExpr across a group of rows.
@@ -5392,6 +5537,18 @@ func projectGroupedRow(groupRows []*engineapi.Row, plan *plannerapi.SelectPlan) 
 			}
 		case *parserapi.AggregateCallExpr:
 			val, err := computeAggregate(expr, groupRows, plan.Table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		case *parserapi.ArrayAggExpr:
+			val, err := computeArrayAgg(expr, groupRows, plan.Table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = val
+		case *parserapi.StringAggExpr:
+			val, err := computeStringAgg(expr, groupRows, plan.Table.Columns)
 			if err != nil {
 				return nil, err
 			}

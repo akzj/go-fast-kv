@@ -79,6 +79,8 @@ func walkExpr(expr parserapi.Expr, fn func(parserapi.Expr)) {
 		// Subquery body not walked here (would need Statement visitor)
 	case *parserapi.CastExpr:
 		walkExpr(e.Expr, fn)
+	case *parserapi.TypeCastFuncExpr:
+		walkExpr(e.Arg, fn)
 	}
 }
 
@@ -147,8 +149,14 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 		return evalExtractExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.JsonbFuncExpr:
 		return evalJsonbFuncExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.ArrayAggExpr:
+		return catalogapi.Value{}, fmt.Errorf("%w: array_agg() must be used in a GROUP BY context", executorapi.ErrExecFailed)
+	case *parserapi.StringAggExpr:
+		return catalogapi.Value{}, fmt.Errorf("%w: string_agg() must be used in a GROUP BY context", executorapi.ErrExecFailed)
 	case *parserapi.CastExpr:
 		return evalCastExpr(node, row, columns, subqueryResults, ex)
+	case *parserapi.TypeCastFuncExpr:
+		return evalTypeCastFuncExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.CaseExpr:
 		return evalCaseExpr(node, row, columns, subqueryResults, ex)
 	case *parserapi.ExistsExpr:
@@ -888,7 +896,7 @@ func evalNullIfExpr(expr *parserapi.NullIfExpr, row *engineapi.Row, columns []ca
 	return left, nil
 }
 
-// evalStringFuncExpr evaluates string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM, LTRIM, RTRIM, REPLACE, STRPOS, SPLIT_PART.
+// evalStringFuncExpr evaluates string functions: SUBSTRING, CONCAT, UPPER, LOWER, LENGTH, TRIM, LTRIM, RTRIM, REPLACE, STRPOS, SPLIT_PART, CONCAT_WS.
 func evalStringFuncExpr(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
 	switch expr.Func {
@@ -914,6 +922,8 @@ func evalStringFuncExpr(expr *parserapi.StringFuncExpr, row *engineapi.Row, colu
 		return evalStrpos(expr, row, columns, subqueryResults, ex)
 	case "SPLIT_PART":
 		return evalSplitPart(expr, row, columns, subqueryResults, ex)
+	case "CONCAT_WS":
+		return evalConcatWs(expr, row, columns, subqueryResults, ex)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unknown string function %s", executorapi.ErrExecFailed, expr.Func)
 	}
@@ -1262,6 +1272,71 @@ func evalSplitPart(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns [
 	return catalogapi.Value{Type: catalogapi.TypeText, Text: parts[n-1]}, nil
 }
 
+// evalConcatWs evaluates CONCAT_WS(sep, str1, str2, ...).
+// Concatenates strings with a separator, skipping NULLs and empty strings.
+// If all inputs are NULL/empty, returns empty string.
+func evalConcatWs(expr *parserapi.StringFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	if len(expr.Args) < 2 {
+		return catalogapi.Value{}, fmt.Errorf("%w: CONCAT_WS requires at least 2 arguments", executorapi.ErrExecFailed)
+	}
+	// Evaluate separator
+	sepVal, err := evalExpr(expr.Args[0], row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL separator → NULL result
+	if sepVal.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+	if sepVal.Type != catalogapi.TypeText {
+		return catalogapi.Value{}, fmt.Errorf("%w: CONCAT_WS separator must be text, got %v", executorapi.ErrExecFailed, sepVal.Type)
+	}
+	sep := sepVal.Text
+
+	var sb strings.Builder
+	first := true
+	for i := 1; i < len(expr.Args); i++ {
+		val, err := evalExpr(expr.Args[i], row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if val.IsNull {
+			continue
+		}
+		switch val.Type {
+		case catalogapi.TypeText:
+			if val.Text == "" {
+				continue
+			}
+			if !first {
+				sb.WriteString(sep)
+			}
+			sb.WriteString(val.Text)
+			first = false
+		case catalogapi.TypeInt:
+			if !first {
+				sb.WriteString(sep)
+			}
+			sb.WriteString(strconv.FormatInt(val.Int, 10))
+			first = false
+		case catalogapi.TypeFloat:
+			if !first {
+				sb.WriteString(sep)
+			}
+			sb.WriteString(strconv.FormatFloat(val.Float, 'f', -1, 64))
+			first = false
+		case catalogapi.TypeBlob:
+			if !first {
+				sb.WriteString(sep)
+			}
+			sb.Write(val.Blob)
+			first = false
+		}
+	}
+	return catalogapi.Value{Type: catalogapi.TypeText, Text: sb.String()}, nil
+}
+
 // evalCastExpr evaluates CAST(expr AS type).
 // Converts a value from one type to another.
 func evalCastExpr(expr *parserapi.CastExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
@@ -1359,6 +1434,31 @@ func castToBlob(val catalogapi.Value) (catalogapi.Value, error) {
 		return catalogapi.Value{Type: catalogapi.TypeBlob, Blob: []byte(strconv.FormatFloat(val.Float, 'f', -1, 64))}, nil
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: cannot cast %v to BLOB", executorapi.ErrExecFailed, val.Type)
+	}
+}
+
+// evalTypeCastFuncExpr evaluates type conversion functions: to_int(), to_float(), to_text()
+func evalTypeCastFuncExpr(expr *parserapi.TypeCastFuncExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Evaluate the expression first
+	val, err := evalExpr(expr.Arg, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// NULL input → NULL output
+	if val.IsNull {
+		return catalogapi.Value{IsNull: true}, nil
+	}
+
+	switch expr.Func {
+	case "TO_INT", "TO_INTEGER":
+		return castToInt(val)
+	case "TO_FLOAT", "TO_DOUBLE":
+		return castToFloat(val)
+	case "TO_TEXT", "TO_VARCHAR":
+		return castToText(val)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unsupported type cast function %s", executorapi.ErrExecFailed, expr.Func)
 	}
 }
 
