@@ -43,7 +43,7 @@ func crc32c(data []byte) uint32 {
 
 // blobStore implements blobstoreapi.BlobStore and blobstoreapi.BlobStoreRecovery.
 type blobStore struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	segMgr     segmentapi.SegmentManager
 	mapping    []blobstoreapi.BlobMeta // dense array: index = blobID, value = BlobMeta
 	nextBlobID uint64
@@ -274,16 +274,15 @@ func (bs *blobStore) GetSnapshotMappings() []blobstoreapi.MappingEntry {
 //
 // Uses per-key sharded lock (not global mu) to allow concurrent CAS on different blobIDs.
 func (bs *blobStore) CompareAndSetBlobMapping(blobID uint64, expectedVAddr uint64, expectedSize uint32, newVAddr uint64, newSize uint32) bool {
-	if bs.closed {
-		return false
-	}
-
 	// Per-key sharded lock — serializes CAS on this specific blobID.
 	lockIdx := blobID & bs.casLockMask
 	bs.casLocks[lockIdx].Lock()
 	defer bs.casLocks[lockIdx].Unlock()
 
-	// Re-check closed status under lock
+	// RLock prevents ensureCapacity from replacing the mapping slice concurrently.
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+
 	if bs.closed {
 		return false
 	}
