@@ -623,6 +623,11 @@ func (it *iterator) Next() bool {
 			}
 			// Read next leaf with read lock, clone, release
 			nextPID := it.curPage.Next()
+			// Guard: store may have closed while iterating (KI-2)
+			if it.tree.closed.Load() {
+				it.done = true
+				return false
+			}
 			it.tree.pageLocks.RLock(nextPID)
 			page, err := it.tree.pages.ReadPage(nextPID)
 			if err != nil {
@@ -660,6 +665,11 @@ func (it *iterator) Next() bool {
 			visible = it.tree.isVisible(eTxnMin, eTxnMax, it.txnID)
 		}
 		if visible {
+			// Guard: store may have closed (KI-2)
+			if it.tree.closed.Load() {
+				it.done = true
+				return false
+			}
 			val, err := it.tree.resolveValue(&eVal)
 			if err != nil {
 				it.err = err
@@ -673,10 +683,25 @@ func (it *iterator) Next() bool {
 	}
 }
 
-func (it *iterator) Key() []byte   { return it.curKey }
-func (it *iterator) Value() []byte { return it.curValue }
-func (it *iterator) Err() error    { return it.err }
-func (it *iterator) Close()        {}
+func (it *iterator) Key() []byte {
+	if it.tree.closed.Load() {
+		return nil
+	}
+	return it.curKey
+}
+func (it *iterator) Value() []byte {
+	if it.tree.closed.Load() {
+		return nil
+	}
+	return it.curValue
+}
+func (it *iterator) Err() error {
+	if it.tree.closed.Load() {
+		return btreeapi.ErrClosed
+	}
+	return it.err
+}
+func (it *iterator) Close() {}
 
 func cloneBytes(b []byte) []byte {
 	if b == nil {

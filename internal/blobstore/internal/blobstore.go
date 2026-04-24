@@ -143,14 +143,23 @@ func (bs *blobStore) Write(data []byte) (blobstoreapi.BlobID, blobstoreapi.WALEn
 	vaddr, err := bs.segMgr.Append(record)
 	if err == segmentapi.ErrSegmentFull {
 		if rotErr := bs.segMgr.Rotate(); rotErr != nil {
-			bs.nextBlobID--
+			// Rollback: add back to free list if from free list
+			if blobID != 0 {
+				bs.freeListMu.Lock()
+				bs.freeList = append(bs.freeList, blobID)
+				bs.freeListMu.Unlock()
+			}
 			return 0, blobstoreapi.WALEntry{}, fmt.Errorf("blobstore: rotate on full: %w", rotErr)
 		}
 		vaddr, err = bs.segMgr.Append(record)
 	}
 	if err != nil {
-		// Roll back the BlobID allocation
-		bs.nextBlobID--
+		// Rollback: add back to free list if from free list
+		if blobID != 0 {
+			bs.freeListMu.Lock()
+			bs.freeList = append(bs.freeList, blobID)
+			bs.freeListMu.Unlock()
+		}
 		return 0, blobstoreapi.WALEntry{}, err
 	}
 
@@ -217,6 +226,7 @@ func (bs *blobStore) Read(blobID blobstoreapi.BlobID) ([]byte, error) {
 }
 
 // Delete marks a BlobID as deleted. The mapping is cleared.
+// The BlobID is added to the free list for potential reuse.
 // Returns a WALEntry (RecordBlobFree) for the caller to batch.
 func (bs *blobStore) Delete(blobID blobstoreapi.BlobID) blobstoreapi.WALEntry {
 	bs.mu.Lock()
@@ -235,6 +245,9 @@ func (bs *blobStore) Delete(blobID blobstoreapi.BlobID) blobstoreapi.WALEntry {
 		recordSize := int64(oldMeta.Size) + int64(blobHeaderSize) + int64(blobChecksumSize)
 		bs.statsMgr.Decrement(oldSegID, 1, recordSize)
 	}
+
+	// Add to free list for potential reuse
+	bs.freeList = append(bs.freeList, blobID)
 
 	return blobstoreapi.WALEntry{
 		Type:  3, // RecordBlobFree
