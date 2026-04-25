@@ -185,6 +185,166 @@ func evalExpr(expr parserapi.Expr, row *engineapi.Row, columns []catalogapi.Colu
 	}
 }
 
+
+
+// ─── UDF Block Statement Evaluation ────────────────────────────────
+
+// evalBlockStmt evaluates a BEGIN...END block statement.
+func evalBlockStmt(block *parserapi.BlockStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	for _, stmt := range block.Statements {
+		val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// We just return the value - if it was a RETURN, it contains the return value.
+		// If it was another statement, caller will decide.
+		return val, nil
+	}
+	// Block completed without RETURN
+	return catalogapi.Value{}, fmt.Errorf("%w: function ended without RETURN", executorapi.ErrExecFailed)
+}
+
+// evalBlockStatement evaluates a single statement in a UDF body.
+func evalBlockStatement(stmt parserapi.Statement, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	switch s := stmt.(type) {
+	case *parserapi.IfStmt:
+		return evalIfStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.ReturnStmt:
+		return evalReturnStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.BlockStmt:
+		return evalBlockStmt(s, row, columns, subqueryResults, ex)
+	default:
+		return catalogapi.Value{}, fmt.Errorf("%w: unsupported statement type in UDF: %T", executorapi.ErrExecFailed, stmt)
+	}
+}
+
+// evalIfStmt evaluates an IF/ELSIF/ELSE statement.
+func evalIfStmt(ifStmt *parserapi.IfStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	// Evaluate IF condition
+	cond, err := evalExpr(ifStmt.Cond, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	// If condition is TRUE, execute IF body
+	if !cond.IsNull && isTruthy(cond) {
+		return evalBlockBody(ifStmt.Body, row, columns, subqueryResults, ex)
+	}
+
+	// Check ELSIF branches
+	for _, elsif := range ifStmt.Elsifs {
+		elsifCond, err := evalExpr(elsif.Cond, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		if !elsifCond.IsNull && isTruthy(elsifCond) {
+			return evalBlockBody(elsif.Body, row, columns, subqueryResults, ex)
+		}
+	}
+
+	// Execute ELSE body if present
+	if len(ifStmt.Else_) > 0 {
+		return evalBlockBody(ifStmt.Else_, row, columns, subqueryResults, ex)
+	}
+
+	// No branch executed, return NULL
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalBlockBody evaluates a list of statements in order.
+func evalBlockBody(stmts []parserapi.Statement, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	for _, stmt := range stmts {
+		val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// If we get here, either:
+		// 1. This was a RETURN statement - val contains the return value
+		// 2. Some other statement - continue to next
+		// We just return the value up - the caller (evalIfStmt) will decide what to do with it
+		return val, nil
+	}
+	// Loop completed - shouldn't happen if there's always a RETURN
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalReturnStmt evaluates a RETURN statement.
+func evalReturnStmt(ret *parserapi.ReturnStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	return evalExpr(ret.Expr, row, columns, subqueryResults, ex)
+}
+
+// hasBlockBody checks if a function body starts with BEGIN.
+func hasBlockBody(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	return strings.HasPrefix(strings.ToUpper(trimmed), "BEGIN")
+}
+
+// bindStatementParams binds parameter values to all statements in a block.
+func bindStatementParams(stmts []parserapi.Statement, paramNames []string, paramValues []catalogapi.Value) []parserapi.Statement {
+	result := make([]parserapi.Statement, len(stmts))
+	for i, stmt := range stmts {
+		result[i] = bindSingleStatementParams(stmt, paramNames, paramValues)
+	}
+	return result
+}
+
+// bindSingleStatementParams binds parameter values to a single statement.
+func bindSingleStatementParams(stmt parserapi.Statement, paramNames []string, paramValues []catalogapi.Value) parserapi.Statement {
+	switch s := stmt.(type) {
+	case *parserapi.IfStmt:
+		return &parserapi.IfStmt{
+			Cond:   bindFunctionParams(s.Cond, paramNames, paramValues),
+			Body:   bindStatementParams(s.Body, paramNames, paramValues),
+			Elsifs: bindElsifParams(s.Elsifs, paramNames, paramValues),
+			Else_:  bindStatementParams(s.Else_, paramNames, paramValues),
+		}
+	case *parserapi.ReturnStmt:
+		return &parserapi.ReturnStmt{
+			Expr: bindFunctionParams(s.Expr, paramNames, paramValues),
+		}
+	case *parserapi.BlockStmt:
+		return &parserapi.BlockStmt{
+			Statements: bindStatementParams(s.Statements, paramNames, paramValues),
+		}
+	default:
+		return stmt
+	}
+}
+
+// bindElsifParams binds parameter values to ELSIF clauses.
+func bindElsifParams(elsifs []parserapi.ElsifClause, paramNames []string, paramValues []catalogapi.Value) []parserapi.ElsifClause {
+	result := make([]parserapi.ElsifClause, len(elsifs))
+	for i, e := range elsifs {
+		result[i] = parserapi.ElsifClause{
+			Cond: bindFunctionParams(e.Cond, paramNames, paramValues),
+			Body: bindStatementParams(e.Body, paramNames, paramValues),
+		}
+	}
+	return result
+}
+
+// evalBlockStatements evaluates a list of block statements.
+func evalBlockStatements(stmts []parserapi.Statement, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	for _, stmt := range stmts {
+		val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// If statement evaluation completed, it either:
+		// - Returned a value (e.g., from an executed RETURN statement)
+		// - Returned NULL without error (e.g., from an IfStmt with no matching branch and no ELSE)
+		// In both cases, we return the value up to the caller.
+		return val, nil
+	}
+	// Block completed without RETURN
+	return catalogapi.Value{}, fmt.Errorf("%w: function ended without RETURN", executorapi.ErrExecFailed)
+}
+
 // FunctionRegistry stores user-defined functions in memory.
 type FunctionRegistry struct {
 	funcs map[string]*FunctionDef
@@ -197,6 +357,7 @@ type FunctionDef struct {
 	Args    []string // parameter names (in order)
 	RetType string   // return type: "INT", "TEXT", "FLOAT", "BLOB"
 	Body    string   // function body expression (e.g., "a + b")
+	Statements []parserapi.Statement // parsed block statements (for block-style UDFs)
 }
 
 // Register adds a function to the registry.
@@ -255,7 +416,22 @@ func evalFunctionCall(call *parserapi.FunctionCallExpr, row *engineapi.Row, colu
 		p = parser.New()
 	}
 
-	// Parse function body as expression
+	// Check if this is a block-style function (starts with BEGIN)
+	if hasBlockBody(fn.Body) {
+		// Parse function body as block statement
+		stmts, err := p.ParseBlockStmt(fn.Body)
+		if err != nil {
+			return catalogapi.Value{}, fmt.Errorf("%w: failed to parse function body %q: %v", executorapi.ErrExecFailed, fn.Body, err)
+		}
+
+		// Bind parameters in all statements
+		boundStmts := bindStatementParams(stmts, fn.Args, argVals)
+
+		// Execute the block statements
+		return evalBlockStatements(boundStmts, row, columns, subqueryResults, ex)
+	}
+
+	// Parse function body as expression (expression-style UDF)
 	bodyExpr, err := p.ParseExpression(fn.Body)
 	if err != nil {
 		return catalogapi.Value{}, fmt.Errorf("%w: failed to parse function body %q: %v", executorapi.ErrExecFailed, fn.Body, err)

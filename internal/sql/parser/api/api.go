@@ -101,6 +101,8 @@ const (
 	TokThen     TokenType = 75 // THEN
 	TokElse     TokenType = 76 // ELSE
 	TokEnd      TokenType = 77 // END
+	TokElsif    TokenType = 168 // ELSIF
+	TokReturn   TokenType = 169 // RETURN
 	TokUnion    TokenType = 78 // UNION
 	TokAll      TokenType = 79 // ALL
 	TokIntersect TokenType = 80 // INTERSECT
@@ -888,6 +890,38 @@ type DropTriggerStmt struct {
 
 func (*DropTriggerStmt) stmtNode() {}
 
+// ElsifClause represents an ELSIF branch in an IF statement.
+type ElsifClause struct {
+	Cond Expr // condition expression
+	Body []Statement // statements to execute if condition is true
+}
+
+// IfStmt: IF condition THEN statements [ELSIF ...] [ELSE ...] END IF
+// Used in procedural UDF bodies for conditional logic.
+type IfStmt struct {
+	Cond   Expr           // condition for the IF branch
+	Body   []Statement    // statements for the IF branch
+	Elsifs []ElsifClause  // ELSIF branches
+	Else_  []Statement    // ELSE branch statements (Else_ to avoid Go keyword)
+}
+
+// ReturnStmt: RETURN expression
+// Used in UDF bodies to return a value.
+type ReturnStmt struct {
+	Expr Expr // expression to return
+}
+
+func (*IfStmt) stmtNode()    {}
+func (*ReturnStmt) stmtNode() {}
+
+// BlockStmt: BEGIN ... END block
+// Used in UDF bodies for statement blocks.
+type BlockStmt struct {
+	Statements []Statement
+}
+
+func (*BlockStmt) stmtNode() {}
+
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 
 // ColumnDef represents a column definition in CREATE TABLE (parser's own type).
@@ -911,6 +945,10 @@ type Parser interface {
 	// ParseExpression parses a single expression (without SELECT/FROM etc).
 	// Useful for function body evaluation, CHECK constraints, DEFAULT expressions.
 	ParseExpression(sql string) (Expr, error)
+	// ParseBlockStmt parses a procedural block: BEGIN ... END
+	// containing statements like IF/ELSIF/ELSE/END IF and RETURN.
+	// Used for UDF body parsing.
+	ParseBlockStmt(sql string) ([]Statement, error)
 }
 
 // ─── Errors ───────────────────────────────────────────────────────

@@ -504,6 +504,237 @@ func (p *parser) parseFunctionArgsWithTypes() ([]api.FunctionArg, error) {
 	return args, nil
 }
 
+
+
+// ParseBlockStmt parses a procedural block: BEGIN ... END
+// containing statements like IF/ELSIF/ELSE/END IF and RETURN.
+// Used for UDF body parsing.
+func (p *parser) ParseBlockStmt(sql string) ([]api.Statement, error) {
+	// Save current parser state
+	savedLex := p.lex
+	savedCur := p.cur
+	savedPeek := p.peek
+	savedRaw := p.rawInput
+	savedCount := p.questionCount
+
+	// Set up expression parsing state
+	lex := newLexer(sql)
+	p.lex = lex
+	p.rawInput = sql
+	p.cur = lex.nextToken()
+	p.peek = lex.nextToken()
+	p.questionCount = 0
+
+	// Parse the block
+	var stmts []api.Statement
+	for p.cur.Type != api.TokEOF && p.cur.Type != api.TokEnd {
+		// Consume optional semicolon between statements
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+			if p.cur.Type == api.TokEOF || p.cur.Type == api.TokEnd {
+				break
+			}
+			continue
+		}
+		stmt, err := p.parseBlockStatement()
+		if err != nil {
+			// Restore state on error
+			p.lex = savedLex
+			p.cur = savedCur
+			p.peek = savedPeek
+			p.rawInput = savedRaw
+			p.questionCount = savedCount
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+		// Consume semicolon after statement
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END keyword
+	if p.cur.Type == api.TokEnd {
+		p.advance()
+	}
+
+	// Restore state
+	p.lex = savedLex
+	p.cur = savedCur
+	p.peek = savedPeek
+	p.rawInput = savedRaw
+	p.questionCount = savedCount
+
+	return stmts, nil
+}
+
+// parseBlockStatement parses a single statement within a block.
+// Handles: IF/ELSIF/ELSE/END IF, RETURN, and nested BEGIN/END.
+func (p *parser) parseBlockStatement() (api.Statement, error) {
+	switch p.cur.Type {
+	case api.TokIf:
+		return p.parseBlockIf()
+	case api.TokReturn:
+		return p.parseBlockReturn()
+	case api.TokBegin:
+		return p.parseBlockBegin()
+	default:
+		// Parse as expression statement (for assignments or standalone expressions)
+		// We only support RETURN for MVP, so any other statement is an error
+		return nil, p.errorf("unsupported statement in UDF body: %s", p.cur.Literal)
+	}
+}
+
+// parseBlockIf parses: IF condition THEN statements [ELSIF ...] [ELSE ...] END IF
+func (p *parser) parseBlockIf() (api.Statement, error) {
+	ifStmt := &api.IfStmt{}
+
+	// Parse IF condition
+	if p.cur.Type != api.TokIf {
+		return nil, p.errorf("expected IF")
+	}
+	p.advance()
+
+	// Parse condition expression
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	ifStmt.Cond = cond
+
+	// Expect THEN
+	if p.cur.Type != api.TokThen {
+		return nil, p.errorf("expected THEN after IF condition")
+	}
+	p.advance()
+
+	// Parse IF branch body
+	ifStmt.Body, err = p.parseBlockBody()
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse ELSIF or ELSE or END IF
+	for p.cur.Type == api.TokElsif {
+		p.advance()
+		elsifCond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Type != api.TokThen {
+			return nil, p.errorf("expected THEN after ELSIF condition")
+		}
+		p.advance()
+		elsifBody, err := p.parseBlockBody()
+		if err != nil {
+			return nil, err
+		}
+		ifStmt.Elsifs = append(ifStmt.Elsifs, api.ElsifClause{
+			Cond: elsifCond,
+			Body: elsifBody,
+		})
+	}
+
+	// Parse ELSE
+	if p.cur.Type == api.TokElse {
+		p.advance()
+		elseBody, err := p.parseBlockBody()
+		if err != nil {
+			return nil, err
+		}
+		ifStmt.Else_ = elseBody
+	}
+
+	// Expect END IF
+	if p.cur.Type != api.TokEnd {
+		return nil, p.errorf("expected END IF")
+	}
+	p.advance()
+	// Consume optional IF after END
+	if p.cur.Type == api.TokIf {
+		p.advance()
+	}
+
+	return ifStmt, nil
+}
+
+// parseBlockBody parses a list of statements until we hit ELSIF, ELSE, or END.
+func (p *parser) parseBlockBody() ([]api.Statement, error) {
+	var stmts []api.Statement
+	for p.cur.Type != api.TokEOF &&
+		p.cur.Type != api.TokElsif &&
+		p.cur.Type != api.TokElse &&
+		p.cur.Type != api.TokEnd {
+		// Consume optional semicolon
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+			// Check if next token ends the block
+			if p.cur.Type == api.TokElsif || p.cur.Type == api.TokElse || p.cur.Type == api.TokEnd {
+				continue
+			}
+		}
+		stmt, err := p.parseBlockStatement()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+		// Consume semicolon after statement
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+	return stmts, nil
+}
+
+// parseBlockReturn parses: RETURN expression
+func (p *parser) parseBlockReturn() (api.Statement, error) {
+	if p.cur.Type != api.TokReturn {
+		return nil, p.errorf("expected RETURN")
+	}
+	p.advance()
+
+	// Parse return expression
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &api.ReturnStmt{Expr: expr}, nil
+}
+
+// parseBlockBegin parses: BEGIN ... END
+func (p *parser) parseBlockBegin() (api.Statement, error) {
+	if p.cur.Type != api.TokBegin {
+		return nil, p.errorf("expected BEGIN")
+	}
+	p.advance()
+
+	// Parse inner statements until END
+	var stmts []api.Statement
+	for p.cur.Type != api.TokEOF && p.cur.Type != api.TokEnd {
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+			if p.cur.Type == api.TokEnd {
+				continue
+			}
+			continue
+		}
+		stmt, err := p.parseBlockStatement()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END
+	if p.cur.Type == api.TokEnd {
+		p.advance()
+	}
+
+	return &api.BlockStmt{Statements: stmts}, nil
+}
 // parseTypeName parses a type name (INT, TEXT, FLOAT, BLOB, or identifier).
 // Handles both type keywords and regular identifiers (including type names that are keywords).
 func (p *parser) parseTypeName() string {
