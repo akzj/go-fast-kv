@@ -2550,9 +2550,9 @@ func (p *parser) parseSelect() (api.Statement, error) {
 	}
 
 	// Optional FOR UPDATE
-	if p.cur.Type == api.TokUpdate || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
-		// Check if it's FOR UPDATE (either as TokUpdate or FOR keyword)
-		if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR" {
+	if p.cur.Type == api.TokUpdate || p.cur.Type == api.TokFor || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
+		// Check if it's FOR UPDATE (either as TokUpdate, TokFor, or FOR keyword)
+		if p.cur.Type == api.TokFor || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
 			p.advance() // consume FOR
 			if p.cur.Type != api.TokUpdate {
 				return nil, p.errorf("expected UPDATE after FOR")
@@ -3357,8 +3357,8 @@ func (p *parser) parseFunctionArgs() ([]api.Expr, error) {
 			p.advance()
 			continue
 		}
-		// FROM and AS terminate function args (e.g., COUNT(*) FROM t, COUNT(*) AS alias)
-		if p.cur.Type == api.TokFrom || p.cur.Type == api.TokAs {
+		// FROM, FOR, and AS terminate function args (e.g., COUNT(*) FROM t, SUBSTRING(s FROM 1 FOR 3))
+		if p.cur.Type == api.TokFrom || p.cur.Type == api.TokAs || p.cur.Type == api.TokFor {
 			break
 		}
 		return nil, p.errorf("expected , or ) in function args, got %s", p.cur.Literal)
@@ -3678,7 +3678,7 @@ func (p *parser) parsePrimary() (api.Expr, error) {
 				return nil, err
 			}
 			// Optional FOR length
-			if p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR" {
+			if p.cur.Type == api.TokFor || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "FOR") {
 				p.advance()
 				length, err = p.parseExpr()
 				if err != nil {
