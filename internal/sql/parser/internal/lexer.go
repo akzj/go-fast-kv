@@ -71,6 +71,12 @@ var keywords = map[string]api.TokenType{
 	"ELSIF":     api.TokElsif,
 	"END":       api.TokEnd,
 	"RETURN":    api.TokReturn,
+	"DECLARE":   api.TokDeclare,
+	"LOOP":      api.TokLoop,
+	"END LOOP":  api.TokEndLoop,
+	"FOR":       api.TokFor,
+	"EXIT":      api.TokExit,
+	"WHILE":     api.TokWhile,
 	"UNION":     api.TokUnion,
 	"ALL":       api.TokAll,
 	"INTERSECT": api.TokIntersect,
@@ -80,7 +86,6 @@ var keywords = map[string]api.TokenType{
 	"ROLLBACK":  api.TokRollback,
 	"SKIP":      api.TokSkip,
 	"LOCKED":    api.TokLocked,
-	"FOR":       api.TokIdent, // FOR UPDATE, handled specially in parser
 	"ALTER":     api.TokAlter,
 	"TRUNCATE":   api.TokTruncate,
 	"ADD":       api.TokAdd,
@@ -187,7 +192,20 @@ func (l *lexer) nextToken() api.Token {
 	case ';':
 		l.pos++
 		return api.Token{Type: api.TokSemicolon, Literal: ";", Pos: startPos}
+	case ':':
+		// Check for := assignment
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '=' {
+			l.pos += 2
+			return api.Token{Type: api.TokAssign, Literal: ":=", Pos: startPos}
+		}
+		l.pos++
+		return api.Token{Type: api.TokIllegal, Literal: ":", Pos: startPos}
 	case '.':
+		// Check for .. range operator
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '.' {
+			l.pos += 2
+			return api.Token{Type: api.TokDotDot, Literal: "..", Pos: startPos}
+		}
 		l.pos++
 		return api.Token{Type: api.TokDot, Literal: ".", Pos: startPos}
 	case '?':

@@ -228,3 +228,162 @@ $$ LANGUAGE SQL`)
 	}
 	fmt.Printf("simple(5) result: %+v\n", rows.Rows)
 }
+
+func TestUDF_Phase3(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "udf-phase3-")
+	defer os.RemoveAll(dir)
+
+	store, err := kvstore.Open(kvstoreapi.Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	db := Open(store)
+	defer db.Close()
+
+	// Test 1: DECLARE + FOR loop sum
+	fmt.Printf("=== Test 1: DECLARE + FOR sum ===\n")
+	_, err = db.Exec(`CREATE FUNCTION sum1to5() RETURNS INT AS $$
+DECLARE
+    result INT := 0;
+BEGIN
+    FOR i IN 1..5 LOOP
+        result := result + i;
+    END LOOP;
+    RETURN result;
+END;
+$$ LANGUAGE SQL`)
+	if err != nil {
+		t.Fatalf("CREATE FUNCTION sum1to5 failed: %v", err)
+	}
+	fmt.Printf("CREATE FUNCTION sum1to5: OK\n")
+
+	rows, err := db.Query(`SELECT sum1to5()`)
+	if err != nil {
+		t.Fatalf("sum1to5() failed: %v", err)
+	}
+	v := rows.Rows[0][0]
+	if v.Int != 15 {
+		t.Fatalf("sum1to5() expected 15, got %d", v.Int)
+	}
+	fmt.Printf("sum1to5() = %d: OK\n", v.Int)
+
+	// Test 2: Factorial with FOR loop
+	fmt.Printf("\n=== Test 2: Factorial ===\n")
+	_, err = db.Exec(`CREATE FUNCTION factorial(n INT) RETURNS INT AS $$
+DECLARE
+    result INT := 1;
+BEGIN
+    FOR i IN 1..n LOOP
+        result := result * i;
+    END LOOP;
+    RETURN result;
+END;
+$$ LANGUAGE SQL`)
+	if err != nil {
+		t.Fatalf("CREATE FUNCTION factorial failed: %v", err)
+	}
+	fmt.Printf("CREATE FUNCTION factorial: OK\n")
+
+	rows, err = db.Query(`SELECT factorial(5)`)
+	if err != nil {
+		t.Fatalf("factorial(5) failed: %v", err)
+	}
+	v = rows.Rows[0][0]
+	if v.Int != 120 {
+		t.Fatalf("factorial(5) expected 120, got %d", v.Int)
+	}
+	fmt.Printf("factorial(5) = %d: OK\n", v.Int)
+
+	// Test 3: LOOP with EXIT WHEN
+	fmt.Printf("\n=== Test 3: LOOP + EXIT WHEN ===\n")
+	_, err = db.Exec(`CREATE FUNCTION count3() RETURNS INT AS $$
+DECLARE
+    c INT := 0;
+BEGIN
+    LOOP
+        c := c + 1;
+        EXIT WHEN c >= 3;
+    END LOOP;
+    RETURN c;
+END;
+$$ LANGUAGE SQL`)
+	if err != nil {
+		t.Fatalf("CREATE FUNCTION count3 failed: %v", err)
+	}
+	fmt.Printf("CREATE FUNCTION count3: OK\n")
+
+	rows, err = db.Query(`SELECT count3()`)
+	if err != nil {
+		t.Fatalf("count3() failed: %v", err)
+	}
+	v = rows.Rows[0][0]
+	if v.Int != 3 {
+		t.Fatalf("count3() expected 3, got %d", v.Int)
+	}
+	fmt.Printf("count3() = %d: OK\n", v.Int)
+
+	// Test 4: WHILE loop
+	fmt.Printf("\n=== Test 4: WHILE loop ===\n")
+	_, err = db.Exec(`CREATE FUNCTION while_test() RETURNS INT AS $$
+DECLARE
+    i INT := 0;
+BEGIN
+    WHILE i < 3 LOOP
+        i := i + 1;
+    END LOOP;
+    RETURN i;
+END;
+$$ LANGUAGE SQL`)
+	if err != nil {
+		t.Fatalf("CREATE FUNCTION while_test failed: %v", err)
+	}
+	fmt.Printf("CREATE FUNCTION while_test: OK\n")
+
+	rows, err = db.Query(`SELECT while_test()`)
+	if err != nil {
+		t.Fatalf("while_test() failed: %v", err)
+	}
+	v = rows.Rows[0][0]
+	if v.Int != 3 {
+		t.Fatalf("while_test() expected 3, got %d", v.Int)
+	}
+	fmt.Printf("while_test() = %d: OK\n", v.Int)
+
+	// Test 5: Simple assignment without DECLARE
+	fmt.Printf("\n=== Test 5: Simple assignment ===\n")
+	_, err = db.Exec(`CREATE FUNCTION double(n INT) RETURNS INT AS $$
+DECLARE
+    x INT;
+BEGIN
+    x := n * 2;
+    RETURN x;
+END;
+$$ LANGUAGE SQL`)
+	if err != nil {
+		t.Fatalf("CREATE FUNCTION double failed: %v", err)
+	}
+	fmt.Printf("CREATE FUNCTION double: OK\n")
+
+	rows, err = db.Query(`SELECT double(7)`)
+	if err != nil {
+		t.Fatalf("double(7) failed: %v", err)
+	}
+	v = rows.Rows[0][0]
+	if v.Int != 14 {
+		t.Fatalf("double(7) expected 14, got %d", v.Int)
+	}
+	fmt.Printf("double(7) = %d: OK\n", v.Int)
+
+	// Cleanup
+	fmt.Printf("\n=== Cleanup ===\n")
+	_, err = db.Exec(`DROP FUNCTION sum1to5`)
+	_, _ = db.Exec(`DROP FUNCTION factorial`)
+	_, _ = db.Exec(`DROP FUNCTION count3`)
+	_, _ = db.Exec(`DROP FUNCTION while_test`)
+	_, _ = db.Exec(`DROP FUNCTION double`)
+	fmt.Printf("DROP FUNCTION: OK\n")
+
+	fmt.Printf("\n✅ Phase 3 UDF: DECLARE/FOR/WHILE/LOOP/EXIT complete\n")
+}

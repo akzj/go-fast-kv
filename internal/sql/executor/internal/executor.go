@@ -65,6 +65,8 @@ type executor struct {
 	triggerDepth int
 	// funcRegistry stores user-defined functions registered via CREATE FUNCTION
 	funcRegistry *FunctionRegistry
+	// funcEnv stores local variables and loop state for UDF execution
+	funcEnv *FuncEnv
 }
 
 // New creates a new Executor.

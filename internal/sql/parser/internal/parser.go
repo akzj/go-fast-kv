@@ -506,8 +506,8 @@ func (p *parser) parseFunctionArgsWithTypes() ([]api.FunctionArg, error) {
 
 
 
-// ParseBlockStmt parses a procedural block: BEGIN ... END
-// containing statements like IF/ELSIF/ELSE/END IF and RETURN.
+// ParseBlockStmt parses a procedural block: [DECLARE ...] BEGIN ... END
+// containing statements like IF/ELSIF/ELSE/END IF, RETURN, DECLARE, LOOP, FOR, WHILE.
 // Used for UDF body parsing.
 func (p *parser) ParseBlockStmt(sql string) ([]api.Statement, error) {
 	// Save current parser state
@@ -525,20 +525,13 @@ func (p *parser) ParseBlockStmt(sql string) ([]api.Statement, error) {
 	p.peek = lex.nextToken()
 	p.questionCount = 0
 
-	// Parse the block
 	var stmts []api.Statement
-	for p.cur.Type != api.TokEOF && p.cur.Type != api.TokEnd {
-		// Consume optional semicolon between statements
-		if p.cur.Type == api.TokSemicolon {
-			p.advance()
-			if p.cur.Type == api.TokEOF || p.cur.Type == api.TokEnd {
-				break
-			}
-			continue
-		}
-		stmt, err := p.parseBlockStatement()
+
+	// Check if body starts with DECLARE
+	if p.cur.Type == api.TokDeclare {
+		// Parse DECLARE ... BEGIN ... END as a single DeclareStmt
+		decl, err := p.parseBlockDeclare()
 		if err != nil {
-			// Restore state on error
 			p.lex = savedLex
 			p.cur = savedCur
 			p.peek = savedPeek
@@ -546,16 +539,44 @@ func (p *parser) ParseBlockStmt(sql string) ([]api.Statement, error) {
 			p.questionCount = savedCount
 			return nil, err
 		}
-		stmts = append(stmts, stmt)
-		// Consume semicolon after statement
-		if p.cur.Type == api.TokSemicolon {
+		stmts = append(stmts, decl)
+	} else {
+		// Parse BEGIN ... END block
+		// Consume BEGIN if present
+		if p.cur.Type == api.TokBegin {
 			p.advance()
 		}
-	}
 
-	// Consume END keyword
-	if p.cur.Type == api.TokEnd {
-		p.advance()
+		// Parse statements until END
+		for p.cur.Type != api.TokEOF && p.cur.Type != api.TokEnd {
+			// Consume optional semicolon between statements
+			if p.cur.Type == api.TokSemicolon {
+				p.advance()
+				if p.cur.Type == api.TokEOF || p.cur.Type == api.TokEnd {
+					break
+				}
+				continue
+			}
+			stmt, err := p.parseBlockStatement()
+			if err != nil {
+				p.lex = savedLex
+				p.cur = savedCur
+				p.peek = savedPeek
+				p.rawInput = savedRaw
+				p.questionCount = savedCount
+				return nil, err
+			}
+			stmts = append(stmts, stmt)
+			// Consume semicolon after statement
+			if p.cur.Type == api.TokSemicolon {
+				p.advance()
+			}
+		}
+
+		// Consume END keyword
+		if p.cur.Type == api.TokEnd {
+			p.advance()
+		}
 	}
 
 	// Restore state
@@ -569,7 +590,7 @@ func (p *parser) ParseBlockStmt(sql string) ([]api.Statement, error) {
 }
 
 // parseBlockStatement parses a single statement within a block.
-// Handles: IF/ELSIF/ELSE/END IF, RETURN, and nested BEGIN/END.
+// Handles: IF/ELSIF/ELSE/END IF, RETURN, LOOP, FOR, WHILE, EXIT, DECLARE, and nested BEGIN/END.
 func (p *parser) parseBlockStatement() (api.Statement, error) {
 	switch p.cur.Type {
 	case api.TokIf:
@@ -578,8 +599,21 @@ func (p *parser) parseBlockStatement() (api.Statement, error) {
 		return p.parseBlockReturn()
 	case api.TokBegin:
 		return p.parseBlockBegin()
+	case api.TokLoop:
+		return p.parseBlockLoop()
+	case api.TokFor:
+		return p.parseBlockFor()
+	case api.TokWhile:
+		return p.parseBlockWhile()
+	case api.TokExit:
+		return p.parseBlockExit()
+	case api.TokDeclare:
+		return p.parseBlockDeclare()
 	default:
-		// Parse as expression statement (for assignments or standalone expressions)
+		// Try to parse as assignment: variable := expression
+		if p.cur.Type == api.TokIdent {
+			return p.parseBlockAssign()
+		}
 		// We only support RETURN for MVP, so any other statement is an error
 		return nil, p.errorf("unsupported statement in UDF body: %s", p.cur.Literal)
 	}
@@ -735,6 +769,288 @@ func (p *parser) parseBlockBegin() (api.Statement, error) {
 
 	return &api.BlockStmt{Statements: stmts}, nil
 }
+
+// parseBlockLoop parses: LOOP ... END LOOP
+func (p *parser) parseBlockLoop() (api.Statement, error) {
+	if p.cur.Type != api.TokLoop {
+		return nil, p.errorf("expected LOOP")
+	}
+	p.advance()
+
+	// Parse loop body
+	body, err := p.parseLoopBody()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.LoopStmt{Body: body}, nil
+}
+
+// parseLoopBody parses the body of a LOOP until END LOOP.
+func (p *parser) parseLoopBody() ([]api.Statement, error) {
+	var stmts []api.Statement
+	for p.cur.Type != api.TokEOF &&
+		!(p.cur.Type == api.TokEnd && p.peek.Type == api.TokLoop) &&
+		p.cur.Type != api.TokEndLoop &&
+		p.cur.Type != api.TokEnd {
+
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+			continue
+		}
+		stmt, err := p.parseBlockStatement()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END LOOP
+	if p.cur.Type == api.TokEnd {
+		p.advance()
+		if p.cur.Type == api.TokLoop {
+			p.advance()
+		} else if p.cur.Type == api.TokEndLoop {
+			p.advance()
+		}
+	} else if p.cur.Type == api.TokEndLoop {
+		p.advance()
+	}
+
+	return stmts, nil
+}
+
+// parseBlockFor parses: FOR var IN start..end LOOP ... END LOOP
+func (p *parser) parseBlockFor() (api.Statement, error) {
+	if p.cur.Type != api.TokFor {
+		return nil, p.errorf("expected FOR")
+	}
+	p.advance()
+
+	// Parse loop variable
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected loop variable name")
+	}
+	varName := p.cur.Literal
+	p.advance()
+
+	// Expect IN
+	upper := strings.ToUpper(p.cur.Literal)
+	if p.cur.Type != api.TokIn && !(p.cur.Type == api.TokIdent && upper == "IN") {
+		return nil, p.errorf("expected IN after FOR variable, got %s", p.cur.Literal)
+	}
+	p.advance() // consume IN (regardless of TokIn or TokIdent)
+
+	// Parse start expression - use parseExpr for full expression support
+	startExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	// Expect .. (range operator)
+	if p.cur.Type != api.TokDotDot {
+		return nil, p.errorf("expected '..' for range")
+	}
+	p.advance()
+
+	// Parse end expression
+	endExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	// Expect LOOP
+	if p.cur.Type != api.TokLoop {
+		return nil, p.errorf("expected LOOP after FOR range")
+	}
+	p.advance()
+
+	// Parse loop body
+	body, err := p.parseLoopBody()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.ForIntStmt{
+		Var:   varName,
+		Start: startExpr,
+		End:   endExpr,
+		Body:  body,
+	}, nil
+}
+
+// parseBlockWhile parses: WHILE condition LOOP ... END LOOP
+func (p *parser) parseBlockWhile() (api.Statement, error) {
+	if p.cur.Type != api.TokWhile {
+		return nil, p.errorf("expected WHILE")
+	}
+	p.advance()
+
+	// Parse condition expression
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	// Expect LOOP
+	if p.cur.Type != api.TokLoop {
+		return nil, p.errorf("expected LOOP after WHILE condition")
+	}
+	p.advance()
+
+	// Parse loop body
+	body, err := p.parseLoopBody()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.WhileStmt{
+		Cond: cond,
+		Body: body,
+	}, nil
+}
+
+// parseBlockExit parses: EXIT [WHEN condition]
+func (p *parser) parseBlockExit() (api.Statement, error) {
+	if p.cur.Type != api.TokExit {
+		return nil, p.errorf("expected EXIT")
+	}
+	p.advance()
+
+	var cond api.Expr
+	// Check for WHEN - use TokWhen, not TokIn!
+	if p.cur.Type == api.TokWhen || (p.cur.Type == api.TokIdent && strings.ToUpper(p.cur.Literal) == "WHEN") {
+		p.advance() // always advance past WHEN
+		var err error
+		cond, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &api.ExitStmt{When: cond}, nil
+}
+
+// parseBlockDeclare parses: DECLARE ... BEGIN ... END
+// Handles the full DECLARE section: DECLARE var declarations BEGIN body END
+func (p *parser) parseBlockDeclare() (api.Statement, error) {
+	if p.cur.Type != api.TokDeclare {
+		return nil, p.errorf("expected DECLARE")
+	}
+	p.advance()
+
+	var decls []api.VarDecl
+	// Parse variable declarations until BEGIN (stop at BEGIN)
+	for p.cur.Type != api.TokEOF &&
+		p.cur.Type != api.TokBegin &&
+		!(p.cur.Type == api.TokEnd && p.peek.Type == api.TokLoop) &&
+		p.cur.Type != api.TokEndLoop &&
+		p.cur.Type != api.TokEnd &&
+		p.cur.Type != api.TokLoop &&
+		p.cur.Type != api.TokFor &&
+		p.cur.Type != api.TokWhile &&
+		p.cur.Type != api.TokIf &&
+		p.cur.Type != api.TokReturn {
+
+		// Parse single variable declaration: name type [:= expr]
+		if p.cur.Type != api.TokIdent {
+			return nil, p.errorf("expected variable name in DECLARE")
+		}
+		varName := p.cur.Literal
+		p.advance()
+
+		// Parse type
+		typeName := p.parseTypeName()
+
+		var value api.Expr
+		// Check for := assignment
+		if p.cur.Type == api.TokAssign {
+			p.advance()
+			var err error
+			value, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		decls = append(decls, api.VarDecl{
+			Name:     varName,
+			TypeName: typeName,
+			Value:    value,
+		})
+
+		// Consume semicolon
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Expect BEGIN
+	if p.cur.Type != api.TokBegin {
+		return nil, p.errorf("expected BEGIN after DECLARE section")
+	}
+	p.advance()
+
+	// Parse body until END
+	var body []api.Statement
+	for p.cur.Type != api.TokEOF && p.cur.Type != api.TokEnd {
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+			if p.cur.Type == api.TokEnd {
+				continue
+			}
+			continue
+		}
+		stmt, err := p.parseBlockStatement()
+		if err != nil {
+			return nil, err
+		}
+		body = append(body, stmt)
+		if p.cur.Type == api.TokSemicolon {
+			p.advance()
+		}
+	}
+
+	// Consume END
+	if p.cur.Type == api.TokEnd {
+		p.advance()
+	}
+
+	return &api.DeclareStmt{
+		Decls: decls,
+		Body:  body,
+	}, nil
+}
+
+// parseBlockAssign parses: variable := expression
+func (p *parser) parseBlockAssign() (api.Statement, error) {
+	if p.cur.Type != api.TokIdent {
+		return nil, p.errorf("expected variable name")
+	}
+	varName := p.cur.Literal
+	p.advance()
+
+	// Expect :=
+	if p.cur.Type != api.TokAssign {
+		return nil, p.errorf("expected ':=' for assignment")
+	}
+	p.advance()
+
+	// Parse expression
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.AssignStmt{
+		Variable: varName,
+		Expr:     expr,
+	}, nil
+}
+
 // parseTypeName parses a type name (INT, TEXT, FLOAT, BLOB, or identifier).
 // Handles both type keywords and regular identifiers (including type names that are keywords).
 func (p *parser) parseTypeName() string {

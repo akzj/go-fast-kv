@@ -215,6 +215,18 @@ func evalBlockStatement(stmt parserapi.Statement, row *engineapi.Row, columns []
 		return evalReturnStmt(s, row, columns, subqueryResults, ex)
 	case *parserapi.BlockStmt:
 		return evalBlockStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.LoopStmt:
+		return evalLoopStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.ForIntStmt:
+		return evalForIntStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.WhileStmt:
+		return evalWhileStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.ExitStmt:
+		return evalExitStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.DeclareStmt:
+		return evalDeclareStmt(s, row, columns, subqueryResults, ex)
+	case *parserapi.AssignStmt:
+		return evalAssignStmt(s, row, columns, subqueryResults, ex)
 	default:
 		return catalogapi.Value{}, fmt.Errorf("%w: unsupported statement type in UDF: %T", executorapi.ErrExecFailed, stmt)
 	}
@@ -271,16 +283,207 @@ func evalBlockBody(stmts []parserapi.Statement, row *engineapi.Row, columns []ca
 	return catalogapi.Value{IsNull: true}, nil
 }
 
+// evalLoopStmt evaluates: LOOP ... END LOOP (infinite loop with EXIT)
+func evalLoopStmt(loop *parserapi.LoopStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+	for {
+		for _, stmt := range loop.Body {
+			val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			// Check if EXIT was triggered
+			if env.ShouldExit() {
+				env.ClearExit()
+				return val, nil
+			}
+		}
+	}
+}
+
+// evalForIntStmt evaluates: FOR var IN start..end LOOP ... END LOOP
+func evalForIntStmt(forStmt *parserapi.ForIntStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+
+	// Evaluate start and end once
+	startVal, err := evalExpr(forStmt.Start, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if startVal.IsNull {
+		return catalogapi.Value{}, fmt.Errorf("%w: FOR start is NULL", executorapi.ErrExecFailed)
+	}
+
+	endVal, err := evalExpr(forStmt.End, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+	if endVal.IsNull {
+		return catalogapi.Value{}, fmt.Errorf("%w: FOR end is NULL", executorapi.ErrExecFailed)
+	}
+
+	if startVal.Type != catalogapi.TypeInt || endVal.Type != catalogapi.TypeInt {
+		return catalogapi.Value{}, fmt.Errorf("%w: FOR requires integer start and end", executorapi.ErrExecFailed)
+	}
+
+	start := startVal.Int
+	end := endVal.Int
+
+	// FOR loop: iterate from start to end (inclusive)
+	for i := start; i <= end; i++ {
+		// Set the loop variable
+		env.Set(forStmt.Var, catalogapi.Value{Type: catalogapi.TypeInt, Int: i})
+
+		// Execute loop body
+		for _, stmt := range forStmt.Body {
+			val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			// Check if EXIT was triggered
+			if env.ShouldExit() {
+				env.ClearExit()
+				return val, nil
+			}
+		}
+	}
+
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalWhileStmt evaluates: WHILE condition LOOP ... END LOOP
+func evalWhileStmt(while *parserapi.WhileStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+
+	for {
+		// Evaluate condition
+		cond, err := evalExpr(while.Cond, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+
+		// If condition is not true (NULL or FALSE), exit loop
+		if cond.IsNull || !isTruthy(cond) {
+			return catalogapi.Value{IsNull: true}, nil
+		}
+
+		// Execute loop body
+		for _, stmt := range while.Body {
+			val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+			// Check if EXIT was triggered
+			if env.ShouldExit() {
+				env.ClearExit()
+				return val, nil
+			}
+		}
+	}
+}
+
+// evalExitStmt evaluates: EXIT [WHEN condition]
+func evalExitStmt(exit *parserapi.ExitStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+
+	// If no condition, unconditional exit
+	if exit.When == nil {
+		env.SetExit()
+		return catalogapi.Value{IsNull: true}, nil
+	}
+
+	// Evaluate condition
+	cond, err := evalExpr(exit.When, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+
+	// If condition is true, exit
+	if !cond.IsNull && isTruthy(cond) {
+		env.SetExit()
+	}
+
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalDeclareStmt evaluates: DECLARE ... BEGIN ... END
+// Sets up local variables and executes the body.
+func evalDeclareStmt(decl *parserapi.DeclareStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+
+	// Initialize declared variables
+	for _, v := range decl.Decls {
+		var val catalogapi.Value
+		if v.Value != nil {
+			// Evaluate initial value
+			var err error
+			val, err = evalExpr(v.Value, row, columns, subqueryResults, ex)
+			if err != nil {
+				return catalogapi.Value{}, err
+			}
+		} else {
+			// Default to NULL
+			val = catalogapi.Value{IsNull: true}
+		}
+		env.Set(v.Name, val)
+	}
+
+	// Execute body
+	for _, stmt := range decl.Body {
+		val, err := evalBlockStatement(stmt, row, columns, subqueryResults, ex)
+		if err != nil {
+			return catalogapi.Value{}, err
+		}
+		// If we hit a RETURN, the value is returned up
+		if val.Type != 0 || !val.IsNull {
+			return val, nil
+		}
+	}
+
+	return catalogapi.Value{IsNull: true}, nil
+}
+
+// evalAssignStmt evaluates: variable := expression
+func evalAssignStmt(assign *parserapi.AssignStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
+	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
+	env := getOrCreateFuncEnv(ex)
+
+	// Evaluate the expression
+	val, err := evalExpr(assign.Expr, row, columns, subqueryResults, ex)
+	if err != nil {
+		return catalogapi.Value{}, err
+	}
+
+	// Assign to variable
+	env.Set(assign.Variable, val)
+
+	return catalogapi.Value{IsNull: true}, nil // no return value
+}
+
+// getOrCreateFuncEnv gets the FuncEnv from executor or creates a new one.
+func getOrCreateFuncEnv(ex *executor) *FuncEnv {
+	if ex.funcEnv == nil {
+		ex.funcEnv = NewFuncEnv(ex)
+	}
+	return ex.funcEnv
+}
+
 // evalReturnStmt evaluates a RETURN statement.
 func evalReturnStmt(ret *parserapi.ReturnStmt, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
 	return evalExpr(ret.Expr, row, columns, subqueryResults, ex)
 }
 
-// hasBlockBody checks if a function body starts with BEGIN.
+// hasBlockBody checks if a function body starts with BEGIN or DECLARE.
 func hasBlockBody(body string) bool {
 	trimmed := strings.TrimSpace(body)
-	return strings.HasPrefix(strings.ToUpper(trimmed), "BEGIN")
+	upper := strings.ToUpper(trimmed)
+	return strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "DECLARE")
 }
 
 // bindStatementParams binds parameter values to all statements in a block.
@@ -309,6 +512,36 @@ func bindSingleStatementParams(stmt parserapi.Statement, paramNames []string, pa
 	case *parserapi.BlockStmt:
 		return &parserapi.BlockStmt{
 			Statements: bindStatementParams(s.Statements, paramNames, paramValues),
+		}
+	case *parserapi.ForIntStmt:
+		return &parserapi.ForIntStmt{
+			Var:   s.Var,
+			Start: bindFunctionParams(s.Start, paramNames, paramValues),
+			End:   bindFunctionParams(s.End, paramNames, paramValues),
+			Body:  bindStatementParams(s.Body, paramNames, paramValues),
+		}
+	case *parserapi.WhileStmt:
+		return &parserapi.WhileStmt{
+			Cond: bindFunctionParams(s.Cond, paramNames, paramValues),
+			Body: bindStatementParams(s.Body, paramNames, paramValues),
+		}
+	case *parserapi.LoopStmt:
+		return &parserapi.LoopStmt{
+			Body: bindStatementParams(s.Body, paramNames, paramValues),
+		}
+	case *parserapi.ExitStmt:
+		return &parserapi.ExitStmt{
+			When: bindFunctionParams(s.When, paramNames, paramValues),
+		}
+	case *parserapi.DeclareStmt:
+		return &parserapi.DeclareStmt{
+			Decls: s.Decls,
+			Body:  bindStatementParams(s.Body, paramNames, paramValues),
+		}
+	case *parserapi.AssignStmt:
+		return &parserapi.AssignStmt{
+			Variable: s.Variable,
+			Expr:     bindFunctionParams(s.Expr, paramNames, paramValues),
 		}
 	default:
 		return stmt
@@ -349,6 +582,47 @@ func evalBlockStatements(stmts []parserapi.Statement, row *engineapi.Row, column
 type FunctionRegistry struct {
 	funcs map[string]*FunctionDef
 	mu    sync.RWMutex
+}
+
+// FuncEnv stores the local variables and loop state for a UDF execution.
+type FuncEnv struct {
+	vars   map[string]catalogapi.Value // local variables
+	loopExit bool                      // set by EXIT statement
+	ex      *executor                  // back-reference for expression evaluation
+}
+
+// NewFuncEnv creates a new function environment.
+func NewFuncEnv(ex *executor) *FuncEnv {
+	return &FuncEnv{
+		vars: make(map[string]catalogapi.Value),
+		ex:   ex,
+	}
+}
+
+// Set sets a variable value.
+func (e *FuncEnv) Set(name string, val catalogapi.Value) {
+	e.vars[strings.ToUpper(name)] = val
+}
+
+// Get retrieves a variable value.
+func (e *FuncEnv) Get(name string) (catalogapi.Value, bool) {
+	val, ok := e.vars[strings.ToUpper(name)]
+	return val, ok
+}
+
+// SetExit marks that an EXIT was executed.
+func (e *FuncEnv) SetExit() {
+	e.loopExit = true
+}
+
+// ShouldExit returns true if EXIT was executed.
+func (e *FuncEnv) ShouldExit() bool {
+	return e.loopExit
+}
+
+// ClearExit clears the EXIT flag.
+func (e *FuncEnv) ClearExit() {
+	e.loopExit = false
 }
 
 // FunctionDef defines a user-defined function.
@@ -664,6 +938,13 @@ func evalColumnRef(ref *parserapi.ColumnRef, row *engineapi.Row, columns []catal
 	// Try OLD. reference for UPDATE/DELETE triggers
 	if upperTable == "OLD" && e != nil {
 		if val, ok := findIn(e.triggerOldCols, e.triggerOldVals); ok {
+			return val, nil
+		}
+	}
+
+	// Try FuncEnv variables (UDF local variables)
+	if upperTable == "" && e != nil && e.funcEnv != nil {
+		if val, ok := e.funcEnv.Get(upper); ok {
 			return val, nil
 		}
 	}

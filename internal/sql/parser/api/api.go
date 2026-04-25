@@ -103,7 +103,15 @@ const (
 	TokEnd      TokenType = 77 // END
 	TokElsif    TokenType = 168 // ELSIF
 	TokReturn   TokenType = 169 // RETURN
-	TokUnion    TokenType = 78 // UNION
+	TokDeclare  TokenType = 170 // DECLARE
+	TokLoop     TokenType = 171 // LOOP
+	TokEndLoop  TokenType = 172 // END LOOP
+	TokFor      TokenType = 173 // FOR
+	TokExit     TokenType = 174 // EXIT
+	TokWhile    TokenType = 175 // WHILE
+	TokDotDot   TokenType = 176 // .. (range)
+	TokAssign   TokenType = 177 // := (assignment)
+	TokUnion    TokenType = 78  // UNION
 	TokAll      TokenType = 79 // ALL
 	TokIntersect TokenType = 80 // INTERSECT
 	TokExcept   TokenType = 81 // EXCEPT
@@ -921,6 +929,67 @@ type BlockStmt struct {
 }
 
 func (*BlockStmt) stmtNode() {}
+
+// DeclareStmt: DECLARE ... BEGIN ... END
+// The declarative section at the start of a block-style UDF.
+type DeclareStmt struct {
+	Decls []VarDecl // variable declarations
+	Body  []Statement // the BEGIN ... END body
+}
+
+func (*DeclareStmt) stmtNode() {}
+
+// VarDecl represents a single variable declaration: name type [:= expr]
+type VarDecl struct {
+	Name    string
+	TypeName string // "INT", "TEXT", "FLOAT", etc.
+	Value   Expr    // initial value expression (nil if not specified)
+}
+
+// AssignStmt: variable := expression
+// Assignment statement in UDF bodies.
+type AssignStmt struct {
+	Variable string // variable name
+	Expr     Expr    // expression to assign
+}
+
+func (*AssignStmt) stmtNode() {}
+
+// LoopStmt: LOOP ... END LOOP
+// Infinite loop that must be exited with EXIT.
+type LoopStmt struct {
+	Body []Statement // loop body
+}
+
+func (*LoopStmt) stmtNode() {}
+
+// ForIntStmt: FOR var IN start..end LOOP ... END LOOP
+// Integer range loop. Evaluates start/end once at entry.
+type ForIntStmt struct {
+	Var   string       // loop variable name
+	Start Expr         // start expression (inclusive)
+	End   Expr         // end expression (inclusive)
+	Body  []Statement  // loop body
+}
+
+func (*ForIntStmt) stmtNode() {}
+
+// WhileStmt: WHILE condition LOOP ... END LOOP
+// Conditional loop that evaluates condition before each iteration.
+type WhileStmt struct {
+	Cond Expr          // condition expression
+	Body []Statement   // loop body
+}
+
+func (*WhileStmt) stmtNode() {}
+
+// ExitStmt: EXIT [WHEN condition]
+// Exits from a loop. If WHEN is present, only exits if condition is true.
+type ExitStmt struct {
+	When Expr // exit condition (nil means unconditional EXIT)
+}
+
+func (*ExitStmt) stmtNode() {}
 
 // ─── Parser's own ColumnDef ───────────────────────────────────────
 
