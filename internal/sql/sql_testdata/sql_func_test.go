@@ -26,4 +26,29 @@ func TestMathFunctions(t *testing.T) {
 	testutil.RunSQLFiles(t, testDir)
 }
 
+func TestDateTimeFunctions(t *testing.T) {
+	dir, _ := os.Getwd()
+	testDir := filepath.Join(dir, "datetime_func")
+	if _, err := os.Stat(testDir); os.IsNotExist(err) {
+		t.Skip("datetime_func sql_testdata not found")
+	}
+	testutil.RunSQLFiles(t, testDir)
+}
 
+func TestJsonFunctions(t *testing.T) {
+	dir, _ := os.Getwd()
+	testDir := filepath.Join(dir, "json_func")
+	if _, err := os.Stat(testDir); os.IsNotExist(err) {
+		t.Skip("json_func sql_testdata not found")
+	}
+	testutil.RunSQLFiles(t, testDir)
+}
+
+func TestUDFunctions(t *testing.T) {
+	dir, _ := os.Getwd()
+	testDir := filepath.Join(dir, "udf")
+	if _, err := os.Stat(testDir); os.IsNotExist(err) {
+		t.Skip("udf sql_testdata not found")
+	}
+	testutil.RunSQLFiles(t, testDir)
+}
