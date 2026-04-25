@@ -1528,7 +1528,70 @@ Parser → FunctionCallExpr
 6. **LOOP/FOR/WHILE** — Loop statements (Phase 3)
 
 
-## §10 Review Resolutions (v1.1)
+## §10 SQL Test Framework — Automated Testing
+
+**Status**: Implemented (`feature/postgres-functions` branch)
+
+### Overview
+
+The SQL test framework provides automated testing via `.sql` files. It parses SQL files with annotations and executes tests, verifying results against expected values.
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `internal/sql/testutil/sql_runner.go` | Test runner framework |
+| `internal/sql/sql_testdata/sql_func_test.go` | Test entry point |
+
+### Test Data (54 files)
+
+| Category | Count | Functions |
+|----------|-------|-----------|
+| string_func | 22 | CONCAT, UPPER, LOWER, SUBSTRING, LENGTH, TRIM, REPLACE, STRPOS, SPLIT_PART, LTRIM, RTRIM, CONCAT_WS |
+| math_func | 17 | ABS, ROUND, CEIL, FLOOR, MOD, GREATEST, LEAST, RANDOM |
+| datetime_func | 5 | NOW, AGE, DATE_TRUNC, TO_CHAR |
+| json_func | 4 | JSONB_ARRAY_LENGTH, JSONB_BUILD_OBJECT, JSONB_BUILD_ARRAY |
+| udf | 2 | factorial, double |
+
+### SQL File Format
+
+```sql
+-- name: concat_basic
+-- description: CONCAT joins two strings
+-- setup: CREATE TABLE t (id INT, name TEXT);
+
+SELECT CONCAT(name, '!') FROM t;
+-- result:
+-- rows: 1
+-- [0][0]: Hello!
+```
+
+### Annotations
+
+| Annotation | Description |
+|------------|-------------|
+| `-- name:` | Test case name |
+| `-- description:` | Human-readable description |
+| `-- setup:` | SQL to execute before main query |
+| `-- result:` | Start of expected results block |
+| `-- rows:` | Expected row count |
+| `-- [row][col]:` | Expected cell value |
+
+### Running Tests
+
+```bash
+# Run all SQL testdata
+go test ./internal/sql/sql_testdata/... -v
+
+# Run specific category
+go test ./internal/sql/sql_testdata/... -run "TestStringFunctions" -v
+```
+
+### Commit
+
+`3954f57` - feat(sql): add SQL testdata framework with 54 test files
+
+## §11 Review Resolutions (v1.1)
 
 Review identified 5 CRITICAL, 10 WARNING, 10 SUGGESTION issues. Resolutions:
 
