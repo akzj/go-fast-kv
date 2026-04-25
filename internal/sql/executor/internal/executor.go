@@ -3871,7 +3871,7 @@ func (e *executor) execSelect(plan *plannerapi.SelectPlan) (*executorapi.Result,
 				name = "expr"
 			}
 			names[i] = name
-			val, err := evalExpr(sc.Expr, emptyRow, emptyCols, nil, nil)
+			val, err := evalExpr(sc.Expr, emptyRow, emptyCols, nil, e)
 			if err != nil {
 				return nil, err
 			}

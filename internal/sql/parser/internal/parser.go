@@ -59,6 +59,58 @@ func (p *parser) Parse(sql string) (api.Statement, error) {
 	return stmt, nil
 }
 
+// ParseExpression parses a single expression and returns it.
+// Useful for function body evaluation, CHECK constraints, DEFAULT expressions.
+// Does NOT support full SQL statements — only standalone expressions.
+func (p *parser) ParseExpression(expr string) (api.Expr, error) {
+	// Create a temporary parser state for the expression
+	lex := newLexer(expr)
+	// Save current state
+	savedLex := p.lex
+	savedCur := p.cur
+	savedPeek := p.peek
+	savedRaw := p.rawInput
+	savedCount := p.questionCount
+	// Set up expression parsing state
+	p.lex = lex
+	p.rawInput = expr
+	p.cur = lex.nextToken()
+	p.peek = lex.nextToken()
+	p.questionCount = 0
+
+	// Parse the expression
+	result, err := p.parseExpr()
+	if err != nil {
+		// Restore state on error
+		p.lex = savedLex
+		p.cur = savedCur
+		p.peek = savedPeek
+		p.rawInput = savedRaw
+		p.questionCount = savedCount
+		return nil, err
+	}
+
+	// Expect end of input
+	if p.cur.Type != api.TokEOF && p.cur.Type != api.TokSemicolon {
+		// Restore state
+		p.lex = savedLex
+		p.cur = savedCur
+		p.peek = savedPeek
+		p.rawInput = savedRaw
+		p.questionCount = savedCount
+		return nil, p.errorf("unexpected token %q in expression", p.cur.Literal)
+	}
+
+	// Restore state
+	p.lex = savedLex
+	p.cur = savedCur
+	p.peek = savedPeek
+	p.rawInput = savedRaw
+	p.questionCount = savedCount
+
+	return result, nil
+}
+
 // ─── Statement Dispatch ───────────────────────────────────────────
 
 func (p *parser) parseStatement() (api.Statement, error) {

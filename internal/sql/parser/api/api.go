@@ -908,6 +908,9 @@ type ColumnDef struct {
 type Parser interface {
 	// Parse parses a single SQL statement.
 	Parse(sql string) (Statement, error)
+	// ParseExpression parses a single expression (without SELECT/FROM etc).
+	// Useful for function body evaluation, CHECK constraints, DEFAULT expressions.
+	ParseExpression(sql string) (Expr, error)
 }
 
 // ─── Errors ───────────────────────────────────────────────────────

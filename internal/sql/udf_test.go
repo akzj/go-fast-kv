@@ -30,14 +30,27 @@ func TestUDF_MVP(t *testing.T) {
 	}
 	fmt.Printf("CREATE FUNCTION myadd: OK\n")
 
-	// Test 2: Function call is recognized (will return "not yet implemented")
+	// Test 2: Function call returns correct result
 	fmt.Printf("\n=== Test 2: Function call ===\n")
-	_, err = db.Query(`SELECT myadd(1, 2)`)
+	rows, err := db.Query(`SELECT myadd(1, 2)`)
 	if err != nil {
-		fmt.Printf("myadd(1,2) error (expected 'not yet implemented'): %v\n", err)
-	} else {
-		fmt.Printf("myadd(1,2): OK (function body evaluation not yet implemented)\n")
+		t.Fatalf("myadd(1,2) failed: %v", err)
 	}
+
+	// Read the result - Result has Rows directly
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows.Rows))
+	}
+	if len(rows.Rows[0]) != 1 {
+		t.Fatalf("expected 1 column, got %d", len(rows.Rows[0]))
+	}
+
+	// Check result is 3
+	v := rows.Rows[0][0]
+	if v.Int != 3 {
+		t.Fatalf("myadd(1,2) expected 3, got %d", v.Int)
+	}
+	fmt.Printf("myadd(1,2) = %d: OK\n", v.Int)
 
 	// Test 3: DROP FUNCTION parses
 	fmt.Printf("\n=== Test 3: DROP FUNCTION ===\n")

@@ -15,6 +15,7 @@ import (
 	encodingapi "github.com/akzj/go-fast-kv/internal/sql/encoding/api"
 	engineapi "github.com/akzj/go-fast-kv/internal/sql/engine/api"
 	executorapi "github.com/akzj/go-fast-kv/internal/sql/executor/api"
+	parser "github.com/akzj/go-fast-kv/internal/sql/parser"
 	parserapi "github.com/akzj/go-fast-kv/internal/sql/parser/api"
 	plannerapi "github.com/akzj/go-fast-kv/internal/sql/planner/api"
 )
@@ -224,9 +225,9 @@ func NewFunctionRegistry() *FunctionRegistry {
 // evalFunctionCall evaluates a user-defined function call.
 func evalFunctionCall(call *parserapi.FunctionCallExpr, row *engineapi.Row, columns []catalogapi.ColumnDef,
 	subqueryResults map[*parserapi.SubqueryExpr]interface{}, ex *executor) (catalogapi.Value, error) {
-	// Check if executor context is available
+	// Get function from registry (ex may be nil in some contexts, e.g., simple SELECT expr evaluation)
 	if ex == nil || ex.funcRegistry == nil {
-		return catalogapi.Value{}, fmt.Errorf("%w: function execution: body evaluation not yet implemented", executorapi.ErrExecFailed)
+		return catalogapi.Value{}, fmt.Errorf("%w: function execution context unavailable", executorapi.ErrExecFailed)
 	}
 
 	// Get function from registry
@@ -235,24 +236,191 @@ func evalFunctionCall(call *parserapi.FunctionCallExpr, row *engineapi.Row, colu
 		return catalogapi.Value{}, fmt.Errorf("%w: function %q not found", executorapi.ErrExecFailed, call.Name)
 	}
 
-	// Bind arguments to parameter names
-	env := make(map[string]parserapi.Expr)
+	// Evaluate arguments and collect their values
+	argVals := make([]catalogapi.Value, len(call.Args))
 	for i, arg := range call.Args {
 		val, err := evalExpr(arg, row, columns, subqueryResults, ex)
 		if err != nil {
-			return catalogapi.Value{}, err
+			return catalogapi.Value{}, fmt.Errorf("%w: failed to evaluate argument %d: %v", executorapi.ErrExecFailed, i, err)
 		}
-		if i < len(fn.Args) {
-			env[fn.Args[i]] = &parserapi.Literal{Value: val}
-		}
+		argVals[i] = val
 	}
 
-	// Parse body as expression using a simple approach:
-	// Re-parse the body expression with parameter substitutions pre-evaluated.
-	// For MVP, body must be a single expression.
-	// Note: Full implementation would substitute parameters in the body string.
-	// Here we return the body string for now (MVP: not yet implemented).
-	return catalogapi.Value{}, fmt.Errorf("%w: function execution: body evaluation not yet implemented", executorapi.ErrExecFailed)
+	// Get parser for expression parsing
+	var p parserapi.Parser
+	if ex.parser != nil {
+		p = ex.parser
+	} else {
+		// Fallback: create a temporary parser
+		p = parser.New()
+	}
+
+	// Parse function body as expression
+	bodyExpr, err := p.ParseExpression(fn.Body)
+	if err != nil {
+		return catalogapi.Value{}, fmt.Errorf("%w: failed to parse function body %q: %v", executorapi.ErrExecFailed, fn.Body, err)
+	}
+
+	// Substitute parameter names with literal values
+	boundExpr := bindFunctionParams(bodyExpr, fn.Args, argVals)
+
+	// Evaluate the bound expression
+	return evalExpr(boundExpr, row, columns, subqueryResults, ex)
+}
+
+// bindFunctionParams substitutes parameter names in expression with their values.
+// For each ColumnRef that matches a parameter name, replace with the literal value.
+func bindFunctionParams(expr parserapi.Expr, paramNames []string, paramValues []catalogapi.Value) parserapi.Expr {
+	if expr == nil {
+		return nil
+	}
+
+	switch e := expr.(type) {
+	case *parserapi.ColumnRef:
+		// Check if this column ref matches a parameter name
+		for i, name := range paramNames {
+			if strings.EqualFold(e.Column, name) || (e.Table != "" && strings.EqualFold(e.Table+"."+e.Column, name)) {
+				return &parserapi.Literal{Value: paramValues[i]}
+			}
+		}
+		return e
+
+	case *parserapi.BinaryExpr:
+		return &parserapi.BinaryExpr{
+			Op:    e.Op,
+			Left:  bindFunctionParams(e.Left, paramNames, paramValues),
+			Right: bindFunctionParams(e.Right, paramNames, paramValues),
+		}
+
+	case *parserapi.UnaryExpr:
+		return &parserapi.UnaryExpr{
+			Op:     e.Op,
+			Operand: bindFunctionParams(e.Operand, paramNames, paramValues),
+		}
+
+	case *parserapi.FunctionCallExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.FunctionCallExpr{Name: e.Name, Args: newArgs}
+
+	case *parserapi.CaseExpr:
+		result := &parserapi.CaseExpr{}
+		if e.Else != nil {
+			result.Else = bindFunctionParams(e.Else, paramNames, paramValues)
+		}
+		for _, when := range e.Whens {
+			result.Whens = append(result.Whens, parserapi.WhenClause{
+				Cond: bindFunctionParams(when.Cond, paramNames, paramValues),
+				Val:  bindFunctionParams(when.Val, paramNames, paramValues),
+			})
+		}
+		return result
+
+	case *parserapi.CastExpr:
+		return &parserapi.CastExpr{
+			TypeName: e.TypeName,
+			Expr:     bindFunctionParams(e.Expr, paramNames, paramValues),
+		}
+
+	case *parserapi.TypeCastFuncExpr:
+		return &parserapi.TypeCastFuncExpr{
+			Func: e.Func,
+			Arg:  bindFunctionParams(e.Arg, paramNames, paramValues),
+		}
+
+	case *parserapi.StringFuncExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.StringFuncExpr{
+			Func:  e.Func,
+			Args:  newArgs,
+			Start: bindFunctionParams(e.Start, paramNames, paramValues),
+			Len:   bindFunctionParams(e.Len, paramNames, paramValues),
+		}
+
+	case *parserapi.MathFuncExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.MathFuncExpr{
+			Func: e.Func,
+			Args: newArgs,
+		}
+
+	case *parserapi.DateTimeFuncExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.DateTimeFuncExpr{
+			Func: e.Func,
+			Args: newArgs,
+		}
+
+	case *parserapi.JsonFuncExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.JsonFuncExpr{
+			Func: e.Func,
+			Args: newArgs,
+		}
+
+	case *parserapi.CoalesceExpr:
+		newArgs := make([]parserapi.Expr, len(e.Args))
+		for i, arg := range e.Args {
+			newArgs[i] = bindFunctionParams(arg, paramNames, paramValues)
+		}
+		return &parserapi.CoalesceExpr{Args: newArgs}
+
+	case *parserapi.InExpr:
+		newValues := make([]parserapi.Expr, len(e.Values))
+		for i, v := range e.Values {
+			newValues[i] = bindFunctionParams(v, paramNames, paramValues)
+		}
+		return &parserapi.InExpr{
+			Expr:   bindFunctionParams(e.Expr, paramNames, paramValues),
+			Values: newValues,
+			Not:    e.Not,
+		}
+
+	case *parserapi.BetweenExpr:
+		return &parserapi.BetweenExpr{
+			Expr: bindFunctionParams(e.Expr, paramNames, paramValues),
+			Low:  bindFunctionParams(e.Low, paramNames, paramValues),
+			High: bindFunctionParams(e.High, paramNames, paramValues),
+			Not:  e.Not,
+		}
+
+	case *parserapi.LikeExpr:
+		return &parserapi.LikeExpr{
+			Expr:     bindFunctionParams(e.Expr, paramNames, paramValues),
+			Pattern:  e.Pattern,
+			Escape:   e.Escape,
+			Not:      e.Not,
+		}
+
+	case *parserapi.IsNullExpr:
+		return &parserapi.IsNullExpr{
+			Expr: bindFunctionParams(e.Expr, paramNames, paramValues),
+			Not:  e.Not,
+		}
+
+	case *parserapi.ExtractExpr:
+		return &parserapi.ExtractExpr{
+			Field: e.Field,
+			Date:  bindFunctionParams(e.Date, paramNames, paramValues),
+		}
+
+	default:
+		return expr
+	}
 }
 
 // evalColumnRef looks up a column value from the row.
