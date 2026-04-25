@@ -134,10 +134,10 @@ SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `FOREIGN KEY` | ✅ | Multi-column supported |
-| `AUTOINCREMENT` | ❌ | Not supported |
-| `SAVEPOINT` | ❌ | Not supported |
+| `AUTOINCREMENT` | ✅ | INT PRIMARY KEY AUTOINCREMENT |
+| `SAVEPOINT` | ✅ | SAVEPOINT, ROLLBACK TO SAVEPOINT, RELEASE SAVEPOINT |
 | Named parameters | ❌ | Only `$1`, `$2`, ... positional |
-| `CHECK` constraints | ❌ | Not supported |
+| `CHECK` constraints | ✅ | Column and table level CHECK |
 | Isolation level configuration | ❌ | Only SERIALIZABLE (SSI) |
 | `LastInsertId()` | ⚠️ | Always returns 0 (KV stores don't support this) |
 
