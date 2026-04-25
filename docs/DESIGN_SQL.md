@@ -1460,16 +1460,25 @@ These changes are backward-compatible — existing tests should still pass.
 
 ---
 
-## §10.5 User-Defined Functions (UDF) — MVP Implemented
+## §10.5 User-Defined Functions (UDF) — Implemented
 
-**Status**: MVP Complete (feature/postgres-functions branch)
+**Status**: Phases 1-2 Complete (feature/postgres-functions branch)
 
 ### Syntax
 
 ```sql
-CREATE FUNCTION name(arg1 type1, arg2 type2) RETURNS type AS $$
-    expression
-$$ LANGUAGE SQL;
+-- Simple expression function
+CREATE FUNCTION myadd(a INT, b INT) RETURNS INT AS $$ a + b $$ LANGUAGE SQL;
+
+-- Block-style function with IF/ELSIF/ELSE
+CREATE FUNCTION grade(score INT) RETURNS TEXT AS $$
+BEGIN
+    IF score >= 90 THEN RETURN 'A';
+    ELSIF score >= 80 THEN RETURN 'B';
+    ELSE RETURN 'C';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
 
 DROP FUNCTION name;
 ```
@@ -1485,6 +1494,8 @@ DROP FUNCTION name;
 | Executor: `evalFunctionCall()` | ✅ | 478beda |
 | Planner: `CreateFunctionPlan` | ✅ | 935fddf |
 | Multi-argument function calls | ✅ | 69df681 |
+| **Phase 1: Function body evaluation** | ✅ | b64abeb |
+| **Phase 2: IF/ELSIF/ELSE/RETURN** | ✅ | 3d0d8e7 |
 
 ### Architecture
 
@@ -1498,21 +1509,23 @@ Parser → CreateFunctionStmt
 Parser → FunctionCallExpr
        → Planner → FunctionCallPlan
        → Executor → FunctionRegistry.Get()
-       → evalFunctionCall() → returns "body evaluation not yet implemented"
+       → evalFunctionCall() → ParseExpression() → bindFunctionParams() → evalExpr()
 ```
 
-### Limitations (MVP)
+### Limitations
 
 1. **No persistent function storage** — Functions exist only in-memory (`FunctionRegistry`)
-2. **No body evaluation** — Function calls return error "body evaluation not yet implemented"
-3. **No plpgsql** — Only SQL scalar expressions in function body
+2. ~~**No body evaluation**~~ — ✅ **DONE** (Phase 1: `b64abeb`)
+3. ~~**No plpgsql**~~ — ✅ **Phase 2 DONE** (IF/ELSIF/ELSE/RETURN: `3d0d8e7`)
 
 ### Future Enhancements
 
-1. **Function body evaluation** — Parse and evaluate function body expression with bound arguments
+1. ~~**Function body evaluation**~~ — ✅ **DONE** (Phase 1: `b64abeb`)
 2. **Persistent function storage** — Store functions in catalog (`FunctionSchema`)
 3. **Built-in functions as UDFs** — Migrate hardcoded built-in functions to UDF registry
-4. **plpgsql support** — `BEGIN...END` blocks, `DECLARE`, `IF`/`CASE`/`LOOP`
+4. ~~**plpgsql support**~~ — ✅ **Phase 2 DONE** (IF/ELSIF/ELSE/RETURN: `3d0d8e7`)
+5. **DECLARE** — Variable declarations (Phase 3)
+6. **LOOP/FOR/WHILE** — Loop statements (Phase 3)
 
 
 ## §10 Review Resolutions (v1.1)
